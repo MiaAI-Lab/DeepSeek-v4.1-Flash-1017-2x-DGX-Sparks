@@ -265,7 +265,7 @@ if [[ "$have" == "$need" ]]; then log "Worker: Engram tables on its disk"
 else
   free=$(worker 1 "mkdir -p $WORKER_ENGRAM_DIR && df -B1 --output=avail $WORKER_ENGRAM_DIR | tail -1")
   # the ~140 GiB for rank 1's weight file is only needed while that file is not on its disk yet
-  spare=150; worker 1 "ls $WORKER_CACHE_DIR/rank1of2-*.bin >/dev/null 2>&1" && spare=10
+  spare=150; worker 1 "find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank1of2-*.bin' 2>/dev/null | grep -q ." && spare=10
   (( free + have > need + spare * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR), its weight file ~106 GB (unless it is already there), and $spare GiB to spare"
   log "Worker: copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over NFS, once)"
   worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$BASE_IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
@@ -274,7 +274,8 @@ fi
 wwant=$(worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' --entrypoint bash '$IMAGE' -c 'tf-dsv41-rank-cache $SNAP_C /tmp/x 1 2 --index-only | sha256sum | cut -c1-20'")
 if worker 1 "[[ -f $WORKER_CACHE_DIR/rank1of2-$wwant.bin ]]"; then log "Worker: weight file of rank 1 ready"
 else
-  worker 1 "mkdir -p $WORKER_CACHE_DIR && rm -f $WORKER_CACHE_DIR/rank1of2-*.bin $WORKER_CACHE_DIR/.rank1of2.partial"
+  # find, not a glob: the worker's login shell may be zsh, which fails a command whose glob matches nothing
+  worker 1 "mkdir -p $WORKER_CACHE_DIR && find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank1of2-*.bin' -delete && rm -f $WORKER_CACHE_DIR/.rank1of2.partial"
   free=$(worker 1 "df -B1 --output=avail $WORKER_CACHE_DIR | tail -1")
   (( free > 130 * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free for rank 1's weight file (WORKER_CACHE_DIR): it needs ~106 GB"
   log "Worker: weight file of rank 1 from the checkpoint over NFS (~106 GB, a few minutes)"
