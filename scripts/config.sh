@@ -107,6 +107,10 @@ MAX_TOKENS="${MAX_TOKENS:-32768}"      # a reply's budget when a request sets no
 THINKING="${THINKING:-1}"              # think first unless a request turns it off
 # The reasoning effort when a request names none: low, medium, high or xhigh (empty: the chat template's default)
 REASONING_EFFORT="${REASONING_EFFORT:-}"
+# Reasoning tokens a reply may spend before the engine closes the think block itself (tensorfold-native --thinking-budget; empty: no
+# cap). A request's own thinking_budget wins. With no cap, a turn on a hard task can spend its whole MAX_TOKENS thinking and end
+# with no text and no tool call (finish_reason length).
+THINKING_BUDGET="${THINKING_BUDGET:-}"
 # The family's measured sampling (BertholomusAI's two-node launch): temperature 1.0, top_p 0.95, from the 20 likeliest
 # tokens (the family's exact sampler needs a top-k). A request's own values win.
 TEMPERATURE="${TEMPERATURE:-1.0}"

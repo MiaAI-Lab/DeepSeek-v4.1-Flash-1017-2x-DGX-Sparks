@@ -11,3 +11,4 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # ABLIT=0                     # 1: matching Keys overlay on Mia EAQ 2.9 bpw; needs your HF token AND access below
 # HF_TOKEN=hf_...              # HF read token (or use hf auth login on the head); never commit your token
 # ABLIT=1 requires access: https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
+# THINKING_BUDGET=20000       # reasoning tokens a reply may spend before the engine closes the think block (empty: no cap)

@@ -277,7 +277,8 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `CONTEXT` | 1048576 | a request's positions at most; rank 1's `--pool` follows it |
 | `PARALLEL` | 4 | requests at once (the engine's streams, 1 to 16; the family was measured at 4) |
 | `THINKING`, `REASONING_EFFORT` | 1, empty | think first unless a request turns it off; `low` / `medium` / `high` / `xhigh` as the default effort |
-| `TEMPERATURE`, `TOP_P`, `TOP_K` | 1.0, 0.95, 20 | the server's sampling defaults; a request's own values win |
+| `THINKING_BUDGET` | empty | reasoning tokens a reply may spend before the engine closes the think block itself and lets the answer continue (`--thinking-budget`; a request's `thinking_budget` wins); empty: no cap. A hard task can otherwise spend its whole `MAX_TOKENS` thinking and end with no text and no tool call. A model that keeps rambling after the cut is not stopped by it |
+| `TEMPERATURE`, `TOP_P`, `TOP_K` | 1.0, 0.95, 20 | the server's sampling defaults; a request's own values win. This engine refuses a `top_k` above 56 with `TooManyCandidates` (the finite candidate list its sampler keeps), so `TOP_K` is at most 56; `top_k` 0 or -1 is refused too, with a different, misleading message |
 | `DRAFTS` | 1 | the checkpoint's DSpark draft blocks (drafted replies equal plain ones) |
 | `RDMA`, `GRAPHS`, `SIDE`, `PREFETCH`, `ENGRAM_AIO` | 1 | the engine's served settings |
 | `MAX_TOKENS` | 32768 | a reply's budget when a request sets none |
