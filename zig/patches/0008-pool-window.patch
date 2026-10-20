@@ -1,0 +1,131 @@
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 7d2e266..e883286 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -48,6 +48,7 @@ pub const draft = @import("draft.zig");
+ pub const sampling = @import("sampling.zig");
+ pub const model = @import("model.zig");
+ pub const lanes = @import("lanes.zig");
++pub const pool = @import("pool.zig");
+ 
+ test {
+     // every declaration of every file, so functions no test calls are still compiled
+@@ -94,4 +95,5 @@ test {
+     refAll(sampling);
+     refAll(model);
+     refAll(lanes);
++    refAll(pool);
+ }
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index ee13c9f..6d601a9 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -27,6 +27,7 @@ const comm_mod = @import("comm.zig");
+ const link = @import("link.zig");
+ const ring2d = @import("ring2d.zig");
+ const rdma = @import("rdma.zig");
++const pool_mod = @import("pool.zig");
+ 
+ /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
+ pub const chunk_rows = 2048;
+@@ -238,9 +239,10 @@ pub const Model = struct {
+         m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
+         errdefer m.ex.unload();
+ 
+-        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position of the pool
++        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream can reach (the window, not the pool)
+         const half = c.rope_dim / 2;
+-        const rope_rows = o.pool + round.max_rows + 1;
++        const win = try pool_mod.window(o.pool, if (std.c.getenv("TF_DS_WINDOW")) |v| std.mem.span(v) else null);
++        const rope_rows = pool_mod.ropeRows(win, round.max_rows);
+         m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
+         errdefer m.rope_buf.free();
+         {
+@@ -249,7 +251,7 @@ pub const Model = struct {
+             for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
+                 var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
+                 defer f.close(io);
+-                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the pool
++                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the window
+                 try m.rope_buf.upload(j * part.len, part);
+             }
+         }
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 55a532f..49e02c7 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -28,6 +28,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const model = @import("model.zig");
++const pool_mod = @import("pool.zig");
+ const lanes_mod = @import("lanes.zig");
+ const round = @import("round.zig");
+ const link = @import("link.zig");
+@@ -133,7 +134,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,
+         .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
+         .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
+-        .pool = o.context,
++        .pool = try pool_mod.resolve(o.context, getenv("TF_DS_POOL")), // may exceed the window: more kept prompts stay resident
+         .drafts = o.drafts,
+         .arena_bytes = arena_gib << 30,
+         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
+diff --git a/zig/src/families/dsv41/pool.zig b/zig/src/families/dsv41/pool.zig
+new file mode 100644
+index 0000000..3c3926b
+--- /dev/null
++++ b/zig/src/families/dsv41/pool.zig
+@@ -0,0 +1,52 @@
++//! The shared pool's size and the RoPE rows it needs. The server's window (--context) is the most positions one request may
++//! use; the pool (TF_DS_POOL) is how many positions the streams' extents and kept prompts share, and may exceed the window so
++//! that more long prompts stay resident. A stream's RoPE positions run from 0 inside its own extent, so the tables need only
++//! the window's rows, however large the pool is (TF_DS_WINDOW names the window to the ranks that are not told it by the server).
++const std = @import("std");
++
++/// A positive count from an environment value; null when unset or blank, `bad` when it is anything else.
++fn count(raw: ?[]const u8, bad: anyerror) !?usize {
++    const t = std.mem.trim(u8, raw orelse return null, " \t\r\n");
++    if (t.len == 0) return null;
++    const n = std.fmt.parseInt(usize, t, 10) catch return bad;
++    if (n == 0) return bad;
++    return n;
++}
++
++/// The pool's positions: TF_DS_POOL when set (it may not be smaller than the window), else the window itself.
++pub fn resolve(context: usize, raw: ?[]const u8) !usize {
++    const n = (try count(raw, error.BadPool)) orelse return context;
++    if (n < context) return error.BadPool;
++    return n;
++}
++
++/// The positions one stream can reach: TF_DS_WINDOW when set, else the whole pool; never more than the pool.
++pub fn window(pool: usize, raw: ?[]const u8) !usize {
++    const n = (try count(raw, error.BadWindow)) orelse return pool;
++    return @min(n, pool);
++}
++
++/// The rows each RoPE table holds on the device: every position of a stream plus a round's rows and one.
++pub fn ropeRows(window_positions: usize, round_rows: usize) usize {
++    return window_positions + round_rows + 1;
++}
++
++test "pool: unset or blank follows the window; a larger pool is kept; a smaller or malformed one is refused" {
++    try std.testing.expectEqual(@as(usize, 1048576), try resolve(1048576, null));
++    try std.testing.expectEqual(@as(usize, 1048576), try resolve(1048576, "  "));
++    try std.testing.expectEqual(@as(usize, 1048576), try resolve(1048576, "1048576"));
++    try std.testing.expectEqual(@as(usize, 2097152), try resolve(1048576, " 2097152\n"));
++    for ([_][]const u8{ "1048575", "0", "-1", "2M", "1.5" }) |bad| try std.testing.expectError(error.BadPool, resolve(1048576, bad));
++}
++
++test "window: unset is the pool; set is kept up to the pool; zero or malformed is refused" {
++    try std.testing.expectEqual(@as(usize, 2097152), try window(2097152, null));
++    try std.testing.expectEqual(@as(usize, 1048576), try window(2097152, "1048576"));
++    try std.testing.expectEqual(@as(usize, 1048576), try window(1048576, "2097152")); // never past the pool
++    for ([_][]const u8{ "0", "x", "-5" }) |bad| try std.testing.expectError(error.BadWindow, window(2097152, bad));
++}
++
++test "rope rows: the window's positions plus a round's rows plus one, whatever the pool is" {
++    try std.testing.expectEqual(@as(usize, 1048576 + 48 + 1), ropeRows(1048576, 48));
++    try std.testing.expectEqual(@as(usize, 1049), ropeRows(1000, 48));
++}

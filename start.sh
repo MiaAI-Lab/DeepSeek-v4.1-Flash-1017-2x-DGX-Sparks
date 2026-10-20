@@ -19,7 +19,7 @@
 # Extra arguments go to rank 0's `tensorfold-native serve` after the defaults, so they win.
 # Setup: WORKER (an ssh target, key-based) in scripts/local.sh.
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and their notes in scripts/config.sh):
-#   serving  CONTEXT, PARALLEL, ROUND_ROWS, MAX_TOKENS, THINKING, REASONING_EFFORT, THINKING_BUDGET, TEMPERATURE, TOP_P, TOP_K, DRAFTS,
+#   serving  CONTEXT, POOL, PARALLEL, ROUND_ROWS, MAX_TOKENS, THINKING, REASONING_EFFORT, THINKING_BUDGET, TEMPERATURE, TOP_P, TOP_K, DRAFTS,
 #            SERVED_NAME, HOST, PORT, RDMA, GRAPHS, SIDE, PREFETCH, ENGRAM_AIO, REPLAY_FLOOR
 #   nodes    WORKER, FABRIC_PEER, MASTER_ADDR, MASTER_PORT, SOCKET_IFNAME, NCCL_RAILS, NCCL_DEBUG
 #   files    ABLIT (0 | 1), ABLIT_REVISION, MODEL_ID, MODEL_REVISION, ENGRAM_ID, ENGRAM_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER, NFS_VOLUME,
@@ -46,6 +46,7 @@ ablit_notice
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
 (( CONTEXT <= 1048576 )) || die "CONTEXT is at most 1048576 (the model's window), not $CONTEXT"
+[[ -z "$POOL" ]] || { [[ "$POOL" =~ ^[1-9][0-9]*$ ]] && (( POOL >= CONTEXT )); } || die "POOL is empty (the pool is CONTEXT) or a count of positions of at least CONTEXT ($CONTEXT), not $POOL"
 (( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16 (the engine's streams), not $PARALLEL"
 [[ -z "$ROUND_ROWS" ]] || { [[ "$ROUND_ROWS" =~ ^[0-9]+$ ]] && (( ROUND_ROWS >= 16 && ROUND_ROWS <= 48 )); } || die "ROUND_ROWS is empty or 16 to 48, not $ROUND_ROWS"
 [[ -z "$THINKING_BUDGET" || "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]] || die "THINKING_BUDGET is a positive count of reasoning tokens (or empty for no cap), not $THINKING_BUDGET"
@@ -198,6 +199,7 @@ foreground() {
 }
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
+[[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' || true)
@@ -208,7 +210,7 @@ KIT=/hf/$KIT_SUB/kit
 # rank 1 takes the round's settings as flags only (tf-dsv41-lanes reads no TF_DS_GRAPHS & co.): without them it runs
 # every round ungraphed, with no side stream, prefetch or AIO, and rank 0 waits on it each round. Its pool is rank 0's
 # context, and its streams rank 0's (TF_DS_STREAMS): with other values the two ranks wait on each other.
-FOLLOW="--pool $CONTEXT --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
+FOLLOW="--pool ${POOL:-$CONTEXT} --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 [[ -z "$ROUND_ROWS" ]] || FOLLOW+=" --round-rows $ROUND_ROWS"
 # RANK1_PROFILE=1|2: rank 1's own profile (--profile; 2 adds prefill_phases_ms), AGGREGATED over the run and printed to its
 # log only when rank 0 goes away first (docker stop rank 0, read rank 1's log, then ./stop.sh). It synchronizes the stream

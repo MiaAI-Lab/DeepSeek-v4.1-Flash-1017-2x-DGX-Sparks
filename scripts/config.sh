@@ -101,6 +101,11 @@ PORT="${PORT:-8888}"
 # A request's positions at most (prompt and reply). The model's window is 1,048,576 tokens. The streams share a pool of
 # CONTEXT positions (rank 1's --pool is rank 0's --context), so PARALLEL streams at the full window take turns.
 CONTEXT="${CONTEXT:-1048576}"
+# zig/patches/0008: the positions the streams' extents and kept prompts share (rank 0's and rank 1's --pool), when more than CONTEXT: more
+# long prompts stay resident (each kept prompt holds its extent) and more long requests run at once. Empty (default): CONTEXT, as before.
+# It may not be smaller than CONTEXT. Its KV caches grow with it (about 0.9 GiB a rank per 1,048,576 positions, in host memory: measure the
+# head's headroom first, see README); the RoPE tables stay the window's size. TF_DS_POOL, and TF_DS_WINDOW (= CONTEXT) on both ranks.
+POOL="${POOL:-}"
 PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams, TF_DS_STREAMS; the family measured 4)
 ROUND_ROWS="${ROUND_ROWS:-}"           # a decode round's rows at most, 16 to 48 (empty: the engine's 16)
 MAX_TOKENS="${MAX_TOKENS:-32768}"      # a reply's budget when a request sets none

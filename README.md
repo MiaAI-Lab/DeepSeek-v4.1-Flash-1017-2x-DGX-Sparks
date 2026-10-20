@@ -286,7 +286,8 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `ABLIT` | 0 | `0`: stock Mia EAQ 2.9 bpw; `1`: apply the matching gated Keys overlay; requires your HF token and repository access (see Abliterated mode) |
 | `ABLIT_REVISION` | `0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0` | pinned Keys overlay and application script; full commit hash |
 | `HF_TOKEN` | unset | Hugging Face read token for downloads; alternatively authenticate with `hf auth login` on the head |
-| `CONTEXT` | 1048576 | a request's positions at most; rank 1's `--pool` follows it |
+| `CONTEXT` | 1048576 | a request's positions at most; rank 1's `--pool` follows it, or `POOL` |
+| `POOL` | empty | positions the streams' extents and kept prompts share, when more than `CONTEXT` (empty: `CONTEXT`; not below it; `zig/patches/0008`): more long prompts stay resident and more long requests run at once. A request still stops at `CONTEXT`. Its KV caches grow with it, about 0.9 GiB a rank per 1,048,576 positions, in host memory: at `POOL=2097152` the head's idle `MemAvailable` went from 6.76 to 5.71 GiB and its lowest during a cold 96K-token prompt from 5.89 to 4.49 GiB (worker: 8.63 to 7.43 and 8.60 to 7.33), so measure the head's headroom before raising it |
 | `PARALLEL` | 4 | requests at once (the engine's streams, 1 to 16; the family was measured at 4) |
 | `THINKING`, `REASONING_EFFORT` | 1, empty | think first unless a request turns it off; `low` / `medium` / `high` / `xhigh` as the default effort |
 | `THINKING_BUDGET` | empty | reasoning tokens a reply may spend before the engine closes the think block itself and lets the answer continue (`--thinking-budget`; a request's `thinking_budget` wins); empty: no cap. A hard task can otherwise spend its whole `MAX_TOKENS` thinking and end with no text and no tool call. A model that keeps rambling after the cut is not stopped by it |
