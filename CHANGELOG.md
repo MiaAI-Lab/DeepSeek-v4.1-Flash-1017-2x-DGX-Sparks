@@ -2,15 +2,16 @@
 
 ## Unreleased
 
-- `zig/patches/0007-rdma-idle-nap.patch` and `RDMA_IDLE_S` / `RDMA_NAP_US` (on by default; 2 s quiet, 100 µs nap):
-  the RDMA gather's proxy naps once the engine is idle instead of spinning a core on each rank (the logic of
-  [TensorFold PR #27](https://github.com/bertholomus/TensorFold/pull/27), ported to the Zig ring). A decode round's
-  gathers come microseconds apart, so they never see a nap; the first gather after a quiet spell waits at most one nap.
-  `RDMA_IDLE_S=0` keeps the stock always-spinning proxy for an A/B. The patch applies after 0001, 0002 and 0004-0006;
-  `zig fmt --check` and `zig ast-check` pass. Measured on this pair with `RDMA_NAP_US=100`: the proxy thread used 11.2%
-  (rank 0) and 8.8% (rank 1) over a 20 s window with the lane host idle, against ~100% a rank before. PR #27's Python
-  line measured 3.9-5.2%; the Zig ring's two CQ polls per 100 µs wake cost more, so `RDMA_NAP_US=500` lowers it further
-  (at most 0.5 ms on the first gather after a quiet spell).
+- `zig/patches/0007-rdma-idle-nap.patch` and `RDMA_IDLE_S` / `RDMA_NAP_US` (on by default; recipe 2 s quiet, 500 µs
+  nap; the patch's engine fallback is 100 µs): the RDMA gather's proxy naps once the engine is idle instead of spinning a
+  core on each rank (the logic of [TensorFold PR #27](https://github.com/bertholomus/TensorFold/pull/27), ported to the
+  Zig ring). A decode round's gathers come microseconds apart, so they never see a nap; the first gather after a quiet
+  spell waits at most one nap (0.5 ms at 500 µs). `RDMA_IDLE_S=0` keeps the stock always-spinning proxy for an A/B. The
+  patch applies after 0001, 0002 and 0004-0006; `zig fmt --check` and `zig ast-check` pass. Measured on this pair with
+  `RDMA_NAP_US=100`: the proxy thread used 11.2% (rank 0) and 8.8% (rank 1) over a 20 s window with the lane host idle,
+  against ~100% a rank before. The Zig ring's two CQ polls per wake cost more than PR #27's Python line (3.9-5.2% at
+  100 µs), so the recipe sets 500 µs; the wake rate falls 5x and the proxy should sit near 2% a rank. 2 s is enough that
+  active decode never naps.
 - `prepare.sh`'s "cannot mount ... over NFS" error shows the last four lines of docker's output, not only the last (which was always
   docker's "Run 'docker run --help'" line, never the reason); the README's NFS section says what to check (issue
   [#15](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/15), reported by **aoeu10**). The README's memory note now
