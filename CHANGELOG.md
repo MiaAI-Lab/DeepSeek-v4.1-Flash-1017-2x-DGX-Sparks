@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `zig/patches/0009-disk-cache.patch` (off by default; `DISK_CACHE=1`): kept conversation states go to disk, each rank its
+  half, before they lose their place in memory, and come back from it; a stop writes every kept state, so a restart
+  resumes them. `start.sh` makes `DISK_CACHE_DIR` on both Sparks, mounts it in both containers and checks its free
+  space; `STOP_TIMEOUT` follows `DISK_CACHE_FLUSH_S`. Replies identical with and without it (`tools/exact.py` 31/31);
+  a 52K turn resumed from disk in 1.1-2.8 s instead of ~32 s; reading a 198,656-token state back pauses the other streams
+  for ~0.35 s. `/health` shows the prompt cache's counts (`prompt_cache`). See the README section "Disk cache of kept
+  conversations".
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,

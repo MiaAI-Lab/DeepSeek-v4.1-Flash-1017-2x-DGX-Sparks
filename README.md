@@ -369,6 +369,51 @@ answering and has to be power-cycled (this happened once, with the engine's rese
   by two memory readings); it is sized from `CONTEXT` when the model loads and shared by the streams. Most of the
   memory is the weights (~99 GiB, of which ~3.5 GiB are the drafter's), so the head's other software decides what is left.
 
+## Disk cache of kept conversations
+
+`zig/patches/0009-disk-cache.patch`, off by default (`DISK_CACHE=1` in `scripts/local.sh` turns it on). The engine keeps a
+conversation's state at its last chunk end so that the next turn resumes there instead of running the whole prompt
+again; that state lives in the shared pool and in a small per-state buffer, and it is lost when a placement needs its
+rows (another long prompt) or the prompt cache's budget. With the disk cache, a kept state about to be lost is written
+to disk first, each rank its half on its own NVMe, and read back when the conversation returns. A stop writes every
+kept state, so a restart resumes them too.
+
+- **Where:** `DISK_CACHE_DIR` (default `/var/tmp/dsv41-disk-cache`), the same absolute path on both Sparks, mounted at
+  the same path in both containers. `start.sh` makes it (mode 0700) and
+  refuses to start if it is not writable or the disk has less than `DISK_CACHE_MIN_FREE_GIB` free. Inside it, one
+  directory per engine identity (a hash of the executable, the rank's weight file size and a state's layout): another
+  build never reads an older build's files; old identities are swept, least recently opened first, when the cap needs
+  room, and rank 1 removes the ones rank 0 no longer keeps.
+- **Files:** `<key>.r<rank>.ds41kv`, one per rank and state (0.87 KiB per token per rank, measured: 163 MiB for a
+  184,320-token state), written to a `.tmp`, fsynced and renamed, the directory fsynced; a CRC-32 every 8 MiB, checked
+  on every read. A file whose head (format, rank, identity, key, position, sizes, length) or any CRC does not match is
+  never used: both halves are dropped and the prompt runs from 0. Rank 0's file carries the state's tokens, so the index
+  is rebuilt from the files if a crash lost its last record.
+- **Settings:** `DISK_CACHE_GIB` (64: each rank's cap), `DISK_CACHE_MIN_FREE_GIB` (20: nothing is written past it),
+  `DISK_CACHE_MIN_TOKENS` (8192: shorter states stay off disk), `DISK_CACHE_TTL_H` (72), `DISK_CACHE_FLUSH_S` (60: a
+  stop's time to write what is kept). With the cache on, `STOP_TIMEOUT` defaults to `DISK_CACHE_FLUSH_S + 15`, and rank 1
+  ignores SIGTERM until rank 0 says done (rank 0 writes first, then stops it). Prompts with pictures stay off disk.
+- **Memory:** the bytes cross between the device and the file through one 32 MiB host buffer; no write or read starts
+  under `DISK_CACHE_MEM_FLOOR_GIB` (3.5) of `MemAvailable`. Measured after the load: the same headroom as without it.
+- **Measured on the pair:** replies identical with and without it (`tools/exact.py` 31/31 against the
+  engine without the patch; `tools/disk_cache_check.py` with 6 conversations of 52K tokens forced out of a 262,144-position pool:
+  0 differences in 12); a 52K turn resumed from disk in 1.1-2.8 s instead of ~32 s, also after `./stop.sh` and
+  `./start.sh`; in real traffic a 189,747-token prompt resumed 186,368 tokens from disk and finished its pass in 2.8 s.
+  A stop wrote 11 kept states in 1.6 s; with the index moved away before the next start, the 17 files came back into
+  it from their heads and the six conversations resumed from disk (1.1-2.7 s), replies identical.
+- **Other live streams:** the read back is synchronous, between rounds, so the other streams wait for it: 350-351 ms for
+  a 198,656-token state (both ranks, 3 runs), 186 ms for 102,400 tokens, 435 ms for 241,664; their median gap between
+  chunks and their speed did not change. A write takes 457-485 ms for 198,656 tokens. The log has one line per write and
+  read with its time.
+- **Counters:** `/health` shows `prompt_cache` (kept states and MiB in memory, hits, misses, evictions, failed restores)
+  and, with the cache on, its `disk` part (states, MiB, writes, failed writes, reads, expired), as of the last prompt pass.
+- **Cap and age**, measured with `DISK_CACHE_GIB=0.05` and `DISK_CACHE_TTL_H=0.01`: a stop wrote six 16 MiB states and
+  kept the three that fit, the same three on both ranks; at the next start the first request expired them on both ranks;
+  the directories of four older builds were removed from both.
+- **Decode speed** with the cache on (`bench_decode`-style runs, 400 tokens, 3 runs each, the server idle): prose 67.0
+  tok/s (67.3 without the patch), structured 140.8 (140.3), 4 streams 183.2 together (184): within 0.5%. Nothing of the
+  cache runs in a decode round.
+
 ## Repository layout
 
 ```
