@@ -217,12 +217,13 @@ engram_in_container() { echo "/hf/hub/models--${ENGRAM_ID//\//--}/snapshots/$(en
 # The folder rank 0 serves (prepare.sh): the checkpoint's files linked, with the recipe's chat template.
 served_in_container() { echo "/hf/$DATA_SUB/model"; }
 
-# What scripts/prepare.sh last left ready (start.sh runs it again when this line changes).
+# What scripts/prepare.sh last left ready (start.sh runs it again when this line changes). "+stock-dtypes": an overlay
+# checkpoint prepared before scripts/ablit_stock_dtypes.py gets that step on the next start.
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
   echo "model=$MODEL_ID@$(snapshot_rev) engram=$ENGRAM_ID@$(engram_rev) image=$(image_ident "$IMAGE") kit=$KIT_REF" \
        "w=$(worker_host 1) wengram=$WORKER_ENGRAM_DIR wcache=$WORKER_CACHE_DIR ablit=$ABLIT" \
-       "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION" || echo none)"
+       "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
 }
 
 # ---------------------------------------------------------------- API key

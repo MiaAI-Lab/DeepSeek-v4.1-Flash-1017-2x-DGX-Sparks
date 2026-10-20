@@ -153,6 +153,13 @@ if [[ "$ABLIT" == 1 ]]; then
   for f in apply_mia29_wo_b_graft.py "$ABLIT_SIDECAR" EXL3_MIA29_ABLIT_META.json; do
     [[ -s "$HF_CACHE/$overlay_sub/$f" ]] || die "matching Mia overlay file is missing: $f"
   done
+  # The overlay script casts four MTP tensors to F32 for another engine; this one reads the drafter's confidence head
+  # as F16 whatever the file holds, so an F32 copy makes it draft almost nothing. Give them their stock dtypes back
+  # (scripts/ablit_stock_dtypes.py; headers only when they already match).
+  stock_dtypes() {
+    in_hf -v "$PWD/scripts/ablit_stock_dtypes.py:/ablit_stock_dtypes.py:ro" --entrypoint python3 "$IMAGE" \
+      /ablit_stock_dtypes.py "/hf/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)" "$1"
+  }
   mkdir -p "$DATA_DIR"
   if [[ ! -f "$DATA_DIR/checkpoint/.ablit-ready" ]]; then
     log "Applying the Mia EAQ 2.9 bpw overlay in $DATA_DIR/checkpoint (stock stays intact; changed shards need extra disk)"
@@ -165,12 +172,15 @@ if [[ "$ABLIT" == 1 ]]; then
       --wo-b "/hf/$overlay_sub/$ABLIT_SIDECAR" || die "applying the matching Mia overlay failed; rerun prepare.sh to retry"
     python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["n_edited"] == 104, "expected 104 Mia overlay tensors"' \
       "$DATA_DIR/checkpoint.new/ABLIT_META.json" || die "Mia overlay did not replace all 104 tensors"
+    stock_dtypes "/hf/$DATA_SUB/checkpoint.new" || die "could not give the overlay checkpoint its stock dtypes back"
     touch "$DATA_DIR/checkpoint.new/.ablit-ready"
     rm -rf "$DATA_DIR/checkpoint"
     mv "$DATA_DIR/checkpoint.new" "$DATA_DIR/checkpoint"
     rm -rf "$DATA_DIR/stock.new"
   else
     log "Matching Mia overlay checkpoint: ready"
+    # prepared before the dtype step: a tensor given back changes the weight files' index, so step 5 and 7 rebuild them
+    stock_dtypes "/hf/$DATA_SUB/checkpoint" || die "could not give the overlay checkpoint its stock dtypes back"
   fi
   SNAP="$DATA_DIR/checkpoint"
 fi

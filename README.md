@@ -228,8 +228,11 @@ inside `HF_CACHE` is part of the shared cache; use `HF_TOKEN` or a token path ou
 `DRY_RUN=1 ABLIT=1 ./start.sh` prints the notice without downloading or checking access.
 
 The overlay is pinned at `0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0` (`ABLIT_REVISION`, a full commit hash).
-It replaces 104 attention tensors in layers 10–35. Its application script also converts four MTP tensors to F32 for Zig
-compatibility, as described in the upstream `TENSORFOLD-ZIG-MIA.md`. The stock Hugging Face snapshot stays intact:
+It replaces 104 attention tensors in layers 10–35. Its application script also converts four MTP tensors from F16 to F32
+for another Zig engine, as described in the upstream `TENSORFOLD-ZIG-MIA.md`; preparation then gives them their stock F16
+back (`scripts/ablit_stock_dtypes.py`). This recipe's engine reads the drafter's `mtp.2.confidence_head.proj.weight` as F16
+whatever the file holds: from the F32 copy it drafts 0.2–0.8 tokens a round and decode falls 25–45% below stock. A
+checkpoint prepared before that step gets it on the next start, which also rebuilds both ~106 GB weight files. The stock Hugging Face snapshot stays intact:
 preparation hardlinks unchanged shards and writes changed shards under a separate
 `$HF_CACHE/tensorfold-dsv41/<model-revision>-ablit-<overlay-revision>/checkpoint` directory. **Allow extra disk space for
 rewritten shards (up to another checkpoint's size), the ~651 MiB sidecar, and a separate ~106 GB rank cache on each Spark.**
