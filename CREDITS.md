@@ -49,7 +49,7 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
     (TensorFold PR #10) that `9f82099` fixes, by BertholomusAI;
   - **[William J Riley (willjriley)](https://github.com/willjriley)**: the RDMA gather proxy's idle nap
     ([TensorFold PR #27](https://github.com/bertholomus/TensorFold/pull/27), `af26d42b`), whose logic
-    `zig/patches/0007-rdma-idle-nap.patch` ports to the Zig ring.
+    `zig/patches/0010-rdma-idle-nap.patch` ports to the Zig ring.
 - **The inputs' tools** (`tf-dsv41-rank-cache`, which writes a rank's weight file from the checkpoint alone with no GPU
   and no Python, and the standalone `make_token_map.py`, `make_rope.py` and `make_bias_vl.py`) were written by
   BertholomusAI in their fork's branch
