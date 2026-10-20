@@ -323,6 +323,22 @@ head_hf_mount() {
 # mem_available_gib: MemAvailable here, in GiB (one decimal)
 mem_available_gib() { awk '/^MemAvailable:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo; }
 
+# await_memory: sets HERE_GB and WORKER_GB (GiB) to the memory available on this Spark and on worker 1, once both reach
+# MIN_AVAIL_GIB or after MIN_AVAIL_WAIT_S seconds at the latest (returns 1 then; the caller words the refusal). A build or a large
+# copy that has just ended leaves page cache that MemAvailable counts only as it is written back (111.6 GiB was read a few
+# seconds after a build, 119 GiB once it settled), so one reading right after it refuses a start the Spark can take.
+await_memory() {
+  local waited=0
+  while :; do
+    HERE_GB=$(mem_available_gib)
+    WORKER_GB=$(worker 1 "awk '/^MemAvailable:/ {printf \"%.1f\", \$2 / 1048576}' /proc/meminfo" 2>/dev/null || echo 0)
+    awk -v a="$HERE_GB" -v b="$WORKER_GB" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a >= m && b >= m)}' && return 0
+    (( waited < MIN_AVAIL_WAIT_S )) || return 1
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
 # The memory guard (scripts/memguard.sh) on this Spark and on the worker, which gets a copy of the script.
 MEMGUARD_REMOTE_DIR='$HOME/.cache/dsv41-tensorfold'
 memguard_start() {
