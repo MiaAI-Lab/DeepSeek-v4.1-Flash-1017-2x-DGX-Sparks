@@ -151,6 +151,8 @@ if docker image inspect "$IMAGE" >/dev/null 2>&1; then
     python3 scripts/zig_flags.py "${SERVE[@]:3}" || die "rank 0's serve arguments are not ones $IMAGE serves (above); nothing was stopped"
 fi
 if (( ! DRY )); then
+  # Preparation's marker cannot detect an export/root change since the last run.
+  worker_files_check 1
   if running_here || running_worker 1; then ./stop.sh; fi
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   worker 1 "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"

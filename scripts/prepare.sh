@@ -258,11 +258,7 @@ manifest() {  # the files a rank reads, with their sizes, as paths under HF_CACH
 }
 want=$(manifest)
 ensure_nfs_volume 1
-if ! out=$(worker_nfs 1 true 2>&1); then
-  die "$(worker_host 1) cannot mount this Spark's :$NFS_PATH from $(nfs_server 1) over NFS ($NFS_VOLUME):
-$(tail -4 <<<"$out" | sed 's/^/    /')
-    This Spark must export HF_CACHE (as $NFS_PATH) read-only to that worker's address on its link (README: NFS)"
-fi
+worker_files_check 1
 have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$BASE_IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
 [[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
   die "$(worker_host 1) does not see every file over NFS ($NFS_VOLUME)"; }

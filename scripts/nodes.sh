@@ -89,6 +89,24 @@ ensure_nfs_volume() {
   fi
 }
 worker_nfs() { local i=$1; shift; worker "$i" "docker run --rm --entrypoint '$1' -v '$NFS_VOLUME:/hf:ro' '$IMAGE' $(printf '%q ' "${@:2}")"; }
+# Check the worker's actual file view, not just a successful mount or a prepared marker.
+# Also works with the documented PREPARE=0 / host-path NFS_VOLUME setup: do not create a volume here.
+worker_files_check() {
+  local i=$1 out
+  if out=$(worker_nfs "$i" sh -ec '
+    for f in "$@"; do
+      if [ ! -r "$f" ] || [ ! -s "$f" ]; then
+        echo "Missing, empty or unreadable on worker: $f" >&2
+        exit 1
+      fi
+    done
+  ' sh "$(model_in_container)/config.json" "/hf/$KIT_SUB/kit/MANIFEST" "/hf/$DATA_SUB/dsv41_token_map.json" 2>&1); then
+    return 0
+  fi
+  printf '%s\n' "$out" >&2
+  die "$(worker_host "$i") cannot read the model/kit through $NFS_VOLUME (NFS :$NFS_PATH from $(nfs_server "$i")). Check the actual NFSv4 root, stale file handles and competing host/container NFS servers (README: NFS); for a host-path mount check that worker's local files. No ranks were launched by this check"
+}
+
 # link_info <peer address>: this node's side of the link to <peer>: "<address> <netdev> <rdma device> <gid index>".
 # The netdev and source address come from the route to the peer; the RDMA device from sysfs; the GID index is the
 # RoCE v2 entry that holds this node's IPv4 address (an all-zero or v1 entry makes NCCL fail about a minute in).

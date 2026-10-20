@@ -137,7 +137,8 @@ watchdog exists because that can freeze a Spark; see [Memory and safety](#memory
 - **Disk.** Head: ~505 GB (the checkpoint 196 GiB, Engram's tables ~203 GB, rank 0's weight file ~106 GB) plus ~25 GB for
   the image under Docker's root. Worker: ~310 GB (Engram's tables and rank 1's weight file) plus the image; the worker
   reads the checkpoint from the head over NFS.
-- **NFS.** The worker mounts the head's Hugging Face cache read-only. On the head, once (needs root; the worker needs
+- **NFS.** The worker mounts the head's Hugging Face cache read-only. If a host or container NFS server already exports
+  that cache, use it (see below); do not start a competing server. Otherwise, on the head, once (needs root; the worker needs
   nothing installed):
 
   ```bash
@@ -146,14 +147,29 @@ watchdog exists because that can freeze a Spark; see [Memory and safety](#memory
   sudo exportfs -ra
   ```
 
-  If `prepare.sh` then stops with "cannot mount this Spark's ... over NFS", read the lines under it: they are the end of docker's own
-  error (the reason is above docker's closing "Run 'docker run --help'" line). Check `sudo exportfs -v` on the head: the export must
+  If `prepare.sh` or `start.sh` stops with "cannot read the model/kit", read the output above it: Docker mount errors are
+  preserved, or the check names the missing, empty or unreadable file. Check `sudo exportfs -v` on the head: the export must
   list the *worker's* address on the link (the user@address in the message), the exported path must be `NFS_PATH`, and the worker must
   reach the head's port 2049; the worker's docker mounts the volume itself, so it needs the host's NFS mount helper (`nfs-common` on
   Ubuntu) if it reports a missing `mount.nfs` helper.
   `prepare.sh` then creates a read-only docker NFS volume on the worker (`NFS_VOLUME`, no sudo) and checks that the worker
   sees every file the ranks read. `NFS_PATH` is the exported path as the worker mounts it (default: the head's `HF_CACHE`;
   `/` for an NFSv4 export with `fsid=0`), `NFS_SERVER` the head's address (default: its address on the link).
+
+  **An existing NFS server (including a container).** Use the server already exporting the cache rather than starting
+  a second one. Host and privileged container NFS servers can share kernel nfsd but run different `rpc.mountd` instances:
+  `showmount -e` or the host's `/etc/exports` can then disagree with the namespace the worker actually mounts. Inspect
+  `/proc/fs/nfs/exports` on the head (and inside the exporter container, if any), and check the worker's actual `/hf` view.
+  If the cache itself is exported as `fsid=0`, its client path is `/`, not its absolute host path. Set `NFS_PATH` accordingly
+  in `scripts/local.sh`; changing it does not update an existing Docker volume. Stop the model ranks before removing the
+  unused worker volume with `docker volume rm <NFS_VOLUME>` and rerun preparation to recreate it. Do not delete model files.
+  If you see stale file handles, resolve the conflicting exporters first, then remount the affected client volumes while
+  ranks are stopped. Choose one NFS owner deliberately; the recipe does not disable host services or containers for you.
+
+  Every fresh launch/restart checks the worker's model config, kit manifest and token map, even when preparation was
+  previously successful. A wrong root that still mounts successfully is rejected before GPU weights are loaded. This is
+  a small-file preflight, not a replacement for preparation's full file-size check; it also checks the documented local
+  host-path setup below. `DRY_RUN=1` skips it, and an already-running server is left alone as before.
 
   **Or no NFS at all.** Each Spark can run from a local copy: set `HF_CACHE` to a local tree holding the checkpoint's small files
   and its vision shard (`model-00039-of-00039`, the only shard read at run time), the served `model/` folder, the kit, the token
