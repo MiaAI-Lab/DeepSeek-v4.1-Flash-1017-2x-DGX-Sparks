@@ -45,6 +45,11 @@
   against ~100% a rank before. The Zig ring's two CQ polls per wake cost more than PR #27's Python line (3.9-5.2% at
   100 µs), so the recipe sets 500 µs; the wake rate falls 5x and the proxy should sit near 2% a rank. 2 s is enough that
   active decode never naps.
+
+- `zig/patches/0007-display-kv.patch` and `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only): the KV caches on the framebuffer the UEFI reserves,
+  so their bytes leave the host's `MemAvailable` (the GLM-5.3-Flash recipe's display-KV idea, not ported until now). At the default setting the head's idle `MemAvailable` went from
+  6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19). `tools/exact.py`: 31 of 31 cases identical with it
+  on and off, the same image; `tools/validate.py` and `tools/prompt_reuse.py` pass with it on. The engine's host tests with the recipe's patches and this one: 21/21 steps, 232/232 tests.
 - `prepare.sh`'s "cannot mount ... over NFS" error shows the last four lines of docker's output, not only the last (which was always
   docker's "Run 'docker run --help'" line, never the reason); the README's NFS section says what to check (issue
   [#15](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/15), reported by **aoeu10**). The README's memory note now

@@ -21,6 +21,8 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 
 ## Engine
 
+- **`zig/patches/0007-display-kv.patch`** (display-reserve KV for the dsv41 family) ports the DRM-framebuffer backend of Mia's AI Lab's TensorFold GLM engine
+  (`glm_cuda/cuda_display_kv.zig`, itself from the TensorFold contributors) to this engine's KV caches; written for this recipe, Apache-2.0.
 - **[TensorFold](https://github.com/ashhart/TensorFold)** by Ash Hart ([ashhart](https://github.com/ashhart)) and the
   TensorFold contributors (Apache-2.0): the native Zig engine, its OpenAI-compatible server, its lane core, CUDA runtime,
   Triton AOT loader and EXL3 module.
