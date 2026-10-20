@@ -165,12 +165,17 @@ if [[ "$ABLIT" == 1 ]]; then
       --wo-b "/hf/$overlay_sub/$ABLIT_SIDECAR" || die "applying the matching Mia overlay failed; rerun prepare.sh to retry"
     python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["n_edited"] == 104, "expected 104 Mia overlay tensors"' \
       "$DATA_DIR/checkpoint.new/ABLIT_META.json" || die "Mia overlay did not replace all 104 tensors"
+    out=$(python3 -I scripts/ablit_relink_stock.py "$DATA_DIR/stock.new" "$DATA_DIR/checkpoint.new" 2>&1) || die "$out"
+    log "$out"
     touch "$DATA_DIR/checkpoint.new/.ablit-ready"
     rm -rf "$DATA_DIR/checkpoint"
     mv "$DATA_DIR/checkpoint.new" "$DATA_DIR/checkpoint"
     rm -rf "$DATA_DIR/stock.new"
   else
     log "Matching Mia overlay checkpoint: ready"
+    # A checkpoint made before the relink: undo its casts in place. Its index hash changes, so both ranks' weight files are rebuilt.
+    out=$(python3 -I scripts/ablit_relink_stock.py "$SNAP" "$DATA_DIR/checkpoint" 2>&1) || die "$out"
+    log "$out"
   fi
   SNAP="$DATA_DIR/checkpoint"
 fi
