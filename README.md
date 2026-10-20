@@ -378,8 +378,9 @@ kept state, so a restart resumes them too.
   read with its time.
 - **Counters:** `/health` shows `prompt_cache` (kept states and MiB in memory, hits, misses, evictions, failed restores)
   and, with the cache on, its `disk` part (states, MiB, writes, failed writes, reads, expired), as of the last prompt pass.
-- **Not measured yet:** decode speed with the cache on against off beyond the runs above (nothing of the cache runs in a
-  decode round).
+- **Decode speed** with the cache on (`bench_decode`-style runs, 400 tokens, 3 runs each, the server idle): prose 67.0
+  tok/s (67.3 without the patch), structured 140.8 (140.3), 4 streams 183.2 together (184): within 0.5%. Nothing of the
+  cache runs in a decode round.
 
 ## Repository layout
 
