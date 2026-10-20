@@ -46,6 +46,17 @@ ablit_notice
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
 (( CONTEXT <= 1048576 )) || die "CONTEXT is at most 1048576 (the model's window), not $CONTEXT"
+[[ "$DISK_CACHE" == 0 || "$DISK_CACHE" == 1 ]] || die "DISK_CACHE is 0 or 1 (got '$DISK_CACHE')"
+if [[ "$DISK_CACHE" == 1 ]]; then
+  [[ "$DISK_CACHE_DIR" == /* && "$DISK_CACHE_DIR" != *..* && "$DISK_CACHE_DIR" != / ]] || die "DISK_CACHE_DIR must be an absolute path (got '$DISK_CACHE_DIR')"
+  case "$DISK_CACHE_DIR" in *[[:space:]]*|*:*) die "DISK_CACHE_DIR may not hold spaces or ':' (docker -v reads them; got '$DISK_CACHE_DIR')" ;; esac
+  for v in DISK_CACHE_GIB DISK_CACHE_MIN_FREE_GIB DISK_CACHE_MEM_FLOOR_GIB DISK_CACHE_TTL_H; do
+    [[ "${!v}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v is a number (got '${!v}')"
+  done
+  for v in DISK_CACHE_MIN_TOKENS DISK_CACHE_FLUSH_S; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v is a whole number (got '${!v}')"
+  done
+fi
 (( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16 (the engine's streams), not $PARALLEL"
 [[ -z "$ROUND_ROWS" ]] || { [[ "$ROUND_ROWS" =~ ^[0-9]+$ ]] && (( ROUND_ROWS >= 16 && ROUND_ROWS <= 48 )); } || die "ROUND_ROWS is empty or 16 to 48, not $ROUND_ROWS"
 [[ -z "$THINKING_BUDGET" || "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]] || die "THINKING_BUDGET is a positive count of reasoning tokens (or empty for no cap), not $THINKING_BUDGET"
@@ -200,7 +211,26 @@ foreground() {
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' || true)
+DISK_MOUNT=""   # zig/patches/0009: the disk cache's directory, the same path in both containers
+if [[ "$DISK_CACHE" == 1 ]]; then
+  ENGINE_ENV+=("TF_DS_DISK_CACHE=1" "TF_DS_DISK_CACHE_DIR=$DISK_CACHE_DIR" "TF_DS_DISK_CACHE_GIB=$DISK_CACHE_GIB"
+               "TF_DS_DISK_CACHE_MIN_FREE_GIB=$DISK_CACHE_MIN_FREE_GIB" "TF_DS_DISK_CACHE_MIN_TOKENS=$DISK_CACHE_MIN_TOKENS"
+               "TF_DS_DISK_CACHE_MEM_FLOOR_GIB=$DISK_CACHE_MEM_FLOOR_GIB" "TF_DS_DISK_CACHE_TTL_H=$DISK_CACHE_TTL_H"
+               "TF_DS_DISK_CACHE_FLUSH_S=$DISK_CACHE_FLUSH_S")
+  DISK_MOUNT="-v $DISK_CACHE_DIR:$DISK_CACHE_DIR"
+  # each Spark: the directory (0700), writable, and the disk's free space against DISK_CACHE_MIN_FREE_GIB
+  disk_prep='d=$1; min=$2; [ -n "$d" ] || exit 2; case "$d" in /*) ;; *) exit 2 ;; esac
+    mkdir -p -m 700 "$d" || exit 3; [ -d "$d" ] && [ ! -L "$d" ] || exit 3
+    touch "$d/.w" 2>/dev/null && rm -f -- "$d/.w" || exit 4
+    free=$(df -Pk "$d" | awk "NR==2 {print \$4}"); [ "$free" -ge $(awk -v g="$min" "BEGIN {printf \"%d\", g * 1048576}") ] || exit 5'
+  if (( ! DRY )); then
+    bash -c "$disk_prep" _ "$DISK_CACHE_DIR" "$DISK_CACHE_MIN_FREE_GIB" || die "DISK_CACHE_DIR $DISK_CACHE_DIR on this Spark: not a writable directory with $DISK_CACHE_MIN_FREE_GIB GiB free (code $?)"
+    worker 1 "bash -c $(printf %q "$disk_prep") _ $(printf %q "$DISK_CACHE_DIR") $(printf %q "$DISK_CACHE_MIN_FREE_GIB")" ||
+      die "DISK_CACHE_DIR $DISK_CACHE_DIR on $(worker_host 1): not a writable directory with $DISK_CACHE_MIN_FREE_GIB GiB free"
+    log "Disk cache: $DISK_CACHE_DIR on both Sparks (up to $DISK_CACHE_GIB GiB each, $DISK_CACHE_MIN_FREE_GIB GiB kept free; stop waits ${STOP_TIMEOUT}s)"
+  fi
+fi
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|DISK_CACHE[A-Z0-9_]*)=' || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 DATA=/hf/$DATA_SUB
@@ -222,7 +252,7 @@ fi
 step 3 "Launch: container $CONTAINER_NAME, rank 1 on the worker, then rank 0 here"
 cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache 1 2 ${LINK_HEAD_ADDR[1]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
 [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[1]}"   # this node's RoCE devices
-remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro $(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}") $(rank_nccl_env 1) $IMAGE $cmd"
+remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro $DISK_MOUNT $(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}") $(rank_nccl_env 1) $IMAGE $cmd"
 if (( DRY )); then printf '[dry-run] rank 1 on %s:\n  %s\n' "$(worker_host 1)" "$remote"
 else
   log "Rank 1 on $(worker_host 1): $cmd"
@@ -232,7 +262,7 @@ ENV0=(TF_TP_WORLD=2 "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_POR
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container)" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json"
       "TF_DS_GRAPHS=$GRAPHS" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
 if (( DRY )); then HEAD_HF=${HEAD_NFS_SERVER:+$HEAD_NFS_VOLUME}; HEAD_HF=${HEAD_HF:-$HF_CACHE}; else HEAD_HF=$(head_hf_mount); fi
-here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro")
+here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro" $DISK_MOUNT)
 if [[ -n "$HEAD_ENGRAM_DIR" ]]; then
   here+=(-v "$HEAD_ENGRAM_DIR:/engram:ro")
 fi

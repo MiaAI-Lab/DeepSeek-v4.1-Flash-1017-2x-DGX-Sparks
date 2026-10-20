@@ -132,6 +132,23 @@ REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
 # rounds for the streams already live (and to their cancels): TF_DS_PREFILL_INTERLEAVE_MS, read by rank 0 only. 0: the pass runs to
 # its end first, as before. 250 is what PR #5 and this recipe measured. Each such stop costs the long prompt about the time given.
 PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
+# zig/patches/0009: the disk cache of kept conversations. A conversation's kept state that is about to lose its place in
+# memory (another long prompt needs the pool's room, or the cache's budget) is written to disk first, each rank its half
+# on its own NVMe, and read back when the conversation returns instead of recomputing it; at a stop every kept state is
+# written, so a restart resumes them too. Off by default. DISK_CACHE_DIR must be the same absolute path on both Sparks
+# (start.sh makes it, mode 0700). It is mounted at the same path in both containers. DISK_CACHE_GIB caps each rank's files, DISK_CACHE_MIN_FREE_GIB leaves the disk that much free (nothing is
+# written past it), DISK_CACHE_MIN_TOKENS: shorter states stay off disk, DISK_CACHE_TTL_H: older ones go, and
+# DISK_CACHE_FLUSH_S: the stop's time to write what is kept (STOP_TIMEOUT follows it when unset), and
+# DISK_CACHE_MEM_FLOOR_GIB: no write or read starts below this MemAvailable (memguard's floor and more).
+DISK_CACHE="${DISK_CACHE:-0}"
+DISK_CACHE_DIR="${DISK_CACHE_DIR:-/var/tmp/dsv41-disk-cache}"
+DISK_CACHE_GIB="${DISK_CACHE_GIB:-64}"
+DISK_CACHE_MIN_FREE_GIB="${DISK_CACHE_MIN_FREE_GIB:-20}"
+DISK_CACHE_MIN_TOKENS="${DISK_CACHE_MIN_TOKENS:-8192}"
+DISK_CACHE_TTL_H="${DISK_CACHE_TTL_H:-72}"
+DISK_CACHE_FLUSH_S="${DISK_CACHE_FLUSH_S:-60}"
+DISK_CACHE_MEM_FLOOR_GIB="${DISK_CACHE_MEM_FLOOR_GIB:-3.5}"
+if [[ "$DISK_CACHE" == 1 && -z "${STOP_TIMEOUT:-}" && "$DISK_CACHE_FLUSH_S" =~ ^[0-9]+$ ]]; then STOP_TIMEOUT=$((DISK_CACHE_FLUSH_S + 15)); fi
 
 # ---------------------------------------------------------------- files
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
