@@ -5,7 +5,9 @@
   half, before they lose their place in memory, and come back from it; a stop writes every kept state, so a restart
   resumes them. `start.sh` makes `DISK_CACHE_DIR` on both Sparks, mounts it in both containers and checks its free
   space; `STOP_TIMEOUT` follows `DISK_CACHE_FLUSH_S`. Replies identical with and without it (`tools/exact.py` 31/31);
-  a 52K turn resumed from disk in 1.1-2.8 s instead of ~32 s. See the README section "Disk cache of kept conversations".
+  a 52K turn resumed from disk in 1.1-2.8 s instead of ~32 s; reading a 198,656-token state back pauses the other streams
+  for ~0.35 s. `/health` shows the prompt cache's counts (`prompt_cache`). See the README section "Disk cache of kept
+  conversations".
 
 - `prepare.sh`'s "cannot mount ... over NFS" error shows the last four lines of docker's output, not only the last (which was always
   docker's "Run 'docker run --help'" line, never the reason); the README's NFS section says what to check (issue

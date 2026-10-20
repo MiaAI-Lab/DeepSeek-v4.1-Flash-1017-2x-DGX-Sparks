@@ -1,8 +1,17 @@
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index 1234369..ba44ed1 100644
+index 1234369..1f486f5 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
-@@ -225,6 +225,9 @@ pub const Engine = struct {
+@@ -205,6 +205,8 @@ pub const Status = struct {
+     streams: usize = 0,
+     /// Generated tokens held by live streams, excluding their prompts.
+     generation_tokens: u64 = 0,
++    /// The prompt cache's counts, when the engine keeps one (as of the last prompt pass).
++    prompt_cache: ?prompt_cache.Status = null,
+ };
+ 
+ pub const SubmitError = error{ Closed, Busy };
+@@ -225,6 +227,9 @@ pub const Engine = struct {
          keepalive: ?*const fn (ctx: *anyopaque) ?keepalive.Target = null,
          /// One logit per label, and the vocabulary logsumexp. Null until a family scores decisions.
          score: ?*const fn (ctx: *anyopaque, prompt: []const u32, labels: []const u32, logits: []f64) error{Failed}!f64 = null,
@@ -12,7 +21,7 @@ index 1234369..ba44ed1 100644
      };
  
      pub fn info(e: Engine) Info {
-@@ -242,6 +245,9 @@ pub const Engine = struct {
+@@ -242,6 +247,9 @@ pub const Engine = struct {
      pub fn memory(e: Engine, reset_peak: bool) ?Memory {
          return e.vtable.memory(e.ctx, reset_peak);
      }
@@ -23,20 +32,21 @@ index 1234369..ba44ed1 100644
      pub fn keepaliveTarget(e: Engine) ?keepalive.Target {
          const f = e.vtable.keepalive orelse return null;
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 99177d2..d4ba642 100644
+index 99177d2..7a466cd 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -35,6 +35,9 @@ pub const LaneHost = struct {
+@@ -35,6 +35,10 @@ pub const LaneHost = struct {
      live_tokens: std.ArrayList(u32) = .empty,
      /// A Metal engine's keepalive target, set by the family that owns the queue; null keeps the ticker off.
      keepalive_target: ?api.keepalive.Target = null,
 +    /// The lane thread's last work before it ends (its CUDA context, its order of frames): the spill tier's write of
 +    /// every kept state, when a family keeps them on disk.
 +    on_exit: ?struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) void } = null,
++    cache_status: ?pc.Status = null, // the prompt cache's counts after the last prompt pass (status reads them under the lock)
      live_generated: u64 = 0,
      lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
      lone_job: ?*Job = null, // the job that driver holds now
-@@ -126,13 +129,18 @@ pub const LaneHost = struct {
+@@ -126,13 +130,18 @@ pub const LaneHost = struct {
      }
  
      /// Stops admitting, cancels what is left and joins the engine thread.
@@ -56,7 +66,7 @@ index 99177d2..d4ba642 100644
          h.queued.deinit(h.gpa);
          h.admitted.deinit(h.gpa);
          h.cancels.deinit(h.gpa);
-@@ -141,7 +149,11 @@ pub const LaneHost = struct {
+@@ -141,7 +150,11 @@ pub const LaneHost = struct {
      }
  
      pub fn engine(h: *LaneHost) Engine {
@@ -69,7 +79,30 @@ index 99177d2..d4ba642 100644
      }
  
      /// The family's queue as a keepalive target, when it set one.
-@@ -599,7 +611,10 @@ pub const LaneHost = struct {
+@@ -206,6 +219,7 @@ pub const LaneHost = struct {
+             .preemptions = 0,
+             .streams = n,
+             .generation_tokens = h.live_generated,
++            .prompt_cache = h.cache_status,
+         };
+     }
+ 
+@@ -461,7 +475,13 @@ pub const LaneHost = struct {
+         job.prefilled = done;
+         h.unlock();
+         job.reported();
+-        if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
++        if (h.cache) |store| {
++            store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
++            const st = store.status();
++            h.lock();
++            h.cache_status = st;
++            h.unlock();
++        }
+         emit(job, .{ .prefilled = job.stream.cached });
+     }
+ 
+@@ -599,7 +619,10 @@ pub const LaneHost = struct {
              if (h.closing) {
                  const left = h.queued.items.len + h.admitted.items.len;
                  h.unlock();
@@ -82,7 +115,7 @@ index 99177d2..d4ba642 100644
                  continue;
              }
 diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
-index cb9ac8f..faabe7f 100644
+index cb9ac8f..2ad1d7e 100644
 --- a/zig/src/core/prompt_cache.zig
 +++ b/zig/src/core/prompt_cache.zig
 @@ -33,6 +33,12 @@ pub const Snapshots = struct {
@@ -98,7 +131,7 @@ index cb9ac8f..faabe7f 100644
      };
  };
  
-@@ -59,7 +65,11 @@ pub const Entry = struct {
+@@ -59,7 +65,28 @@ pub const Entry = struct {
      shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
  };
  
@@ -108,10 +141,27 @@ index cb9ac8f..faabe7f 100644
 +/// The spill tier: every state the store (or its family) lets go is written to disk first, and read back by a later
 +/// prompt it resumes, after a restart too. Shorter states and states past the age limit stay off disk.
 +pub const Spill = struct { min_tokens: u32 = 8192, ttl_s: u64 = 72 * 3600 };
++
++/// What /health shows of a store: its states in memory and, with a disk tier, on disk.
++pub const Status = struct {
++    states: u64 = 0,
++    held_bytes: u64 = 0,
++    hits: u64 = 0,
++    misses: u64 = 0,
++    evicted: u64 = 0,
++    failed: u64 = 0,
++    disk: bool = false,
++    disk_states: u64 = 0,
++    disk_bytes: u64 = 0,
++    disk_writes: u64 = 0,
++    disk_write_failed: u64 = 0,
++    disk_reads: u64 = 0,
++    disk_expired: u64 = 0,
++};
  
  /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
  pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
-@@ -78,6 +88,7 @@ pub const Store = struct {
+@@ -78,6 +105,7 @@ pub const Store = struct {
      counts: Counts = .{},
      shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
      imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
@@ -119,7 +169,7 @@ index cb9ac8f..faabe7f 100644
  
      const SHARED_KEYS = 64;
  
-@@ -149,6 +160,7 @@ pub const Store = struct {
+@@ -149,6 +177,7 @@ pub const Store = struct {
  
      /// begin without the restore, for backends that restore inside their own prompt pass and then call `resumed`.
      pub fn lookup(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32) !Lookup {
@@ -127,7 +177,7 @@ index cb9ac8f..faabe7f 100644
          const e = s.recall(prompt, starts, s.find(prompt, starts));
          if (e == null) s.counts.misses += 1;
          const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
-@@ -166,7 +178,7 @@ pub const Store = struct {
+@@ -166,7 +195,7 @@ pub const Store = struct {
          for (marks_) |at| need += s.family.vtable.bytes(s.family.ptr, at);
          while (s.held + need > s.budget) {
              const i = s.victimBut(from, prompt) orelse return;
@@ -136,7 +186,7 @@ index cb9ac8f..faabe7f 100644
              s.counts.evicted += 1;
          }
      }
-@@ -272,7 +284,7 @@ pub const Store = struct {
+@@ -272,7 +301,7 @@ pub const Store = struct {
                  if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                  if (s.spare() < free_) continue;
              }
@@ -145,7 +195,7 @@ index cb9ac8f..faabe7f 100644
              s.counts.evicted += 1;
          }
          if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
-@@ -300,6 +312,7 @@ pub const Store = struct {
+@@ -300,6 +329,7 @@ pub const Store = struct {
          };
          s.held += charged;
          s.counts.kept += 1;
@@ -153,7 +203,7 @@ index cb9ac8f..faabe7f 100644
          if (shared) s.learn(e, starts);
          if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
          return true;
-@@ -310,10 +323,11 @@ pub const Store = struct {
+@@ -310,10 +340,11 @@ pub const Store = struct {
          const im = s.imprint orelse return;
          const write = s.family.vtable.write orelse return;
          const key = imprint.Imprint.keyOf(e.tokens);
@@ -168,7 +218,7 @@ index cb9ac8f..faabe7f 100644
          if (!@import("builtin").is_test) std.log.info("prompt cache: learned {d} tokens to disk", .{e.at});
      }
  
-@@ -327,15 +341,16 @@ pub const Store = struct {
+@@ -327,18 +358,20 @@ pub const Store = struct {
      fn recall(s: *Store, prompt: []const u32, starts: []const u32, have: ?*Entry) ?*Entry {
          const im = s.imprint orelse return have;
          const read = s.family.vtable.read orelse return have;
@@ -187,16 +237,22 @@ index cb9ac8f..faabe7f 100644
          e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
          e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
          const key = m.key;
-@@ -347,6 +362,8 @@ pub const Store = struct {
++        const t0 = monotonicNs();
+         e.saved = read(s.family.ptr, im.dir, key, m.at) catch |err| {
+             note("reading the learned {d} tokens failed ({s}); forgotten, a later pass learns them again", .{ e.at, @errorName(err) });
+             s.unlearn(im, key);
+@@ -347,7 +380,9 @@ pub const Store = struct {
          im.touch(key);
          s.entries.append(s.gpa, e) catch return s.drop(e, have, true);
          s.held += bytes;
+-        if (!@import("builtin").is_test) std.log.info("prompt cache: read {d} learned tokens from disk", .{m.at});
 +        s.counts.recalled += 1;
 +        s.tagged(e);
-         if (!@import("builtin").is_test) std.log.info("prompt cache: read {d} learned tokens from disk", .{m.at});
++        if (!@import("builtin").is_test) std.log.info("prompt cache: read {d} learned tokens from disk ({d} ms)", .{ m.at, (monotonicNs() - t0) / std.time.ns_per_ms });
          return e;
      }
-@@ -360,6 +377,100 @@ pub const Store = struct {
+ 
+@@ -360,6 +395,118 @@ pub const Store = struct {
          return have;
      }
  
@@ -219,17 +275,19 @@ index cb9ac8f..faabe7f 100644
 +        if (bytes > im.cap) return;
 +        s.expire(im, sp);
 +        while (!im.fits(bytes)) s.unlearn(im, im.victim() orelse return); // the least recently used go first
++        const t0 = monotonicNs();
 +        write(s.family.ptr, e.saved, im.dir, key) catch |err| {
 +            s.counts.spill_failed += 1;
 +            return note("writing {d} tokens to disk failed ({s})", .{ e.at, @errorName(err) });
 +        };
++        const ms = (monotonicNs() - t0) / std.time.ns_per_ms;
 +        im.addState(key, e.at, e.tokens, &.{}, bytes, e.shared) catch |err| {
 +            s.counts.spill_failed += 1;
 +            if (s.family.vtable.forget) |f| f(s.family.ptr, im.dir, key);
 +            return note("indexing {d} tokens on disk failed ({s})", .{ e.at, @errorName(err) });
 +        };
 +        s.counts.spilled += 1;
-+        if (!@import("builtin").is_test) std.log.info("prompt cache: wrote {d} tokens to disk ({d} MiB)", .{ e.at, bytes >> 20 });
++        if (!@import("builtin").is_test) std.log.info("prompt cache: wrote {d} tokens to disk ({d} MiB, {d} ms)", .{ e.at, bytes >> 20, ms });
 +    }
 +
 +    /// The family is about to give up `saved` on its own (its rows are needed): written to disk first, if it is kept here.
@@ -294,10 +352,26 @@ index cb9ac8f..faabe7f 100644
 +        return s.counts.spilled - before;
 +    }
 +
++    /// Its counts now (the lane thread copies them for /health: the store itself is that thread's).
++    pub fn status(s: *const Store) Status {
++        const c = s.counts;
++        var out: Status = .{ .states = s.entries.items.len, .held_bytes = s.held, .hits = c.hits, .misses = c.misses, .evicted = c.evicted, .failed = c.failed };
++        if (s.spill != null) if (s.imprint) |im| {
++            out.disk = true;
++            out.disk_states = im.metas.items.len;
++            out.disk_bytes = im.total();
++            out.disk_writes = c.spilled;
++            out.disk_write_failed = c.spill_failed;
++            out.disk_reads = c.recalled;
++            out.disk_expired = c.expired;
++        };
++        return out;
++    }
++
      /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
      pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
          if (@import("builtin").is_test) return;
-@@ -398,6 +509,12 @@ fn note(comptime fmt: []const u8, args: anytype) void {
+@@ -398,6 +545,12 @@ fn note(comptime fmt: []const u8, args: anytype) void {
      std.log.warn("prompt cache: " ++ fmt, args);
  }
  
@@ -1215,7 +1289,7 @@ index 7d2e266..8e5f80e 100644
      refAll(tri);
      refAll(tri_basic);
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index 2c76760..0f90881 100644
+index 2c76760..d92f52a 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -20,6 +20,7 @@ const round = @import("round.zig");
@@ -1524,7 +1598,7 @@ index 2c76760..0f90881 100644
          errdefer sn.buf.free();
          try self.snaps.append(self.gpa, sn);
          self.next_snap += 1;
-@@ -876,6 +1062,211 @@ pub const Lanes = struct {
+@@ -876,6 +1062,213 @@ pub const Lanes = struct {
          self.gpa.destroy(sn);
      }
  
@@ -1651,6 +1725,8 @@ index 2c76760..0f90881 100644
 +        const dir = self.dir orelse return error.NoDiskCache;
 +        var rb: [256]disco.Span = undefined;
 +        const rows = try self.m.rowSpans(base, sn.at, &rb);
++        const t0 = self.m.now();
++        defer std.log.info("dsv41: the rows of {d} kept tokens read back from disk in {d} ms (both ranks; the rounds wait)", .{ sn.at, (self.m.now() - t0) / std.time.ns_per_ms });
 +        try self.m.ctx.synchronize(); // nothing in flight still writes there
 +        const req = d.next_req;
 +        d.next_req += 1;
@@ -1736,7 +1812,7 @@ index 2c76760..0f90881 100644
      fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
          const self = of(ptr);
          const kv = self.streams.fetchRemove(s) orelse return;
-@@ -921,6 +1312,23 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -921,6 +1314,23 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
          while (ki.next()) |b| b.free();
          kept.deinit(gpa);
      }
@@ -1760,7 +1836,7 @@ index 2c76760..0f90881 100644
      while (true) {
          // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
          // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
-@@ -935,12 +1343,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -935,12 +1345,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
              7 => .snap_drop,
              8 => .fill_images,
              9 => .done,
@@ -1778,7 +1854,7 @@ index 2c76760..0f90881 100644
              m.joinAhead();
              m.fill_seq = &.{};
          }
-@@ -1048,11 +1460,118 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -1048,11 +1462,118 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                      b.free();
                  }
              },
@@ -1897,7 +1973,7 @@ index 2c76760..0f90881 100644
  test "draft chances are the prefix survivals chooseK sums" {
      var out: [3]f64 = undefined;
      survivals(&.{ 0.0, 0.0, 2.0 }, &out);
-@@ -1158,3 +1677,31 @@ test "a prefix two conversations share: the second one resuming it in place woul
+@@ -1158,3 +1679,31 @@ test "a prefix two conversations share: the second one resuming it in place woul
      try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
      try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
  }
@@ -2233,3 +2309,40 @@ index cef3e6c..ec77f5c 100644
      return 0;
  }
  
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index 186a4e1..09f4342 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -30,9 +30,32 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     }
+     try o.put(a, "memory", .{ .object = memory });
+     try o.put(a, "live", try live.snapshot(a, srv.engine));
++    if (status.prompt_cache) |pc| try o.put(a, "prompt_cache", try promptCache(a, pc));
+     routes.sendValue(conn, a, 200, .{ .object = o });
+ }
+ 
++/// /health's ``prompt_cache``: kept states in memory and, with a disk tier, on disk (as of the last prompt pass).
++fn promptCache(a: Allocator, pc: api.prompt_cache.Status) Allocator.Error!Value {
++    const o = try json.newObject(a);
++    try o.put(a, "states", try json.intValue(a, pc.states));
++    try o.put(a, "mib", try json.intValue(a, pc.held_bytes >> 20));
++    try o.put(a, "hits", try json.intValue(a, pc.hits));
++    try o.put(a, "misses", try json.intValue(a, pc.misses));
++    try o.put(a, "evicted", try json.intValue(a, pc.evicted));
++    try o.put(a, "failed", try json.intValue(a, pc.failed));
++    if (pc.disk) {
++        const d = try json.newObject(a);
++        try d.put(a, "states", try json.intValue(a, pc.disk_states));
++        try d.put(a, "mib", try json.intValue(a, pc.disk_bytes >> 20));
++        try d.put(a, "writes", try json.intValue(a, pc.disk_writes));
++        try d.put(a, "write_failed", try json.intValue(a, pc.disk_write_failed));
++        try d.put(a, "reads", try json.intValue(a, pc.disk_reads));
++        try d.put(a, "expired", try json.intValue(a, pc.disk_expired));
++        try o.put(a, "disk", .{ .object = d });
++    }
++    return .{ .object = o };
++}
++
+ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+     const created = std.Io.Clock.real.now(srv.io).toSeconds();
+     const data = try a.alloc(Value, srv.config.model_ids.len);

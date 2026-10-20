@@ -372,8 +372,14 @@ kept state, so a restart resumes them too.
   `./start.sh`; in real traffic a 189,747-token prompt resumed 186,368 tokens from disk and finished its pass in 2.8 s.
   A stop wrote 11 kept states in 1.6 s; with the index moved away before the next start, the 17 files came back into
   it from their heads and the six conversations resumed from disk (1.1-2.7 s), replies identical.
-- **Not measured yet:** the gap a 200K read causes in other live streams (it is synchronous, between rounds) and decode
-  speed with the cache on against off beyond the runs above.
+- **Other live streams:** the read back is synchronous, between rounds, so the other streams wait for it: 350-351 ms for
+  a 198,656-token state (both ranks, 3 runs), 186 ms for 102,400 tokens, 435 ms for 241,664; their median gap between
+  chunks and their speed did not change. A write takes 457-485 ms for 198,656 tokens. The log has one line per write and
+  read with its time.
+- **Counters:** `/health` shows `prompt_cache` (kept states and MiB in memory, hits, misses, evictions, failed restores)
+  and, with the cache on, its `disk` part (states, MiB, writes, failed writes, reads, expired), as of the last prompt pass.
+- **Not measured yet:** decode speed with the cache on against off beyond the runs above (nothing of the cache runs in a
+  decode round).
 
 ## Repository layout
 
