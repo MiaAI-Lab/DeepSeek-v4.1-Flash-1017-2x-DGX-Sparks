@@ -1289,7 +1289,7 @@ index 7d2e266..8e5f80e 100644
      refAll(tri);
      refAll(tri_basic);
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index 2c76760..d92f52a 100644
+index 2c76760..91645a3 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -20,6 +20,7 @@ const round = @import("round.zig");
@@ -1598,7 +1598,7 @@ index 2c76760..d92f52a 100644
          errdefer sn.buf.free();
          try self.snaps.append(self.gpa, sn);
          self.next_snap += 1;
-@@ -876,6 +1062,213 @@ pub const Lanes = struct {
+@@ -876,6 +1062,219 @@ pub const Lanes = struct {
          self.gpa.destroy(sn);
      }
  
@@ -1801,10 +1801,16 @@ index 2c76760..d92f52a 100644
 +        };
 +        const gone = disco.sweep(dir, 0, keys, Keys.has);
 +        if (gone > 0) std.log.info("dsv41: removed {d} kept-state files no index holds", .{gone});
++        // the identity directories this rank still has under the root (its index sweeps old builds' as the cap needs):
++        // rank 1 keeps the same ones and removes the rest, which nothing would ever read again
++        var ids: [64][16]u8 = undefined;
++        const n_ids = identities(rootOf(dir), &ids);
 +        if (self.begin(.snap_sweep) catch false) {
 +            self.dirField(dir) catch return;
 +            self.wire.int(self.gpa, u32, @intCast(keys.len)) catch return;
 +            for (keys) |k| self.wire.int(self.gpa, u64, k) catch return;
++            self.wire.int(self.gpa, u32, @intCast(n_ids)) catch return;
++            for (ids[0..n_ids]) |*x| self.wire.buf.appendSlice(self.gpa, x) catch return;
 +            self.flush() catch |err| std.log.err("dsv41: rank 1's disk sweep: {s}", .{@errorName(err)});
 +        }
 +    }
@@ -1812,7 +1818,7 @@ index 2c76760..d92f52a 100644
      fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
          const self = of(ptr);
          const kv = self.streams.fetchRemove(s) orelse return;
-@@ -921,6 +1314,23 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -921,6 +1320,23 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
          while (ki.next()) |b| b.free();
          kept.deinit(gpa);
      }
@@ -1836,7 +1842,7 @@ index 2c76760..d92f52a 100644
      while (true) {
          // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
          // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
-@@ -935,12 +1345,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -935,12 +1351,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
              7 => .snap_drop,
              8 => .fill_images,
              9 => .done,
@@ -1854,7 +1860,7 @@ index 2c76760..d92f52a 100644
              m.joinAhead();
              m.fill_seq = &.{};
          }
-@@ -1048,11 +1462,118 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -1048,11 +1468,212 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                      b.free();
                  }
              },
@@ -1891,6 +1897,14 @@ index 2c76760..d92f52a 100644
 +                const keys = try gpa.alloc(u64, n);
 +                defer gpa.free(keys);
 +                for (keys) |*k| k.* = try r.int(u64);
++                const n_ids = try r.int(u32);
++                if (n_ids > 64 or r.at + 16 * n_ids > r.b.len) return error.BadFrame;
++                const kept_ids = r.b[r.at..][0 .. 16 * n_ids];
++                r.at += 16 * n_ids;
++                if (disk) |*d| if (d.owns(dir)) {
++                    const old = sweepIdentities(d.root, dir, kept_ids);
++                    if (old > 0) std.log.info("dsv41 rank 1: removed {d} directories of builds rank 0 no longer keeps", .{old});
++                };
 +                if (disk) |*d| if (d.owns(dir) and realDir(dir)) {
 +                    const Keys = struct {
 +                        fn has(k: []const u64, key: u64) bool {
@@ -1906,6 +1920,92 @@ index 2c76760..d92f52a 100644
      }
  }
  
++/// The tier's root of one of its directories (`root/<identity>`).
++fn rootOf(dir: []const u8) []const u8 {
++    const i = std.mem.lastIndexOfScalar(u8, dir, '/') orelse return dir;
++    return dir[0..i];
++}
++
++/// Whether `name` is an identity directory's name: 16 hex digits.
++fn identityName(name: []const u8) bool {
++    if (name.len != 16) return false;
++    for (name) |ch| if (!std.ascii.isHex(ch)) return false;
++    return true;
++}
++
++/// The identity directories under `root` (at most out.len).
++fn identities(root: []const u8, out: *[64][16]u8) usize {
++    var pb: [1100]u8 = undefined;
++    const d = std.c.opendir(std.fmt.bufPrintSentinel(&pb, "{s}", .{root}, 0) catch return 0) orelse return 0;
++    defer _ = std.c.closedir(d);
++    var n: usize = 0;
++    while (std.c.readdir(d)) |ent| {
++        const name = std.mem.sliceTo(&ent.name, 0);
++        if (ent.type != std.c.DT.DIR or !identityName(name) or n == out.len) continue;
++        out[n] = name[0..16].*;
++        n += 1;
++    }
++    return n;
++}
++
++/// Rank 1: identity directories under `root` other than `current`'s and not among `kept` (16 bytes each) emptied of this
++/// rank's files and removed (one that holds anything else stays). The directories removed.
++fn sweepIdentities(root: []const u8, current: []const u8, kept: []const u8) usize {
++    var ids: [64][16]u8 = undefined;
++    const n = identities(root, &ids);
++    var gone: usize = 0;
++    for (ids[0..n]) |*x| {
++        if (std.mem.endsWith(u8, current, x)) continue;
++        var keep = false;
++        var i: usize = 0;
++        while (i + 16 <= kept.len) : (i += 16) if (std.mem.eql(u8, kept[i..][0..16], x)) {
++            keep = true;
++        };
++        if (keep) continue;
++        var pb: [1100]u8 = undefined;
++        const path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ root, x }) catch continue;
++        if (!realDir(path)) continue;
++        const None = struct {
++            fn no(_: void, _: u64) bool {
++                return false;
++            }
++        };
++        _ = disco.sweep(path, 1, {}, None.no);
++        var zb: [1100]u8 = undefined;
++        if (std.c.rmdir(std.fmt.bufPrintSentinel(&zb, "{s}", .{path}, 0) catch continue) == 0) gone += 1;
++    }
++    return gone;
++}
++
++test "rank 1 keeps the identity directories rank 0 keeps and removes the others' files" {
++    var rb: [256]u8 = undefined;
++    const root = try std.fmt.bufPrint(&rb, "/tmp/tf-ids-{d}", .{std.c.getpid()});
++    var zb: [300]u8 = undefined;
++    _ = std.c.mkdir(try std.fmt.bufPrintSentinel(&zb, "{s}", .{root}, 0), 0o700);
++    const names = [_][]const u8{ "00000000000000a1", "00000000000000b2", "00000000000000c3" };
++    for (names) |nm| {
++        var db: [300]u8 = undefined;
++        const d = try std.fmt.bufPrint(&db, "{s}/{s}", .{ root, nm });
++        makeDir(d);
++        var fb: [400]u8 = undefined;
++        const fd = std.c.open(try disco.path(&fb, d, 7, 1), .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o600));
++        _ = std.c.close(fd);
++    }
++    var cb: [300]u8 = undefined;
++    const current = try std.fmt.bufPrint(&cb, "{s}/{s}", .{ root, names[0] });
++    try std.testing.expectEqual(@as(usize, 1), sweepIdentities(root, current, names[1])); // c3 goes, a1 (current) and b2 stay
++    var ids: [64][16]u8 = undefined;
++    try std.testing.expectEqual(@as(usize, 2), identities(root, &ids));
++    // the test's own tree
++    for (names[0..2]) |nm| {
++        var db: [300]u8 = undefined;
++        const d = try std.fmt.bufPrint(&db, "{s}/{s}", .{ root, nm });
++        _ = sweepIdentities(root, "/none", "");
++        _ = d;
++    }
++    _ = std.c.rmdir(try std.fmt.bufPrintSentinel(&zb, "{s}", .{root}, 0));
++}
++
 +/// A disk step's directory (after its fixed fields).
 +fn dirOfFrame(r: *Reader) ![]const u8 {
 +    const n = try r.int(u32);
@@ -1973,7 +2073,7 @@ index 2c76760..d92f52a 100644
  test "draft chances are the prefix survivals chooseK sums" {
      var out: [3]f64 = undefined;
      survivals(&.{ 0.0, 0.0, 2.0 }, &out);
-@@ -1158,3 +1679,31 @@ test "a prefix two conversations share: the second one resuming it in place woul
+@@ -1158,3 +1779,31 @@ test "a prefix two conversations share: the second one resuming it in place woul
      try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
      try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
  }

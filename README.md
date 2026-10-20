@@ -354,7 +354,7 @@ kept state, so a restart resumes them too.
   refuses to start if it is not writable or the disk has less than `DISK_CACHE_MIN_FREE_GIB` free. Inside it, one
   directory per engine identity (a hash of the executable, the rank's weight file size and a state's layout): another
   build never reads an older build's files; old identities are swept, least recently opened first, when the cap needs
-  room.
+  room, and rank 1 removes the ones rank 0 no longer keeps.
 - **Files:** `<key>.r<rank>.ds41kv`, one per rank and state (0.87 KiB per token per rank, measured: 163 MiB for a
   184,320-token state), written to a `.tmp`, fsynced and renamed, the directory fsynced; a CRC-32 every 8 MiB, checked
   on every read. A file whose head (format, rank, identity, key, position, sizes, length) or any CRC does not match is
@@ -378,6 +378,9 @@ kept state, so a restart resumes them too.
   read with its time.
 - **Counters:** `/health` shows `prompt_cache` (kept states and MiB in memory, hits, misses, evictions, failed restores)
   and, with the cache on, its `disk` part (states, MiB, writes, failed writes, reads, expired), as of the last prompt pass.
+- **Cap and age**, measured with `DISK_CACHE_GIB=0.05` and `DISK_CACHE_TTL_H=0.01`: a stop wrote six 16 MiB states and
+  kept the three that fit, the same three on both ranks; at the next start the first request expired them on both ranks;
+  the directories of four older builds were removed from both.
 - **Decode speed** with the cache on (`bench_decode`-style runs, 400 tokens, 3 runs each, the server idle): prose 67.0
   tok/s (67.3 without the patch), structured 140.8 (140.3), 4 streams 183.2 together (184): within 0.5%. Nothing of the
   cache runs in a decode round.
