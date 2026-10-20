@@ -88,9 +88,10 @@ the load, 4.9 at 159K tokens, 4.2 at 261K), and a larger `CONTEXT` only allows l
 such a head, or free more of its memory first. A 100K-token prompt also ran without errors at the full
 1,048,576-token window (3.14 GiB free at the lowest) and at 524,288 tokens.
 
-**Engine patches** (`zig/patches/`, three, written for this recipe). Each is **off by default**, so the image behaves like
-the pinned engine: its replies' token hashes equal the unpatched image's on 31 of 31 prompts (1 to 100,000 tokens, cached-prefix
-resumes, four at once, a three-conversation scenario; `tools/exact.py`). Each is switched on with a `TF_DS_*` variable, which
+**Engine patches** (`zig/patches/`, six, written for this recipe; `zig/patches/README.md` lists them all). Some are
+**off by default**, some are on; the table says which. With every switch unset, the image behaves like the pinned engine:
+its replies' token hashes equal the unpatched image's on 31 of 31 prompts (1 to 100,000 tokens, cached-prefix resumes, four
+at once, a three-conversation scenario; `tools/exact.py`). Each switch is a `TF_DS_*` or `TF_RDMA_*` variable, which
 `start.sh` gives to both ranks, and each was tested on its own:
 
 | Switch | Result |
@@ -98,6 +99,7 @@ resumes, four at once, a three-conversation scenario; `tools/exact.py`). Each is
 | `TF_DS_CACHE_PLACEMENT=1` (gone) | Measured on the earlier pin: in the three-conversation scenario conversation B's second turn used to miss the prompt cache and re-read its whole 6K-token prompt; with the patch it reused 4,096, with an identical reply. The pin is now `629c524`, whose engine places kept states itself (a conversation sharing a prefix copies the shared rows to a free extent); the patch was removed and the scenario was not re-measured on it. |
 | `TF_DS_ENGRAM_LANES=2` (off) | A second I/O ring for the prompt's Engram reads. Bit-identical, but prefill 1.5-2.6% *slower* from 8K to 131K: the drive is the limit. |
 | `TF_DS_IDX_SPLIT=1` (off) | Splits the prefill indexer's rows between the two ranks. Bit-identical, with no measurable gain on this pair (modeled at +1% at 64K and +2% at 128K; the undisturbed 32K repetitions tie the baseline). If the two ranks ever disagree on the setting the pair hangs, so it stays off. |
+| `TF_RDMA_IDLE_S` / `TF_RDMA_NAP_US` (on by default) | The RDMA gather's proxy naps when the engine is idle instead of spinning a core on each rank (the logic of [TensorFold PR #27](https://github.com/bertholomus/TensorFold/pull/27), ported to the Zig ring). Defaults: 2 s quiet, then 100 µs between looks; `TF_RDMA_IDLE_S=0` restores the stock always-spinning proxy. A decode round's gathers never see a nap. Measured on this pair with 100 µs: 11.2% (rank 0) and 8.8% (rank 1) idle, against ~100% before; `TF_RDMA_NAP_US=500` lowers it further, at most 0.5 ms on the first gather after a quiet spell. |
 
 Two limits of BertholomusAI's engine, reported in issues [#2](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/2) and
 [#3](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/3), are patched here (`zig/patches/0005`, `0006`), and measured on the pair
@@ -293,6 +295,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `TEMPERATURE`, `TOP_P`, `TOP_K` | 1.0, 0.95, 20 | the server's sampling defaults; a request's own values win. This engine refuses a `top_k` above 56 with `TooManyCandidates` (the finite candidate list its sampler keeps), so `TOP_K` is at most 56; `top_k` 0 or -1 is refused too, with a different, misleading message |
 | `DRAFTS` | 1 | the checkpoint's DSpark draft blocks (drafted replies equal plain ones) |
 | `RDMA`, `GRAPHS`, `SIDE`, `PREFETCH`, `ENGRAM_AIO` | 1 | the engine's served settings |
+| `RDMA_IDLE_S`, `RDMA_NAP_US` | 2, 100 | the RDMA proxy naps after this many quiet seconds, sleeping `RDMA_NAP_US` between looks (`zig/patches/0007`); `RDMA_IDLE_S=0` keeps the stock always-spinning proxy |
 | `MAX_TOKENS` | 32768 | a reply's budget when a request sets none |
 | `MIN_AVAIL_GIB`, `MIN_AVAIL_WAIT_S` | 112, 30 | `start.sh` refuses to start with less memory available than this on either Spark (`0` skips the check); it re-reads the memory for up to `MIN_AVAIL_WAIT_S` seconds first, because the page cache a build or a large copy just left counts as available only once it is written back (`0` reads once) |
 | `MEMGUARD_GIB`, `MEMGUARD_HOLD_S`, `MEMGUARD_HARD_GIB` | 2.5, 4, 1 | `scripts/memguard.sh` kills a rank's container when the memory available stays under the floor for `MEMGUARD_HOLD_S` seconds without coming back over it, or at once when it falls under the hard floor. A dip that recovers is logged and not killed (decimals fine; `MEMGUARD_GIB=0` turns the guard off) |

@@ -121,6 +121,10 @@ DRAFTS="${DRAFTS:-1}"                  # the checkpoint's own DSpark draft block
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).
 RDMA="${RDMA:-1}"
+# zig/patches/0007: the RDMA proxy naps once quiet for RDMA_IDLE_S seconds, RDMA_NAP_US between looks. 0 keeps the
+# always-spinning proxy (the stock engine's behavior). A decode round's gathers never see a nap.
+RDMA_IDLE_S="${RDMA_IDLE_S:-2}"
+RDMA_NAP_US="${RDMA_NAP_US:-100}"
 GRAPHS="${GRAPHS:-1}"
 SIDE="${SIDE:-1}"
 PREFETCH="${PREFETCH:-1}"

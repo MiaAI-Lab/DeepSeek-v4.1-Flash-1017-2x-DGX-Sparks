@@ -1,0 +1,159 @@
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index 008baed4..071b0d45 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -24,8 +24,13 @@ const collect_threads = 256;
+ const wc_recv_rdma_with_imm = 129;
+ const host_register_portable = 0x01;
+ const host_register_devicemap = 0x02;
++const pr_set_timerslack: c_int = 29;
++const default_idle_ns: u64 = 2 * std.time.ns_per_s;
++const default_nap_ns: u64 = 100 * std.time.ns_per_us;
+ 
+-pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
++extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
++
++pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+ 
+ /// The served ring has its own GID selection, independent of NCCL's.
+ pub fn parseGidIndex(text: ?[]const u8) error{InvalidRdmaGidIndex}!u8 {
+@@ -43,6 +48,44 @@ pub fn servedGidIndex() error{InvalidRdmaGidIndex}!u8 {
+     };
+ }
+ 
++/// TF_RDMA_IDLE_S: seconds with nothing posted or reaped before the proxy naps (0: never nap; default 2).
++fn parseIdleNs(text: []const u8) Error!u64 {
++    const seconds = std.fmt.parseFloat(f64, text) catch return error.BadRdmaIdle;
++    if (!std.math.isFinite(seconds) or seconds < 0) return error.BadRdmaIdle;
++    const ns = seconds * @as(f64, @floatFromInt(std.time.ns_per_s));
++    if (ns > @as(f64, @floatFromInt(3600 * std.time.ns_per_s))) return error.BadRdmaIdle;
++    return @intFromFloat(ns);
++}
++
++fn envIdleNs() Error!u64 {
++    const raw = std.c.getenv("TF_RDMA_IDLE_S") orelse return default_idle_ns;
++    const text = std.mem.span(raw);
++    return if (text.len == 0) default_idle_ns else parseIdleNs(text);
++}
++
++/// TF_RDMA_NAP_US: the proxy's sleep between looks once it is idle (default 100; at least 1).
++fn parseNapNs(text: []const u8) Error!u64 {
++    const us = std.fmt.parseInt(u64, text, 10) catch return error.BadRdmaNap;
++    return std.math.mul(u64, @max(us, 1), std.time.ns_per_us) catch return error.BadRdmaNap;
++}
++
++fn envNapNs() Error!u64 {
++    const raw = std.c.getenv("TF_RDMA_NAP_US") orelse return default_nap_ns;
++    const text = std.mem.span(raw);
++    return if (text.len == 0) default_nap_ns else parseNapNs(text);
++}
++
++fn monotonicNs() u64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
++}
++
++fn nap(ns: u64) void {
++    const ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
++    _ = std.c.nanosleep(&ts, null);
++}
++
+ /// ibv_mtu is an ordered enum, 1=256 through 5=4096. Both ends use the smaller active MTU.
+ fn pathMtu(local: c_int, remote: c_int) error{BadMtu}!c_int {
+     if (local < 1 or local > 5 or remote < 1 or remote > 5) return error.BadMtu;
+@@ -171,6 +214,9 @@ pub const Ring = struct {
+     running: std.atomic.Value(bool) = .init(false),
+     failed: std.atomic.Value(bool) = .init(false),
+     why: [128]u8 = @splat(0),
++    /// The proxy's idle back-off: quiet for `idle_ns` (0: never nap), then sleep `nap_ns` between looks.
++    idle_ns: u64 = default_idle_ns,
++    nap_ns: u64 = default_nap_ns,
+ 
+     // the metadata block: flags [slots][world], doorbell, sizes [slots], sent [slots], abort word
+     fn flags(r: *const Ring) [*]u64 {
+@@ -196,6 +242,8 @@ pub const Ring = struct {
+     pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, k: Kernels, devices: []const []const u8, rank: u32, world: u32, s: Settings) Error!*Ring {
+         if (world < 2 or world > max_ranks or rank >= world or devices.len == 0 or devices.len > max_devices) return error.BadInfo;
+         if (s.slots < 2 or s.slots > seqs.max_slots or s.max_bytes == 0 or s.max_bytes % 64 != 0) return error.BadInfo;
++        const idle_ns = try envIdleNs();
++        const nap_ns = try envNapNs();
+         const r = try gpa.create(Ring);
+         errdefer gpa.destroy(r);
+         var verbs = try Verbs.open(null);
+@@ -211,7 +259,7 @@ pub const Ring = struct {
+         var scalars = try cuda.DeviceBuffer.alloc(d, 80);
+         errdefer scalars.free();
+         try scalars.fill8(0, null);
+-        r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars };
++        r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars, .idle_ns = idle_ns, .nap_ns = nap_ns };
+         r.v = &r.verbs;
+         errdefer for (r.nics[0..r.nd]) |*n| r.closeNic(n);
+         for (devices) |name| {
+@@ -357,8 +405,16 @@ pub const Ring = struct {
+         var arrivals: seqs.Arrivals = .{ .nd = nd };
+         var posted: u64 = 0;
+         var wc: [64]vabi.Wc = undefined;
++        // A decode round's gathers come microseconds apart; only a long quiet spell naps. The first gather after one
++        // waits out at most one nap, and the next doorbell or completion spins again.
++        const naps = r.idle_ns > 0;
++        if (naps) _ = prctl(pr_set_timerslack, 1000, 0, 0, 0); // 1 us, so a nap is about TF_RDMA_NAP_US
++        var quiet: u64 = 0; // passes with nothing posted or reaped
++        var quiet_since: u64 = monotonicNs();
++        var drowsy = false;
+         while (r.running.load(.monotonic)) {
+             const ring = @atomicLoad(u64, r.doorbell(), .acquire);
++            var busy = posted < ring;
+             while (posted < ring) {
+                 const q = posted + 1;
+                 const slot: usize = @intCast(q % r.s.slots);
+@@ -385,6 +441,7 @@ pub const Ring = struct {
+                     r.fail("ibv_poll_cq failed");
+                     return;
+                 }
++                busy = busy or k > 0;
+                 for (wc[0..@intCast(k)]) |w| {
+                     if (w.status != vabi.wc_success) {
+                         r.fail(r.v.statusText(w.status));
+@@ -407,6 +464,22 @@ pub const Ring = struct {
+                     }
+                 }
+             }
++            if (!naps) continue;
++            if (busy) {
++                drowsy = false;
++                quiet = 0;
++                continue;
++            }
++            if (drowsy) {
++                nap(r.nap_ns);
++                continue;
++            }
++            quiet += 1;
++            if (quiet == 1) {
++                quiet_since = monotonicNs();
++            } else if ((quiet & 1023) == 0 and monotonicNs() -% quiet_since > r.idle_ns) {
++                drowsy = true;
++            }
+         }
+     }
+ 
+@@ -549,6 +622,18 @@ test "served GID defaults to 5 and accepts explicit 3 without silently accepting
+     for ([_][]const u8{ "", "-1", "+3", " 3", "3 ", "0x3", "3_0", "256", "invalid" }) |value|
+         try std.testing.expectError(error.InvalidRdmaGidIndex, parseGidIndex(value));
+ }
++test "the RDMA proxy's idle back-off parses its settings" {
++    try std.testing.expectEqual(default_idle_ns, try parseIdleNs("2"));
++    try std.testing.expectEqual(@as(u64, 0), try parseIdleNs("0"));
++    try std.testing.expectEqual(@as(u64, 1500 * std.time.ns_per_ms), try parseIdleNs("1.5"));
++    for ([_][]const u8{ "", "-1", "nan", "inf", "3601", "x" }) |bad|
++        try std.testing.expectError(error.BadRdmaIdle, parseIdleNs(bad));
++    try std.testing.expectEqual(default_nap_ns, try parseNapNs("100"));
++    try std.testing.expectEqual(@as(u64, 1 * std.time.ns_per_us), try parseNapNs("0"));
++    for ([_][]const u8{ "", "-1", "x", "18446744073709551615" }) |bad|
++        try std.testing.expectError(error.BadRdmaNap, parseNapNs(bad));
++}
++
+ test "RDMA MTU negotiation is symmetric for every supported port MTU and rejects invalid metadata" {
+     for (1..6) |a| for (1..6) |b| {
+         try std.testing.expectEqual(@as(c_int, @intCast(@min(a, b))), try pathMtu(@intCast(a), @intCast(b)));
