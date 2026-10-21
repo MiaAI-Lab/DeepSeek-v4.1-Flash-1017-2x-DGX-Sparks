@@ -98,8 +98,9 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   ([@kerpopule](https://github.com/kerpopule)); `scripts/zig_flags.py` (the serve flags checked against
   `tensorfold-native capabilities --json`), `scripts/publish-image.sh` and the registry pull in `scripts/prepare.sh`, and the
   issue and pull request templates and `FUNDING.yml` in `.github`, by Mia's AI Lab.
-- **`zig/patches/0001-0002`** are changes to BertholomusAI's engine written by Mia's AI Lab for this recipe (Apache-2.0), each off by default: a
-  second AIO ring for Engram reads (0002) and a row split of the prefill indexer between the two ranks (0001). A prompt-cache placement
+- **`zig/patches/0001-0002`** are changes to BertholomusAI's engine written by Mia's AI Lab for this recipe (Apache-2.0), a second AIO
+  ring for Engram reads (0002, off by default) and a row split of the prefill indexer between the two ranks (0001, by default only in
+  prompt chunks that end at token 131,072 or later). A prompt-cache placement
   patch (0003) was dropped when the pin moved to `629c524`, which places kept states itself. The idea of splitting the indexer is credited to drowzeys, from the GLM-5.3-Flash recipe's design; no code of
   that recipe was used. They modify code by TensorFold's contributors and BertholomusAI, which keeps their licences.
 - **`zig/patches/0005-prefill-interleave.patch`** was authored by **[Coinupbtc](https://github.com/Coinupbtc)** (@Coinupbtc), in [pull request #5](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/5)

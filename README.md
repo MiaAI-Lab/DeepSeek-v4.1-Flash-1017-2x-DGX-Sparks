@@ -88,7 +88,8 @@ the load, 4.9 at 159K tokens, 4.2 at 261K), and a larger `CONTEXT` only allows l
 such a head, or free more of its memory first. A 100K-token prompt also ran without errors at the full
 1,048,576-token window (3.14 GiB free at the lowest) and at 524,288 tokens.
 
-**Engine patches** (`zig/patches/`, three, written for this recipe). Each is **off by default**, so the image behaves like
+**Engine patches** (`zig/patches/`, three, written for this recipe). They keep the replies' bits; two are **off by default**, and
+the indexer split runs by default only in prompt chunks that end at token 131,072 or later, so below that the image behaves like
 the pinned engine: its replies' token hashes equal the unpatched image's on 31 of 31 prompts (1 to 100,000 tokens, cached-prefix
 resumes, four at once, a three-conversation scenario; `tools/exact.py`). Each is switched on with a `TF_DS_*` variable, which
 `start.sh` gives to both ranks, and each was tested on its own:
@@ -97,7 +98,7 @@ resumes, four at once, a three-conversation scenario; `tools/exact.py`). Each is
 | --- | --- |
 | `TF_DS_CACHE_PLACEMENT=1` (gone) | Measured on the earlier pin: in the three-conversation scenario conversation B's second turn used to miss the prompt cache and re-read its whole 6K-token prompt; with the patch it reused 4,096, with an identical reply. The pin is now `629c524`, whose engine places kept states itself (a conversation sharing a prefix copies the shared rows to a free extent); the patch was removed and the scenario was not re-measured on it. |
 | `TF_DS_ENGRAM_LANES=2` (off) | A second I/O ring for the prompt's Engram reads. Bit-identical, but prefill 1.5-2.6% *slower* from 8K to 131K: the drive is the limit. |
-| `TF_DS_IDX_SPLIT=1` (off) | Splits the prefill indexer's rows between the two ranks. Bit-identical, with no measurable gain on this pair (modeled at +1% at 64K and +2% at 128K; the undisturbed 32K repetitions tie the baseline). If the two ranks ever disagree on the setting the pair hangs, so it stays off. |
+| `TF_DS_IDX_SPLIT` (unset: from 131,072 tokens) | Splits the prefill indexer's rows between the two ranks and all-gathers their selections. Bit-identical. The indexer's work grows with the history and the gather's does not, so it pays only in long prompts: with the switch unset it runs in chunks that end at 65,536 compressed keys or more (token 131,072 of a ratio-2 layer) and below that the replicated loop runs as before. Cold prefill against the image without it, three alternating pairs each: **+4.25% at 256K** (1,976 to 2,060 tok/s) and **+7.46% at 400K** (1,874 to 2,014 tok/s, TTFT 213 to 198 s); 8K/32K prefill, decode and four streams within 0.9%. `1` splits every eligible chunk (earlier: no measurable gain up to 128K), any other value turns it off. Both ranks must agree or the pair hangs: `start.sh` gives the variable to both. |
 
 Two limits of BertholomusAI's engine, reported in issues [#2](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/2) and
 [#3](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/3), are patched here (`zig/patches/0005`, `0006`), and measured on the pair
@@ -298,7 +299,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `MEMGUARD_GIB`, `MEMGUARD_HOLD_S`, `MEMGUARD_HARD_GIB` | 2.5, 4, 1 | `scripts/memguard.sh` kills a rank's container when the memory available stays under the floor for `MEMGUARD_HOLD_S` seconds without coming back over it, or at once when it falls under the hard floor. A dip that recovers is logged and not killed (decimals fine; `MEMGUARD_GIB=0` turns the guard off) |
 | `HEAD_ENGRAM_DIR` | empty | a local folder with Engram's two shards for rank 0 (as `WORKER_ENGRAM_DIR` is on the worker); empty reads them from `HF_CACHE` |
 | `HEAD_NFS_SERVER`, `HEAD_NFS_VOLUME` | empty | rank 0 reads the checkpoint over NFS through a docker volume the docker daemon mounts (no root, survives a reboot); empty uses `HF_CACHE` as a host path. sshfs does not work: it lists files as type "unknown", which the engine skips |
-| `TF_DS_ENGRAM_LANES`, `TF_DS_IDX_SPLIT` | unset | the engine patches' switches (`zig/patches/`, see Status); a `TF_DS_*` variable you export goes to both ranks |
+| `TF_DS_ENGRAM_LANES`, `TF_DS_IDX_SPLIT` | unset (the indexer split from token 131,072) | the engine patches' switches (`zig/patches/`, see Status); a `TF_DS_*` variable you export goes to both ranks |
 | `RANK1_PROFILE` | empty | `1` or `2` starts rank 1 with `--profile`, which prints its prefill phase timings when rank 0 stops first (adds a sync per chunk: for attribution, not for timing) |
 | `API_KEY` | 0 | `1` makes rank 0 require a key (`Authorization: Bearer`; generated in `$STATE_DIR/api-key`, mode 600). The API is open on the network by default |
 | `HOST`, `PORT`, `SERVED_NAME` | 0.0.0.0, 8888, `DeepSeek-V4.1-Flash-1017` | |
