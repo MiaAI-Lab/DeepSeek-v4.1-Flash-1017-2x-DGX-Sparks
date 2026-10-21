@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Rank 0's memory with long prompts: `zig/patches/0011-server-prepare-memory.patch` (base engine: server and core). A
+  prompt's render and tokenization kept their scratch in the request's memory until the reply ended: a resumed
+  ~948K-token conversation held ~1.3-1.5 GB on rank 0, and eight at once took its MemAvailable from 6 GiB to 0.16 GiB
+  until the memory guard killed it. The tokenizer and the template now give their scratch back (~6 bytes a text byte
+  instead of ~117, the same ids), a prepare waits while others are in flight and MemAvailable would fall under
+  `TENSORFOLD_PREPARE_FLOOR_GIB` (default 3; `0` off), and a kept-alive connection keeps at most 1 MiB between its
+  requests. Replies are unchanged (`zig build test-golden`). By **Robert Wojciechowski
+  ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)**.
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,
