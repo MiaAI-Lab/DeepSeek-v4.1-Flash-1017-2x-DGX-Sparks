@@ -59,6 +59,23 @@ How `scripts/config.sh` reaches the two commands (the flags and variables are th
 Rank 1 takes the round's settings as flags only (it reads no `TF_DS_GRAPHS` and the like), and its pool and streams must
 equal rank 0's context and streams, or the two ranks wait on each other.
 
+## Wider rounds
+
+`ROUND_ROWS` may be 16 to 48. Draft depth is the smaller of the engine's table and `(ROUND_ROWS / live_streams) - 1`.
+The table allows 5 drafts for one stream and 3 once four or more streams are live. Twelve streams at 48 rows is 4 rows
+each. Sixteen streams at 48 rows is 3 rows each.
+
+Kit `abe07c7` records `_rowmm_parts` for 1 to 16 rows. That kernel sets its `RB` constexpr to the row count, so a wider
+round dies while the CUDA graph is captured (`no captured Triton variant of _rowmm_parts`, then `CudaFailed`).
+Recapturing the graph does not compile the cubin. `_rowmm2r` and the mHC mix kernels tile inside the variants the kit
+already has, so they do not need a new cubin for a 48-row round.
+
+`tools/make_rowmm_wide.py` compiles rows 17 to 48 for both gate widths (N=128 and N=384, BN=8) from the
+`deepseek-v41-tp2` `kernels.py` and merges them into the kit directory `prepare.sh` installed. Copy the updated
+`aot/aot.json`, `MANIFEST`, and the new cubins to the other Spark. `prepare.sh` does not run again while `KIT_REF` is
+unchanged, and a later prepare that replaces the kit drops the added cubins. The tool checks a rows=16 launch against
+the kit's recorded BN=8 variant (shared 32, 2 warps) and does not install that one.
+
 ## Not verified
 
 Served and measured on one pair of Sparks (README, Status). Still open:
