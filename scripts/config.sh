@@ -102,7 +102,7 @@ PORT="${PORT:-8888}"
 # CONTEXT positions (rank 1's --pool is rank 0's --context), so PARALLEL streams at the full window take turns.
 CONTEXT="${CONTEXT:-1048576}"
 PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams, TF_DS_STREAMS; the family measured 4)
-ROUND_ROWS="${ROUND_ROWS:-}"           # a decode round's rows at most, 16 to 48 (empty: the engine's 16)
+ROUND_ROWS="${ROUND_ROWS:-}"           # 16 to 48 rows in a decode round (empty: the engine's 16). The kit's _rowmm_parts stops at 16; wider rounds need tools/make_rowmm_wide.py
 MAX_TOKENS="${MAX_TOKENS:-32768}"      # a reply's budget when a request sets none
 THINKING="${THINKING:-1}"              # think first unless a request turns it off
 # The reasoning effort when a request names none: low, medium, high or xhigh (empty: the chat template's default)
