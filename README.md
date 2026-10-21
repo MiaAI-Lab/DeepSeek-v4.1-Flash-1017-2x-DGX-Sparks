@@ -70,6 +70,8 @@ to predict; medians of one or two repetitions, so differences of a few percent a
 | Drafting (DSpark) | ~2.2-2.4 tokens a round on random-word prompts (about 50 of 88 and 58 of 93 drafted tokens accepted) |
 
 The lower `bench.py` decode numbers are the prompt, not the engine: real text drafts much better than random words.
+`bench.py` talks to `--url`, else `API_URL`, else the `PORT` in `scripts/local.sh` (8888 when neither sets one), so it
+follows a pair that moved the server off the recipe's default port.
 
 These need **Engram's tables on local disk on both Sparks**: with the head reading them over NFS (`HEAD_ENGRAM_DIR` unset
 and a remote `HF_CACHE`) a random 4 KiB read took ~940 us against ~90 us from local disk, and prefill was ~690-890 tok/s.

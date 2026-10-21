@@ -21,7 +21,8 @@ whose name has "draft" or "accept" is also summed into the run's "draft" figures
 exist. Optionally --health / --metrics snapshots are taken before and after (raw, not interpreted). Exit code 1 if a
 needle is missed or a request fails.
 
-Stdlib only. Endpoint: --url or API_URL / PORT (default http://127.0.0.1:8888); model: --model or MODEL.
+Stdlib only. Endpoint: --url, else API_URL, else PORT from the environment or from scripts/local.sh (the file the
+README tells you to put settings in; 8888 when neither sets it); model: --model or MODEL.
 New for this recipe; its measurements follow the GLM-5.3-Flash recipe's tools (Mia's AI Lab, Apache-2.0: client.py's
 random prose, needle.py, prompt_reuse.py, hermes_benchmark.py's per-request figures) and the lead's streaming
 bench.py (TTFT, usage-based prefill and decode rates). No code is copied from them beyond the prose generator below.
@@ -31,6 +32,7 @@ import json
 import os
 import platform
 import random
+import re
 import statistics
 import sys
 import threading
@@ -318,10 +320,34 @@ def compare(a_path: str, b_path: str) -> int:
     return 0
 
 
+def _port_from_local_sh():
+    """The kit's PORT, from scripts/local.sh beside this tool: start.sh serves on it, so bench.py must talk to it."""
+    local = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "local.sh")
+    try:
+        with open(local, encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"""\s*(?:export\s+)?PORT\s*=\s*["']?(\d{1,5})["']?\s*(?:#.*)?$""", line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def default_base() -> str:
+    """--url's default: API_URL, else the port from PORT or scripts/local.sh, else the recipe's 8888.
+
+    local.sh is the file the README says to put settings in, and it is where most pairs change PORT; reading it here
+    keeps the tool on the port the server actually listens on instead of a refused 8888.
+    """
+    if os.environ.get("API_URL"):
+        return os.environ["API_URL"]
+    return "http://127.0.0.1:" + (os.environ.get("PORT") or _port_from_local_sh() or "8888")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    base = os.environ.get("API_URL", "http://127.0.0.1:" + os.environ.get("PORT", "8888"))
-    ap.add_argument("--url", default=base)
+    ap.add_argument("--url", default=default_base())
     ap.add_argument("--model", default=os.environ.get("MODEL", DEFAULT_MODEL))
     ap.add_argument("--suite", default="prefill,decode,multi,needle")
     ap.add_argument("--label", default="")

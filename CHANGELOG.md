@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `tools/bench.py` uses the port the server actually listens on when neither `--url` nor `API_URL` is given: `PORT` from the
+  environment, then from `scripts/local.sh` (the file the README says to put settings in), then the recipe's 8888. A pair that
+  moved `PORT` no longer gets a page of `Connection refused` from the recipe's own bench. `--url`, `API_URL` and `PORT` keep
+  their precedence.
 - `prepare.sh`'s "cannot mount ... over NFS" error shows the last four lines of docker's output, not only the last (which was always
   docker's "Run 'docker run --help'" line, never the reason); the README's NFS section says what to check (issue
   [#15](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/15), reported by **aoeu10**). The README's memory note now
