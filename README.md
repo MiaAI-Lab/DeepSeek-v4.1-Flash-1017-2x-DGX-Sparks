@@ -30,6 +30,11 @@ What is checked, and how:
 
 - `DRY_RUN=1 ./start.sh` prints the link it found (on a pair of Sparks) and both ranks' docker commands; `./stop.sh`
   and `scripts/*.sh` pass `bash -n`.
+- `scripts/check-pins.sh` resolves every pin before anything is built or downloaded: the checkpoint's and Engram's
+  revisions on Hugging Face, the files `prepare.sh` reads inside them, the checkpoint's index against its shards,
+  Engram's two shards against the sizes the card lists, and the engine's, the inputs' tools' and the kit's commits.
+  `prepare.sh` runs it at the end of its preflight (one HTTPS request per pin; `PIN_CHECK=0` skips it). `bash
+  scripts/test_check_pins.sh` runs its failure cases against a local fixture of both APIs.
 - The kit's RoPE tables, made from this checkpoint's `config.json`, match the kit's recorded sha256 (4 of 4), and the
   token map made from its `tokenizer.json` is byte for byte the one the kit's Engram fixtures were recorded with.
   `scripts/prepare.sh` checks both on every run. The checkpoint holds all 43 `gate.bias_vl` tensors (F32) the image
@@ -258,7 +263,7 @@ The stock performance and correctness results above do not validate the ablitera
 
 `scripts/prepare.sh` (run by `start.sh` when something is missing; safe to re-run) on the head:
 
-1. checks docker, the GPU, ssh and the link;
+1. checks docker, the GPU, ssh and the link, and resolves every pin in `scripts/config.sh` (`scripts/check-pins.sh`);
 2. builds the image from `zig/Dockerfile` (the pinned engine plus the inputs' tools) and copies it to the worker;
 3. downloads the checkpoint and Engram's two shards (with their index and config) at their pinned revisions, and checks the
    shards' sizes (`VERIFY_SHA=1` also their sha256, as the model card lists them: the 1017 tables are new, the older
@@ -347,6 +352,7 @@ start.sh, stop.sh            start and stop both ranks
 scripts/config.sh            every setting and its default (layered: environment, scripts/local.sh, .env)
 scripts/nodes.sh             the worker over ssh, the CX7 link and its RoCE rails, NFS volume, NCCL settings
 scripts/prepare.sh           image, downloads, kit, token map, weight files, the worker's NFS volume and disk
+scripts/check-pins.sh        resolves every pin (Hugging Face revisions, their files, the git commits) before prepare.sh starts
 scripts/memguard.sh          the memory watchdog start.sh runs on both Sparks (kills a rank's container below MEMGUARD_GIB)
 scripts/zig_flags.py         start.sh's check of rank 0's serve flags against the image's `capabilities --json`
 scripts/publish-image.sh     pushes the built image to ghcr.io (only on purpose)

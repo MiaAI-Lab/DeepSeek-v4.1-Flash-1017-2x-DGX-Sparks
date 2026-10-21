@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The checkpoint pin moves from `6d54be4f` to `45ee5d0f`: the Hub repo was force-squashed on 19.10 and the old commit no
+  longer resolves (`hf download` fails with "File not found"), while the new one's 39 weight shards are byte-identical (all
+  39 sha256 compared against a prepared pair) and it carries the `tokenizer.json` the old snapshot did not. A pair that
+  is already prepared reuses the cached shards, but writes both ~106 GB rank weight files again under the new revision's
+  folder, because those folders are keyed by the revision. Reported by **ajbmachon** in issue
+  [#36](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/36), who found the same replacement.
+  New `scripts/check-pins.sh` resolves every pin, and the checkpoint's index against its shards, before the preflight
+  builds an image or downloads anything; `prepare.sh` runs it (`PIN_CHECK=0` skips it), and `scripts/test_check_pins.sh`
+  covers each failure against a local fixture of the two APIs.
 - `prepare.sh`'s "cannot mount ... over NFS" error shows the last four lines of docker's output, not only the last (which was always
   docker's "Run 'docker run --help'" line, never the reason); the README's NFS section says what to check (issue
   [#15](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/15), reported by **aoeu10**). The README's memory note now
