@@ -32,6 +32,67 @@
   gave about 1.5K reasoning tokens and a finished answer. README: the engine refuses a `top_k` above 56 (`TooManyCandidates`) and `top_k` 0 or -1.
   By **ezoushen**, [pull request #8](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/8).
 
+- **Spill v2 and KV sharding ON by default** (2026-10-20, the daily configuration): `SPILL_GIB=64` a Spark, `KV_SHARD=1`
+  and `POOL` derived from `CONTEXT` by the engine's rule (each of the two owner parts holds a whole window
+  plus a round's rows and two, in 4,096-position parts: 2,101,248 at `CONTEXT=1048576` and 16-row rounds; another `CONTEXT` or
+  `ROUND_ROWS` gets its own). The engine's own defaults are unchanged (patch `0007` is the same); only the recipe's settings
+  changed. Each turns off explicitly: `SPILL_GIB=0`, `KV_SHARD=0` (with `POOL` empty the pool is `CONTEXT` again), both for the
+  recipe before the port. **A default that cannot run degrades, an explicit one refuses:** when the default spill folder fails
+  its checks on either Spark (missing and not creatable, not yours, on NFS or a memory file system, inside the export or a model
+  folder, below `SPILL_FLOOR_GIB`, an unusable path, the worker's probe not answering) `start.sh` warns
+  `SPILL TIER OFF for this start` and starts both ranks without the tier; `SPILL_GIB` (or `TF_DS_SPILL_GIB`) set explicitly
+  refuses as before. The default `KV_SHARD=1` is likewise turned off with a warning when `TP` is not 2 or an explicit `POOL`
+  cannot hold two windows (`POOL=1048576`); explicit `KV_SHARD=1` refuses. The spill folders are now checked before the flags
+  and the `tf.recipe.port` label are made (and `need_workers` runs first), so a degraded start is labelled `spill=0` and
+  `./start.sh` adopts a running pair against the same decision. Disk: ~890 bytes a token a Spark replicated; sharded, the owner
+  ~890 and the other ~170; at most 64 GiB a Spark, with 50 GiB always left free. Rolling back to an image without the port now
+  needs the switches off explicitly: `SPILL_GIB=0 KV_SHARD=0 IMAGE=<tag> PREPARE=0 ./start.sh restart`. Containers started with
+  every switch off (`tf.recipe.port=off`) are not adopted by a default `./start.sh`: restart, or set both to 0.
+  `scripts/port_test.sh` tests the defaults, each switch off, the degrade and refuse paths and (bash 4) the golden DRY_RUN cases
+  for the defaults; `tools/gpu_validate.sh`'s configurations name the switch they do not test as off.
+- **Renamed** (2026-10-20): the branch `port/recipe` is now `spill-kvshard` (on GitHub `wojo/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks`,
+  the old name redirects) and the engine export `zig/patches/0007-glm-port.patch` is now `0007-spill-kvshard.patch`
+  (`scripts/port-patches.sh`'s default `--name`). The image tag changes with the file: `./start.sh restart` rebuilds. Docs no
+  longer say spill and KV sharding refuse each other (they run together since `PORT_SHARD_SPILL_READY=1`). `NOTICE` lists
+  `0007` and its author (Robert Wojciechowski, wojo) beside the other patches, and the patch header names him in full.
+- **Port, recipe: a broken pair restarts itself** ([docs/PORT-RECIPE.md](docs/PORT-RECIPE.md) "When the rank pair breaks"):
+  with spill or KV sharding on, the engine ends rank 0 with status 75 when the rank pair breaks
+  (`TF_DS_PAIR_BROKEN=exit`). The new `scripts/pairwatch.sh` runs on rank 0 beside the memory guard and answers an
+  `exited 75` with `./start.sh restart` within ~2 s (`PAIR_RESTART`, `PAIR_RESTART_MAX`, `PAIR_RESTART_HOLD`).
+  `stop.sh` disarms it first, and with both features off nothing changes. `tools/gpu_validate.sh` gains `spill-shard`,
+  `spill-shard-pressure` (opt-in), `spill-pictures`, `spill-pictures-mismatch`, `pair-kill` and `pair-stop`.
+  `tools/pair_check.py` is new, and `spill_check.py` has `--checks pictures` and `--pictures`.
+- **Port, recipe:** the fake server's `parked` gauge counts requests waiting on a restore (the reader and each coalesced one),
+  so `spill_check.py`'s settled check is exercised against a non-zero value (`tools/selftest.py`); `tools/prefix_fanout.py`
+  runs in the `off` configuration with `--expect-one-fill` (the native engine computes a shared prefix once at every level).
+  A running pair started by an earlier tree carries another `tf.recipe.port` label and is not adopted by `./start.sh`: run
+  `./start.sh restart`, as a new image needs anyway.
+- **Port, round 2 (recipe):** rank 1 gets the engine's own spill names (`TF_DS_SPILL_DIR`, `_GIB`, `_MIN_FREE_GIB`,
+  `_MIN_TOKENS`, `_QUOTA`, `_STAGING_MIB`, `TF_SPILL_TURNS`, `TF_SPILL_FLUSH_MS`; the round-1 `TF_SPILL_*` placeholders are gone) and
+  rank 0 `--spill-min-tokens` from the same `SPILL_MIN_TOKENS`; the identity the engine requires with spill (`TF_DS_ENGINE_ID`,
+  `TF_DS_RECIPE_PATCHES` from the image's labels, `TF_DS_MODEL_REVISION`, `TF_DS_ENGRAM_REVISION`, each rank's `TF_DS_RANK_CACHE_SHA`
+  cached beside its weight file); `KV_SHARD_CARRY` / `_TWINS` / `_CHECK`; `MIN_AVAIL_GIB` counts pages parked on the per-CPU free lists
+  as the engine's 0119 does and waits up to `MIN_AVAIL_WAIT_S` (`scripts/memavail.sh`); the tools read the engine's `kv_shard`
+  counters; `tools/gpu_validate.sh` covers the engine's GPU validation lists; [docs/FORK-DEPLOY.md](docs/FORK-DEPLOY.md).
+- **Port of Robert Wojciechowski's (wojo) GLM patches, recipe side** (all off by default; [docs/PORT-RECIPE.md](docs/PORT-RECIPE.md), README "Spill v2 and KV
+  sharding"): the settings `SPILL_GIB`, `SPILL_DIR`, `WORKER_SPILL_DIR`, `SPILL_FLOOR_GIB`, `SPILL_QUOTA_GIB`, `KV_SHARD`,
+  `KV_SHARD_DECODE` and `POOL` (total pool positions, apart from `CONTEXT`, the window), mapped to the engine's flags and variables in one
+  place (`scripts/port.sh`) and passed to both ranks alike; each rank's own local spill folder mounted at `/spill` after checks on both
+  Sparks (local disk, outside the NFS export, the model folders and archives, not root-owned, above the floor), its files given back to
+  the folder's owner; both containers labelled with the settings, and running ranks that disagree are not adopted. The engine side:
+  Robert Wojciechowski's (**[wojo](https://github.com/wojo)**) spill tier and spill v2 blocks (GLM PRs #78 and #124, on
+  **[BadAd84](https://github.com/BadAd84)**'s block-tier design), chat continuation (#128), KV sharding (#152) and the parked-page
+  startup budget (#149), ported to the native engine and exported as `zig/patches/0007-...` by the new `scripts/port-patches.sh`
+  (checked with `git apply --check` on a clean `TF_REF`). Validated on the pair (README, "Spill v2 and KV sharding"). With every setting off the only change in the docker
+  commands is a `tf.recipe.port=off` label (`scripts/port_test.sh` compares `DRY_RUN=1 ./start.sh` against the recipe before the port,
+  with bash 4). Spill folders on tmpfs, ramfs, overlay, squashfs or zram are refused, as are ones inside an export listed in
+  `/var/lib/nfs/etab` or `/etc/exports(.d)`; `STOP_TIMEOUT` follows `TF_SPILL_FLUSH_MS`; `POOL` above 4x `CONTEXT` warns and above 16x is
+  refused. Rollback to the live image: `IMAGE=<noted tag> PREPARE=0 ./start.sh restart`, or the exact tree (commit and working-tree diff).
+- The two fixes of the live two-Spark deployment: `zig/Dockerfile` downloads Zig from `ZIG_MIRRORS` (default `zig.linus.dev`) and then
+  ziglang.org, each with bounded retries (20 s connect, 300 s a try, 3 retries, 600 s of retrying at most) and the pinned sha256
+  (`ZIG_MIRRORS=` empty: ziglang.org only); `scripts/prepare.sh`'s worker
+  checks (the NFS file list, Engram's copy) run in the serving image the worker already holds instead of pulling the base image again.
+  The Dockerfile change gives the image a new tag (one rebuild).
 - Issues #3 and #2 in the engine (patches, both **off or on as noted, not yet merged**): `zig/patches/0005-prefill-interleave.patch` (**Coinupbtc**,
   [pull request #5](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/5)) gives the streams already live decode rounds and their cancels between the
   chunks of a long prompt pass, `PREFILL_INTERLEAVE_MS` (default 0: off); `0006-image-prompt-cache.patch` lets a prompt with pictures resume and keep prompt states,

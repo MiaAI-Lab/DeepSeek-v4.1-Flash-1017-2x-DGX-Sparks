@@ -286,7 +286,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `ABLIT` | 0 | `0`: stock Mia EAQ 2.9 bpw; `1`: apply the matching gated Keys overlay; requires your HF token and repository access (see Abliterated mode) |
 | `ABLIT_REVISION` | `0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0` | pinned Keys overlay and application script; full commit hash |
 | `HF_TOKEN` | unset | Hugging Face read token for downloads; alternatively authenticate with `hf auth login` on the head |
-| `CONTEXT` | 1048576 | a request's positions at most; rank 1's `--pool` follows it |
+| `CONTEXT` | 1048576 | a request's positions at most; the pool follows it (two windows with the default `KV_SHARD=1`, one with `KV_SHARD=0`) unless `POOL` is set |
 | `PARALLEL` | 4 | requests at once (the engine's streams, 1 to 16; the family was measured at 4) |
 | `THINKING`, `REASONING_EFFORT` | 1, empty | think first unless a request turns it off; `low` / `medium` / `high` / `xhigh` as the default effort |
 | `THINKING_BUDGET` | empty | reasoning tokens a reply may spend before the engine closes the think block itself and lets the answer continue (`--thinking-budget`; a request's `thinking_budget` wins); empty: no cap. A hard task can otherwise spend its whole `MAX_TOKENS` thinking and end with no text and no tool call. A model that keeps rambling after the cut is not stopped by it. For long agentic or tool-calling jobs, leave it empty or set it large: a small budget cuts the reasoning mid-plan, which can make the model repeat a tool call it already made |
@@ -304,10 +304,76 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `HOST`, `PORT`, `SERVED_NAME` | 0.0.0.0, 8888, `DeepSeek-V4.1-Flash-1017` | |
 | `WORKER`, `FABRIC_PEER`, `NFS_*` | | see Requirements |
 | `TF_REF`, `INPUTS_REF`, `KIT_REF` | pinned | the engine, the inputs' tools and the kit (changing one rebuilds or re-checks) |
+| `SPILL_GIB`, `SPILL_DIR`, `WORKER_SPILL_DIR`, `SPILL_FLOOR_GIB`, `SPILL_QUOTA_GIB` | 64 (`0`: off), beside `HF_CACHE`, `SPILL_DIR`, 50, 0 | spill v2: kept prompt states on each Spark's own NVMe ([Spill v2 and KV sharding](#spill-v2-and-kv-sharding-ported-on-by-default)) |
+| `KV_SHARD`, `KV_SHARD_DECODE`, `POOL` | 1 (`0`: off), empty, empty (= the pool `KV_SHARD=1` needs, 2101248 at the 1M window; `CONTEXT` with `KV_SHARD=0`) | KV sharding and the pool apart from the window (same section) |
+| `ZIG_MIRRORS` | `https://zig.linus.dev/zig` | where the image build downloads Zig first (ziglang.org last), with bounded retries; the bytes are pinned by `ZIG_SHA256` |
 | `PULL` | 1 | `0` never pulls a published image (`GHCR_IMAGE`, `IMAGE_TAG`, `IMAGE_DIGEST`; the image of these pins is `ghcr.io/miaai-lab/deepseek-v4.1-flash-1017-2x-dgx-sparks-tensorfold:exl3-tp2-7c9bf5d36350`) |
 
-Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after the defaults; every `TENSORFOLD_*` and
-`TF_DS_*` variable you set goes to both ranks. Images are always on (rank 0 runs the vision tower).
+Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after the defaults; every `TENSORFOLD_*`,
+`TF_DS_*` and `TF_SPILL_*` variable you set goes to both ranks. Images are always on (rank 0 runs the vision tower).
+
+## Spill v2 and KV sharding (ported, on by default)
+
+The port of Robert Wojciechowski's ([wojo](https://github.com/wojo)) GLM-5.3-Flash patches into this engine: the spill
+tier and its v2 block store (GLM `0088` and `0110`, PRs #78 and #124; the block layout, lineage, write-at-keep ring and
+fsync order are [BadAd84](https://github.com/BadAd84)'s block-tier design), chat continuation (`0111`, PR #128), KV sharding (`0118`, PR #152) and the parked-page startup budget (`0119`, PR #149). The
+engine changes come in as `zig/patches/0007-...` (exported from the port's engine branch by `scripts/port-patches.sh`);
+**the recipe turns them on by default**, as the daily server runs them: spill v2 at `SPILL_GIB=64` a Spark, KV
+sharding (`KV_SHARD=1`) and the 2,101,248-position pool it needs at the 1,048,576-token window
+(derived from `CONTEXT`, so another window gets its own). The engine's own switches stay off by default; only the
+recipe's settings changed. Status: validated on the pair (replies byte-identical to the stock engine in every
+configuration: all off, `POOL`, KV sharding at 1 and 8 streams, spill, spill with KV sharding; restore after
+eviction, a restart and damaged files); the fork serving on gx10-a runs this configuration, updated as
+[docs/FORK-DEPLOY.md](docs/FORK-DEPLOY.md) says. Full detail: [docs/PORT-RECIPE.md](docs/PORT-RECIPE.md).
+
+**Turning them off:** `SPILL_GIB=0` (spill), `KV_SHARD=0` (sharding, and with `POOL` empty the pool is `CONTEXT`
+again), both for the recipe as before the port (no flag, variable or mount the engine did not get before). **A spill
+folder that cannot be used** (missing and not creatable, not yours, on NFS or tmpfs, inside the export or a model
+folder, below `SPILL_FLOOR_GIB` free) on either Spark makes a default start go on **without** the tier, with a loud
+`SPILL TIER OFF for this start` warning; set `SPILL_GIB` explicitly (`SPILL_GIB=64` in `scripts/local.sh`) and the
+same problem refuses the start instead. The same holds for the default `KV_SHARD=1` where it cannot run (an explicit
+`POOL` it cannot use, such as `POOL=1048576`): off with a warning, explicit `KV_SHARD=1` refuses.
+
+- **Spill v2** (`SPILL_GIB`): each kept prompt state is written, when it is kept, to each Spark's own local disk in
+  2,048-token blocks that later turns of the conversation share, and read back instead of a new prefill: after
+  eviction, after a restart, after a crash. Room is made by conversation (old turns past the newest few, abandoned
+  forks, whole conversations least recently used, shared prefixes last), with an optional per-conversation quota.
+- **KV sharding** (`KV_SHARD=1`): each conversation's compressed latents are stored once, on the Spark whose half of the
+  pool holds it, instead of on both. It needs `POOL`, the total pool positions, apart from `CONTEXT`, the window one
+  request may use: each Spark's half must hold a whole window, so at the 1,048,576-token window `POOL=2101248` (start.sh
+  refuses a pool that would cut a conversation's window and names the value; left empty, it is derived). Calculated:
+  530 instead of 890 bytes a token a Spark for these planes, about 1,060 MiB a Spark for the 2,101,248-position pool
+  against 890 MiB for the replicated 1M pool. Runs together with spill (`port/spill-shard`).
+
+| Switch | Default | |
+| --- | --- | --- |
+| `SPILL_GIB` | `64` (`0`: off) | the spill tier's cap a Spark, GiB. Left at the default, a Spark whose folder fails the checks starts the pair without the tier (a warning); set explicitly, that refuses |
+| `SPILL_DIR` / `WORKER_SPILL_DIR` | `$(dirname HF_CACHE)/dsv41-tensorfold-spill` / `SPILL_DIR` | each rank's own folder on its local NVMe, mounted at `/spill`. Never inside `HF_CACHE` (it is the NFS export the worker reads), never on a network file system, never under an archive folder: `start.sh` checks this on both Sparks, creates the folder as you, and refuses a root-owned one |
+| `SPILL_FLOOR_GIB` | `50` | free disk the tier always leaves on that file system |
+| `SPILL_QUOTA_GIB` | `0` (none) | one conversation's share of `SPILL_GIB` before its own old turns and forks go first |
+| `SPILL_MIN_TOKENS`, `SPILL_STAGING_MIB`, `SPILL_TURNS`, `SPILL_FLUSH_MS` | `8192`, `128`, `4`, `60000` | the tier's shortest written state, pinned staging, turns kept, stop flush bound: the same on both ranks |
+| `KV_SHARD`, `KV_SHARD_DECODE` | `1` (`0`: off), empty (`fetch`) | KV sharding; `owner` for owner-computed decode |
+| `KV_SHARD_CARRY`, `KV_SHARD_TWINS`, `KV_SHARD_CHECK` | `1`, `1`, `1024` | carries and live moves, borrowed twins, rounds between the ranks' planner checks |
+| `POOL` | empty (with `KV_SHARD=1`: two owner parts of a whole `CONTEXT` window each, 2101248 at 1048576; with `KV_SHARD=0`: `CONTEXT`) | total pool positions; rank 1's `--pool` |
+
+Both ranks get the same settings (the engine's flags and variables are mapped in one place, `scripts/port.sh`); both
+containers are labelled with them, and `./start.sh` will not adopt two running ranks that disagree. With the spill tier
+on, `start.sh` also gives both ranks the identity the engine requires (the image's patch hash and ref, the checkpoint's
+and Engram's revisions, each rank's weight-file digest, computed once and cached beside the file). **Disk use**
+(calculated): ~890 bytes a token a Spark replicated, 1,822,720 bytes per 2,048-token block (~85 MiB for a 100K-token
+conversation, ~890 MiB for the 1M window) plus 6.4 MiB a kept point a Spark; with KV sharding (the default) the owner
+Spark writes ~890 and the other ~170 bytes a token. Blocks a later turn shares are stored once. The tier holds at most
+`SPILL_GIB` (64 GiB) of each Spark's own disk and always leaves `SPILL_FLOOR_GIB` (50 GiB) free there. The engine runs as root; spill
+files are given back to the folder's owner before each start and at every stop. With the tier on, `./stop.sh` gives
+the ranks 90 s (`SPILL_FLUSH_MS` plus 30 s) to write what still waits.
+
+**Rollback:** `SPILL_GIB=0` / `KV_SHARD=0` (and `POOL` empty) with `./start.sh restart` turns a feature
+off on the same image. The previous image comes back with `SPILL_GIB=0 KV_SHARD=0 IMAGE=<its tag> PREPARE=0 ./start.sh
+restart` (every port setting off, explicitly: the defaults are on), or by restoring the exact tree it was built from, commit **and** working-tree diff (the image tag is a
+hash of `zig/patches` and `zig/Dockerfile` as they are on disk), then `./start.sh restart`: record both at deploy, as
+[docs/PORT-RECIPE.md](docs/PORT-RECIPE.md) describes. Spilled files stay in each Spark's folder for inspection
+(`rm -rf <SPILL_DIR>/native-spill-*` reclaims them); no weights, Engram or NFS change in either direction, and the
+memory guards are unchanged.
 
 ## Memory and safety
 
@@ -349,8 +415,11 @@ scripts/nodes.sh             the worker over ssh, the CX7 link and its RoCE rail
 scripts/prepare.sh           image, downloads, kit, token map, weight files, the worker's NFS volume and disk
 scripts/memguard.sh          the memory watchdog start.sh runs on both Sparks (kills a rank's container below MEMGUARD_GIB)
 scripts/zig_flags.py         start.sh's check of rank 0's serve flags against the image's `capabilities --json`
+scripts/port.sh              the ported features' settings (spill v2, KV sharding, POOL), checks and engine mapping
+scripts/port_test.sh         checks of scripts/port.sh (no Sparks needed)
+scripts/port-patches.sh      exports the port's engine branch as zig/patches/0007-..., checked on a clean TF_REF
 scripts/publish-image.sh     pushes the built image to ghcr.io (only on purpose)
-zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine (three)
+zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine (five by hand, then the port's 0007-... by scripts/port-patches.sh)
 model/chat_template.jinja    the chat template rank 0 serves
 tools/validate.py            an end-to-end check of a running server
 tools/bench.py               prefill, decode, multi-stream and needle measurements as JSON, with `--compare A.json B.json`
@@ -359,6 +428,8 @@ tools/smoke.py               a quick correctness check: health, stop strings, st
 tools/prompt_reuse.py        a conversation resumes from its kept prompt state (from the GLM-5.3-Flash recipe)
 tools/toolcheck.py, needle.py, end_of_turn.py, anthropiccheck.py   single checks, from the GLM-5.3-Flash recipe
 docs/zig-engine.md           how the pieces fit, and what is not verified
+docs/PORT-RECIPE.md          the GLM port's settings, their engine mapping, deploy and rollback
+docs/FORK-DEPLOY.md          updating and rolling back the port fork that serves on gx10-a
 docs/hermes-agent.md         Hermes Agent as a client (by Steve Darlow)
 ```
 
