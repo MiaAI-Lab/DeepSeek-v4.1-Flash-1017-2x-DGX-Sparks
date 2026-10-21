@@ -43,7 +43,12 @@ SOCKET_IFNAME="${SOCKET_IFNAME:-}"     # NCCL's bootstrap socket's netdev on bot
 # the vision tower and the DSpark draft blocks are in it). Its Engram n-gram tables are not: they are read unquantized from
 # the base model's shards 47 and 48 (ENGRAM_ID, ~203 GB), which this Spark downloads beside it.
 MODEL_ID="${MODEL_ID:-Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw}"
-_rev=""; [[ "$MODEL_ID" == Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw ]] && _rev=6d54be4fca338d79b17c3b03cc9a423bb3ac6718
+# The pin was 6d54be4f until 2026-10-21: the Hub repo was force-squashed on 19.10 and that commit no longer resolves ("Invalid
+# rev id", 404), so nothing could be downloaded from it. 45ee5d0f is the repo's main; its 39 weight shards are byte-identical
+# to the ones a prepared pair holds from 6d54be4f (all 39 sha256 compared on 2026-10-21), and it carries the tokenizer.json
+# that the old snapshot did not. scripts/check-pins.sh checks this resolution before prepare.sh downloads anything (issue #36,
+# reported by ajbmachon, who found the same replacement).
+_rev=""; [[ "$MODEL_ID" == Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw ]] && _rev=45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
 # Keys' matching Mia EAQ 2.9 bpw overlay (not a standalone checkpoint).
 export ABLIT="${ABLIT:-0}"

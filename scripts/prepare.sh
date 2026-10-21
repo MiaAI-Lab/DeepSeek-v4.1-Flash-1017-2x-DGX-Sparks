@@ -15,7 +15,8 @@
 #   7. on the worker's own disk: Engram's tables, and rank 1's weight file (~106 GB, written there from the NFS volume)
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch; PULL=0 never pulls a published image. VERIFY_SHA=1 also checks Engram's shards against the sha256 the
-# checkpoint's model card lists (a few minutes of reading 203 GB).
+# checkpoint's model card lists (a few minutes of reading 203 GB). The preflight resolves every pin first (scripts/check-pins.sh, one HTTPS request each);
+# PIN_CHECK=0 skips that.
 # ABLIT=1 applies Keys' matching Mia EAQ 2.9 bpw overlay in a separate folder. Requires your Hugging Face read token
 # (HF_TOKEN or hf auth login) AND access to https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated.
 set -euo pipefail
@@ -56,6 +57,11 @@ worker 1 'docker info >/dev/null 2>&1' || die "$(worker_host 1) cannot talk to i
 worker 1 'nvidia-smi -L >/dev/null 2>&1' || warn "nvidia-smi failed on $(worker_host 1)"
 detect_links
 log "Link: this node $HEAD_ADDR ($HEAD_DEV, RoCE $HEAD_HCAS) <-> $(worker_host 1) $WORKER_ADDR ($WORKER_DEV, RoCE $WORKER_HCAS); NFS from $(nfs_server 1)"
+# Every pin resolves, and the files this reads are in the revisions it will download: a dead revision or a snapshot without
+# its tokenizer stops here, in seconds, instead of after the image build or half way through 196 GiB (PIN_CHECK=0 skips it).
+if [[ "${PIN_CHECK:-1}" == 1 ]]; then
+  ./scripts/check-pins.sh || die "the pins in scripts/config.sh do not resolve (above); nothing was built or downloaded (PIN_CHECK=0 skips this check)"
+fi
 
 # ---------------------------------------------------------------- 2. the image
 hash=$(image_hash)
