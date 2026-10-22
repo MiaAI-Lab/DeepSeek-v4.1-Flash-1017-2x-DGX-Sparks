@@ -167,6 +167,10 @@ if [[ "$ABLIT" == 1 ]]; then
     mkdir -p "$DATA_DIR/stock.new"
     # Dereference HF's relative blob symlinks before upstream hardlinks unchanged shards into the destination.
     cp -alL "$SNAP/." "$DATA_DIR/stock.new/"
+    # The overlay rewrites the index in its destination, and copies of a hardlinked read-only blob (huggingface_hub
+    # stores blobs 0444) cannot be opened for writing: give the work folder its own writable copy of the index.
+    rm -f "$DATA_DIR/stock.new/model.safetensors.index.json" &&
+      cp -L --no-preserve=mode "$SNAP/model.safetensors.index.json" "$DATA_DIR/stock.new/" || die "could not copy the checkpoint index"
     in_hf --entrypoint python3 "$IMAGE" "/hf/$overlay_sub/apply_mia29_wo_b_graft.py" \
       --src "/hf/$DATA_SUB/stock.new" --dst "/hf/$DATA_SUB/checkpoint.new" \
       --wo-b "/hf/$overlay_sub/$ABLIT_SIDECAR" || die "applying the matching Mia overlay failed; rerun prepare.sh to retry"
