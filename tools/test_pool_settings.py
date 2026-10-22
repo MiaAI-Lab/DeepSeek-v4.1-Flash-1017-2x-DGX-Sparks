@@ -15,7 +15,7 @@ class PoolSettingsTest(unittest.TestCase):
         for pool in ("", "131072"):
             with self.subTest(pool=pool):
                 env = dict(PATH=os.environ["PATH"], CONTEXT="65536", POOL=pool, REPLAY_FLOOR="0", PARALLEL="4",
-                           HF_HUB_OFFLINE="1", ROUND_ROWS="", PREFILL_INTERLEAVE_MS="0", RDMA_IDLE_S="2",
+                           HF_HUB_OFFLINE="1", ROUND_ROWS="", PREFILL_INTERLEAVE_MS="0", STEP_AHEAD="0", RDMA_IDLE_S="2",
                            RDMA_NAP_US="500", DRAFTS="1", GRAPHS="1", SIDE="0", PREFETCH="0", ENGRAM_AIO="0",
                            TF_DS_POOL="999999", TF_DS_WINDOW="1")
                 result = subprocess.run(["bash", "-euc", engine + follow + '\nprintf "%s\\n" "${ENGINE_ENV[@]}" "$FOLLOW"'],

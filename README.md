@@ -324,6 +324,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `DRAFTS` | 1 | the checkpoint's DSpark draft blocks (drafted replies equal plain ones) |
 | `RDMA`, `GRAPHS`, `SIDE`, `PREFETCH`, `ENGRAM_AIO` | 1 | the engine's served settings |
 | `RDMA_IDLE_S`, `RDMA_NAP_US` | 2, 500 | the RDMA proxy naps after 0–3600 quiet seconds, sleeping `RDMA_NAP_US` (1–1000000 microseconds) between looks (`zig/patches/0010`); `RDMA_IDLE_S=0` keeps the stock always-spinning proxy. The patch's engine fallback is 100 µs if `TF_RDMA_NAP_US` is unset; the recipe sets 500 µs because the Zig ring's two CQ polls per wake cost more than the Python line's. 2 s is enough that active decode never naps |
+| `STEP_AHEAD` | 0 | `1`: when a reply ends and nothing else runs or waits, rank 0 reads it ahead while the client runs its tools (`zig/patches/0030`), so an agent's next request resumes past its own previous reply instead of reading it again. Replies keep their bits. Measured on an 8-step agent loop at 62-72K tokens: time to first token of the steps after the first 1.99 -> 1.34 s. Costs otherwise idle GPU time (one prompt pass of up to about 2K tokens a reply) and one kept state of the prompt cache |
 | `MAX_TOKENS` | 32768 | a reply's budget when a request sets none |
 | `MIN_AVAIL_GIB`, `MIN_AVAIL_WAIT_S` | 112, 30 | `start.sh` refuses to start with less memory available than this on either Spark (`0` skips the check); it re-reads the memory for up to `MIN_AVAIL_WAIT_S` seconds first, because the page cache a build or a large copy just left counts as available only once it is written back (`0` reads once) |
 | `MEMGUARD_GIB`, `MEMGUARD_HOLD_S`, `MEMGUARD_HARD_GIB` | 2.5, 4, 1 | `scripts/memguard.sh` kills a rank's container when the memory available stays under the floor for `MEMGUARD_HOLD_S` seconds without coming back over it, or at once when it falls under the hard floor. A dip that recovers is logged and not killed (decimals fine; `MEMGUARD_GIB=0` turns the guard off) |
@@ -349,7 +350,7 @@ The port of Robert Wojciechowski's ([wojo](https://github.com/wojo) on GitHub, [
 tier and its v2 block store (GLM `0088` and `0110`, PRs #78 and #124; the block layout, lineage, write-at-keep ring and
 fsync order are [BadAd84](https://github.com/BadAd84)'s block-tier design), chat continuation (`0111`, PR #128), KV
 sharding with prompt borrowing and the ring exchange (`0118`, PR #152) and the parked-page startup budget (`0119`, PR
-#149). The engine changes come in as `zig/patches/0011-...` to `0022-...`, one patch per feature, after `0008` and
+#149). The engine changes come in as `zig/patches/0030-...` to `0022-...`, one patch per feature, after `0008` and
 `0010` ([zig/patches/README.md](zig/patches/README.md)). **Everything is off by default**, in the engine and in the recipe: with
 `SPILL_GIB` and `KV_SHARD` unset (or `0`) and `POOL` empty the recipe runs as before the port, with no flag, variable
 or mount it did not have (one engine change acts regardless, after a failure only: a broken rank pair ends the
