@@ -1,0 +1,61 @@
+# dsv41: two fixes to the pinned engine and the patches before this one.
+# - A prompt pass drops the Engram read-ahead an earlier pass left. fillChunk takes a joined read-ahead whose
+#   (ahead_start, ahead_n) match its chunk; a pass that ends between two chunks (a cancel or an error) leaves one
+#   standing, and a later prompt resuming a kept state at exactly that position (in memory, or restored from disk once
+#   the spill tier is on) took rows hashed from the other prompt's ids: wrong Engram rows, and no error. fillBegin now
+#   calls the new Model.resetEngramAhead (joinAhead, then the read-ahead's ready flags, count and error cleared) at the
+#   start of every pass, so each chunk reads its own rows. Found while porting spill v2's kept state.
+# - 0010's timer-slack prctl runs on Linux only, so the dsv41 module's host tests also build on macOS (rdma.zig).
+# No switch (always on). A pass reads the rows an unbroken pass reads, so replies are unchanged: exact.py identical to
+# the daily baseline on the pair with the fix in (every run since the round-1 engine, 31/31 there, 39/39 later).
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 07d01c139e01a4ce221cd2944acfbc9f638e4a62..f406ddf974059a21877a0ad4b82ab8a7908d9aa7 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -518,6 +518,21 @@ pub const Model = struct {
+         try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
+     }
+ 
++    /// The Engram read-ahead joined and its rows dropped, so the next chunk reads its own rows from its prompt's ids.
++    /// Baseline hazard (also without spill): fillChunk takes a joined read-ahead whose (ahead_start, ahead_n) match its
++    /// chunk, and a pass that ends between chunks (cancel, error) leaves one standing; a later prompt resuming a kept
++    /// point at that position (in memory or restored) would consume rows hashed from the other prompt's ids. The fix
++    /// is one call at the start of every pass, in fillBegin after its joinAhead (outside this block: routed to the
++    /// coordinator, docs/port/dsv41-state.md); until it lands, a restore calls this right before the resumed pass.
++    pub fn resetEngramAhead(m: *Model) void {
++        m.joinAhead();
++        if (m.eh) |*eh| {
++            eh.ahead_ready = .{ false, false };
++            eh.ahead_n = 0;
++            eh.ahead_err = null;
++        }
++    }
++
+     /// Each layer's gate_bias_vl (f32 [experts], the checkpoint's extra file) on the device: Gate.forward's bias at
+     /// image-span positions.
+     fn loadVisionBias(m: *Model, path: []const u8) !void {
+@@ -557,6 +572,9 @@ pub const Model = struct {
+ 
+     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
+         if (slot >= m.streams) return error.BadSlot;
++        // a read-ahead an earlier pass left (cancelled between chunks) never feeds this one: a resume at that pass's
++        // next chunk start would otherwise take its rows, hashed from the other prompt's ids
++        m.resetEngramAhead();
+         m.spans.clearRetainingCapacity();
+         m.ch.spans = &.{};
+         m.view = try m.caches.view(&m.eng, slot, base);
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index d6e4d8d1e99b5aca1c1361a5c5e8a55399981259..309fed77d926dd1e26ac9e92f07470a1558edb2d 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -409,7 +409,8 @@ pub const Ring = struct {
+         // A decode round's gathers come microseconds apart; only a long quiet spell naps. The first gather after one
+         // waits out at most one nap, and the next doorbell or completion spins again.
+         const naps = r.idle_ns > 0;
+-        if (naps) _ = prctl(pr_set_timerslack, 1000, 0, 0, 0); // 1 us, so a nap is about TF_RDMA_NAP_US
++        // 1 us, so a nap is about TF_RDMA_NAP_US (Linux only: the host tests build this file for macOS too)
++        if (naps and @import("builtin").os.tag == .linux) _ = prctl(pr_set_timerslack, 1000, 0, 0, 0);
+         var quiet: u64 = 0; // passes with nothing posted or reaped
+         var quiet_since: u64 = monotonicNs();
+         var drowsy = false;

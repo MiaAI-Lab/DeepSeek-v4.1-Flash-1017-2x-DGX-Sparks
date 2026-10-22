@@ -17,7 +17,7 @@ The DeepSeek-V4.1-Flash family on TensorFold's native engine (BertholomusAI's fo
   629c524a0ea57512a5342abb498d1b7c25353343; and, for the inputs' tools only, branch deepseek-v41-zig-tp4, commit
   59402086381a42c74d53053443224eec2790b4c5)
   Written by BertholomusAI (Albert Lee, @bertholomus), on TensorFold. Apache License, Version 2.0.
-  zig/Dockerfile builds those commits and applies the files in zig/patches (five: 0001, 0002, 0004 and 0006 written for this project; 0005 by Coinupbtc, pull request #5 of this repository, Apache-2.0) to the first. Any change in
+  zig/Dockerfile builds those commits and applies the files in zig/patches (0001, 0002, 0004 and 0006 written for this project; 0005 by Coinupbtc, pull request #5 of this repository, Apache-2.0; the others as zig/patches/README.md lists them; 0011 to 0022 by Robert Wojciechowski (wojo, https://github.com/wojo; @rwojo, https://x.com/rwojo), his GLM-5.3-Flash recipe patches 0088/0110/0111/0118/0119 (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull requests #78, #124, #128, #152 and #149) ported by him to this engine, with spill v2's block layout after BadAd84's block-tier design (#118 there), Apache-2.0) to the first. Any change in
   zig/patches is this project's work under Apache-2.0; the code it modifies, and quotes as diff context, stays under its
   authors' license.
 

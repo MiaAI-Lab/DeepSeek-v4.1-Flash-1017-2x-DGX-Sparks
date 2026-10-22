@@ -115,6 +115,20 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's
   Python engine (`call_gate.py`, by the TensorFold contributors, Apache-2.0). The rest of the patch wires it into the
   DeepSeek-V4.1 lanes.
+- **The port of the GLM spill tier and KV sharding** (the engine patches `zig/patches/0011-...` to `0022-...` and their settings; KV sharding built on `0008`'s pool) carries work
+  authored by **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)** in the GLM-5.3-Flash recipe: the spill tier (`0088`,
+  [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78)), spill v2 blocks, quotas and
+  crash recovery (`0110`, [PR #124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124)),
+  chat continuation (`0111`, [PR #128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128)),
+  the parked-page startup budget (`0119`, [PR #149](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/149))
+  and KV sharding with prompt borrowing and the ring exchange (`0118`, [PR #152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152)), ported by
+  him to TensorFold's native engine and the dsv41 family (Apache-2.0). Spill v2's block store (the 2,048-token block layout,
+  lineage, the write-at-keep ring, release and fsync order, read-ahead) is **[BadAd84](https://github.com/BadAd84)**'s block-tier
+  design from that recipe (#118), credited in the patches' headers. The recipe side (`scripts/port.sh`, `scripts/port_test.sh`,
+  `scripts/port-patches.sh`, the spill folder checks and ownership in `start.sh` / `stop.sh`, `docs/PORT-RECIPE.md`) was written
+  for this recipe by wojo, after the GLM recipe's spill settings (`SPILL_GIB`, `SPILL_DIR`, the `/spill` mount; Mia's AI Lab and wojo).
+- The Zig mirror list with bounded retries in `zig/Dockerfile` and the worker checks in the serving image in `scripts/prepare.sh` come
+  from wojo's two-Spark deployment of this recipe.
 - **Written for this recipe** (Apache-2.0, see [`NOTICE`](NOTICE)): `tools/exact.py`, `scripts/memguard.sh` (the memory watchdog), the memory
   preflight (`MIN_AVAIL_GIB`), `HEAD_ENGRAM_DIR` and `HEAD_NFS_SERVER` / `HEAD_NFS_VOLUME` (rank 0's local Engram folder
   and docker NFS volume), and `tools/bench.py` and `tools/smoke.py`. They use the engine's flags, `/health` and

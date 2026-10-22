@@ -6,6 +6,9 @@
 # here (~/.cache/dsv41-tensorfold/logs) and ~/.cache/dsv41-tensorfold/logs on each worker; the newest LOG_KEEP (10) of
 # each rank stay.
 # From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's stop.sh (Mia's AI Lab).
+# With the spill tier on (SPILL_GIB, scripts/port.sh) STOP_TIMEOUT defaults to 90 s (SPILL_FLUSH_MS rounded up to
+# seconds, plus 30), so the ranks can write what still waits; each rank's spill files written as root are then given
+# back to the owner of its spill directory.
 # Usage: ./stop.sh      Env: CONTAINER_NAME, PORT, WORKER (see scripts/config.sh), STOP_TIMEOUT,
 #                       LOG_DIR, LOG_KEEP
 #   DRY_RUN=1 ./stop.sh   says what it would stop, and on which Spark, and stops nothing
@@ -16,6 +19,11 @@ source ./scripts/nodes.sh
 
 # Where the containers are: here (rank 0) and on the workers (rank i on worker i)
 here=0; docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME" && here=1
+# a server started with the spill tier gets the longer stop even when SPILL_GIB has been set to 0 since (a rollback)
+if [[ -z "${STOP_TIMEOUT:-}" ]] && (( here )); then
+  _spill=$(docker inspect -f '{{index .Config.Labels "tf.recipe.spill"}}' "$CONTAINER_NAME" 2>/dev/null || true)
+  [[ -z "$_spill" || "$_spill" == '<no value>' ]] || STOP_TIMEOUT=$(port_stop_timeout)
+fi
 workers=$(configured_workers)
 nw=$(wc -w <<<"$workers")
 declare -a there=()
@@ -60,10 +68,12 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then
 fi
 log "Stopping $CONTAINER_NAME $where (up to ${STOP_TIMEOUT:-30}s)"
 
-# each rank: stop, save its log (with the shutdown lines), then remove the container
+# each rank: stop, save its log (with the shutdown lines), give its spill files back to their directory's owner (a
+# container started with the spill tier carries the tf.recipe.spill label; scripts/port.sh), then remove the container
 stop_here() {
   local saved
   docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  spill_fix_container "$CONTAINER_NAME" || warn "could not give rank 0's spill files back to their directory's owner"
   saved=$(save_log "$LOG_DIR" 0 "$CONTAINER_NAME" "$LOG_KEEP") || warn "could not save rank 0's log to $LOG_DIR"
   docker rm -f "$CONTAINER_NAME" >/dev/null
   log "Stopped and removed rank 0 here${saved:+; its log: $saved}"
@@ -72,6 +82,8 @@ stop_worker() {
   local saved h
   h=$(worker_host "$1")
   worker "$1" "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME' >/dev/null 2>&1" || true
+  worker "$1" "$(declare -f spill_fix_target spill_fix_owner spill_fix_container); spill_fix_container '$CONTAINER_NAME'" ||
+    warn "could not give rank $1's spill files back to their directory's owner on $h"
   saved=$(worker_save_log "$1") || warn "could not save rank $1's log on $h"
   worker "$1" "docker rm -f '$CONTAINER_NAME' >/dev/null" || { warn "could not stop rank $1 on $h"; return 1; }
   log "Stopped and removed rank $1 on $h${saved:+; its log there: $saved}"

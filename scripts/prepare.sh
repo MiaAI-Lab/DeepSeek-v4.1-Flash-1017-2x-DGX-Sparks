@@ -80,7 +80,8 @@ if [[ $REBUILD -eq 1 || "$built" != "$hash" ]]; then
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
   docker build "${nocache[@]}" -t "$IMAGE" -f "$ctx/Dockerfile" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" --build-arg INPUTS_REF="$INPUTS_REF" \
-    --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" --build-arg PATCHES_HASH="$hash" "$ctx"
+    --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" --build-arg ZIG_MIRRORS="$ZIG_MIRRORS" \
+    --build-arg PATCHES_HASH="$hash" "$ctx"
   rm -rf -- "$ctx"; trap - EXIT
 else
   log "Image $IMAGE already built (hash $hash; --rebuild forces it)"
@@ -259,7 +260,7 @@ manifest() {  # the files a rank reads, with their sizes, as paths under HF_CACH
 want=$(manifest)
 ensure_nfs_volume 1
 worker_files_check 1
-have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$BASE_IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
+have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
 [[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
   die "$(worker_host 1) does not see every file over NFS ($NFS_VOLUME)"; }
 log "Worker ($(worker_host 1)) reads the checkpoint, the kit and rank 0's files over NFS"
@@ -275,7 +276,7 @@ else
   spare=150; worker 1 "find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank1of2-*.bin' 2>/dev/null | grep -q ." && spare=10
   (( free + have > need + spare * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR), its weight file ~106 GB (unless it is already there), and $spare GiB to spare"
   log "Worker: copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over NFS, once)"
-  worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$BASE_IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
+  worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
     die "copying Engram's tables to $(worker_host 1) failed"
 fi
 wwant=$(worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' --entrypoint bash '$IMAGE' -c 'tf-dsv41-rank-cache $SNAP_C /tmp/x 1 2 --index-only | sha256sum | cut -c1-20'")

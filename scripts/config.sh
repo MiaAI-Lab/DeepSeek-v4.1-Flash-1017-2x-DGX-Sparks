@@ -72,6 +72,10 @@ KIT_REPO="${KIT_REPO:-https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp
 KIT_REF="${KIT_REF:-abe07c7d509a0199cc7fec15263be2aa52ac652f}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"   # zig-aarch64-linux-0.17.0.tar.xz
+# Where zig/Dockerfile downloads the compiler: these community mirrors first (space-separated; each serves
+# <base>/zig-aarch64-linux-<version>.tar.xz), then ziglang.org, each with bounded retries, the first that serves
+# ZIG_SHA256 wins. Set but empty (ZIG_MIRRORS=): ziglang.org only. Not part of the image hash (the bytes are pinned).
+ZIG_MIRRORS="${ZIG_MIRRORS-https://zig.linus.dev/zig}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 image_hash() {
   ( cd "$_cfg_root" || exit 1
@@ -105,6 +109,9 @@ CONTEXT="${CONTEXT:-1048576}"
 # long prompts stay resident (each kept prompt holds its extent) and more long requests run at once. Empty (default): CONTEXT, as before.
 # It may not be smaller than CONTEXT. Its KV caches grow with it (about 0.9 GiB a rank per 1,048,576 positions, in host memory: measure the
 # head's headroom first, see README); the RoPE tables stay the window's size. TF_DS_POOL, and TF_DS_WINDOW (= CONTEXT) on both ranks.
+# With KV_SHARD=1 (scripts/port.sh) the same POOL is cut into one part a Spark, each holding a whole CONTEXT window, and each Spark
+# keeps only its own part's compressed KV: about half the KV memory a Spark for the same POOL (measured at 2,101,248 positions:
+# 1,062 MiB a rank against 1,783 MiB replicated; decode 1-4% slower). Empty with KV_SHARD=1: the pool it needs (2,101,248 at 1,048,576).
 POOL="${POOL:-}"
 PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams, TF_DS_STREAMS; the family measured 4)
 ROUND_ROWS="${ROUND_ROWS:-}"           # empty or 16: the pinned kit only has row kernels through 16 (issue #23)
@@ -185,9 +192,11 @@ HEAD_NFS_VOLUME="${HEAD_NFS_VOLUME:-dsv41-hf-head}"
 # A Spark's GPU shares its 121 GiB with the host: a rank that takes it all does not fail cleanly, the machine freezes and has
 # to be power-cycled. Two guards:
 #  - MIN_AVAIL_GIB: start.sh refuses to start unless each Spark has this much memory available (the weights, 98.9 GiB, plus
-#    the engine's own 12.2 GiB reserve). 0 turns the check off. MIN_AVAIL_WAIT_S: it re-reads the memory for up to this many
-#    seconds before refusing, because the page cache a build or a large copy just left is counted as available only as it is
-#    written back (0 reads once).
+#    the engine's own 12.2 GiB reserve). 0 turns the check off. Available is MemAvailable plus the pages parked on the
+#    kernel's per-CPU free lists beyond their resting level, as the engine's startup budget counts it (GLM 0119;
+#    scripts/memavail.sh): a docker save | load or an image build leaves several GiB there for a minute or two.
+#    MIN_AVAIL_WAIT_S: it re-reads the memory for up to this many seconds before refusing (0 reads once): the page cache a
+#    build or a large copy just left is counted as available only as it is written back, and parked pages drain (120).
 #  - MEMGUARD_GIB: scripts/memguard.sh runs on both Sparks while the server is up and kills the rank's container when the
 #    memory available stays under this floor for MEMGUARD_HOLD_S seconds without coming back over it (GiB, decimals allowed:
 #    2.5; 0 turns the guard off), or at once when it falls under MEMGUARD_HARD_GIB. A long prompt's workspace takes a few GiB
@@ -195,10 +204,16 @@ HEAD_NFS_VOLUME="${HEAD_NFS_VOLUME:-dsv41-hf-head}"
 # Do not lower TENSORFOLD_MEMORY_RESERVE_GIB to make the weights fit: the engine then takes the reserve too (a rank 0 with a
 # 10 GiB reserve froze its Spark).
 MIN_AVAIL_GIB="${MIN_AVAIL_GIB:-112}"
-MIN_AVAIL_WAIT_S="${MIN_AVAIL_WAIT_S:-30}"
+MIN_AVAIL_WAIT_S="${MIN_AVAIL_WAIT_S:-120}"
 MEMGUARD_GIB="${MEMGUARD_GIB:-2.5}"
 MEMGUARD_HOLD_S="${MEMGUARD_HOLD_S:-4}"
 MEMGUARD_HARD_GIB="${MEMGUARD_HARD_GIB:-1}"
+
+# ---------------------------------------------------------------- the ported features (off by default: spill v2, KV sharding)
+# Spill v2 (SPILL_GIB, SPILL_DIR, WORKER_SPILL_DIR, SPILL_FLOOR_GIB, SPILL_QUOTA_GIB), KV sharding (KV_SHARD,
+# KV_SHARD_DECODE; it builds on POOL above): defaults, checks and their mapping to the engine's flags and variables in
+# scripts/port.sh (docs/PORT-RECIPE.md).
+source "$_cfg_root/scripts/port.sh"
 
 # Colours only on a terminal.
 _c() { [[ -t "$1" ]] && printf '\033[%sm' "$2" || true; }

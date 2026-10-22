@@ -1,0 +1,2989 @@
+# dsv41: KV sharding in the lanes (port of GLM 0118, second half,
+# MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#152): 0015's planner (parts.zig) runs placement, release,
+# verify and the follower, so every extent lives inside one part and the pair serves --parallel streams. A cache hit
+# whose part has no room is carried to the other part (its latents sent by the owner) only when that saves a
+# recompute, an eviction or a pause, never to even out the parts
+# (TF_DS_KV_SHARD_CARRY=1); a prompt that runs from 0 borrows free rows of the other part and attends locally instead
+# of fetching (TF_DS_KV_SHARD_TWINS=1; the borrowed rows go back at its first decode round). kv_lanes.zig: rank 0's Kv
+# (plan, apply, send, run and finish each transfer over 0016's rank_wire) and the follower (replay, transfers, binds,
+# round checks); the ranks compare the planner's digest every TF_DS_KV_SHARD_CHECK decode rounds (1024; 0: at start
+# only). core/lanes/kv_parts.zig: the parts' stats, on /health kv_shard and /metrics.
+# Switches (both ranks; in the startup agreement's features): TF_DS_KV_SHARD_CARRY 1, TF_DS_KV_SHARD_TWINS 1,
+# TF_DS_KV_SHARD_CHECK 1024, all inert unless TF_DS_KV_SHARD=1 (then a pool of at least two windows, e.g. 2,101,248
+# for the 1M window; the recipe's KV_SHARD derives it when POOL is empty). Off: Lanes.kv stays null and every frame,
+# placement and byte is as before.
+# Measured on the pair (engine 98370ef, before the rebase onto 0008; pool 2,101,248, 8 streams): exact.py 31/31
+# identical to the daily baseline with carries and borrowing off (kept rows in both parts, 167,936 and 118,784, so
+# rank 1 owned conversations) and with the defaults (24 borrowed extents; prompt fetches 3,774 -> 304, prompt bytes
+# 13.9 GB -> 0.42 GB). Decode at this stage runs NCCL collectives each compressed layer: -10.6 % at one stream, -12.3 %
+# at eight; 0022 moves the exchange onto the RDMA ring. Builds on 0015 and 0016. By Robert Wojciechowski (GitHub @wojo, X @rwojo).
+# Apache-2.0.
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 65d8a2bd0be5c00ae1a277ed8da433ddfaef2c1f..08a0078f49c22cb2aea20e9b030c23b1df1c6e21 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -332,8 +332,13 @@ pub const Status = struct {
+     generation_tokens: u64 = 0,
+     /// The prompt cache's counters, when its tier or grouping is on.
+     cache: ?CacheStats = null,
++    /// KV ownership's counters and parts (a backend that shards its pool over the ranks: dsv41's TF_DS_KV_SHARD).
++    kv_parts: ?KvParts = null,
+ };
+ 
++/// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
++pub const KvParts = lanes.kv_parts.Stats;
++
+ pub const SubmitError = error{ Closed, Busy };
+ 
+ pub const Engine = struct {
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 485783dd14dd004e3f972af4079bee2c172351cd..b67e7e2bd778e47587481587df3e994d4aa93a2e 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -73,6 +73,9 @@ pub const LaneHost = struct {
+     host_counts: HostCounts = .{},
+     /// What status reports under `cache` (published on the engine thread at each noteLive; null until configured).
+     tele: ?api.CacheStats = null,
++    /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
++    kv_parts: ?lanes.kv_parts.Source = null,
++    kv_tele: ?api.KvParts = null,
+ 
+     const Mark = struct { at: i96, tokens: u64 };
+     const full_retry_ns: i96 = std.time.ns_per_s;
+@@ -279,6 +282,7 @@ pub const LaneHost = struct {
+             .streams = n,
+             .generation_tokens = h.live_generated,
+             .cache = h.tele,
++            .kv_parts = h.kv_tele,
+         };
+     }
+ 
+@@ -713,6 +717,11 @@ pub const LaneHost = struct {
+ 
+     fn noteLive(h: *LaneHost) void {
+         const tele = h.telemetry();
++        var parts: ?api.KvParts = null;
++        if (h.kv_parts) |src| {
++            parts = .{};
++            src.read(src.ctx, &parts.?);
++        }
+         h.lock();
+         defer h.unlock();
+         h.live_tokens.clearRetainingCapacity();
+@@ -722,6 +731,7 @@ pub const LaneHost = struct {
+             h.live_generated += @intCast(job.stream.emitted().len);
+         };
+         if (tele) |t| h.tele = t;
++        if (parts) |p| h.kv_tele = p;
+     }
+ 
+     fn run(h: *LaneHost) void {
+diff --git a/zig/src/core/lanes/kv_parts.zig b/zig/src/core/lanes/kv_parts.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..a32daa4196c0933e29c9fa78771964be5d2d93bc
+--- /dev/null
++++ b/zig/src/core/lanes/kv_parts.zig
+@@ -0,0 +1,116 @@
++//! A backend's KV-ownership counters for /health and /metrics (family-neutral): a pool cut into parts, one a rank
++//! (dsv41's TF_DS_KV_SHARD, wojo's GLM 0118 `kv_shard` stats), what the parts' planner decided and moved, the sharded
++//! attention's transfers, and every part's rows by what holds them. A backend that shards hands the host a `Source`;
++//! the host reads it on its engine thread (the backend's own thread) and publishes the copy for status readers.
++const std = @import("std");
++
++pub const max_parts = 8;
++
++/// One part's rows now (gauges).
++pub const Part = struct {
++    free: u64 = 0, // rows nothing holds
++    live_rows: u64 = 0, // live streams' reservations
++    kept_rows: u64 = 0, // kept prompt states' rows outside live extents
++    twin_rows: u64 = 0, // borrowed twins
++    hold_rows: u64 = 0, // reserved destinations (a restore landing, a live move in flight)
++    live: u64 = 0, // live streams placed in it
++
++    pub const help = .{
++        .free = "Rows of this part nothing holds.",
++        .live_rows = "Rows of this part live streams reserve.",
++        .kept_rows = "Rows of this part kept prompt states hold outside live extents.",
++        .twin_rows = "Rows of this part borrowed twins hold.",
++        .hold_rows = "Rows of this part reserved for a restore or a live move in flight.",
++        .live = "Live streams whose extent lies in this part.",
++    };
++};
++
++pub const Stats = struct {
++    parts: u64 = 0, // gauge: the parts (ranks)
++    part_rows: u64 = 0, // gauge: positions a part
++    carries: u64 = 0, // admissions that carried a kept state into another part
++    carry_rescued: u64 = 0,
++    carry_pressure: u64 = 0,
++    carry_others: u64 = 0,
++    carry_paused: u64 = 0,
++    moves: u64 = 0, // live streams moved to another part
++    moved_tokens: u64 = 0, // tokens carried or moved across parts
++    moved_bytes: u64 = 0, // ...the owner-only bytes that took, by the layout's bytes a token
++    transfers_failed: u64 = 0,
++    staged: u64 = 0,
++    staled: u64 = 0,
++    twins_made: u64 = 0,
++    twins_revoked: u64 = 0,
++    refused_pinned: u64 = 0,
++    refused_twin: u64 = 0,
++    refused_loading: u64 = 0,
++    refused_partial: u64 = 0,
++    refused_no_target: u64 = 0,
++    refused_small: u64 = 0,
++    no_part: u64 = 0, // admissions no part could make room for
++    plans: u64 = 0, // op lists sent to the followers
++    checks: u64 = 0, // planner digests the ranks compared
++    prompt_fetches: u64 = 0,
++    prompt_rows: u64 = 0,
++    prompt_picks: u64 = 0,
++    prompt_bytes: u64 = 0,
++    prompt_syncs: u64 = 0,
++    fetch_rounds: u64 = 0,
++    owner_rounds: u64 = 0,
++    copies: u64 = 0, // cross-part extent transfers the attention side ran
++    copy_bytes: u64 = 0,
++    part: [max_parts]Part = @splat(.{}),
++
++    pub const gauges = [_][]const u8{ "parts", "part_rows" };
++
++    /// Each counter's /metrics help (a missing one fails the build).
++    pub const help = .{
++        .parts = "KV-ownership parts (one a rank).",
++        .part_rows = "Pool positions a part holds.",
++        .carries = "Admissions that carried a kept prompt state into another part.",
++        .carry_rescued = "Carries made because the state's own part would drop it.",
++        .carry_pressure = "Carries made because the state's own part would evict kept states.",
++        .carry_others = "Carries made because resuming in place would stale another conversation's state.",
++        .carry_paused = "Carries made instead of waiting for the live stream holding the state.",
++        .moves = "Live streams moved whole to another part to admit a request.",
++        .moved_tokens = "Tokens carried or moved across parts.",
++        .moved_bytes = "Owner-only bytes the carries and moves sent.",
++        .transfers_failed = "Copies, carries or moves that finished failed (the prompt ran from 0, or the stream stayed).",
++        .staged = "Kept states whose pending spill writes were staged before their rows changed.",
++        .staled = "Kept states given up for a placement.",
++        .twins_made = "Filling prompts given borrowed twins.",
++        .twins_revoked = "Borrowed twins taken back for an admission or a restore.",
++        .refused_pinned = "Moves refused: a copy or carry reads the stream's rows.",
++        .refused_twin = "Carries or moves refused: the stream holds twins.",
++        .refused_loading = "Carries or moves refused: a transfer of the stream is in flight.",
++        .refused_partial = "Carries or moves refused: a prompt chunk is in flight.",
++        .refused_no_target = "Carries or moves refused: no part had the room.",
++        .refused_small = "Carries refused: the state is under the minimum carry.",
++        .no_part = "Admissions no part could make room for (the request waited).",
++        .plans = "Ownership op lists rank 0 sent the followers.",
++        .checks = "Planner digests the ranks compared (equal, or the pair ended).",
++        .prompt_fetches = "Prompt-chunk layers that fetched the owner's compressed rows.",
++        .prompt_rows = "Compressed rows the prompt fetches sent.",
++        .prompt_picks = "Rows the prompt fetches would have sent unfolded (every pick of every row).",
++        .prompt_bytes = "Bytes the prompt fetches sent.",
++        .prompt_syncs = "Host reads the prompt fetches waited on.",
++        .fetch_rounds = "Decode rounds that fetched the owners' picked rows.",
++        .owner_rounds = "Decode rounds the owners attended.",
++        .copies = "Cross-part extent transfers sent.",
++        .copy_bytes = "Bytes the cross-part extent transfers sent.",
++    };
++};
++
++/// How the host reads a backend's stats (on its engine thread, the backend's own).
++pub const Source = struct {
++    ctx: *anyopaque,
++    read: *const fn (ctx: *anyopaque, out: *Stats) void,
++};
++
++test "every counter has its help" {
++    inline for (@typeInfo(Stats).@"struct".field_names) |n| {
++        if (comptime std.mem.eql(u8, n, "part")) continue;
++        try std.testing.expect(@field(Stats.help, n).len > 0);
++    }
++    inline for (@typeInfo(Part).@"struct".field_names) |n| try std.testing.expect(@field(Part.help, n).len > 0);
++}
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 74ca8e1b52e44ecc21cc378202d42c0436205cbf..b7c8e13091c20a81ece4f88c833453266859db65 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -20,6 +20,7 @@ pub const windows = @import("windows.zig");
+ pub const trail = @import("trail.zig");
+ pub const engine = @import("engine.zig");
+ pub const fake = @import("fake.zig");
++pub const kv_parts = @import("kv_parts.zig");
+ 
+ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index b614bbe0baa625969bd8c7a2a72408cc72536d55..33b4122f67475d9af99f789c64eb8bd89a3c912e 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -51,6 +51,7 @@ pub const lanes = @import("lanes.zig");
+ pub const pool = @import("pool.zig");
+ pub const spill_state = @import("spill_state.zig");
+ pub const spill_tier = @import("spill_tier.zig");
++pub const kv_lanes = @import("kv_lanes.zig");
+ pub const rank_wire = @import("rank_wire.zig");
+ pub const fingerprint = @import("fingerprint.zig");
+ pub const rank_identity = @import("rank_identity.zig");
+@@ -102,6 +103,7 @@ test {
+     refAll(lanes);
+     refAll(pool);
+     refAll(spill_state);
++    refAll(kv_lanes);
+     refAll(rank_wire);
+     refAll(fingerprint);
+     refAll(rank_identity);
+diff --git a/zig/src/families/dsv41/kv_lanes.zig b/zig/src/families/dsv41/kv_lanes.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..1edd4d7f348ebea45b3ede36a89608b1ddb35255
+--- /dev/null
++++ b/zig/src/families/dsv41/kv_lanes.zig
+@@ -0,0 +1,1461 @@
++//! TF_DS_KV_SHARD round 2: parts.zig's ownership planner driven from the lanes (port of wojo's GLM 0118 lane wiring,
++//! PR #152 at fork main 8641c90: multi.py's placement calls, the ordered op frames, carry/move finish and the borrowed
++//! twins' lifetimes). Rank 0 (`Kv`) plans every placement, applies the plan, sends its ops to the followers as one
++//! rank_wire shard_ops transaction (lanes Kind.rank_wire), then runs the transfers the ops name in their order (both
++//! ranks call the part-aware Model.copyExtent, shard-attn's transport), asks every follower whether its side completed
++//! (shard_xfer) and posts the verdict (shard_finish: its own side and every follower's); every rank finishes with rank
++//! 0's ok. A follower (`Follower`) applies the same ops to its own planner (applyOps), runs the same transfers in the
++//! same order, answers shard_xfer with its own side's result and finishes with rank 0's ok, never its own (without the
++//! ask, a follower whose own transfer failed under rank 0's ok ends the pair). The planners' digests are compared after
++//! the parts are set and every `check_rounds` decode rounds (rank_wire shard_check).
++//!
++//! The lanes keep their bookkeeping (Lane, Snap); this file owns the planner and calls back into the lanes through
++//! `Hooks` (a kept state staled, a stream moved) and into the device through `Dev` (the transfer, the twin view), so
++//! the whole flow runs on the host in tests with a recorder for the device and an in-process follower.
++//!
++//! Twins (stage 6): a fresh prompt's planner twins are one extent in every other part (all or none). While its prompt
++//! fills, both ranks hold its compressed rows (the owner in its extent, the other rank in its twin), so both attend
++//! locally with no fetch (Dev.twin binds the fill's view: prompt.Caches.twinned). The binding follows the planner on
++//! both ranks at the same frames (a fill's begin and every applied op list), so it is all or none and the ranks agree;
++//! the planner pins the twins while a chunk runs (setPartial) and the first decode round gives them back (planDecode).
++const std = @import("std");
++const lanes = @import("lanes");
++const parts = @import("parts.zig");
++const rank_wire = @import("rank_wire.zig");
++const fingerprint = @import("fingerprint.zig");
++const link = @import("link.zig");
++const Allocator = std.mem.Allocator;
++
++pub const Op = parts.Op;
++pub const WireOp = rank_wire.ShardOp;
++
++comptime {
++    // the wire's shard-op records are parts.Op field for field (rank_wire.ShardOp is its copy until rank-wire imports
++    // parts.Op itself): a drift fails the build instead of a frame
++    if (rank_wire.schemaOf(parts.Op) != rank_wire.shard_schema) @compileError("kv_lanes: rank_wire.ShardOp differs from parts.Op");
++}
++
++/// A planner op as the wire carries it (rank_wire.ShardOp is parts.Op now: the identity, kept so a copy of the type
++/// would still convert field for field).
++pub fn toWire(op: Op) WireOp {
++    return conv(WireOp, op);
++}
++
++/// A wire op as the planner applies it.
++pub fn fromWire(op: WireOp) Op {
++    return conv(Op, op);
++}
++
++/// The same value in a type with the same fields and tags (enums by value).
++fn conv(comptime To: type, v: anytype) To {
++    const From = @TypeOf(v);
++    if (From == To) return v;
++    switch (@typeInfo(To)) {
++        .@"union" => switch (v) {
++            inline else => |p, tag| return @unionInit(To, @tagName(tag), conv(@FieldType(To, @tagName(tag)), p)),
++        },
++        .@"struct" => |s| {
++            var out: To = undefined;
++            inline for (s.field_names) |n| @field(out, n) = conv(@FieldType(To, n), @field(v, n));
++            return out;
++        },
++        .@"enum" => return @enumFromInt(@intFromEnum(v)),
++        else => return v,
++    }
++}
++
++/// Rows a transfer of `rows` valid rows copies: whole blocks (Model.copyExtent needs a multiple of every ratio; a live
++/// stream's partly filled last block travels whole), never past the reservation (`size`, chunk-aligned).
++pub fn transferRows(rows: usize, size: usize) usize {
++    return @min(std.mem.alignForward(usize, rows, parts.chunk_rows), size);
++}
++
++/// What the device side does for the planner's ops (the Model on a GPU; a recorder in tests).
++pub const Dev = struct {
++    ctx: *anyopaque,
++    /// copy's refusals with nothing enqueued (Model.checkExtent): the same on every rank for the same arguments under
++    /// the agreed layout, so a refused transfer is refused alike everywhere and no rank's NCCL half waits for another.
++    check: *const fn (ctx: *anyopaque, from: usize, to: usize, rows: usize) anyerror!void,
++    /// The compressed rows [0, rows) of the extent at `from` into the extent at `to` (Model.copyExtent: within a part
++    /// the owner copies, across parts the source's owner sends and the destination's receives), in the frame order.
++    copy: *const fn (ctx: *anyopaque, from: usize, to: usize, rows: usize) anyerror!void,
++    /// The filling prompt's view at `base` with its twins (`on`: both ranks hold its rows and attend locally; `local`:
++    /// this rank's twin base when it is not the owner), or plain again (Model.bindTwin).
++    twin: *const fn (ctx: *anyopaque, base: usize, on: bool, local: ?usize) anyerror!void,
++    /// Every transfer enqueued so far done (an event after them polled: its NCCL halves completed) within
++    /// `timeout_ns`, else error.TransferTimeout (never an unbounded stream synchronize: a peer half that was never
++    /// enqueued would hold it forever).
++    wait: *const fn (ctx: *anyopaque, timeout_ns: u64) anyerror!void,
++};
++
++/// A follower's bound on its own side of a transfer when shard_xfer asks (below rank 0's deadline for the reply,
++/// rank_wire.Timeouts.xfer_ns, by a margin): past it the follower ends instead of answering late.
++pub const follower_wait_ns: u64 = 20 * std.time.ns_per_s;
++
++/// Whether an op's transfer crosses parts: an NCCL send on one rank and its receive on another, so one rank's side
++/// that never runs leaves the other's waiting (a copy within one part has no peer half).
++fn crosses(op: Op) bool {
++    return switch (op) {
++        .carry => |x| x.src_part != x.dst_part,
++        .move => |x| x.src_part != x.dst_part,
++        else => false,
++    };
++}
++
++/// Rank 0's frames to the followers (lanes.zig's ordered command stream).
++pub const Out = struct {
++    ctx: *anyopaque,
++    /// A rank_wire frame's bytes (lanes Kind.rank_wire).
++    rw: *const fn (ctx: *anyopaque, sub: []const u8) anyerror!void,
++};
++
++/// What rank 0's lanes do for the ops (their Snaps and Lanes follow the planner).
++pub const Hooks = struct {
++    ctx: *anyopaque,
++    /// A kept state given up (Snap.stale).
++    stale: *const fn (ctx: *anyopaque, kept: u64) void,
++    /// A live stream moved with its kept states: every Snap's and Lane's rows again from the planner.
++    moved: *const fn (ctx: *anyopaque, stream: u64) void,
++};
++
++/// The switches beyond TF_DS_KV_SHARD (rank 0 plans with them; every rank reads them for the agreement).
++pub const Settings = struct {
++    carry: bool = true, // TF_DS_KV_SHARD_CARRY: carries and live moves across parts (GLM TF_GLM_KV_SHARD_CARRY)
++    twins: bool = true, // TF_DS_KV_SHARD_TWINS: borrowed twins for filling prompts
++    check_rounds: u64 = 1024, // TF_DS_KV_SHARD_CHECK: decode rounds between digest checks (0: at start only)
++
++    pub fn fromEnv(get: *const fn ([:0]const u8) ?[]const u8) !Settings {
++        var s: Settings = .{};
++        if (get("TF_DS_KV_SHARD_CARRY")) |v| s.carry = try flag(v);
++        if (get("TF_DS_KV_SHARD_TWINS")) |v| s.twins = try flag(v);
++        if (get("TF_DS_KV_SHARD_CHECK")) |v| if (v.len > 0) {
++            s.check_rounds = std.fmt.parseInt(u64, v, 10) catch return error.BadKvShardSetting;
++        };
++        return s;
++    }
++
++    fn flag(v: []const u8) !bool {
++        if (v.len == 0 or std.mem.eql(u8, v, "1")) return true;
++        if (std.mem.eql(u8, v, "0")) return false;
++        return error.BadKvShardSetting;
++    }
++};
++
++/// The startup agreement when nothing else ran one (the spill tier's full fingerprint, rank_identity.zig, replaces it
++/// when both are on: Lanes.rw is one Leader): every field the shard path depends on (the wire, the block, the owner
++/// layout and parts, the split, the switches, the rank), the others marked as not covered.
++pub fn shardExchange(rank: u32, world: u32, cfg: parts.Config, s: Settings) fingerprint.Exchange {
++    var b: fingerprint.Builder = .{};
++    for (fingerprint.all) |f| switch (f) {
++        .wire_version => b.part(f, &rank_wire.stampBytes()),
++        .chunk_rows => b.int(f, u32, parts.chunk_rows),
++        .owner_layout => {
++            b.part(f, "owner_sharded");
++            b.int(f, u16, parts.layout_version);
++            b.int(f, u8, cfg.parts);
++            b.int(f, u64, cfg.cap);
++        },
++        .tp_split => b.int(f, u32, world),
++        .features => {
++            var buf: [64]u8 = undefined;
++            b.part(f, std.fmt.bufPrint(&buf, "kv_shard=1;kv_carry={d};twins={d};", .{ @intFromBool(s.carry), @intFromBool(s.twins) }) catch unreachable);
++        },
++        .rank_split => b.int(f, u32, rank),
++        else => b.part(f, "shard-only"),
++    };
++    const fp = b.finish(null) catch unreachable; // (every field given)
++    return fp.exchange();
++}
++
++const Fill = struct { stream: u64, base: usize };
++const Bound = struct { on: bool, local: ?usize };
++
++/// The twin binding a planner asks for the filling stream on rank `rank`: none, or on with this rank's twin (null on
++/// the owner, whose part holds the extent).
++fn wantTwin(p: *const parts.Planner, f: Fill, rank: u32) Bound {
++    if (!p.hasTwins(f.stream)) return .{ .on = false, .local = null };
++    var local: ?usize = null;
++    for (p.twins.items) |t| if (t.stream == f.stream and t.part == rank) {
++        local = t.base;
++    };
++    return .{ .on = true, .local = local };
++}
++
++fn sameBound(a: ?Bound, b: Bound) bool {
++    const x = a orelse return !b.on; // (a fill begins plain)
++    return x.on == b.on and x.local == b.local;
++}
++
++/// Lanes-side counts (the planner's own are parts.Counters).
++pub const Counts = struct {
++    plans: u64 = 0, // op lists sent
++    ops: u64 = 0,
++    transfers: u64 = 0,
++    relocations: u64 = 0,
++    checks: u64 = 0,
++    deferred_drops: u64 = 0,
++};
++
++// -- rank 0 ---------------------------------------------------------------------------------------------------------
++
++pub const Admitted = struct {
++    id: u64, // the planner's stream (Lane.id)
++    part: u8,
++    base: usize,
++    gen: u64,
++    resumed: bool, // the source's rows are the stream's (in place, or copied/carried and finished ok)
++    dropped: bool, // the hit was given up (the prompt runs from 0)
++    mode: parts.Mode,
++};
++
++pub const Kv = struct {
++    gpa: Allocator,
++    planner: parts.Planner,
++    settings: Settings,
++    dev: Dev,
++    hooks: Hooks,
++    out: ?Out = null, // null: no followers
++    leader: ?*rank_wire.Leader = null, // the followers' protocol (Lanes.rw when the spill side made one)
++    own_leader: bool = false,
++    links: []const ?link.Link = &.{}, // the followers' links for asks (Model.followers())
++    started: bool = false,
++    next_id: u64 = 1,
++    waiting: std.ArrayList(Wait) = .empty, // requests not yet placed, by their lanes.Stream (refusals once a request)
++    drops: std.ArrayList(u64) = .empty, // kept states whose drop waits for a transfer reading them (error.InFlight)
++    rounds: u64 = 0,
++    filling: ?Fill = null,
++    bound: ?Bound = null,
++    counts: Counts = .{},
++    wire_ops: [rank_wire.max_shard_ops]WireOp = undefined,
++
++    const Wait = struct { key: usize, tag: u64, id: u64 };
++    /// Waiting requests remembered at most (a request the host gave up while it waited is never told to the backend:
++    /// the oldest record is forgotten past this).
++    pub const max_waiting = 64;
++    /// Live moves one admission makes at most before it waits (error.ContextFull).
++    pub const max_relocations = 2;
++
++    pub fn init(gpa: Allocator, cfg: parts.Config, settings: Settings, dev: Dev, hooks: Hooks) !Kv {
++        var c = cfg;
++        c.carry = settings.carry;
++        c.twins = settings.twins;
++        return .{ .gpa = gpa, .planner = try parts.Planner.init(c), .settings = settings, .dev = dev, .hooks = hooks };
++    }
++
++    pub fn deinit(kv: *Kv) void {
++        kv.planner.deinit(kv.gpa);
++        kv.waiting.deinit(kv.gpa);
++        kv.drops.deinit(kv.gpa);
++        if (kv.own_leader) if (kv.leader) |l| kv.gpa.destroy(l);
++    }
++
++    /// The followers: frames through `out`, asks over `links`, under `leader` (null: a leader of its own at `epoch`
++    /// whose hello carries `fx`).
++    pub fn lead(kv: *Kv, out: Out, links: []const ?link.Link, leader: ?*rank_wire.Leader, epoch: u64, fx: fingerprint.Exchange) !void {
++        kv.out = out;
++        kv.links = links;
++        if (leader) |l| {
++            kv.leader = l;
++            return;
++        }
++        const l = try kv.gpa.create(rank_wire.Leader);
++        l.* = rank_wire.Leader.init(@intCast(links.len + 1), epoch, fx);
++        kv.leader = l;
++        kv.own_leader = true;
++    }
++
++    fn sink(kv: *Kv) rank_wire.Sink {
++        return .{ .ctx = kv, .send = sendRw };
++    }
++
++    fn sendRw(ctx: *anyopaque, sub: []const u8) anyerror!void {
++        const kv: *Kv = @ptrCast(@alignCast(ctx));
++        const o = kv.out orelse return error.NoFollowers;
++        try o.rw(o.ctx, sub);
++    }
++
++    fn asks(kv: *const Kv) bool {
++        return kv.links.len > 0;
++    }
++
++    /// Rank 0, once before the first plan: the startup agreement (unless one ran: the spill side's full fingerprint),
++    /// the followers' layouts (shard_layout), the parts (shard_set) and the first digest check. Without links (tests)
++    /// only shard_set goes out.
++    pub fn start(kv: *Kv) !void {
++        if (kv.started) return;
++        const l = kv.leader orelse {
++            kv.started = true;
++            return;
++        };
++        const cfg = kv.planner.cfg;
++        if (kv.asks()) {
++            if (l.agreement == null) _ = try l.agree(kv.sink(), kv.links);
++            var replies: [rank_wire.max_world - 1]rank_wire.Frame = undefined;
++            _ = try l.ask(kv.sink(), kv.links, 0, .{ .shard_layout = .{ .version = parts.layout_version, .parts = cfg.parts, .cap = cfg.cap, .carry = cfg.carry, .schema = rank_wire.shard_schema } }, replies[0..kv.links.len]);
++            for (replies[0..kv.links.len]) |f| {
++                const r = f.msg.shard_layout_reply;
++                if (r.version != parts.layout_version or r.parts != cfg.parts or r.cap != cfg.cap or r.schema != rank_wire.shard_schema) return error.ShardLayoutMismatch;
++            }
++        }
++        _ = try l.post(kv.sink(), 0, .{ .shard_set = .{ .version = parts.layout_version, .parts = cfg.parts, .part_rows = kv.planner.part_rows, .owner_epoch = l.t.owner_epoch + 1 } });
++        kv.started = true;
++        try kv.check();
++    }
++
++    /// The planner's digest against every follower's (rank_wire shard_check); a difference ends the pair.
++    pub fn check(kv: *Kv) !void {
++        const l = kv.leader orelse return;
++        if (!kv.asks()) return;
++        const d = kv.planner.digest();
++        var replies: [rank_wire.max_world - 1]rank_wire.Frame = undefined;
++        _ = try l.ask(kv.sink(), kv.links, 0, .{ .shard_check = .{ .owner_epoch = l.t.owner_epoch, .digest = d } }, replies[0..kv.links.len]);
++        for (replies[0..kv.links.len]) |f| if (!std.mem.eql(u8, &f.msg.shard_check_reply.digest, &d)) return error.ShardDiverged;
++        kv.counts.checks += 1;
++    }
++
++    /// A plan as the followers heard it: its transaction and owner epoch (its transfers' shard_xfer and shard_finish
++    /// name both).
++    const Sent = struct { txn: u64, epoch: u64 };
++
++    /// The ops to every follower as one plan (one owner epoch; frames of max_shard_ops each).
++    fn sendOps(kv: *Kv, ops: []const Op) !?Sent {
++        if (ops.len == 0) return null;
++        const l = kv.leader orelse return null;
++        const epoch = l.t.owner_epoch + 1;
++        var i: usize = 0;
++        var index: u16 = 0;
++        var txn: u64 = 0;
++        while (i < ops.len) {
++            const n = @min(rank_wire.max_shard_ops, ops.len - i);
++            for (ops[i..][0..n], kv.wire_ops[0..n]) |o, *w| w.* = toWire(o);
++            const head = try l.post(kv.sink(), txn, .{ .shard_ops = .{ .owner_epoch = epoch, .index = index, .last = i + n == ops.len, .ops = kv.wire_ops[0..n] } });
++            if (index == 0) txn = head.txn;
++            i += n;
++            index += 1;
++        }
++        kv.counts.plans += 1;
++        kv.counts.ops += ops.len;
++        return .{ .txn = txn, .epoch = epoch };
++    }
++
++    /// A plan applied (checked, all or nothing) and then sent: a refused plan sends nothing.
++    fn applyPlan(kv: *Kv, plan: *const parts.Plan) !?Sent {
++        try kv.planner.apply(kv.gpa, plan);
++        return kv.sendOps(plan.ops.items);
++    }
++
++    /// A `full` plan applied: no ops, only its refusals counted (once a request). Ops here would change rank 0's
++    /// planner and no follower's (a full plan is never sent): refused before anything changes.
++    fn applyFull(kv: *Kv, plan: *const parts.Plan) !void {
++        if (plan.ops.items.len != 0) return error.BadPlan;
++        try kv.planner.apply(kv.gpa, plan);
++    }
++
++    /// One op outside a plan (keep, drop), applied and sent.
++    fn applyOne(kv: *Kv, op: Op) !void {
++        try kv.planner.applyOps(kv.gpa, &.{op});
++        _ = try kv.sendOps(&.{op});
++    }
++
++    /// The ops' effects past the planner, in plan order: stales into the Snaps, the transfers (each finished with
++    /// rank 0's ok over every rank), a moved stream's rows back into the lanes, the fill's twin view.
++    fn runOps(kv: *Kv, ops: []const Op, sent: ?Sent) !bool {
++        var resumed = false;
++        for (ops) |op| switch (op) {
++            .stage => {}, // PORT(round3): the spill tier stages the point's pending rows (spill with TF_DS_KV_SHARD is refused until then)
++            .stale => |x| kv.hooks.stale(kv.hooks.ctx, x.kept),
++            .copy => |x| resumed = try kv.transfer(sent, x.stream, x.src, x.dst, x.rows, crosses(op)),
++            .carry => |x| resumed = try kv.transfer(sent, x.stream, x.src, x.dst, x.rows, crosses(op)),
++            .move => |x| if (try kv.transfer(sent, x.stream, x.src, x.dst, transferRows(x.rows, x.size), crosses(op))) kv.hooks.moved(kv.hooks.ctx, x.stream),
++            else => {},
++        };
++        try kv.syncTwin();
++        kv.retryDrops();
++        return resumed;
++    }
++
++    /// Both ranks' transfer (each enqueues its own side in this order, the followers at the plan's frame): rank 0's
++    /// side completed, every follower's asked (shard_xfer), the verdict posted (shard_finish) and every rank's finish
++    /// with it. Without links (tests) rank 0's own side is the verdict.
++    ///
++    /// Failures: a refusal (Dev.check: deterministic, nothing enqueued) is every rank's alike, and an enqueue failure
++    /// of a copy within one part leaves no peer waiting: both finish failed (the prompt runs from 0) and the pair goes
++    /// on. An enqueue failure across parts (`cross`: the peer's NCCL half would wait for this one forever), or a side
++    /// that does not complete within its bound (a peer that never enqueued its half or ended, a device fault), ends
++    /// the pair: no wait is unbounded, but the device stream holds an unmatched NCCL call, so the engine restarts.
++    fn transfer(kv: *Kv, sent: ?Sent, stream: u64, from: usize, to: usize, rows: usize, cross: bool) !bool {
++        var ok = true;
++        if (kv.dev.check(kv.dev.ctx, from, to, rows)) |_| {
++            if (kv.dev.copy(kv.dev.ctx, from, to, rows)) |_| {
++                kv.dev.wait(kv.dev.ctx, kv.waitNs()) catch |err| {
++                    std.log.warn("dsv41: a KV transfer of {d} rows from {d} to {d} did not complete: {s}; the ranks end", .{ rows, from, to, @errorName(err) });
++                    return kv.endPair(err);
++                };
++            } else |err| {
++                if (cross) {
++                    std.log.warn("dsv41: a KV transfer of {d} rows from {d} to {d} across parts failed: {s}; the ranks end", .{ rows, from, to, @errorName(err) });
++                    return kv.endPair(err);
++                }
++                std.log.warn("dsv41: a KV transfer of {d} rows from {d} to {d} failed: {s}", .{ rows, from, to, @errorName(err) });
++                ok = false;
++            }
++        } else |err| {
++            std.log.warn("dsv41: a KV transfer of {d} rows from {d} to {d} was refused: {s}", .{ rows, from, to, @errorName(err) });
++            ok = false;
++        }
++        if (kv.leader) |l| if (sent) |p| {
++            if (kv.asks()) {
++                var replies: [rank_wire.max_world - 1]rank_wire.Frame = undefined;
++                _ = try l.ask(kv.sink(), kv.links, p.txn, .{ .shard_xfer = .{ .owner_epoch = p.epoch, .stream = stream } }, replies[0..kv.links.len]);
++                for (replies[0..kv.links.len], 1..) |f, r| if (!f.msg.shard_xfer_reply.ok) {
++                    std.log.warn("dsv41: rank {d}'s side of a KV transfer of {d} rows failed", .{ r, rows });
++                    ok = false;
++                };
++            }
++            _ = try l.post(kv.sink(), p.txn, .{ .shard_finish = .{ .owner_epoch = p.epoch, .stream = stream, .ok = ok } });
++        };
++        const r = try kv.planner.finish(stream, ok);
++        kv.counts.transfers += 1;
++        return r.resumed;
++    }
++
++    /// Whether the followers' pair ended (nothing more reaches them).
++    fn ended(kv: *const Kv) bool {
++        const l = kv.leader orelse return false;
++        return l.broken != null;
++    }
++
++    /// Rank 0's bound on its own side of a transfer: the followers' reply deadline (rank_wire.Timeouts.xfer_ns).
++    fn waitNs(kv: *const Kv) u64 {
++        return if (kv.leader) |l| l.timeouts.xfer_ns else (rank_wire.Timeouts{}).xfer_ns;
++    }
++
++    /// Rank 0 ends the pair for a cause of its own (as rank_wire's refused posts do: `broken` names rank 0 and the
++    /// cause; PORT(rank-wire): Leader.fail is private, so its first-cause rule is repeated here). No followers: the
++    /// cause itself.
++    fn endPair(kv: *Kv, err: anyerror) anyerror {
++        const l = kv.leader orelse return err;
++        if (l.broken == null) l.broken = .{ .rank = 0, .err = err };
++        return error.PairBroken;
++    }
++
++    /// The planner's stream for a request (`key`: its lanes.Stream, `tag`: its id's hash), the same while it waits.
++    fn idFor(kv: *Kv, key: usize, tag: u64) !u64 {
++        for (kv.waiting.items, 0..) |w, i| if (w.key == key) {
++            if (w.tag == tag) return w.id;
++            kv.planner.forget(w.id); // another request at the same address: the old one was given up
++            _ = kv.waiting.orderedRemove(i);
++            break;
++        };
++        if (kv.waiting.items.len >= max_waiting) {
++            kv.planner.forget(kv.waiting.items[0].id);
++            _ = kv.waiting.orderedRemove(0);
++        }
++        const id = kv.next_id;
++        kv.next_id += 1;
++        try kv.waiting.append(kv.gpa, .{ .key = key, .tag = tag, .id = id });
++        return id;
++    }
++
++    /// A request the host gave up (cancelled while waiting, or placed elsewhere): its refusal record goes.
++    pub fn forgetKey(kv: *Kv, key: usize) void {
++        for (kv.waiting.items, 0..) |w, i| if (w.key == key) {
++            kv.planner.forget(w.id);
++            _ = kv.waiting.orderedRemove(i);
++            return;
++        };
++    }
++
++    fn placed(kv: *Kv, key: usize) void {
++        for (kv.waiting.items, 0..) |w, i| if (w.key == key) {
++            _ = kv.waiting.orderedRemove(i);
++            return;
++        };
++    }
++
++    /// lanes.prefillFn's placement (shard-parts.md's six steps): plan; `full` applied (its refusals counted once a
++    /// request) and error.ContextFull; `relocate` applied, sent, its move run and finished, then planned again;
++    /// `placed` applied, sent, its ops acted on in order. `source`: the kept state it resumes from (lanes checked it
++    /// usable), `patient`: held(source) and lanes' wait clock still runs.
++    pub fn admit(kv: *Kv, key: usize, tag: u64, slot: u32, size: usize, source: ?u64, patient: bool) !Admitted {
++        try kv.start();
++        const id = try kv.idFor(key, tag);
++        return kv.place(key, id, slot, size, source, patient) catch |err| {
++            if (err != error.ContextFull) kv.forgetKey(key); // (a waiting request keeps its record)
++            return err;
++        };
++    }
++
++    fn place(kv: *Kv, key: usize, id: u64, slot: u32, size: usize, source: ?u64, patient: bool) !Admitted {
++        var relocations: usize = 0;
++        while (true) {
++            var plan = try kv.planner.planAdmit(kv.gpa, .{ .stream = id, .slot = slot, .size = size, .source = source, .patient = patient });
++            defer plan.deinit(kv.gpa);
++            switch (plan.status) {
++                .full => {
++                    try kv.applyFull(&plan);
++                    return error.ContextFull;
++                },
++                .relocate => {
++                    if (relocations == max_relocations) return error.ContextFull;
++                    relocations += 1;
++                    const sent = try kv.applyPlan(&plan);
++                    _ = try kv.runOps(plan.ops.items, sent);
++                    kv.counts.relocations += 1;
++                },
++                .placed => {
++                    const sent = try kv.applyPlan(&plan);
++                    // a later step failing (a twin bind, a finish) releases the extent on every rank (planRelease's
++                    // ops sent): else its Live and its lanes slot stay taken on both ranks. A broken pair sends
++                    // nothing more (and may leave the transfer in flight): nothing to release then.
++                    errdefer if (!kv.ended()) kv.release(id) catch |err| std.log.warn("dsv41: a failed placement kept its part's extent: {s}", .{@errorName(err)});
++                    kv.placed(key);
++                    const ran = try kv.runOps(plan.ops.items, sent);
++                    const l = kv.planner.lives.items[kv.planner.liveIndex(id) orelse return error.UnknownStream];
++                    const resumed = plan.source != null and !plan.dropped and (plan.mode == .in_place or ran);
++                    return .{ .id = id, .part = l.part, .base = l.base, .gen = l.gen, .resumed = resumed, .dropped = plan.dropped, .mode = plan.mode };
++                },
++            }
++        }
++    }
++
++    /// A stream ends (released, or its prompt pass failed after placement): its twins, then its extent.
++    pub fn release(kv: *Kv, id: u64) !void {
++        if (kv.filling) |f| if (f.stream == id) {
++            kv.filling = null;
++            kv.bound = null;
++        };
++        var plan = kv.planner.planRelease(kv.gpa, id) catch |err| switch (err) {
++            error.UnknownStream => return,
++            else => return err,
++        };
++        defer plan.deinit(kv.gpa);
++        _ = try kv.applyPlan(&plan);
++        kv.retryDrops();
++    }
++
++    /// lanes.snapSaveFn: the live stream's state at `at` kept.
++    pub fn keep(kv: *Kv, kept: u64, stream: u64, at: usize) !void {
++        try kv.applyOne(try kv.planner.keepOp(kept, stream, at));
++    }
++
++    /// lanes.snapDropFn: a kept state dropped; deferred while a copy or carry reads it (retried after each finish).
++    pub fn drop(kv: *Kv, kept: u64) !void {
++        const op = kv.planner.dropOp(kept) catch |err| switch (err) {
++            error.UnknownKept => return, // (its keep never reached the planner: nothing to drop)
++            error.InFlight => {
++                try kv.drops.append(kv.gpa, kept);
++                kv.counts.deferred_drops += 1;
++                return;
++            },
++        };
++        try kv.applyOne(op);
++    }
++
++    fn retryDrops(kv: *Kv) void {
++        var i: usize = 0;
++        while (i < kv.drops.items.len) {
++            const id = kv.drops.items[i];
++            const op = kv.planner.dropOp(id) catch |err| switch (err) {
++                error.InFlight => {
++                    i += 1;
++                    continue;
++                },
++                else => {
++                    _ = kv.drops.orderedRemove(i);
++                    continue;
++                },
++            };
++            kv.applyOne(op) catch |err| std.log.err("dsv41: a deferred kept-state drop failed: {s}", .{@errorName(err)});
++            _ = kv.drops.orderedRemove(i);
++        }
++    }
++
++    /// A stream's first decode round: its twins given back first (decode reads the owners' rows only).
++    pub fn decodeStart(kv: *Kv, id: u64) !void {
++        var plan = try kv.planner.planDecode(kv.gpa, id);
++        defer plan.deinit(kv.gpa);
++        _ = try kv.applyPlan(&plan);
++        kv.planner.setDecoding(id, true);
++        try kv.syncTwin();
++    }
++
++    pub const Valid = struct { id: u64, valid: usize };
++
++    /// Each verify round: the planner's clock, every window's cache length, and the periodic digest check.
++    pub fn round(kv: *Kv, wins: []const Valid) !void {
++        kv.planner.tick();
++        for (wins) |w| kv.planner.setValid(w.id, w.valid);
++        kv.rounds += 1;
++        if (kv.settings.check_rounds > 0 and kv.rounds % kv.settings.check_rounds == 0) try kv.check();
++    }
++
++    /// A prompt pass of stream `id` begins at `base` (after Model.fillBegin): its twin view as the planner has it.
++    /// The fill stays this rank's `filling` past its last chunk, until the next fill begins or the stream is
++    /// released, exactly as on a follower (which hears no fill end): both ranks then bind and unbind at the same
++    /// frames (the first decode round's untwin, a revoke between).
++    pub fn fillBegin(kv: *Kv, id: u64, base: usize) !void {
++        kv.filling = .{ .stream = id, .base = base };
++        kv.bound = null;
++        try kv.syncTwin();
++    }
++
++    /// The fill's view bound to its twins exactly while the planner holds them (both ranks at the same frames).
++    fn syncTwin(kv: *Kv) !void {
++        const f = kv.filling orelse return;
++        const want = wantTwin(&kv.planner, f, 0);
++        if (sameBound(kv.bound, want)) return;
++        try kv.dev.twin(kv.dev.ctx, f.base, want.on, want.local);
++        kv.bound = want;
++    }
++
++    /// The counters and every part's rows (health), the attention side's transfer stats added by the caller.
++    pub fn stats(kv: *const Kv, out: *lanes.kv_parts.Stats) void {
++        const c = kv.planner.counters;
++        out.parts = kv.planner.cfg.parts;
++        out.part_rows = kv.planner.part_rows;
++        out.carries = c.hits;
++        out.carry_rescued = c.rescued;
++        out.carry_pressure = c.pressure;
++        out.carry_others = c.others;
++        out.carry_paused = c.paused;
++        out.moves = c.live;
++        out.moved_tokens = c.tokens;
++        out.moved_bytes = c.bytes;
++        out.transfers_failed = c.failed;
++        out.staged = c.staged;
++        out.staled = c.staled;
++        out.twins_made = c.twins_made;
++        out.twins_revoked = c.twins_revoked;
++        out.refused_pinned = c.refusals(.pinned);
++        out.refused_twin = c.refusals(.twin);
++        out.refused_loading = c.refusals(.loading);
++        out.refused_partial = c.refusals(.partial);
++        out.refused_no_target = c.refusals(.no_target);
++        out.refused_small = c.refusals(.small);
++        out.no_part = c.no_part;
++        out.plans = kv.counts.plans;
++        out.checks = kv.counts.checks;
++        for (0..@min(kv.planner.cfg.parts, lanes.kv_parts.max_parts)) |p| {
++            // (a failed allocation reads as an empty part; health is best effort)
++            const s = kv.planner.partStats(kv.gpa, @intCast(p)) catch continue;
++            out.part[p] = .{ .free = s.free, .live_rows = s.live_rows, .kept_rows = s.kept_rows, .twin_rows = s.twin_rows, .hold_rows = s.hold_rows, .live = s.live };
++        }
++    }
++};
++
++// -- followers -------------------------------------------------------------------------------------------------------
++
++pub const Follower = struct {
++    gpa: Allocator,
++    rank: u32,
++    cfg: parts.Config,
++    dev: Dev,
++    rw: rank_wire.Follower, // (the spill side's handlers join this one when both are on: one Follower a rank)
++    planner: ?parts.Planner = null, // from shard_set
++    filling: ?Fill = null,
++    bound: ?Bound = null,
++    failed: std.ArrayList(u64) = .empty, // streams whose own transfer failed, until rank 0's finish
++    diverged: bool = false,
++    ops: [rank_wire.max_shard_ops]Op = undefined,
++
++    pub fn init(gpa: Allocator, rank: u32, cfg: parts.Config, settings: Settings, dev: Dev) !*Follower {
++        // (the switches as rank 0's Kv.init sets them: both planners' configs alike, the features fingerprint agreed)
++        var c = cfg;
++        c.carry = settings.carry;
++        c.twins = settings.twins;
++        try c.check();
++        const f = try gpa.create(Follower);
++        f.* = .{ .gpa = gpa, .rank = rank, .cfg = c, .dev = dev, .rw = rank_wire.Follower.init(@intCast(rank), shardExchange(rank, c.parts, c, settings)) };
++        return f;
++    }
++
++    pub fn deinit(f: *Follower) void {
++        if (f.planner) |*p| p.deinit(f.gpa);
++        f.failed.deinit(f.gpa);
++        f.gpa.destroy(f);
++    }
++
++    /// A lanes Kind.rank_wire frame's payload: decoded, admitted in order, handled; an ask answered on `l`.
++    pub fn onFrame(f: *Follower, l: link.Link, payload: []const u8) !void {
++        try rank_wire.serve(&f.rw, l, payload, f);
++        if (f.diverged) return error.ShardDiverged;
++    }
++
++    // rank_wire.serve's handler methods
++
++    pub fn shardLayout(f: *Follower, _: rank_wire.Head, _: rank_wire.ShardLayout) !rank_wire.ShardLayoutReply {
++        return .{ .version = parts.layout_version, .parts = f.cfg.parts, .cap = f.cfg.cap, .schema = rank_wire.shard_schema };
++    }
++
++    pub fn shardSet(f: *Follower, _: rank_wire.Head, m: rank_wire.ShardSet) !void {
++        if (m.version != parts.layout_version or m.parts != f.cfg.parts or m.part_rows != f.cfg.partRows()) return error.ShardLayoutMismatch;
++        if (f.planner == null) f.planner = try parts.Planner.init(f.cfg);
++    }
++
++    pub fn shardOps(f: *Follower, _: rank_wire.Head, m: rank_wire.ShardOps) !void {
++        const p = &(f.planner orelse return error.NotAgreed);
++        if (m.ops.len > f.ops.len) return error.BadCount;
++        for (m.ops, f.ops[0..m.ops.len]) |w, *o| o.* = fromWire(w);
++        const ops = f.ops[0..m.ops.len];
++        try p.applyOps(f.gpa, ops);
++        // the same transfers as rank 0, in its order (a pair of NCCL calls across parts): enqueued now, before any ask
++        // (rank_wire's deadlock rule 3); shard_xfer asks how this rank's side ended, shard_finish brings rank 0's ok
++        for (ops) |op| switch (op) {
++            .copy => |x| try f.transfer(x.stream, x.src, x.dst, x.rows, crosses(op)),
++            .carry => |x| try f.transfer(x.stream, x.src, x.dst, x.rows, crosses(op)),
++            .move => |x| try f.transfer(x.stream, x.src, x.dst, transferRows(x.rows, x.size), crosses(op)),
++            else => {},
++        };
++        try f.syncTwin();
++    }
++
++    pub fn shardCheck(f: *Follower, _: rank_wire.Head, m: rank_wire.ShardCheck) !rank_wire.ShardCheckReply {
++        const p = &(f.planner orelse return error.NotAgreed);
++        const d = p.digest();
++        if (!std.mem.eql(u8, &d, &m.digest)) {
++            std.log.err("dsv41: rank {d}'s KV-part planner differs from rank 0's at owner epoch {d}", .{ f.rank, m.owner_epoch });
++            f.diverged = true; // (answered first: rank 0 sees the difference and ends too)
++        }
++        return .{ .owner_epoch = m.owner_epoch, .digest = d };
++    }
++
++    /// This rank's side, as Kv.transfer's: a refusal (rank 0 refuses alike) or a failed copy within one part is
++    /// recorded for shard_xfer; a failed enqueue across parts ends this rank (rank 0's half would wait for it; its own
++    /// wait is bounded, so rank 0 ends too).
++    fn transfer(f: *Follower, stream: u64, from: usize, to: usize, rows: usize, cross: bool) !void {
++        f.dev.check(f.dev.ctx, from, to, rows) catch |err| {
++            std.log.warn("dsv41: rank {d}'s KV transfer of {d} rows from {d} to {d} was refused: {s}", .{ f.rank, rows, from, to, @errorName(err) });
++            try f.failed.append(f.gpa, stream);
++            return;
++        };
++        f.dev.copy(f.dev.ctx, from, to, rows) catch |err| {
++            if (cross) {
++                std.log.warn("dsv41: rank {d}'s KV transfer of {d} rows from {d} to {d} across parts failed: {s}; this rank ends", .{ f.rank, rows, from, to, @errorName(err) });
++                return error.TransferFailed;
++            }
++            std.log.warn("dsv41: rank {d}'s KV transfer of {d} rows from {d} to {d} failed: {s}", .{ f.rank, rows, from, to, @errorName(err) });
++            try f.failed.append(f.gpa, stream);
++        };
++    }
++
++    fn mine(f: *const Follower, stream: u64) bool {
++        return std.mem.indexOfScalar(u64, f.failed.items, stream) == null;
++    }
++
++    /// rank_wire shard_xfer: whether this rank's side of the stream's transfer completed (enqueued without error, and
++    /// done within follower_wait_ns: its NCCL half needs only rank 0's half, enqueued before the ask). A side that does
++    /// not complete in time ends this rank instead of answering (the stream holds an unmatched call; rank 0 sees the
++    /// link go or its deadline pass and ends too).
++    pub fn shardXfer(f: *Follower, _: rank_wire.Head, m: rank_wire.ShardXfer) !rank_wire.ShardXferReply {
++        const ok = f.mine(m.stream);
++        if (ok) f.dev.wait(f.dev.ctx, follower_wait_ns) catch |err| {
++            std.log.warn("dsv41: rank {d}'s side of a KV transfer did not complete: {s}; this rank ends", .{ f.rank, @errorName(err) });
++            return err;
++        };
++        return .{ .owner_epoch = m.owner_epoch, .stream = m.stream, .ok = ok };
++    }
++
++    /// rank_wire shard_finish: rank 0's ok, never this rank's own result.
++    pub fn shardFinish(f: *Follower, _: rank_wire.Head, m: rank_wire.ShardFinish) !void {
++        try f.finish(m.stream, m.ok);
++    }
++
++    fn finish(f: *Follower, stream: u64, ok: bool) !void {
++        const p = &(f.planner orelse return error.NotAgreed);
++        const own = f.mine(stream);
++        if (std.mem.indexOfScalar(u64, f.failed.items, stream)) |i| _ = f.failed.orderedRemove(i);
++        // rank 0 says the rows are good where this rank's are not (no shard_xfer told it): the pair ends
++        if (ok and !own) return error.TransferFailed;
++        _ = try p.finish(stream, ok);
++        try f.syncTwin();
++    }
++
++    /// The live stream in pool slot `slot`.
++    fn liveAt(f: *const Follower, slot: usize) ?parts.Live {
++        const p = &(f.planner orelse return null);
++        for (p.lives.items) |l| if (l.slot == slot) return l;
++        return null;
++    }
++
++    /// A fill_begin (after Model.fillBegin): the twin view as this rank's planner has it.
++    pub fn fillBegin(f: *Follower, slot: usize, base: usize) !void {
++        const l = f.liveAt(slot) orelse return error.UnknownStream; // rank 0 placed it before the fill began
++        if (l.base != base) return error.StaleExtent;
++        f.filling = .{ .stream = l.stream, .base = base };
++        f.bound = null;
++        try f.syncTwin();
++    }
++
++    fn syncTwin(f: *Follower) !void {
++        const fl = f.filling orelse return;
++        const p = &(f.planner orelse return);
++        if (p.liveIndex(fl.stream) == null) {
++            f.filling = null;
++            f.bound = null;
++            return;
++        }
++        const want = wantTwin(p, fl, f.rank);
++        if (sameBound(f.bound, want)) return;
++        try f.dev.twin(f.dev.ctx, fl.base, want.on, want.local);
++        f.bound = want;
++    }
++
++    /// A verify window as rank 0 built it: the live stream in its slot at its extent, part and generation (a frame
++    /// for a reused extent fails closed).
++    pub fn checkWin(f: *const Follower, slot: usize, base: usize, end: usize, part: u8, gen: u64) !void {
++        const l = f.liveAt(slot) orelse return error.StaleExtent;
++        if (l.base != base or l.base + l.size != end or l.part != part or l.gen != gen) return error.StaleExtent;
++    }
++};
++
++// -- tests -------------------------------------------------------------------------------------------------------------
++
++const testing = std.testing;
++const C = parts.chunk_rows;
++
++/// A device that records what it was asked (and fails transfers on request).
++pub const FakeDev = struct {
++    copies: std.ArrayList([3]usize) = .empty,
++    twins: std.ArrayList(Bound) = .empty,
++    fail_next: bool = false, // the next copy's enqueue fails
++    fail_check: bool = false, // the next check refuses (every rank's alike in the tests that set it)
++    fail_wait: bool = false, // the next wait does not complete in time
++    fail_twin: bool = false, // the next twin bind fails
++    gpa: Allocator,
++
++    pub fn dev(d: *FakeDev) Dev {
++        return .{ .ctx = d, .check = checkFn, .copy = copyFn, .twin = twinFn, .wait = waitFn };
++    }
++
++    fn checkFn(ctx: *anyopaque, _: usize, _: usize, _: usize) anyerror!void {
++        const d: *FakeDev = @ptrCast(@alignCast(ctx));
++        if (d.fail_check) {
++            d.fail_check = false;
++            return error.CrossesPart;
++        }
++    }
++
++    fn waitFn(ctx: *anyopaque, _: u64) anyerror!void {
++        const d: *FakeDev = @ptrCast(@alignCast(ctx));
++        if (d.fail_wait) {
++            d.fail_wait = false;
++            return error.TransferTimeout;
++        }
++    }
++
++    fn copyFn(ctx: *anyopaque, from: usize, to: usize, rows: usize) anyerror!void {
++        const d: *FakeDev = @ptrCast(@alignCast(ctx));
++        if (d.fail_next) {
++            d.fail_next = false;
++            return error.InjectedFailure;
++        }
++        try d.copies.append(d.gpa, .{ from, to, rows });
++    }
++
++    fn twinFn(ctx: *anyopaque, _: usize, on: bool, local: ?usize) anyerror!void {
++        const d: *FakeDev = @ptrCast(@alignCast(ctx));
++        if (d.fail_twin) {
++            d.fail_twin = false;
++            return error.BadView;
++        }
++        try d.twins.append(d.gpa, .{ .on = on, .local = local });
++    }
++
++    pub fn deinit(d: *FakeDev) void {
++        d.copies.deinit(d.gpa);
++        d.twins.deinit(d.gpa);
++    }
++};
++
++/// Rank 0's lanes as far as the hooks see them.
++const FakeLanes = struct {
++    staled: std.ArrayList(u64) = .empty,
++    moved: std.ArrayList(u64) = .empty,
++    gpa: Allocator,
++
++    fn hooks(x: *FakeLanes) Hooks {
++        return .{ .ctx = x, .stale = staleFn, .moved = movedFn };
++    }
++
++    fn staleFn(ctx: *anyopaque, kept: u64) void {
++        const x: *FakeLanes = @ptrCast(@alignCast(ctx));
++        x.staled.append(x.gpa, kept) catch unreachable;
++    }
++
++    fn movedFn(ctx: *anyopaque, stream: u64) void {
++        const x: *FakeLanes = @ptrCast(@alignCast(ctx));
++        x.moved.append(x.gpa, stream) catch unreachable;
++    }
++
++    fn deinit(x: *FakeLanes) void {
++        x.staled.deinit(x.gpa);
++        x.moved.deinit(x.gpa);
++    }
++};
++
++/// Rank 0 and an in-process follower: rank 0's frames go straight to the follower's handler, in order (lanes.zig's
++/// tests drive it with the lanes' own hooks: initWith).
++pub const Pair = struct {
++    gpa: Allocator,
++    kv: Kv,
++    dev0: FakeDev,
++    dev1: FakeDev,
++    lanes0: FakeLanes,
++    fol: *Follower,
++    leader: rank_wire.Leader,
++    frames: u64 = 0,
++
++    fn init(gpa: Allocator, cfg: parts.Config, settings: Settings) !*Pair {
++        return initWith(gpa, cfg, settings, null);
++    }
++
++    /// `hooks`: rank 0's lanes (null: a recorder).
++    pub fn initWith(gpa: Allocator, cfg: parts.Config, settings: Settings, hooks: ?Hooks) !*Pair {
++        const p = try gpa.create(Pair);
++        errdefer gpa.destroy(p);
++        p.* = .{ .gpa = gpa, .kv = undefined, .dev0 = .{ .gpa = gpa }, .dev1 = .{ .gpa = gpa }, .lanes0 = .{ .gpa = gpa }, .fol = undefined, .leader = undefined };
++        p.kv = try Kv.init(gpa, cfg, settings, p.dev0.dev(), hooks orelse p.lanes0.hooks());
++        p.fol = try Follower.init(gpa, 1, cfg, settings, p.dev1.dev());
++        p.leader = rank_wire.Leader.init(2, 9, shardExchange(0, 2, cfg, settings));
++        try agreeInProcess(&p.leader, &p.fol.rw);
++        try p.kv.lead(.{ .ctx = p, .rw = rwFn }, &.{}, &p.leader, 0, undefined);
++        try p.kv.start();
++        return p;
++    }
++
++    fn rwFn(ctx: *anyopaque, sub: []const u8) anyerror!void {
++        const p: *Pair = @ptrCast(@alignCast(ctx));
++        p.frames += 1;
++        try p.fol.onFrame(undefined, sub); // (no asks without links: the link is never used)
++    }
++
++    pub fn same(p: *Pair) !void {
++        try testing.expectEqualSlices(u8, &p.kv.planner.digest(), &p.fol.planner.?.digest());
++    }
++
++    pub fn deinit(p: *Pair) void {
++        p.kv.deinit();
++        p.fol.deinit();
++        p.dev0.deinit();
++        p.dev1.deinit();
++        p.lanes0.deinit();
++        p.gpa.destroy(p);
++    }
++};
++
++/// The startup agreement between a leader and an in-process follower, without the reply link (tests only).
++fn agreeInProcess(l: *rank_wire.Leader, f: *rank_wire.Follower) !void {
++    var buf: [rank_wire.max_frame]u8 = undefined;
++    const hello: rank_wire.Msg = .{ .hello = .{ .world = l.world, .fx = l.fx } };
++    var head: rank_wire.Head = .{ .op = .hello, .from = 0, .epoch = l.epoch, .txn = 0, .seq = l.t.next_seq };
++    try l.t.admit(&.{ .head = head, .msg = hello });
++    _ = try f.accept(try rank_wire.encode(&buf, head, hello));
++    f.owed = null;
++    var a: fingerprint.Agreement = .{ .common = l.fx.common, .world = l.world };
++    a.ranks[0] = l.fx.rank;
++    a.ranks[1] = f.fx.rank;
++    const agreed: rank_wire.Msg = .{ .agreed = .{ .world = l.world, .common = a.common, .ranks = a.ranks } };
++    head = .{ .op = .agreed, .from = 0, .epoch = l.epoch, .txn = 0, .seq = l.t.next_seq };
++    try l.t.admit(&.{ .head = head, .msg = agreed });
++    _ = try f.accept(try rank_wire.encode(&buf, head, agreed));
++    l.agreement = a;
++}
++
++const sharded: parts.Config = .{ .cap = 64 * C, .parts = 2, .carry_bytes = 720 };
++
++test "ops cross the wire unchanged" {
++    const samples = [_]Op{
++        .{ .stage = .{ .kept = 3, .gen = 4 } },
++        .{ .carry = .{ .kept = 1, .kept_gen = 2, .stream = 3, .src = 4 * C, .src_part = 0, .dst = 40 * C, .dst_part = 1, .rows = 2 * C, .why = .pressure } },
++        .{ .move = .{ .stream = 9, .gen = 2, .src = 0, .src_part = 0, .dst = 33 * C, .dst_part = 1, .size = 4 * C, .rows = 3000, .hold_gen = 7, .tick = -5 } },
++        .{ .untwin = .{ .stream = 1, .gen = 2, .revoke = true } },
++    };
++    for (samples) |o| try testing.expectEqualDeep(o, fromWire(toWire(o)));
++    try testing.expectEqual(@as(usize, 4 * C), transferRows(3 * C + 1, 4 * C));
++    try testing.expectEqual(@as(usize, 2 * C), transferRows(2 * C, 4 * C));
++}
++
++test "settings: carry and twins on by default, 0 turns each off, anything else is refused" {
++    const env = struct {
++        var vals: [3]?[]const u8 = .{ null, null, null };
++        fn get(n: [:0]const u8) ?[]const u8 {
++            if (std.mem.eql(u8, n, "TF_DS_KV_SHARD_CARRY")) return vals[0];
++            if (std.mem.eql(u8, n, "TF_DS_KV_SHARD_TWINS")) return vals[1];
++            return vals[2];
++        }
++    };
++    try testing.expectEqualDeep(Settings{}, try Settings.fromEnv(env.get));
++    env.vals = .{ "0", "0", "16" };
++    try testing.expectEqualDeep(Settings{ .carry = false, .twins = false, .check_rounds = 16 }, try Settings.fromEnv(env.get));
++    env.vals = .{ "yes", null, null };
++    try testing.expectError(error.BadKvShardSetting, Settings.fromEnv(env.get));
++}
++
++test "admissions are part-local, the follower's planner stays rank 0's, and a release frees the part" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{ .twins = false });
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    var ids: [4]u64 = undefined;
++    for (&ids, 0..) |*id, i| {
++        const a = try p.kv.admit(100 + i, 7, @intCast(i), 12 * C, null, false);
++        id.* = a.id;
++        try testing.expect(a.base + 12 * C <= (@as(usize, a.part) + 1) * half and a.base >= @as(usize, a.part) * half);
++        try p.same();
++    }
++    // the parts fill evenly (fewer live streams first)
++    var per: [2]usize = .{ 0, 0 };
++    for (p.kv.planner.lives.items) |l| per[l.part] += 1;
++    try testing.expectEqual([2]usize{ 2, 2 }, per);
++    // a request no part holds waits (no ops, nothing sent), counted once however often it is planned again
++    const frames = p.frames;
++    try testing.expectError(error.ContextFull, p.kv.admit(200, 1, 5, 20 * C, null, false));
++    try testing.expectError(error.ContextFull, p.kv.admit(200, 1, 5, 20 * C, null, false));
++    try testing.expectEqual(frames, p.frames);
++    try testing.expectEqual(@as(u64, 1), p.kv.planner.counters.no_part);
++    p.kv.forgetKey(200);
++    for (ids) |id| try p.kv.release(id);
++    try p.same();
++    try testing.expectEqual(@as(usize, 0), p.kv.planner.lives.items.len);
++    try testing.expectEqual(@as(usize, 0), p.kv.waiting.items.len);
++}
++
++test "a hit its part cannot hold is carried: both ranks transfer in order and finish with rank 0's ok" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{ .twins = false });
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    // a conversation in part 0 keeps a state of 8 blocks, then a long stream fills the rest of part 0 around it
++    const a = try p.kv.admit(1, 1, 0, 10 * C, null, false);
++    try testing.expectEqual(@as(u8, 0), a.part);
++    try p.kv.keep(500, a.id, 8 * C);
++    try p.same();
++    const big = try p.kv.admit(2, 2, 1, 16 * C, null, false); // part 1 (fewer streams)
++    try testing.expectEqual(@as(u8, 1), big.part);
++    const fill0 = try p.kv.admit(3, 3, 2, 20 * C, null, false); // part 0 past the conversation
++    try testing.expectEqual(@as(u8, 0), fill0.part);
++    try p.kv.release(a.id);
++    // the conversation's next turn: its own part has no room for 12 blocks without dropping it; part 1 has
++    const next = try p.kv.admit(4, 4, 0, 12 * C, 500, false);
++    try p.same();
++    try testing.expect(next.resumed);
++    try testing.expectEqual(parts.Mode.carry, next.mode);
++    try testing.expectEqual(@as(u8, 1), next.part);
++    try testing.expect(next.base >= half);
++    // both ranks ran the one transfer: the kept rows from their base to the new extent
++    try testing.expectEqual(@as(usize, 1), p.dev0.copies.items.len);
++    try testing.expectEqualSlices([3]usize, p.dev0.copies.items, p.dev1.copies.items);
++    try testing.expectEqual([3]usize{ 0, next.base, 8 * C }, p.dev0.copies.items[0]);
++    try testing.expectEqual(@as(u64, 1), p.kv.planner.counters.hits);
++    try testing.expectEqual(@as(u64, 8 * C * 720), p.kv.planner.counters.bytes);
++    // the source stays, readable again once finished
++    try testing.expect(!p.kv.planner.readBy(500));
++    try testing.expect(p.kv.planner.keptAt(500) != null);
++    try p.kv.release(next.id);
++    try p.kv.release(big.id);
++    try p.kv.release(fill0.id);
++    try p.same();
++}
++
++test "a failed transfer on rank 0 runs the prompt from 0 on both ranks; a follower's own failure under rank 0's ok ends the pair" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{ .twins = false });
++    defer p.deinit();
++    const a = try p.kv.admit(1, 1, 0, 10 * C, null, false);
++    try p.kv.keep(500, a.id, 8 * C);
++    // a second request on the same prefix while the first holds it: copied within the part (it would wait, but not
++    // patient: a copy)
++    p.dev0.fail_next = true;
++    const b = try p.kv.admit(2, 2, 1, 10 * C, 500, false);
++    try testing.expect(!b.resumed);
++    try testing.expectEqual(@as(u64, 1), p.kv.planner.counters.failed);
++    try p.same();
++    try testing.expectEqual(@as(usize, 0), p.kv.planner.lives.items[p.kv.planner.liveIndex(b.id).?].valid);
++    try p.kv.release(b.id);
++    // the follower's own copy fails while rank 0's works: rank 0's ok reaches it and the pair ends
++    p.dev1.fail_next = true;
++    try testing.expectError(error.PairBroken, p.kv.admit(3, 3, 1, 10 * C, 500, false));
++    try testing.expectEqual(@as(anyerror, error.TransferFailed), p.leader.broken.?.err); // (rank_wire: a refused post ends the pair)
++}
++
++test "twins: a fresh prompt borrows the other part all or none, both ranks bind it, the first decode round gives it back" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{});
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    const a = try p.kv.admit(1, 1, 0, 8 * C, null, false);
++    try testing.expect(p.kv.planner.hasTwins(a.id));
++    try p.same();
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    // rank 0 owns part 0 (the extent): on, no local twin; rank 1 binds its twin in part 1
++    try testing.expectEqual(@as(usize, 1), p.dev0.twins.items.len);
++    try testing.expect(p.dev0.twins.items[0].on and p.dev0.twins.items[0].local == null);
++    try testing.expect(p.dev1.twins.items[0].on and p.dev1.twins.items[0].local.? >= half);
++    // pinned while a chunk runs: no room for an admission that would need it back
++    p.kv.planner.setPartial(a.id, true);
++    try testing.expect(!try p.kv.planner.fits(gpa, 28 * C));
++    p.kv.planner.setPartial(a.id, false);
++    try testing.expect(try p.kv.planner.fits(gpa, 28 * C));
++    // (the fill's last chunk ran: no fill end on either rank, both still hold it as their fill)
++    try p.kv.decodeStart(a.id);
++    try testing.expect(!p.kv.planner.hasTwins(a.id));
++    try p.same();
++    // both ranks unbind at the same frame (the untwin): the same binds, the views plain again
++    try testing.expectEqual(p.dev0.twins.items.len, p.dev1.twins.items.len);
++    try testing.expectEqual(@as(usize, 2), p.dev0.twins.items.len);
++    try testing.expect(!p.dev0.twins.items[1].on and !p.dev1.twins.items[1].on);
++    try p.kv.release(a.id);
++    try p.same();
++}
++
++test "twins taken back between chunks unbind the fill's view on both ranks" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{});
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    const a = try p.kv.admit(1, 1, 0, 20 * C, null, false);
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    try testing.expect(p.kv.planner.hasTwins(a.id));
++    // between two chunks (not pinned) a request needs part 1's rows: the twin is revoked, both views go plain
++    const b = try p.kv.admit(2, 2, 1, half, null, false);
++    try testing.expect(!p.kv.planner.hasTwins(a.id));
++    try testing.expectEqual(@as(u8, 1), b.part);
++    try p.same();
++    try testing.expect(!p.dev0.twins.items[p.dev0.twins.items.len - 1].on);
++    try testing.expect(!p.dev1.twins.items[p.dev1.twins.items.len - 1].on);
++    try testing.expectEqual(@as(u64, 1), p.kv.planner.counters.twins_revoked);
++}
++
++test "a request that would wait moves the cheapest decoding stream to the other part; the lanes hear it" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{ .twins = false });
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    // part 0: x (14 blocks, 18 free); part 1: z (10 blocks, 22 free); a 24-block request fits neither
++    const x = try p.kv.admit(1, 1, 0, 14 * C, null, false);
++    const z = try p.kv.admit(2, 2, 1, 10 * C, null, false);
++    try testing.expectEqual(@as(u8, 0), x.part);
++    try testing.expectEqual(@as(u8, 1), z.part);
++    try p.kv.decodeStart(x.id);
++    try p.kv.decodeStart(z.id);
++    // x has used one block and a few rows, z three blocks: x is the cheaper move
++    try p.kv.round(&.{ .{ .id = x.id, .valid = C + 5 }, .{ .id = z.id, .valid = 3 * C } });
++    const w = try p.kv.admit(3, 3, 2, 24 * C, null, false);
++    try p.same();
++    try testing.expectEqual(@as(u64, 1), p.kv.counts.relocations);
++    try testing.expectEqualSlices(u64, &.{x.id}, p.lanes0.moved.items);
++    try testing.expectEqual(@as(usize, 1), p.dev0.copies.items.len);
++    try testing.expectEqualSlices([3]usize, p.dev0.copies.items, p.dev1.copies.items);
++    const xl = p.kv.planner.lives.items[p.kv.planner.liveIndex(x.id).?];
++    try testing.expectEqual(@as(u8, 1), xl.part);
++    try testing.expectEqual([3]usize{ 0, xl.base, 2 * C }, p.dev0.copies.items[0]); // its used rows, in whole blocks
++    try testing.expectEqual(@as(u8, 0), w.part);
++    try testing.expect(w.base + 24 * C <= half);
++    try testing.expectEqual(@as(u64, 1), p.kv.planner.counters.live);
++}
++
++test "random traffic: rank 0's and the follower's planners never differ, every op list replays" {
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(0x0118);
++    const rnd = prng.random();
++    for (0..6) |trial| {
++        const p = try Pair.init(gpa, .{ .cap = 96 * C, .parts = 2, .carry_bytes = 720 }, .{ .twins = trial % 2 == 0, .carry = trial % 3 != 2 });
++        defer p.deinit();
++        var live: std.ArrayList(struct { id: u64, slot: u32, decoding: bool }) = .empty;
++        defer live.deinit(gpa);
++        var kept: std.ArrayList(u64) = .empty;
++        defer kept.deinit(gpa);
++        var next_kept: u64 = 1;
++        var key: usize = 1;
++        for (0..400) |_| {
++            const roll = rnd.uintLessThan(u32, 10);
++            if (roll < 4 and live.items.len < 8) {
++                var used: [8]bool = @splat(false);
++                for (live.items) |l| used[l.slot] = true;
++                const slot: u32 = @intCast(std.mem.indexOfScalar(bool, &used, false).?);
++                const size = (1 + rnd.uintLessThan(usize, 20)) * C;
++                var src: ?u64 = null;
++                if (kept.items.len > 0 and rnd.boolean()) {
++                    const k = kept.items[rnd.uintLessThan(usize, kept.items.len)];
++                    if (p.kv.planner.keptAt(k)) |kk| if (!kk.stale and kk.at < size) {
++                        src = k;
++                    };
++                }
++                key += 1;
++                const a = p.kv.admit(key, key, slot, size, src, false) catch |err| switch (err) {
++                    error.ContextFull => {
++                        p.kv.forgetKey(key);
++                        continue;
++                    },
++                    else => return err,
++                };
++                try live.append(gpa, .{ .id = a.id, .slot = slot, .decoding = false });
++            } else if (roll < 6 and live.items.len > 0) {
++                const i = rnd.uintLessThan(usize, live.items.len);
++                const l = p.kv.planner.lives.items[p.kv.planner.liveIndex(live.items[i].id).?];
++                const at = (1 + rnd.uintLessThan(usize, l.size / C)) * C;
++                if (at < l.size) {
++                    try p.kv.keep(next_kept, l.stream, at);
++                    try kept.append(gpa, next_kept);
++                    next_kept += 1;
++                }
++            } else if (roll < 7 and kept.items.len > 0) {
++                const i = rnd.uintLessThan(usize, kept.items.len);
++                try p.kv.drop(kept.items[i]);
++                _ = kept.swapRemove(i);
++            } else if (roll < 8 and live.items.len > 0) {
++                const i = rnd.uintLessThan(usize, live.items.len);
++                try p.kv.release(live.items[i].id);
++                _ = live.swapRemove(i);
++            } else if (live.items.len > 0) {
++                var vs: [8]Kv.Valid = undefined;
++                for (live.items, 0..) |*l, i| {
++                    if (!l.decoding) {
++                        try p.kv.decodeStart(l.id);
++                        l.decoding = true;
++                    }
++                    vs[i] = .{ .id = l.id, .valid = C };
++                }
++                try p.kv.round(vs[0..live.items.len]);
++            }
++            try p.same();
++        }
++        try testing.expectEqualSlices([3]usize, p.dev0.copies.items, p.dev1.copies.items);
++    }
++}
++
++/// Part 0 holds a kept state whose next turn its part cannot hold (the carry test's setup): the next admission carries.
++fn carrySetup(p: *Pair) !struct { a: u64, big: u64, fill0: u64 } {
++    const a = try p.kv.admit(1, 1, 0, 10 * C, null, false);
++    try p.kv.keep(500, a.id, 8 * C);
++    const big = try p.kv.admit(2, 2, 1, 16 * C, null, false);
++    const fill0 = try p.kv.admit(3, 3, 2, 20 * C, null, false);
++    try p.kv.release(a.id);
++    return .{ .a = a.id, .big = big.id, .fill0 = fill0.id };
++}
++
++test "a carry across parts: a follower half that fails to enqueue, or rank 0's side not completing in time, ends the pair (never a hang)" {
++    const gpa = testing.allocator;
++    {
++        const p = try Pair.init(gpa, sharded, .{ .twins = false });
++        defer p.deinit();
++        _ = try carrySetup(p);
++        // rank 1's NCCL half fails to enqueue: it ends (rank 0's post of the ops fails here; over a link rank 0's
++        // bounded wait or the reply deadline ends it)
++        p.dev1.fail_next = true;
++        try testing.expectError(error.PairBroken, p.kv.admit(4, 4, 0, 12 * C, 500, false));
++        try testing.expectEqual(@as(anyerror, error.TransferFailed), p.leader.broken.?.err);
++    }
++    {
++        const p = try Pair.init(gpa, sharded, .{ .twins = false });
++        defer p.deinit();
++        _ = try carrySetup(p);
++        p.dev0.fail_wait = true;
++        try testing.expectError(error.PairBroken, p.kv.admit(4, 4, 0, 12 * C, 500, false));
++        try testing.expectEqual(@as(anyerror, error.TransferTimeout), p.leader.broken.?.err);
++        try testing.expectEqual(@as(u16, 0), p.leader.broken.?.rank);
++    }
++    {
++        // rank 0's own enqueue across parts fails: its peer's half would wait, so the pair ends too
++        const p = try Pair.init(gpa, sharded, .{ .twins = false });
++        defer p.deinit();
++        _ = try carrySetup(p);
++        p.dev0.fail_next = true;
++        try testing.expectError(error.PairBroken, p.kv.admit(4, 4, 0, 12 * C, 500, false));
++        try testing.expectEqual(@as(anyerror, error.InjectedFailure), p.leader.broken.?.err);
++    }
++}
++
++test "a carry refused alike on every rank (nothing enqueued) finishes failed on both and the pair goes on" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{ .twins = false });
++    defer p.deinit();
++    const s = try carrySetup(p);
++    p.dev0.fail_check = true;
++    p.dev1.fail_check = true;
++    const next = try p.kv.admit(4, 4, 0, 12 * C, 500, false);
++    try testing.expect(!next.resumed);
++    try testing.expectEqual(@as(usize, 0), p.dev0.copies.items.len);
++    try testing.expectEqual(@as(usize, 0), p.dev1.copies.items.len);
++    try testing.expectEqual(@as(u64, 1), p.kv.planner.counters.failed);
++    try p.same();
++    try testing.expectEqual(@as(usize, 0), p.fol.failed.items.len);
++    for ([_]u64{ next.id, s.big, s.fill0 }) |id| try p.kv.release(id);
++    try p.same();
++}
++
++test "a step failing after a placed plan releases its extent on both ranks; the slot is admitted again" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{});
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    // a fills with its twin in part 1; b needs part 1 whole: its plan revokes a's twin, and rank 0's unbind fails
++    const a = try p.kv.admit(1, 1, 0, 20 * C, null, false);
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    p.dev0.fail_twin = true;
++    try testing.expectError(error.BadView, p.kv.admit(2, 2, 1, half, null, false));
++    try p.same();
++    try testing.expectEqual(@as(usize, 1), p.kv.planner.lives.items.len);
++    try testing.expectEqual(@as(usize, 1), p.fol.planner.?.lives.items.len);
++    try testing.expectEqual(@as(usize, 0), p.kv.waiting.items.len);
++    // the same lanes slot takes the next request (no SlotTaken on either rank)
++    const b = try p.kv.admit(3, 3, 1, half, null, false);
++    try testing.expectEqual(@as(u8, 1), b.part);
++    try p.same();
++    try p.kv.release(b.id);
++    try p.kv.release(a.id);
++    try p.same();
++    try testing.expectEqual(@as(usize, 0), p.kv.planner.lives.items.len);
++}
++
++test "a full plan carrying ops is refused before rank 0's planner changes" {
++    const gpa = testing.allocator;
++    var dev: FakeDev = .{ .gpa = gpa };
++    defer dev.deinit();
++    var fl: FakeLanes = .{ .gpa = gpa };
++    defer fl.deinit();
++    var kv = try Kv.init(gpa, sharded, .{ .twins = false }, dev.dev(), fl.hooks());
++    defer kv.deinit();
++    try kv.start();
++    _ = try kv.admit(1, 1, 0, 30 * C, null, false);
++    _ = try kv.admit(2, 2, 1, 30 * C, null, false);
++    const before = kv.planner.digest();
++    // (a real planner never emits one: the guard is for a mutant or a future change)
++    var plan = try kv.planner.planAdmit(gpa, .{ .stream = 9, .slot = 2, .size = 20 * C, .source = null, .patient = false });
++    defer plan.deinit(gpa);
++    try testing.expectEqual(parts.Status.full, plan.status);
++    try plan.ops.append(gpa, .{ .stale = .{ .kept = 1, .gen = 1 } });
++    try testing.expectError(error.BadPlan, kv.applyFull(&plan));
++    try testing.expectEqualSlices(u8, &before, &kv.planner.digest());
++    try testing.expectError(error.ContextFull, kv.admit(3, 3, 2, 20 * C, null, false)); // (the honest plan: no ops)
++}
++
++test "the follower's planner config takes the switches as rank 0's does" {
++    const gpa = testing.allocator;
++    var dev: FakeDev = .{ .gpa = gpa };
++    defer dev.deinit();
++    const f = try Follower.init(gpa, 1, sharded, .{ .carry = false, .twins = false }, dev.dev());
++    defer f.deinit();
++    try testing.expect(!f.cfg.carry and !f.cfg.twins);
++}
++
++/// A follower on its own thread over a loopback link: every frame through Follower.onFrame until an empty one.
++const LoopPeer = struct {
++    port: u16,
++    cfg: parts.Config,
++    settings: Settings, // (rank 0's: the hello's features must agree)
++    dev: FakeDev,
++    fol: ?*Follower = null,
++    err: ?anyerror = null,
++
++    fn run(p: *LoopPeer) void {
++        p.loop() catch |e| {
++            p.err = e;
++        };
++    }
++
++    fn loop(p: *LoopPeer) !void {
++        var l = try link.Link.connect(testing.io, .{ 127, 0, 0, 1 }, p.port, 10);
++        defer l.close();
++        p.fol = try Follower.init(testing.allocator, 1, p.cfg, p.settings, p.dev.dev());
++        const buf = try testing.allocator.alloc(u8, rank_wire.max_frame);
++        defer testing.allocator.free(buf);
++        while (true) {
++            const bytes = try l.recv(buf);
++            if (bytes.len == 0) return;
++            try p.fol.?.onFrame(l, bytes);
++        }
++    }
++};
++
++const LoopOut = struct {
++    l: link.Link,
++    fn rw(ctx: *anyopaque, sub: []const u8) anyerror!void {
++        const o: *LoopOut = @ptrCast(@alignCast(ctx));
++        try o.l.send(sub);
++    }
++};
++
++test "over a loopback link: hello, layouts, parts and checks; each transfer asks the follower's side (shard_xfer) before finishing; a failed local copy finishes failed" {
++    const gpa = testing.allocator;
++    var b: [2]u8 = undefined;
++    testing.io.random(&b);
++    const port = 30000 + std.mem.readInt(u16, &b, .little) % 20000;
++    const peer = try gpa.create(LoopPeer);
++    defer gpa.destroy(peer);
++    const settings: Settings = .{ .twins = false, .check_rounds = 2 };
++    peer.* = .{ .port = port, .cfg = sharded, .settings = settings, .dev = .{ .gpa = gpa } };
++    defer peer.dev.deinit();
++    defer if (peer.fol) |f| f.deinit();
++    const th = try std.Thread.spawn(.{}, LoopPeer.run, .{peer});
++    var l = try link.Link.listen(.{ 127, 0, 0, 1 }, port);
++    defer l.close();
++    var out: LoopOut = .{ .l = l };
++    var dev0: FakeDev = .{ .gpa = gpa };
++    defer dev0.deinit();
++    var lanes0: FakeLanes = .{ .gpa = gpa };
++    defer lanes0.deinit();
++    var kv = try Kv.init(gpa, sharded, settings, dev0.dev(), lanes0.hooks());
++    defer kv.deinit();
++    const links = [_]?link.Link{l};
++    try kv.lead(.{ .ctx = &out, .rw = LoopOut.rw }, &links, null, 77, shardExchange(0, 2, sharded, settings));
++    try kv.start(); // hello/agreed, shard_layout, shard_set, shard_check
++    try testing.expectEqual(@as(u64, 1), kv.counts.checks);
++    // a conversation kept in part 0, a resume while its stream still runs: copied in its part, both sides asked
++    const a = try kv.admit(1, 1, 0, 10 * C, null, false);
++    try kv.keep(500, a.id, 8 * C);
++    const c1 = try kv.admit(2, 2, 1, 10 * C, 500, false);
++    try testing.expect(c1.resumed);
++    // the follower's side of this copy within part 0 fails (no peer half waits on it): its reply says so, both
++    // ranks finish failed (the prompt from 0), the pair goes on (across parts the pair would end: next tests)
++    peer.dev.fail_next = true;
++    const c2 = try kv.admit(3, 3, 2, 10 * C, 500, false);
++    try testing.expect(!c2.resumed);
++    try testing.expectEqual(@as(u64, 1), kv.planner.counters.failed);
++    try kv.decodeStart(c2.id);
++    try kv.round(&.{.{ .id = c2.id, .valid = 1 }});
++    try kv.round(&.{.{ .id = c2.id, .valid = 2 }}); // (the periodic check: equal)
++    try testing.expectEqual(@as(u64, 2), kv.counts.checks);
++    for ([_]u64{ a.id, c1.id, c2.id }) |id| try kv.release(id);
++    try kv.check();
++    try l.send(&.{}); // done
++    th.join();
++    try testing.expectEqual(@as(?anyerror, null), peer.err);
++    const fol = peer.fol.?;
++    try testing.expectEqualSlices(u8, &kv.planner.digest(), &fol.planner.?.digest());
++    try testing.expectEqual(@as(usize, 2), dev0.copies.items.len);
++    try testing.expectEqual(@as(usize, 1), peer.dev.copies.items.len); // (its second side failed)
++    try testing.expectEqual(@as(usize, 0), fol.failed.items.len);
++}
++
++test "over a loopback link: a follower started with other shard switches is refused at hello, naming the field" {
++    const gpa = testing.allocator;
++    var b: [2]u8 = undefined;
++    testing.io.random(&b);
++    const port = 30000 + std.mem.readInt(u16, &b, .little) % 20000;
++    const peer = try gpa.create(LoopPeer);
++    defer gpa.destroy(peer);
++    peer.* = .{ .port = port, .cfg = sharded, .settings = .{ .twins = false }, .dev = .{ .gpa = gpa } };
++    defer peer.dev.deinit();
++    defer if (peer.fol) |f| f.deinit();
++    const th = try std.Thread.spawn(.{}, LoopPeer.run, .{peer});
++    var l = try link.Link.listen(.{ 127, 0, 0, 1 }, port);
++    defer l.close();
++    var out: LoopOut = .{ .l = l };
++    var dev0: FakeDev = .{ .gpa = gpa };
++    defer dev0.deinit();
++    var lanes0: FakeLanes = .{ .gpa = gpa };
++    defer lanes0.deinit();
++    var kv = try Kv.init(gpa, sharded, .{}, dev0.dev(), lanes0.hooks());
++    defer kv.deinit();
++    const links = [_]?link.Link{l};
++    try kv.lead(.{ .ctx = &out, .rw = LoopOut.rw }, &links, null, 78, shardExchange(0, 2, sharded, .{}));
++    try testing.expectError(error.FingerprintMismatch, kv.start());
++    try testing.expectEqual(@as(u16, @intFromEnum(fingerprint.Field.features)), kv.leader.?.broken.?.field);
++    th.join();
++    try testing.expectEqual(@as(?anyerror, error.FingerprintMismatch), peer.err);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c22f42ad08 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -22,6 +22,9 @@ const sampling = @import("sampling.zig");
+ const link = @import("link.zig");
+ const cuda = @import("cuda");
+ const spill_tier = @import("spill_tier.zig");
++const parts = @import("parts.zig");
++const kv_lanes = @import("kv_lanes.zig");
++const shard = @import("shard.zig");
+ 
+ const be = lanes.backend;
+ const Model = model.Model;
+@@ -32,6 +35,11 @@ const max_rows = round.max_rows;
+ pub const SpillTier = spill_tier.Leader(Model.SpillDev);
+ pub const SpillFollower = spill_tier.Follower(Model.SpillDev);
+ 
++comptime {
++    // parts.zig keeps lanes' block and growth slack (it is self-contained so `zig test` runs it alone)
++    std.debug.assert(parts.chunk_rows == model.chunk_rows and parts.growth_rows == growth_rows);
++}
++
+ /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
+ pub const window_rows = 6;
+ 
+@@ -42,8 +50,10 @@ pub const image_piece = 32 << 10;
+ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-/// With the spill tier on (only then): rank_wire's frames (spill_tier: restores' agreement, guards) and the spill notes
+-/// (rank 0's write-at-keep and metadata).
++/// With the spill tier on: rank_wire's frames (spill_tier: restores' agreement, guards) and the spill notes (rank 0's
++/// write-at-keep and metadata). TF_DS_KV_SHARD adds rank_wire too (rank_wire.zig's frames: the parts' agreement, each
++/// plan's ops, each transfer's shard_xfer/shard_finish, the digest checks). The two are never on together
++/// (SpillWithKvShard), so one rank_wire Leader/Follower a rank serves either.
+ pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, spill = 11 };
+ 
+ comptime {
+@@ -78,6 +88,38 @@ pub const Wire = struct {
+     }
+ };
+ 
++/// A verify frame's window: slot, extent, first position, absorb, ids; TF_DS_KV_SHARD (`sharded`) adds its extent's
++/// part (u8) and generation (u64), so a follower refuses a round for a reused extent. Off, the bytes are as ever.
++pub fn writeWin(w: *Wire, gpa: std.mem.Allocator, win: Win, sharded: bool) !void {
++    try w.int(gpa, u32, @intCast(win.slot));
++    try w.int(gpa, u64, win.base);
++    try w.int(gpa, u64, win.end);
++    try w.int(gpa, u64, win.start);
++    try w.int(gpa, u8, @intFromBool(win.absorb));
++    try w.ids(gpa, win.ids);
++    if (sharded) {
++        if (win.part < 0 or win.part >= parts.max_parts) return error.BadPart;
++        try w.int(gpa, u8, @intCast(win.part));
++        try w.int(gpa, u64, win.gen);
++    }
++}
++
++/// writeWin's window read back, its ids into `ids` (the window's slice points there).
++pub fn readWin(r: *Reader, gpa: std.mem.Allocator, ids: *std.ArrayList(i32), sharded: bool) !Win {
++    const slot: usize = try r.int(u32);
++    const base: usize = @intCast(try r.int(u64));
++    const end: usize = @intCast(try r.int(u64));
++    const start: usize = @intCast(try r.int(u64));
++    const absorb = try r.int(u8) != 0;
++    try r.ids(gpa, ids);
++    var win: Win = .{ .slot = slot, .base = base, .end = end, .start = start, .absorb = absorb, .ids = ids.items };
++    if (sharded) {
++        win.part = try r.int(u8);
++        win.gen = try r.int(u64);
++    }
++    return win;
++}
++
+ /// A frame being read.
+ pub const Reader = struct {
+     b: []const u8,
+@@ -108,8 +150,9 @@ pub const Reader = struct {
+ 
+ /// A window of a round as both ranks build it: its stream's slot and extent, its first position, whether its rows'
+ /// taps go into the drafter, its rows' ids; TF_DS_KV_SHARD: its extent's part (the rank holding its compressed rows;
+-/// -1: its base's, which round.Rows.ownerOf derives and checks).
+-pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32, part: i64 = -1 };
++/// -1: its base's, which round.Rows.ownerOf derives and checks) and its extent's generation (parts.zig: a follower
++/// refuses a round naming a reused extent).
++pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32, part: i64 = -1, gen: u64 = 0 };
+ 
+ /// The rows of a round (round.Rows' slices point here).
+ pub const Built = struct {
+@@ -276,11 +319,16 @@ pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
+     return out.items;
+ }
+ 
+-/// A stream's place in the pool and the drafts it holds.
++/// A stream's place in the pool and the drafts it holds; TF_DS_KV_SHARD: its planner stream, part and generation
++/// (parts.zig's Live), and whether its first decode round ran (planDecode).
+ const Lane = struct {
+     slot: usize,
+     base: usize,
+     end: usize,
++    id: u64 = 0,
++    part: u8 = 0,
++    gen: u64 = 0,
++    decoding: bool = false,
+     first: u64 = 0, // the prompt's draw (a handle)
+     held: [draft.max_block]u32 = undefined,
+     confs: [draft.max_block]f32 = undefined,
+@@ -304,6 +352,7 @@ pub const Snap = struct {
+     slot: u32 = 0, // the slot it was kept from (the spill tier's keep note: a follower reads the prompt's ids there)
+     loading: bool = false, // a restore's destination: its rows held back, not usable until every rank installed it
+     restored: bool = false, // read back from the spill tier
++    part: u8 = 0, // TF_DS_KV_SHARD: the part holding its rows (parts.zig's Kept; a live move changes it)
+ };
+ 
+ /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
+@@ -340,6 +389,7 @@ pub const Lanes = struct {
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+     next_snap: u64 = 1,
+     spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
++    kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
+         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+@@ -352,6 +402,7 @@ pub const Lanes = struct {
+ 
+     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
+     pub fn deinit(self: *Lanes) void {
++        self.stopKv();
+         for (self.snaps.items) |sn| {
+             sn.buf.free();
+             self.gpa.destroy(sn);
+@@ -435,6 +486,136 @@ pub const Lanes = struct {
+         if (try self.begin(kind)) try self.flush();
+     }
+ 
++    // -- TF_DS_KV_SHARD: kv_lanes.zig drives parts.zig's planner (docs/port/shard-lanes.md) ------------------------
++
++    /// TF_DS_KV_SHARD: the parts' planner made and agreed with the followers (hello, shard_layout, shard_set, the
++    /// first digest check), once, at open with the Lanes at their final address (the hooks point here): a follower
++    /// started with other switches or another pool fails the start, never a request. Nothing with the switch off.
++    pub fn startKv(self: *Lanes) !void {
++        const m = self.m;
++        if (m.kvs == null or self.kv != null) return;
++        const settings = try kv_lanes.Settings.fromEnv(getenv);
++        const k = try self.gpa.create(kv_lanes.Kv);
++        errdefer self.gpa.destroy(k);
++        k.* = try kv_lanes.Kv.init(self.gpa, kvConfig(m), settings, modelDev(m), .{ .ctx = self, .stale = kvStale, .moved = kvMoved });
++        errdefer k.deinit();
++        // the shard's own leader agrees on the shard's fields (the spill tier is refused with TF_DS_KV_SHARD:
++        // SpillWithKvShard). PORT(round3): with both on, pass the spill side's Leader (its full fingerprint,
++        // rank_identity.zig) here so the followers hear one hello and one Tracker sees every frame
++        if (self.peer != null) try k.lead(.{ .ctx = self, .rw = kvSendRw }, m.followers(), null, m.now() | 1, kv_lanes.shardExchange(0, m.world, k.planner.cfg, settings));
++        try k.start();
++        self.kv = k;
++    }
++
++    /// startKv undone (an open that fails after it).
++    pub fn stopKv(self: *Lanes) void {
++        const k = self.kv orelse return;
++        k.deinit();
++        self.gpa.destroy(k);
++        self.kv = null;
++    }
++
++    fn kvSendRw(ctx: *anyopaque, sub: []const u8) anyerror!void {
++        const self = of(ctx);
++        if (try self.begin(.rank_wire)) {
++            try self.wire.buf.appendSlice(self.gpa, sub);
++            try self.flush();
++        }
++    }
++
++    /// A kept state the planner gave up (a stale op): its Snap too.
++    fn kvStale(ctx: *anyopaque, kept: u64) void {
++        const self = of(ctx);
++        for (self.snaps.items) |sn| if (sn.id == kept) {
++            if (!sn.stale) noteStale(sn, "a placement needed its room (its part's oldest first)");
++            sn.stale = true;
++        };
++    }
++
++    /// A live stream moved with its kept states: every Snap's and Lane's rows from the planner again (copyExtent,
++    /// usable and the spill tier read them).
++    fn kvMoved(ctx: *anyopaque, _: u64) void {
++        of(ctx).kvSync();
++    }
++
++    fn kvSync(self: *Lanes) void {
++        const p = &(self.kv orelse return).planner;
++        for (self.snaps.items) |sn| if (p.keptAt(sn.id)) |k| {
++            sn.base = k.base;
++            sn.end = k.end;
++            sn.part = k.part;
++        };
++        var it = self.streams.valueIterator();
++        while (it.next()) |l| if (p.liveIndex(l.id)) |i| {
++            const x = p.lives.items[i];
++            l.base = x.base;
++            l.end = x.base + x.size;
++            l.part = x.part;
++            l.gen = x.gen;
++        };
++    }
++
++    const PlacedParts = struct { id: u64, part: u8, gen: u64, base: usize, kept: ?*Snap, moved: bool };
++
++    /// prefillFn's placement with the switch on (kv_lanes.Kv.admit: plan, apply, send, act on the ops in order, the
++    /// transfers finished with rank 0's ok): the extent in one part, and the kept state it resumes from when the plan
++    /// resumed it (in place, or copied or carried there and finished ok).
++    fn placeParts(self: *Lanes, k: *kv_lanes.Kv, s: *lanes.Stream, size: usize, slot: usize, len: usize) !PlacedParts {
++        var src: ?*Snap = null;
++        if (s.reuse.saved) |p| {
++            const sn: *Snap = @ptrCast(@alignCast(p));
++            if (self.usable(sn, len)) src = sn else s.reuse_failed = true;
++        }
++        // (lanes owns the clock: patient only when a live stream holds the state, as placeKept asks)
++        const waits = if (src) |sn| k.planner.held(sn.id) and self.patient(sn) else false;
++        const a = try k.admit(@intFromPtr(s), std.hash.Wyhash.hash(0, s.id), @intCast(slot), size, if (src) |sn| sn.id else null, waits);
++        if (src) |sn| {
++            sn.wanted = 0;
++            if (!a.resumed) {
++                if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} was not resumed ({s}); the prompt runs from 0", .{ sn.at, sn.base, if (a.dropped) "no room in its part" else "its transfer failed" });
++                s.reuse_failed = true;
++            }
++        }
++        const kept = if (a.resumed) src else null;
++        return .{ .id = a.id, .part = a.part, .gen = a.gen, .base = a.base, .kept = kept, .moved = if (kept) |sn| a.base != sn.base else false };
++    }
++
++    /// verifyFn's planner side: a stream's first round gives its twins back (planDecode), then the planner's clock and
++    /// every window's rows with content once this round ran (its cache length plus the round's rows, which it
++    /// writes at [cache_len, cache_len + rows): an upper bound, rejected drafts' rows included, so a live move before
++    /// the next round copies every row this one wrote), and the periodic digest check.
++    fn kvRound(self: *Lanes, k: *kv_lanes.Kv, windows: []const be.Window) !void {
++        var vs: [max_streams]kv_lanes.Kv.Valid = undefined;
++        for (windows, 0..) |w, i| {
++            const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
++            if (!l.decoding) {
++                try k.decodeStart(l.id);
++                l.decoding = true;
++            }
++            vs[i] = .{ .id = l.id, .valid = @as(usize, @intCast(w.stream.cache_len)) + w.rows() };
++        }
++        try k.round(vs[0..windows.len]);
++    }
++
++    /// The parts' stats for /health and /metrics (native.Loaded.kv_parts: the host reads them on its engine thread).
++    pub fn kvPartsFn(ptr: *anyopaque, out: *lanes.kv_parts.Stats) void {
++        const self = of(ptr);
++        const k = self.kv orelse return;
++        k.stats(out);
++        if (self.m.kvs) |x| {
++            const st = x.stats;
++            out.prompt_fetches = st.prompt_fetches;
++            out.prompt_rows = st.prompt_rows;
++            out.prompt_picks = st.prompt_picks;
++            out.prompt_bytes = st.prompt_bytes;
++            out.prompt_syncs = st.prompt_syncs;
++            out.fetch_rounds = st.fetch_rounds;
++            out.owner_rounds = st.owner_rounds;
++            out.copies = st.carries;
++            out.copy_bytes = st.carry_bytes;
++        }
++    }
++
+     // -- the vtable ---------------------------------------------------------------------------------------------
+ 
+     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
+@@ -453,10 +634,14 @@ pub const Lanes = struct {
+         if (len == 0) return error.EmptyPrompt;
+         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
+         if (size > m.request_cap) return error.PromptTooLong; // (the pool's, unless TF_DS_POOL or TF_DS_KV_SHARD part it)
+-        // PORT(round2): TF_DS_KV_SHARD places an extent inside one part (parts.zig's planner: part-local placeSoft and
+-        // eviction, borrowed twins, carries) and sets Win.part; until then an extent across the parts' boundary is
+-        // refused where it is used (prompt.kvSourceUpdate, round.Rows.ownerOf: CrossesPart), never written past.
+-        if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
++        // TF_DS_KV_SHARD: parts.zig's planner places the extent inside one part (placeParts: part-local placeSoft and
++        // eviction, borrowed twins, carries, live moves) and the lane carries its part into every round (Win.part)
++        const kv = self.kv;
++        if (kv == null and m.kvs != null) return error.KvShardNotStarted; // (startKv at open)
++        if (self.streams.fetchRemove(s)) |old| {
++            self.used[old.value.slot] = false;
++            if (kv) |k| try k.release(old.value.id);
++        }
+         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
+         if (self.spill) |t| t.bumpSlot(slot);
+         var taken: [max_streams][2]usize = undefined;
+@@ -469,9 +654,11 @@ pub const Lanes = struct {
+         // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent, or in one of its own
+         // with the kept rows copied there when a live stream holds that extent (a burst's second request on a prompt)
+         s.cached = 0;
+-        var kept: ?*Snap = null;
+-        var moved = false;
+-        if (s.reuse.saved) |p| {
++        const parted: ?PlacedParts = if (kv) |k| try self.placeParts(k, s, size, slot, len) else null;
++        errdefer if (parted) |pp| kv.?.release(pp.id) catch |err| std.log.err("dsv41: a failed prompt pass kept its part's extent: {s}", .{@errorName(err)});
++        var kept: ?*Snap = if (parted) |pp| pp.kept else null;
++        var moved = if (parted) |pp| pp.moved else false;
++        if (parted == null) if (s.reuse.saved) |p| {
+             const sn: *Snap = @ptrCast(@alignCast(p));
+             // (a prompt with images resumes a kept state too: the cache keys the image positions by the picture's content, so the
+             // state's rows are this prompt's own; the pictures before the cut need no rows again, below)
+@@ -482,8 +669,8 @@ pub const Lanes = struct {
+                 // the Python lane's _place resumes "here" only in a free extent)
+                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn);
+             } else s.reuse_failed = true;
+-        }
+-        const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
++        };
++        const base = if (parted) |pp| pp.base else if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
+         if (kept) |sn| {
+             sn.wanted = 0;
+             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
+@@ -494,8 +681,8 @@ pub const Lanes = struct {
+             s.reuse_failed = true;
+         };
+         // the rows this stream writes are no other kept state's
+-        self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
+-        try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
++        if (parted == null) self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
++        try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size, .id = if (parted) |pp| pp.id else 0, .part = if (parted) |pp| pp.part else 0, .gen = if (parted) |pp| pp.gen else 0 });
+         self.used[slot] = true;
+         errdefer {
+             _ = self.streams.remove(s);
+@@ -543,6 +730,9 @@ pub const Lanes = struct {
+             try self.flush();
+         }
+         try m.fillBegin(slot, base);
++        // (its twins' view, bound as the follower binds it at fill_begin; it stays the fill on both ranks past the last
++        // chunk, until the next fill or its release: the first decode round's untwin unbinds on both)
++        if (parted) |pp| try kv.?.fillBegin(pp.id, base);
+         if (spans.items.len > 0) {
+             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
+             // the ids of a full pool)
+@@ -569,12 +759,12 @@ pub const Lanes = struct {
+             if (try self.begin(.snap_restore)) {
+                 try self.wire.int(gpa, u64, sn.id);
+                 try self.wire.int(gpa, u32, @intCast(slot));
+-                try self.wire.int(gpa, u64, sn.base);
++                try self.wire.int(gpa, u64, if (parted != null) base else sn.base); // (TF_DS_KV_SHARD: the plan's transfer ran)
+                 try self.wire.int(gpa, u64, base);
+                 try self.wire.int(gpa, u64, sn.at);
+                 try self.flush();
+             }
+-            if (base != sn.base) {
++            if (base != sn.base and parted == null) {
+                 if (self.spill) |t| t.bump(base, base + sn.at);
+                 try m.copyExtent(sn.base, base, sn.at);
+             }
+@@ -601,7 +791,12 @@ pub const Lanes = struct {
+                 try self.flush();
+             }
+             if (self.spill) |t| t.bump(base + start, base + start + n);
+-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
++            head = blk: {
++                // TF_DS_KV_SHARD: the stream's twins pinned while its chunk runs (parts.zig setPartial), not between
++                if (parted) |pp| kv.?.planner.setPartial(pp.id, true);
++                defer if (parted) |pp| kv.?.planner.setPartial(pp.id, false);
++                break :blk try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
++            };
+             start += n;
+             if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+             // prefill interleave: the other streams' rounds between this pass's chunks (verify frames go to rank 1 in
+@@ -652,30 +847,11 @@ pub const Lanes = struct {
+         if (windows.len > max_streams) return error.WindowTooWide;
+         var ids: [max_streams][max_rows]i32 = undefined;
+         var wins: [max_streams]Win = undefined;
+-        for (windows, 0..) |w, k| {
+-            if (w.parents != null) return error.TreesNotBuilt;
+-            const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
+-            const rows = w.rows();
+-            if (rows > window_rows) return error.WindowTooWide;
+-            const start: usize = @intCast(w.stream.cache_len);
+-            for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
+-            if (w.held > l.nheld) return error.HeldMismatch;
+-            ids[k][0] = @intCast(w.pending);
+-            for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
+-            for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
+-            wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows] };
+-        }
++        try self.roundWins(windows, &ids, &wins);
+         const t0 = m.now();
+         if (try self.begin(.verify)) {
+             try self.wire.int(gpa, u32, @intCast(windows.len));
+-            for (wins[0..windows.len]) |w| {
+-                try self.wire.int(gpa, u32, @intCast(w.slot));
+-                try self.wire.int(gpa, u64, w.base);
+-                try self.wire.int(gpa, u64, w.end);
+-                try self.wire.int(gpa, u64, w.start);
+-                try self.wire.int(gpa, u8, @intFromBool(w.absorb));
+-                try self.wire.ids(gpa, w.ids);
+-            }
++            for (wins[0..windows.len]) |w| try writeWin(&self.wire, gpa, w, self.kv != null);
+             try self.flush();
+         }
+         const t1 = m.now();
+@@ -714,6 +890,25 @@ pub const Lanes = struct {
+         }
+     }
+ 
++    /// verifyFn's windows as both ranks build them (each stream's Lane: slot, extent, part, generation; its pending
++    /// row, held drafts and host drafts), then the planner's round (kvRound: its frames go out before the verify's).
++    fn roundWins(self: *Lanes, windows: []const be.Window, ids: *[max_streams][max_rows]i32, wins: *[max_streams]Win) !void {
++        for (windows, 0..) |w, k| {
++            if (w.parents != null) return error.TreesNotBuilt;
++            const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
++            const rows = w.rows();
++            if (rows > window_rows) return error.WindowTooWide;
++            const start: usize = @intCast(w.stream.cache_len);
++            for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
++            if (w.held > l.nheld) return error.HeldMismatch;
++            ids[k][0] = @intCast(w.pending);
++            for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
++            for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
++            wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = self.m.drafting() and w.stream.drafts, .ids = ids[k][0..rows], .part = if (self.kv != null) l.part else -1, .gen = l.gen };
++        }
++        if (self.kv) |kvp| try self.kvRound(kvp, windows);
++    }
++
+     /// The caches are positional: the next window starts at the stream's new length and writes over the rows past it.
+     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+         _ = ptr;
+@@ -800,6 +995,7 @@ pub const Lanes = struct {
+     /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
+     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
+         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
++        if (self.kv) |k| if (k.planner.keptIndex(sn.id) == null) return false; // (TF_DS_KV_SHARD: its rows the planner holds)
+         return !sn.stale and !sn.loading and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+     }
+ 
+@@ -886,7 +1082,7 @@ pub const Lanes = struct {
+         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+         const sn = try self.gpa.create(Snap);
+         errdefer self.gpa.destroy(sn);
+-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot) };
++        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .part = l.part, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()), .slot = @intCast(l.slot) };
+         errdefer sn.buf.free();
+         try self.snaps.append(self.gpa, sn);
+         self.next_snap += 1;
+@@ -896,6 +1092,11 @@ pub const Lanes = struct {
+             try self.flush();
+         }
+         try self.m.snapCopy(l.slot, sn.buf.ptr, true);
++        // TF_DS_KV_SHARD: the planner keeps it too (its rows held in its part); a refused keep leaves the state unusable
++        // (usable asks the planner), never one whose rows a placement may take
++        if (self.kv) |k| k.keep(sn.id, l.id, at) catch |err| std.log.err("dsv41: the parts' planner did not keep a prompt state: {s}", .{@errorName(err)});
++        // PORT(round3): the spill tier's writes of this point mark it pending (planner.setPending) and salt its block
++        // lineage with its part (planner.saltOf, parts.Root.inPart); spill with TF_DS_KV_SHARD is refused until then
+         return sn;
+     }
+ 
+@@ -913,6 +1114,8 @@ pub const Lanes = struct {
+             self.wire.int(self.gpa, u64, sn.id) catch {};
+             self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
+         }
++        // TF_DS_KV_SHARD: the planner's record goes too (deferred while a copy or carry still reads its rows)
++        if (self.kv) |k| k.drop(sn.id) catch |err| std.log.err("dsv41: the parts' planner kept a dropped prompt state: {s}", .{@errorName(err)});
+         sn.buf.free();
+         self.gpa.destroy(sn);
+     }
+@@ -998,8 +1201,12 @@ pub const Lanes = struct {
+ 
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+         const self = of(ptr);
+-        const kv = self.streams.fetchRemove(s) orelse return;
++        const kv = self.streams.fetchRemove(s) orelse {
++            if (self.kv) |k| k.forgetKey(@intFromPtr(s)); // (a request that never placed: its refusal record goes)
++            return;
++        };
+         self.used[kv.value.slot] = false;
++        if (self.kv) |k| k.release(kv.value.id) catch |err| std.log.err("dsv41: the parts' planner kept a released stream: {s}", .{@errorName(err)});
+     }
+ };
+ 
+@@ -1012,6 +1219,66 @@ pub fn survivals(conf: []const f32, out: []f64) void {
+     }
+ }
+ 
++fn getenv(name: [:0]const u8) ?[]const u8 {
++    return std.mem.span(std.c.getenv(name) orelse return null);
++}
++
++/// The parts' planner for this model: its agreed pool in one part a rank, and the owner-only bytes a carried token
++/// costs (carryBytes over the model's kv sources).
++pub fn kvConfig(m: *const Model) parts.Config {
++    var buf: [16]shard.Source = undefined;
++    return .{ .cap = m.pool_cap, .parts = @intCast(m.world), .carry_bytes = carryBytes(m.kvSources(&buf)) };
++}
++
++/// The bytes a carried token costs, rounded up: every source's compressed codes and scales at its ratio (the owner's
++/// rows, shard.planeBytes over a whole number of every ratio's blocks, so no ratio's share truncates; the index
++/// keys copy on every rank and are not sent). (3/2 + 1) x 288 = 720 at this checkpoint.
++pub fn carryBytes(sources: []const shard.Source) usize {
++    var owner: [16]shard.Source = undefined; // (Model.kvSources' bound)
++    std.debug.assert(sources.len <= owner.len);
++    var tokens: usize = 1;
++    for (sources, owner[0..sources.len]) |s, *o| {
++        o.* = .{ .ratio = s.ratio, .comp_row = s.comp_row, .idx_row = 0 };
++        tokens = tokens / std.math.gcd(tokens, s.ratio) * s.ratio;
++    }
++    const bytes = shard.planeBytes(owner[0..sources.len], tokens, 1, false);
++    return (bytes + tokens - 1) / tokens;
++}
++
++/// The device side of the planner's ops on this rank (Model.copyExtent, Model.bindTwin).
++fn modelDev(m: *Model) kv_lanes.Dev {
++    return .{ .ctx = m, .check = devCheck, .copy = devCopy, .twin = devTwin, .wait = devWait };
++}
++
++fn devCheck(ctx: *anyopaque, from: usize, to: usize, rows: usize) anyerror!void {
++    const m: *Model = @ptrCast(@alignCast(ctx));
++    try m.checkExtent(from, to, rows);
++}
++
++/// The transfers enqueued so far done within `timeout_ns`: an event after them polled (a stream synchronize would
++/// wait forever for an NCCL half whose peer never enqueued its own).
++fn devWait(ctx: *anyopaque, timeout_ns: u64) anyerror!void {
++    const m: *Model = @ptrCast(@alignCast(ctx));
++    var ev = try cuda.Event.init(m.ctx.d, false);
++    defer ev.deinit();
++    try ev.record(m.stream);
++    const deadline = m.now() +| timeout_ns;
++    while (!try ev.done()) {
++        if (m.now() > deadline) return error.TransferTimeout;
++        std.atomic.spinLoopHint();
++    }
++}
++
++fn devCopy(ctx: *anyopaque, from: usize, to: usize, rows: usize) anyerror!void {
++    const m: *Model = @ptrCast(@alignCast(ctx));
++    try m.copyExtent(from, to, rows);
++}
++
++fn devTwin(ctx: *anyopaque, base: usize, on: bool, local: ?usize) anyerror!void {
++    const m: *Model = @ptrCast(@alignCast(ctx));
++    try m.bindTwin(base, on, local);
++}
++
+ /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
+ /// request ends with the error), so the follower reports it and takes the next frame instead of ending.
+ fn refused(err: anyerror) void {
+@@ -1114,6 +1381,10 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
+         sd.quiesce();
+     };
+     var fill_base: usize = 0;
++    // TF_DS_KV_SHARD: this rank's copy of the parts' planner, fed rank 0's ops (never with the spill tier on:
++    // SpillWithKvShard, so the rank_wire frames go to one of the two)
++    const kvf: ?*kv_lanes.Follower = if (m.kvs != null) try kv_lanes.Follower.init(gpa, m.rank, kvConfig(m), try kv_lanes.Settings.fromEnv(getenv), modelDev(m)) else null;
++    defer if (kvf) |k| k.deinit();
+     while (true) {
+         // with spill writes or restores pending, they progress while rank 0 sends nothing (2 ms polls)
+         if (spill) |sd| while (sd.busy() and !try peer.readable(2 * std.time.ns_per_ms)) sd.service(std.time.ns_per_ms);
+@@ -1151,7 +1422,9 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
+                 try r.ids(gpa, &seqs[slot]);
+                 fill_base = @intCast(base);
+                 if (spill) |sd| sd.bumpSlot(slot);
+-                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
++                if (m.fillBegin(slot, @intCast(base))) {
++                    if (kvf) |k| try k.fillBegin(slot, @intCast(base)); // (its twins' view, as rank 0 binds it)
++                } else |err| refused(err);
+                 m.fill_seq = seqs[slot].items;
+             },
+             .fill_chunk => {
+@@ -1168,13 +1441,9 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
+                 if (nw == 0 or nw > max_streams) return error.BadFrame;
+                 var wins: [max_streams]Win = undefined;
+                 for (0..nw) |k| {
+-                    const s: usize = try r.int(u32);
+-                    const base: usize = @intCast(try r.int(u64));
+-                    const end: usize = @intCast(try r.int(u64));
+-                    const start: usize = @intCast(try r.int(u64));
+-                    const absorb = try r.int(u8) != 0;
+-                    try r.ids(gpa, &win_ids[k]);
+-                    wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
++                    wins[k] = try readWin(&r, gpa, &win_ids[k], kvf != null);
++                    // TF_DS_KV_SHARD: a round naming a reused extent (its part or generation not the planner's) fails closed
++                    if (kvf) |kf| try kf.checkWin(wins[k].slot, wins[k].base, wins[k].end, @intCast(wins[k].part), wins[k].gen);
+                 }
+                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
+                 if (spill) |sd| for (wins[0..nw]) |w| sd.bump(w.base + w.start, w.base + w.start + w.ids.len);
+@@ -1254,7 +1523,8 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
+                     b.free();
+                 }
+             },
+-            .rank_wire => try (spill orelse return error.SpillNotStarted).wireFrame(peer, r.rest()),
++            // one rank_wire Follower a rank: the spill tier's or the KV parts' (never both: SpillWithKvShard)
++            .rank_wire => if (spill) |sd| try sd.wireFrame(peer, r.rest()) else if (kvf) |k| try k.onFrame(peer, r.rest()) else return error.Unsupported,
+             .spill => try (spill orelse return error.SpillNotStarted).note(r.rest()),
+             .done => {
+                 if (spill) |sd| {
+@@ -1423,3 +1693,282 @@ test "a restore's destination holds the waiting prompt's room past its rows whil
+     try std.testing.expectEqual(@as(?usize, null), try ln.placeFree(&.{.{ 4 * c, 64 * c }}, 8 * c));
+     try std.testing.expect(!kept.stale);
+ }
++
++test "a verify window's frame bytes: as ever with the switch off, its part and generation added with it on" {
++    const gpa = std.testing.allocator;
++    const win: Win = .{ .slot = 2, .base = 4096, .end = 8192, .start = 7, .absorb = true, .ids = &.{ 5, 6 }, .part = 1, .gen = 9 };
++    var w: Wire = .{};
++    defer w.deinit(gpa);
++    try writeWin(&w, gpa, win, false);
++    // the layout before TF_DS_KV_SHARD: verifyFn's fields in their order
++    var old: Wire = .{};
++    defer old.deinit(gpa);
++    try old.int(gpa, u32, 2);
++    try old.int(gpa, u64, 4096);
++    try old.int(gpa, u64, 8192);
++    try old.int(gpa, u64, 7);
++    try old.int(gpa, u8, 1);
++    try old.ids(gpa, &.{ 5, 6 });
++    try std.testing.expectEqualSlices(u8, old.buf.items, w.buf.items);
++    var ids: std.ArrayList(i32) = .empty;
++    defer ids.deinit(gpa);
++    var r: Reader = .{ .b = w.buf.items };
++    const off = try readWin(&r, gpa, &ids, false);
++    try std.testing.expectEqual(@as(i64, -1), off.part);
++    try std.testing.expectEqual(@as(u64, 0), off.gen);
++    try std.testing.expectEqual(w.buf.items.len, r.at);
++    w.buf.clearRetainingCapacity();
++    try writeWin(&w, gpa, win, true);
++    try std.testing.expectEqual(old.buf.items.len + 9, w.buf.items.len);
++    r = .{ .b = w.buf.items };
++    const on = try readWin(&r, gpa, &ids, true);
++    try std.testing.expectEqual(@as(i64, 1), on.part);
++    try std.testing.expectEqual(@as(u64, 9), on.gen);
++    try std.testing.expectEqualSlices(i32, &.{ 5, 6 }, on.ids);
++    var bad = win;
++    bad.part = -1;
++    try std.testing.expectError(error.BadPart, writeWin(&w, gpa, bad, true));
++}
++
++/// The device side for the lanes tests: transfers and twin binds counted.
++const TestDev = struct {
++    copies: usize = 0,
++    binds: usize = 0,
++
++    fn dev(d: *TestDev) kv_lanes.Dev {
++        return .{ .ctx = d, .check = checkFn, .copy = copyFn, .twin = twinFn, .wait = waitFn };
++    }
++
++    fn checkFn(_: *anyopaque, _: usize, _: usize, _: usize) anyerror!void {}
++
++    fn waitFn(_: *anyopaque, _: u64) anyerror!void {}
++
++    fn copyFn(ctx: *anyopaque, _: usize, _: usize, _: usize) anyerror!void {
++        const d: *TestDev = @ptrCast(@alignCast(ctx));
++        d.copies += 1;
++    }
++
++    fn twinFn(ctx: *anyopaque, _: usize, _: bool, _: ?usize) anyerror!void {
++        const d: *TestDev = @ptrCast(@alignCast(ctx));
++        d.binds += 1;
++    }
++};
++
++/// A stream as placeParts and releaseFn read it.
++fn testStream(id: []const u8, saved: ?*Snap) lanes.Stream {
++    var s: lanes.Stream = undefined;
++    s.id = id;
++    s.reuse = .{ .saved = if (saved) |sn| @ptrCast(sn) else null };
++    s.reuse_failed = false;
++    return s;
++}
++
++fn testLanes(m: *Model) Lanes {
++    m.pool_cap = 64 * model.chunk_rows;
++    m.cfg.window = 0;
++    m.io = std.testing.io;
++    return .{ .gpa = std.testing.allocator, .m = m, .peer = null };
++}
++
++fn testPut(ln: *Lanes, s: *const lanes.Stream, slot: usize, size: usize, p: anytype) !void {
++    try ln.streams.put(ln.gpa, s, .{ .slot = slot, .base = p.base, .end = p.base + size, .id = p.id, .part = p.part, .gen = p.gen });
++    ln.used[slot] = true;
++}
++
++test "TF_DS_KV_SHARD lanes: part-local placement, a kept state resumed in place, the planner's stales reach the Snaps" {
++    const c = model.chunk_rows;
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    var ln = testLanes(&m);
++    defer ln.snaps.deinit(gpa);
++    defer ln.streams.deinit(gpa);
++    var dev: TestDev = .{};
++    var k = try kv_lanes.Kv.init(gpa, .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 }, .{ .twins = false }, dev.dev(), .{ .ctx = &ln, .stale = Lanes.kvStale, .moved = Lanes.kvMoved });
++    defer k.deinit();
++    ln.kv = &k;
++    // a conversation's first turn, kept at 8 blocks, then released
++    var sa = testStream("a", null);
++    const pa = try ln.placeParts(&k, &sa, 10 * c, 0, 10 * c);
++    try std.testing.expect(pa.kept == null and pa.base + 10 * c <= 32 * c);
++    try testPut(&ln, &sa, 0, 10 * c, pa);
++    var s1: Snap = .{ .id = 1, .at = 8 * c, .base = pa.base, .end = pa.base + 10 * c, .buf = undefined, .part = pa.part };
++    try ln.snaps.append(gpa, &s1);
++    try k.keep(1, pa.id, 8 * c);
++    Lanes.releaseFn(&ln, &sa);
++    try std.testing.expectEqual(@as(usize, 0), k.planner.lives.items.len);
++    // its next turn resumes it in place (the extent grows into its slack: the planner's kept end follows)
++    var sb = testStream("b", &s1);
++    const pb = try ln.placeParts(&k, &sb, 12 * c, 1, 9 * c);
++    try std.testing.expect(pb.kept == &s1 and !pb.moved and !sb.reuse_failed);
++    try std.testing.expectEqual(s1.base, pb.base);
++    try std.testing.expectEqual(pa.base + 12 * c, k.planner.keptAt(1).?.end);
++    try testPut(&ln, &sb, 1, 12 * c, pb);
++    try std.testing.expectEqual(@as(usize, 0), dev.copies); // (in place: no transfer)
++    // a long stream takes the other part; the conversation ends; a request that needs part 0 whole gives up the state
++    var sc = testStream("c", null);
++    const pc = try ln.placeParts(&k, &sc, 30 * c, 2, 30 * c);
++    try std.testing.expect(pc.part != pb.part);
++    try testPut(&ln, &sc, 2, 30 * c, pc);
++    Lanes.releaseFn(&ln, &sb);
++    var sd = testStream("d", null);
++    const pd = try ln.placeParts(&k, &sd, 30 * c, 1, 30 * c);
++    try std.testing.expectEqual(pb.part, pd.part);
++    try std.testing.expect(s1.stale); // (kvStale: the planner's stale op)
++    try std.testing.expect(!ln.usable(&s1, 9 * c));
++    // a waiting request is counted once and forgotten when the host gives it up
++    var se = testStream("e", null);
++    try std.testing.expectError(error.ContextFull, ln.placeParts(&k, &se, 20 * c, 0, 20 * c));
++    try std.testing.expectEqual(@as(usize, 1), k.waiting.items.len);
++    Lanes.releaseFn(&ln, &se);
++    try std.testing.expectEqual(@as(usize, 0), k.waiting.items.len);
++    try testPut(&ln, &sd, 1, 30 * c, pd);
++    Lanes.releaseFn(&ln, &sc);
++    Lanes.releaseFn(&ln, &sd);
++    try std.testing.expectEqual(@as(usize, 0), k.planner.lives.items.len);
++}
++
++test "TF_DS_KV_SHARD lanes: a live move rewrites the moved Lane and the Snaps inside it" {
++    const c = model.chunk_rows;
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    var ln = testLanes(&m);
++    defer ln.snaps.deinit(gpa);
++    defer ln.streams.deinit(gpa);
++    var dev: TestDev = .{};
++    var k = try kv_lanes.Kv.init(gpa, .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 }, .{ .twins = false }, dev.dev(), .{ .ctx = &ln, .stale = Lanes.kvStale, .moved = Lanes.kvMoved });
++    defer k.deinit();
++    ln.kv = &k;
++    var sx = testStream("x", null);
++    const px = try ln.placeParts(&k, &sx, 14 * c, 0, 14 * c);
++    try testPut(&ln, &sx, 0, 14 * c, px);
++    var sz = testStream("z", null);
++    const pz = try ln.placeParts(&k, &sz, 10 * c, 1, 10 * c);
++    try testPut(&ln, &sz, 1, 10 * c, pz);
++    try std.testing.expect(px.part != pz.part);
++    var s2: Snap = .{ .id = 2, .at = 2 * c, .base = px.base, .end = px.base + 14 * c, .buf = undefined, .part = px.part };
++    try ln.snaps.append(gpa, &s2);
++    try k.keep(2, px.id, 2 * c);
++    try k.decodeStart(px.id);
++    try k.decodeStart(pz.id);
++    try k.round(&.{ .{ .id = px.id, .valid = 2 * c }, .{ .id = pz.id, .valid = 3 * c } });
++    // a 24-block request fits neither part: x (two blocks used) moves, with its kept state
++    var sw = testStream("w", null);
++    const pw = try ln.placeParts(&k, &sw, 24 * c, 2, 24 * c);
++    const lx = ln.streams.get(&sx).?;
++    try std.testing.expectEqual(pz.part, lx.part);
++    try std.testing.expect(lx.base != px.base and lx.gen != px.gen);
++    try std.testing.expectEqual(lx.base + 14 * c, lx.end);
++    try std.testing.expectEqual(lx.base, s2.base);
++    try std.testing.expectEqual(lx.part, s2.part);
++    try std.testing.expectEqual(px.part, pw.part);
++    try std.testing.expectEqual(@as(usize, 1), dev.copies);
++    try testPut(&ln, &sw, 2, 24 * c, pw);
++    // the next round names the moved extent's generation (a follower checks it)
++    try std.testing.expectEqual(k.planner.lives.items[k.planner.liveIndex(lx.id).?].gen, lx.gen);
++}
++
++/// A window of the pending row and `n - 1` host drafts at the stream's cache length (verifyFn's input).
++fn testWindow(s: *lanes.Stream, positions: []u64, tokens: []const u32) be.Window {
++    for (positions, 0..) |*p, r| p.* = s.cache_len + 1 + r;
++    return .{ .stream = s, .pending = 1, .held = 0, .tokens = tokens, .parents = null, .positions = positions[0 .. 1 + tokens.len] };
++}
++
++test "TF_DS_KV_SHARD lanes: a round's windows reach the follower with part and generation; a move right after a round crossing a block copies its rows; the old generation is refused" {
++    const c = model.chunk_rows;
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    m.dr = null;
++    var ln = testLanes(&m);
++    defer ln.snaps.deinit(gpa);
++    defer ln.streams.deinit(gpa);
++    // rank 0's Kv with an in-process follower (kv_lanes.Pair), its hooks the lanes'
++    const pr = try kv_lanes.Pair.initWith(gpa, .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 }, .{ .twins = false }, .{ .ctx = &ln, .stale = Lanes.kvStale, .moved = Lanes.kvMoved });
++    defer pr.deinit();
++    ln.kv = &pr.kv;
++    var sx = testStream("x", null);
++    const px = try ln.placeParts(&pr.kv, &sx, 14 * c, 0, 14 * c);
++    try testPut(&ln, &sx, 0, 14 * c, px);
++    var sz = testStream("z", null);
++    const pz = try ln.placeParts(&pr.kv, &sz, 10 * c, 1, 10 * c);
++    try testPut(&ln, &sz, 1, 10 * c, pz);
++    // x's round starts 3 rows before its second block ends and writes 6 rows into its third
++    sx.cache_len = 2 * c - 3;
++    sx.drafts = false;
++    sz.cache_len = 3 * c;
++    sz.drafts = false;
++    var pos: [2][window_rows]u64 = undefined;
++    const drafts = [_]u32{ 2, 3, 4, 5, 6 };
++    const windows = [_]be.Window{ testWindow(&sx, &pos[0], &drafts), testWindow(&sz, &pos[1], drafts[0..1]) };
++    var ids: [max_streams][max_rows]i32 = undefined;
++    var wins: [max_streams]Win = undefined;
++    try ln.roundWins(&windows, &ids, &wins);
++    try std.testing.expectEqual(@as(usize, 2 * c + 3), pr.kv.planner.lives.items[pr.kv.planner.liveIndex(px.id).?].valid);
++    try std.testing.expectEqual(@as(usize, 3 * c + 2), pr.kv.planner.lives.items[pr.kv.planner.liveIndex(pz.id).?].valid);
++    try pr.same(); // (the first rounds' untwin plans reached the follower)
++    // the verify frame's windows as the follower reads and checks them
++    var w: Wire = .{};
++    defer w.deinit(gpa);
++    for (wins[0..2]) |x| try writeWin(&w, gpa, x, true);
++    var r: Reader = .{ .b = w.buf.items };
++    var got: std.ArrayList(i32) = .empty;
++    defer got.deinit(gpa);
++    var old_x: Win = undefined;
++    for (0..2) |k| {
++        const x = try readWin(&r, gpa, &got, true);
++        try pr.fol.checkWin(x.slot, x.base, x.end, @intCast(x.part), x.gen);
++        if (k == 0) old_x = x;
++    }
++    // a 24-block request fits neither part: x moves with every row the round wrote (whole blocks: 3, not 2)
++    var sw = testStream("w", null);
++    const pw = try ln.placeParts(&pr.kv, &sw, 24 * c, 2, 24 * c);
++    try testPut(&ln, &sw, 2, 24 * c, pw);
++    try std.testing.expectEqual(@as(usize, 1), pr.dev0.copies.items.len);
++    try std.testing.expectEqual(@as(usize, 3 * c), pr.dev0.copies.items[0][2]);
++    try std.testing.expectEqualSlices([3]usize, pr.dev0.copies.items, pr.dev1.copies.items);
++    try pr.same();
++    // the follower refuses a round naming x's old extent, and takes the next one at the new generation
++    try std.testing.expectError(error.StaleExtent, pr.fol.checkWin(old_x.slot, old_x.base, old_x.end, @intCast(old_x.part), old_x.gen));
++    sx.cache_len += 6;
++    const next = [_]be.Window{testWindow(&sx, &pos[0], drafts[0..1])};
++    try ln.roundWins(&next, &ids, &wins);
++    try std.testing.expect(wins[0].gen != old_x.gen and wins[0].base != old_x.base);
++    try pr.fol.checkWin(wins[0].slot, wins[0].base, wins[0].end, @intCast(wins[0].part), wins[0].gen);
++    for ([_]*lanes.Stream{ &sx, &sz, &sw }) |s| Lanes.releaseFn(&ln, s);
++    try pr.same();
++    try std.testing.expectEqual(@as(usize, 0), pr.fol.planner.?.lives.items.len);
++}
++
++test "TF_DS_KV_SHARD lanes: a prompt pass failing after its placement (prefillFn's errdefer) frees the extent on both ranks" {
++    const c = model.chunk_rows;
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    var ln = testLanes(&m);
++    defer ln.snaps.deinit(gpa);
++    defer ln.streams.deinit(gpa);
++    const pr = try kv_lanes.Pair.initWith(gpa, .{ .cap = 64 * c, .parts = 2, .carry_bytes = 720 }, .{}, .{ .ctx = &ln, .stale = Lanes.kvStale, .moved = Lanes.kvMoved });
++    defer pr.deinit();
++    ln.kv = &pr.kv;
++    var sa = testStream("a", null);
++    const pa = try ln.placeParts(&pr.kv, &sa, 30 * c, 0, 30 * c);
++    try pr.same();
++    try std.testing.expect(pr.fol.planner.?.liveIndex(pa.id) != null);
++    // (prefillFn's errdefer after placeParts: a fill chunk failed, the request cancelled)
++    try pr.kv.release(pa.id);
++    try pr.same();
++    try std.testing.expectEqual(@as(usize, 0), pr.fol.planner.?.lives.items.len);
++    // slot 0 and the whole part take the next request
++    var sb = testStream("b", null);
++    const pb = try ln.placeParts(&pr.kv, &sb, 30 * c, 0, 30 * c);
++    try testPut(&ln, &sb, 0, 30 * c, pb);
++    Lanes.releaseFn(&ln, &sb);
++    try pr.same();
++}
++
++test "TF_DS_KV_SHARD lanes: a carried token's bytes are the owners' rows over whole blocks of every ratio, rounded up" {
++    // this checkpoint's four kv sources (ratios 2, 2, 2, 1): (3/2 + 1) x 288 = 720, the index keys not sent
++    const row = shard.comp_row_bytes;
++    const idx = shard.idx_row_bytes;
++    try std.testing.expectEqual(@as(usize, 720), carryBytes(&.{ .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 2, .comp_row = row, .idx_row = idx }, .{ .ratio = 1, .comp_row = row, .idx_row = idx } }));
++    // ratios that do not divide the row: 72 + 2.25 a token rounds up to 75 (per-layer integer division said 74)
++    try std.testing.expectEqual(@as(usize, 75), carryBytes(&.{ .{ .ratio = 4, .comp_row = row, .idx_row = idx }, .{ .ratio = 128, .comp_row = row, .idx_row = 0 } }));
++}
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index de3a867f86f6e749c2bc142e98a10c701a1e3de5..2f1f4c1615e7c4954ce81444fc87333cc1b5ee7a 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -265,6 +265,7 @@ pub fn main(init: std.process.Init) !u8 {
+     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
+     var ln = dsv41.lanes.Lanes.init(gpa, m);
+     defer ln.deinit();
++    try ln.startKv(); // (TF_DS_KV_SHARD: the parts agreed with the followers before the first request)
+     ln.fix_k = fix_k;
+     // the spill tier and the prompt cache over it (the server's wiring: native/cuda.zig openWith)
+     var events: []cuda.Event = &.{};
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 54f9e300ae80706861e5ca0fe0c4c67f87a101ed..dc34d86743ed270d605a482931e39a9e0267a6a7 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -470,23 +470,30 @@ pub const Model = struct {
+     /// the single-conversation limit (below the window asked: said so, with the numbers), the compressed planes'
+     /// bytes a rank (calculated: rows by the formula; the arena's figure is the measured one).
+     fn notePlan(m: *const Model, mode: shard.Mode, pl: shard.Plan) void {
+-        var src: [16]shard.Source = undefined;
+-        var ns: usize = 0;
+-        const c = m.eng.c;
+-        for (m.w.layers) |lay| {
+-            if (lay.comp_wkv == null or ns == src.len) continue;
+-            src[ns] = .{ .ratio = lay.ratio, .comp_row = c.head_dim / 2 + c.head_dim / 16, .idx_row = if (lay.idx_wk != null) c.index_head_dim / 2 + c.index_head_dim / 32 else 0 };
+-            ns += 1;
+-        }
++        var buf: [16]shard.Source = undefined;
++        const src = m.kvSources(&buf);
+         const sharded = mode != .off;
+         const trash: usize = if (m.kvs) |k| k.sh.trash else 0;
+-        const planes = shard.poolBytes(src[0..ns], pl.pool, m.world, sharded, trash);
+-        const flat = shard.poolBytes(src[0..ns], pl.pool, m.world, false, 0);
++        const planes = shard.poolBytes(src, pl.pool, m.world, sharded, trash);
++        const flat = shard.poolBytes(src, pl.pool, m.world, false, 0);
+         std.log.info("dsv41: pool {d} positions, {s} {d} a part; a conversation may use up to {d} tokens{s}; compressed planes {d} MiB a rank ({d} MiB replicated); arena {d} MiB used", .{
+             pl.pool, @tagName(mode), pl.part, pl.window, if (pl.shrunk) " (less than the window asked: a part holds no more)" else "", planes >> 20, flat >> 20, m.arena.used >> 20,
+         });
+     }
+ 
++    /// Every kv-source layer's packed row bytes (shard.Source: the capacity arithmetic's and the carry cost's), the
++    /// first `buf.len` of them.
++    pub fn kvSources(m: *const Model, buf: *[16]shard.Source) []shard.Source {
++        var ns: usize = 0;
++        const c = m.eng.c;
++        for (m.w.layers) |lay| {
++            if (lay.comp_wkv == null or ns == buf.len) continue;
++            buf[ns] = .{ .ratio = lay.ratio, .comp_row = c.head_dim / 2 + c.head_dim / 16, .idx_row = if (lay.idx_wk != null) c.index_head_dim / 2 + c.index_head_dim / 32 else 0 };
++            ns += 1;
++        }
++        return buf[0..ns];
++    }
++
+     pub fn close(m: *Model) void {
+         m.joinAhead();
+         m.stream.synchronize() catch {};
+@@ -625,6 +632,8 @@ pub const Model = struct {
+     /// destination's owner receives them into its own, both ranks in this same order (lanes.zig runs copyExtent on
+     /// every rank in its frame order). The source's rows stay; nothing is freed.
+     pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
++        // PORT(round3): copyExtent may call checkExtent first so a refusal never follows a partial copy; kept as it
++        // was here so the switch-off path is unchanged (kv_lanes calls checkExtent before every transfer)
+         const c = m.eng.c;
+         const cs = &m.caches;
+         const mv: ?shard.Move = if (cs.shard) |sh| try sh.extentMove(from, to, at) else null;
+@@ -662,8 +671,8 @@ pub const Model = struct {
+                 try m.copySpan(cs.idx_scales[i], from / r, to / r, n, c.index_head_dim / 32);
+             }
+         }
+-        // PORT(round2): a carry (lanes' frame order, parts.zig's carry plan: only to avoid a recompute, an eviction or a
+-        // pause; staged spill writes and the new generation published after both ranks finish) calls this across parts
++        // a carry or a live move across parts (kv_lanes.zig runs parts.zig's ops in frame order on every rank, rank 0
++        // decides the transfer's ok and every rank finishes with it; the generation is published at finish)
+         const x = mv orelse return;
+         var bytes: usize = 0;
+         for (spans[0..ns]) |sp| bytes += sp.bytes;
+@@ -678,6 +687,18 @@ pub const Model = struct {
+         }
+     }
+ 
++    /// copyExtent's refusals with nothing enqueued: the extents' parts (shard.Shard.extentMove: CrossesPart) and every
++    /// kv source's ratio (BadView). Deterministic: every rank refuses the same arguments alike under the agreed
++    /// layout (kv_lanes.zig checks before any rank enqueues its side, so a refused carry leaves no NCCL half waiting).
++    pub fn checkExtent(m: *const Model, from: usize, to: usize, at: usize) !void {
++        if (m.caches.shard) |sh| _ = try sh.extentMove(from, to, at);
++        for (m.eng.w.layers) |lay| {
++            if (lay.comp_wkv == null) continue;
++            const r: usize = lay.ratio;
++            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
++        }
++    }
++
+     /// Rows [from, from + n) of `plane` (rows of `row` bytes; a sharded plane's rows of this rank's part) to rows
+     /// [to, to + n), in the stream's order.
+     fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
+@@ -994,6 +1015,14 @@ pub const Model = struct {
+         m.fill_slot = slot;
+     }
+ 
++    /// TF_DS_KV_SHARD: the filling prompt's view (fillBegin's, at `base`) with its borrowed twins (`on`; `local`: this
++    /// rank's twin when it does not own the extent; prompt.Caches.twinned), or plain again. Both ranks bind at the
++    /// same frame (kv_lanes.zig), between chunks only.
++    pub fn bindTwin(m: *Model, base: usize, on: bool, local: ?usize) !void {
++        const v = try m.caches.view(&m.eng, m.fill_slot, base);
++        m.view = if (on) try v.twinned(&m.caches, &m.eng, base, local) else v;
++    }
++
+     /// The prompt's chunk of n rows from position `start` (seq: the stream's ids through the chunk's end) through every
+     /// layer with the served bounded replay (replay = the prompt's length - the window: an encoder-only chunk stops at
+     /// the decoder's first layer). A chunk that reaches the head leaves the logits of its last row in ch.head_g and,
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 05391bfc3cd1c5fc8f612eeb97cd2cf3450ebb12..d94a9702eebde57695970a6f949e65911afe9639 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -109,6 +109,8 @@ pub const Loaded = struct {
+     /// replay window, Lanes.usable's).
+     grid: u32 = 0,
+     replay: u32 = 0,
++    /// TF_DS_KV_SHARD: the parts' counters and rows for /health and /metrics (null: the switch off).
++    kv_parts: ?lanes.kv_parts.Source = null,
+ };
+ 
+ pub const Snaps = struct {
+@@ -203,6 +205,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     // a start refused past here (a fingerprint mismatch at openPair, a store that does not open) frees the frames the
+     // agreement wrote through the lanes (the hello: leaked on the mismatch path before); rank 1 ends on its own
+     errdefer st.lanes.wire.deinit(gpa);
++    // TF_DS_KV_SHARD: the parts' planner agreed with rank 1 now (its other switches or pool fail the start, named)
++    try st.lanes.startKv();
++    errdefer st.lanes.stopKv();
+     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
+     st.vision = null;
+@@ -219,7 +224,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         snaps.usable = L.usableFn;
+         tier = st.lanes.spill.?.tier();
+     }
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window) };
++    const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts };
+ }
+ 
+ fn deinitFn(ptr: *anyopaque) void {
+@@ -400,7 +406,7 @@ pub fn followerSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, mo: mo
+ 
+ /// A request or a start this engine refuses, in words; null: none of its own.
+ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+-    if (rank_wire.explain(err)) |t| return t;
++    if (rank_wire.explain(err)) |t| return t; // the ranks' agreement (TF_DS_KV_SHARD's frames, the spill tier's)
+     return switch (err) {
+         error.NotPortedYet => "the native DeepSeek-V4.1 engine runs tensor parallel over two GPUs or the four nodes of the 2D split: set TF_TP_WORLD=2 or 4",
+         error.NoMaster, error.BadMaster => "set TF_TP_MASTER to rank 0's fabric address (rank 1: tf-dsv41-lanes MODEL CACHE 1 2 MASTER PORT KIT; ranks 1-3 of four: ... G 4 ...)",
+@@ -434,6 +440,12 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.SpillNotStarted => "rank 0 runs the spill tier (--spill-dir/--spill-gib): start this rank with it too (TF_DS_SPILL_DIR and TF_DS_SPILL_GIB, or tf-dsv41-lanes --spill-dir/--spill-gib)",
+         error.BadSpillSetting => "TF_DS_SPILL_STAGING_MIB: the spill staging cap in MiB, at least 16 (default 128)",
+         error.StagingTooSmall => "the spill staging cap (TF_DS_SPILL_STAGING_MIB) holds too few slots for this model's blocks and small state: raise it",
++        error.BadKvShardSetting => "TF_DS_KV_SHARD_CARRY and TF_DS_KV_SHARD_TWINS: 1 (on, the default) or 0; TF_DS_KV_SHARD_CHECK: decode rounds between the ranks' planner checks (0: at start only)",
++        error.ShardLayoutMismatch => "TF_DS_KV_SHARD=1: the ranks cut the pool into different parts (another TF_DS_POOL, --pool or build on rank 1): give every rank the same TF_DS_* environment and build",
++        error.ShardDiverged, error.StaleExtent => "TF_DS_KV_SHARD=1: the ranks' KV-part planners disagree (an engine bug; the pair stops rather than read the wrong rows): restart with TF_DS_KV_SHARD=0",
++        error.TransferFailed => "TF_DS_KV_SHARD=1: a KV transfer between the ranks failed on one rank only: restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
++        error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
++        error.KvShardNotStarted, error.BadPlan => "TF_DS_KV_SHARD=1: the KV-part planner was not set up as the lanes need (an engine bug): restart with TF_DS_KV_SHARD=0",
+         else => null,
+     };
+ }
+@@ -442,7 +454,7 @@ test "refusals name what to set" {
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
+-    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart }) |err|
++    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart, error.ShardDiverged, error.StaleExtent, error.TransferFailed, error.TransferTimeout, error.KvShardNotStarted, error.BadPlan }) |err|
+         try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
+     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index c801dfe7cd3184ee4dc136e98374dbd0167bbc63..959ad6592b340c632504d8405285063308da5084 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -724,6 +724,30 @@ pub const Caches = struct {
+         }
+         return v;
+     }
++
++    /// TF_DS_KV_SHARD's borrowed twins (stage 6, GLM 0118): view `v` of the extent at `base` while its filling prompt
++    /// holds twins (parts.zig: free rows in every other part, all or none). Both ranks then hold the prompt's
++    /// compressed rows, the owner in its extent and the other rank in its twin at `local` (null on the owner), so the
++    /// view is replicated on both (`own` null): every chunk stores its rows on both ranks and attends locally, with no
++    /// prompt fetch. The twin's rows have every row of the prompt because a twin is only made for a pass from 0, and
++    /// the owner keeps storing its own, so dropping the twin between chunks (a plain view again) is always safe.
++    pub fn twinned(v: Caches, cs: *const Caches, e: *const Engine, base: usize, local: ?usize) !Caches {
++        const sh = cs.shard orelse return error.NoKvShard;
++        if (sh.owns(base) != (local == null)) return error.BadPart; // (the owner has no twin; the other rank has one)
++        var t = v;
++        t.own = null;
++        const tb = local orelse return t;
++        if (!sh.owns(tb)) return error.BadPart; // (its rows are the reservation's, inside its part: the planner's)
++        const c = e.c;
++        for (e.w.layers, 0..) |lay, i| {
++            if (lay.comp_wkv == null) continue;
++            const r: usize = lay.ratio;
++            const lg = sh.planeBase(tb, r) orelse return error.BadPart;
++            t.comp_codes[i] = cs.comp_codes[i] + lg * c.head_dim / 2;
++            t.comp_scales[i] = cs.comp_scales[i] + lg * c.head_dim / 16;
++        }
++        return t;
++    }
+ };
+ 
+ /// What one forward carries from layer to layer (model.py _forward_k's `shared`): the latest kv-source layer, and the
+@@ -952,8 +976,8 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+ /// Either way every row reads the same bytes in the same order as replicated (shard.zig's "prompt fetch" test), so its
+ /// bits are the replicated ones. The owner attends its own rows after its sends, so the other rank starts at once.
+ /// Needs GPU validation of the blocked launches against the whole-chunk one (docs/port/shard-attn.md).
+-/// PORT(round2): borrowed twins (the other part's free rows hold a copy of the filling prompt's latents, all or none,
+-/// released before the first round) skip this fetch entirely.
++/// Borrowed twins (the other part's free rows hold a copy of the filling prompt's latents, all or none, released
++/// before the first round: Caches.twinned) skip this fetch entirely: their view is replicated, own null.
+ fn shardAttend(e: *const Engine, ch: *Chunk, cs: *const Caches, a: tri_attn.Attn, n_comp_end: usize) !void {
+     const kv = e.kv orelse return error.NoKvShard;
+     const own = cs.own.?;
+@@ -1052,7 +1076,7 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared,
+     const cwkv = lay.comp_wkv.?;
+     if (start % r != 0) return notPorted(@src()); // the group's earlier rows from the positional store
+     // TF_DS_KV_SHARD: a sharded view ends at its part's end (an extent never crosses a part: refused, not written past)
+-    if (cs.own != null and start + n > cs.cap) return error.CrossesPart;
++    if (cs.shard != null and start + n > cs.cap) return error.CrossesPart;
+     const full = n / r;
+     if (r == 1) {
+         try mm(e, ch, cwkv, ch.x, c.hidden, ch.lat2, .bf16, hd);
+diff --git a/zig/src/families/dsv41/shard_ops.zig b/zig/src/families/dsv41/shard_ops.zig
+index 5238df5c5e82aa9e829641b626db4825d5216f03..77c515d3de5b5dbcc22c2e21c6e5092dc982371e 100644
+--- a/zig/src/families/dsv41/shard_ops.zig
++++ b/zig/src/families/dsv41/shard_ops.zig
+@@ -173,8 +173,7 @@ pub const KvShard = struct {
+     // rows and bytes, rounds by fetch and by owner decode (each of a round's compressed layers fetches or exchanges once;
+     // counted when the round is issued, graphs or not), carried extents (copyExtent across parts) and their bytes
+     stats: Stats = .{},
+-    // PORT(round2): exported on /health and /metrics with the per-part rows (free, twin, kept, live) once lanes.zig
+-    // tracks parts
++    // (exported on /health and /metrics with the parts' rows: lanes.zig kvPartsFn, core lanes.kv_parts)
+ 
+     pub const Stats = struct {
+         prompt_fetches: u64 = 0,
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index b26486ee918b23beac02f7d2bab0e6bb15e1ac7e..ff2aa584008baa014b794b9b72f0e70a6481c19c 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -161,6 +161,7 @@ const Host = struct {
+     startup: []u8 = &.{},
+     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
++    kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
+     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+     spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
+ 
+@@ -201,6 +202,7 @@ const Host = struct {
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
+         if (h.cache) |*store| h.host.cache = store;
++        h.host.kv_parts = h.kv_parts;
+         if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
+         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+         try h.host.start();
+@@ -366,6 +368,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         return null;
+     };
+     defer if (!opened) loaded.deinit(loaded.ctx);
++    // a family's KV parts and the disk tier together need the part-salted spill identity (dsv41: round 3), refused
++    // until then rather than storing a sharded plane's local rows as pool rows
++    if (@hasField(@TypeOf(loaded), "kv_parts")) if (loaded.kv_parts != null and o.spill.enabled()) {
++        problem.* = "TF_DS_KV_SHARD=1 with --spill-dir: the disk tier does not store sharded KV yet; drop --spill-dir or set TF_DS_KV_SHARD=0";
++        return null;
++    };
+     const model = cuda.usage(false).device - held0;
+     const after = try pool(a, io, &g.ctx, problem) orelse return null;
+     for ([_]Pool{ before, after }, [_][]const u8{ "the weights' check", "the streams' admission" }) |p, what| if (p.parked >= 1 << 28) {
+@@ -389,6 +397,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), served, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+     });
+     errdefer gpa.free(h.startup);
++    if (@hasField(@TypeOf(loaded), "kv_parts")) h.kv_parts = loaded.kv_parts;
+     // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
+     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 22ccc8e0d101c59b4c0f2d0d4776d45417f3d600..32c945a114b6c2d07f0a717ca2a4f76ca6155b1c 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -142,6 +142,7 @@ pub const Metrics = struct {
+         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
+         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+         if (status.cache) |c| try cacheFamilies(w, c);
++        if (status.kv_parts) |k| try kvPartFamilies(w, k);
+     }
+ };
+ 
+@@ -164,6 +165,22 @@ pub fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStats) !void {
+     }
+ }
+ 
++/// KV ownership's counters (a backend that shards its pool: tensorfold:kv_shard_*), then every part's rows
++/// (tensorfold:kv_shard_part_*{part="N"}, gauges).
++pub fn kvPartFamilies(w: *std.Io.Writer, k: api.KvParts) !void {
++    const H = api.KvParts.help;
++    const info = @typeInfo(api.KvParts).@"struct";
++    inline for (info.field_names, info.field_types) |name, T| if (T == u64) {
++        try gauge(w, "kv_shard_" ++ name, comptime kindOf(&api.KvParts.gauges, name), @field(H, name), @field(k, name));
++    };
++    const P = @TypeOf(k.part[0]);
++    const n: usize = @intCast(@min(k.parts, k.part.len));
++    inline for (@typeInfo(P).@"struct".field_names) |name| {
++        try family(w, "kv_shard_part_" ++ name, "gauge", @field(P.help, name));
++        for (k.part[0..n], 0..) |p, i| try w.print("{s}kv_shard_part_{s}{{part=\"{d}\"}} {d}\n", .{ prefix, name, i, @field(p, name) });
++    }
++}
++
+ fn kindOf(comptime gauges: []const []const u8, comptime name: []const u8) []const u8 {
+     @setEvalBranchQuota(100_000);
+     for (gauges) |g| if (std.mem.eql(u8, g, name)) return "gauge";
+@@ -377,3 +394,34 @@ test "cache families: present only with the cache's counters, every field with i
+         "# TYPE tensorfold:spill_staging_peak gauge\n",
+     }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+ }
++
++test "kv shard families: present only with a sharded backend's stats, its counters and every part's rows" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    var stub: RenderStub = .{};
++    var plain: std.Io.Writer.Allocating = .init(gpa);
++    defer plain.deinit();
++    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "kv_shard") == null);
++    var k: api.KvParts = .{ .parts = 2, .part_rows = 1048576, .carries = 3, .moved_bytes = 720 };
++    k.part[0] = .{ .free = 10, .live = 1 };
++    k.part[1] = .{ .free = 20, .twin_rows = 4096 };
++    stub.status_value.kv_parts = k;
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    for ([_][]const u8{
++        "# TYPE tensorfold:kv_shard_parts gauge\n",
++        "tensorfold:kv_shard_parts 2\n",
++        "# TYPE tensorfold:kv_shard_carries counter\n",
++        "tensorfold:kv_shard_carries 3\n",
++        "tensorfold:kv_shard_moved_bytes 720\n",
++        "# TYPE tensorfold:kv_shard_part_free gauge\n",
++        "tensorfold:kv_shard_part_free{part=\"0\"} 10\n",
++        "tensorfold:kv_shard_part_free{part=\"1\"} 20\n",
++        "tensorfold:kv_shard_part_twin_rows{part=\"1\"} 4096\n",
++        "tensorfold:kv_shard_part_live{part=\"0\"} 1\n",
++    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "part=\"2\"") == null);
++}
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index 9dddf4ede2ebc86d297b4257c8065ace46b0cc30..58e95e50f36816c56eb4ae9402406b5dff7952da 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -31,6 +31,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     try o.put(a, "memory", .{ .object = memory });
+     try o.put(a, "live", try live.snapshot(a, srv.engine));
+     if (status.cache) |c| try putCache(a, o, c);
++    if (status.kv_parts) |k| try putKvParts(a, o, k);
+     routes.sendValue(conn, a, 200, .{ .object = o });
+ }
+ 
+@@ -57,6 +58,24 @@ pub fn putCache(a: Allocator, o: *json.Object, c: api.CacheStats) Allocator.Erro
+     try o.put(a, "prompt_cache", .{ .object = pc });
+ }
+ 
++/// KV ownership's counters under `kv_shard` (a backend that shards its pool over the ranks: wojo's GLM 0118), every
++/// part's rows under kv_shard.per_part (an array, one object per part, part 0 first).
++pub fn putKvParts(a: Allocator, o: *json.Object, k: api.KvParts) Allocator.Error!void {
++    const ks = try json.newObject(a);
++    const info = @typeInfo(api.KvParts).@"struct";
++    inline for (info.field_names, info.field_types) |name, T| if (T == u64) try ks.put(a, name, try json.intValue(a, @field(k, name)));
++    const n: usize = @intCast(@min(k.parts, k.part.len));
++    const arr = try a.alloc(json.Value, n);
++    for (k.part[0..n], arr, 0..) |p, *v, i| {
++        const po = try json.newObject(a);
++        try po.put(a, "part", try json.intValue(a, i));
++        inline for (@typeInfo(@TypeOf(p)).@"struct".field_names) |name| try po.put(a, name, try json.intValue(a, @field(p, name)));
++        v.* = .{ .object = po };
++    }
++    try ks.put(a, "per_part", .{ .array = arr });
++    try o.put(a, "kv_shard", .{ .object = ks });
++}
++
+ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+     const created = std.Io.Clock.real.now(srv.io).toSeconds();
+     const data = try a.alloc(Value, srv.config.model_ids.len);
+@@ -167,3 +186,21 @@ test "health's prompt cache counters: the GLM names on top, every counter below,
+     try putCache(a, none, .{});
+     try std.testing.expect(none.get("prompt_cache").?.object.get("spill") == null);
+ }
++
++test "health's kv shard counters: every counter under kv_shard, each part's rows under per_part" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const o = try json.newObject(a);
++    var k: api.KvParts = .{ .parts = 2, .carries = 5, .twins_made = 1 };
++    k.part[1] = .{ .free = 7, .live = 2 };
++    try putKvParts(a, o, k);
++    const ks = o.get("kv_shard").?.object;
++    try std.testing.expectEqualStrings("5", ks.get("carries").?.int);
++    try std.testing.expectEqualStrings("1", ks.get("twins_made").?.int);
++    const pp = ks.get("per_part").?.array;
++    try std.testing.expectEqual(@as(usize, 2), pp.len);
++    try std.testing.expectEqualStrings("1", pp[1].object.get("part").?.int);
++    try std.testing.expectEqualStrings("7", pp[1].object.get("free").?.int);
++    try std.testing.expectEqualStrings("2", pp[1].object.get("live").?.int);
++}

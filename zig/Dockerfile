@@ -17,8 +17,21 @@ FROM ${BASE_IMAGE}
 RUN python3 -m pip install --no-cache-dir safetensors
 ARG ZIG_VERSION
 ARG ZIG_SHA256
-RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" && \
-    echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
+# The compiler from the first of ZIG_MIRRORS (community mirrors: <base>/zig-aarch64-linux-<version>.tar.xz) that answers
+# with the pinned sha256, then ziglang.org itself as the last resort (the Zig project asks downloads to prefer mirrors, and
+# ziglang.org stalled a build on the pair). Each source gets bounded tries (connect 20 s, 300 s a try, 3 retries, at
+# most 600 s of retrying); a source that fails or serves other bytes is skipped. An empty ZIG_MIRRORS (scripts/config.sh
+# passes what you set, empty included) means ziglang.org only. ZIG_MIRRORS is not part of the image hash: the bytes
+# are pinned.
+ARG ZIG_MIRRORS="https://zig.linus.dev/zig"
+RUN ok=0; \
+    for base in ${ZIG_MIRRORS} "https://ziglang.org/download/${ZIG_VERSION}"; do \
+      url="${base%/}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz"; echo "zig: trying ${url}"; \
+      if curl --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 --retry-max-time 600 -fsSL -o /tmp/zig.tar.xz "${url}" && \
+         echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -; then ok=1; break; fi; \
+      rm -f /tmp/zig.tar.xz; \
+    done; \
+    [ "$ok" = 1 ] || { echo "zig ${ZIG_VERSION}: no source served the pinned sha256" >&2; exit 1; }; \
     mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz && \
     /opt/zig/zig version
 ARG SM=121

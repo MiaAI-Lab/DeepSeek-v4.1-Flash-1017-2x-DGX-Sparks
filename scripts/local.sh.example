@@ -11,3 +11,17 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # ABLIT=0                     # 1: matching Keys overlay on Mia EAQ 2.9 bpw; needs your HF token AND access below
 # HF_TOKEN=hf_...              # HF read token (or use hf auth login on the head); never commit your token
 # ABLIT=1 requires access: https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
+# The ported engine features (docs/PORT-RECIPE.md, README "Spill v2 and KV sharding"): OFF by default (the recipe as
+# before the port). Turn them on here: SPILL_GIB=64 KV_SHARD=1 is what the pair was validated with (POOL left empty is
+# then derived from CONTEXT: 2,101,248 at the 1M window). Set here, a spill folder that fails its checks on either
+# Spark refuses the start.
+# SPILL_GIB=64                # spill v2: kept prompt states on each Spark's own NVMe, up to this many GiB a Spark (0: off)
+# SPILL_DIR=/home/user/.cache/dsv41-tensorfold-spill   # rank 0's spill folder (default: beside HF_CACHE; never inside it,
+#                             # never on NFS or under an archive folder); created by start.sh as you, mounted at /spill
+# WORKER_SPILL_DIR='$HOME/.cache/dsv41-tensorfold-spill'  # rank 1's on the worker (default: SPILL_DIR)
+# SPILL_FLOOR_GIB=50          # free disk the tier leaves on that file system
+# SPILL_QUOTA_GIB=16          # one conversation's share of SPILL_GIB before its old turns and forks go (0: none)
+# KV_SHARD=1                  # each conversation's compressed KV once, on its owner Spark (0: off)
+# POOL=2101248                # total pool positions (zig/patches/0008); with KV_SHARD=1, empty: two owner parts of a CONTEXT
+#                             # window each, derived; the same POOL costs about half the KV memory a Spark sharded
+# KV_SHARD_DECODE=fetch       # fetch (reference) or owner (owner-computed decode); empty: the engine's default

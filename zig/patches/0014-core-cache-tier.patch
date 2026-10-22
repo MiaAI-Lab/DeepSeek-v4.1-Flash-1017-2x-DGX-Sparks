@@ -1,0 +1,3553 @@
+# core: the host side of spill v2 and continued chats (port of GLM 0088, 0110 and 0111,
+# MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#78, #124 and #128), family-neutral: any native backend can bind
+# them.
+# - prompt_cache.zig: a Tier vtable the store calls on the engine thread only (lookup and counts in memory; restore
+#   jobs begin/poll/cancel; keep, release, share, touch, flush), each call bounded; stale-aware find, probe, lineage
+#   as a Fork chain on every entry, per-rank counters; Rules.grid/window for the native rule of where a point may sit
+#   (on a chunk boundary, before the replay window). A restore replaces its point's memory twin when the family has
+#   staled it (KV sharding's placements give a kept state's rows away): a lookup skips a stale state, so the restore is
+#   the resume, not a drop and a recompute (found under pool stress on the pair: two 948K resumes recomputed with the
+#   points on disk on both ranks, restores_dropped 2).
+# - lane_host.zig: a request whose state is on disk is parked while the tier reads it beside decoding rounds
+#   (TF_SPILL_LOAD_MS a round, 40; waits bounded by TF_SPILL_LOAD_WAIT_MS, 30000) and admitted once every rank holds
+#   it; requests that want the same point share one restore; a clean stop gives the tier TF_SPILL_FLUSH_MS (60000) to
+#   write what still waits.
+# - 0111: a stream that continues its conversation without resuming that conversation's own kept state (a client
+#   rewind, a state back from disk, states that were dropped) keeps the conversation instead of starting a new one,
+#   so per-conversation room counts it once; /health and /metrics count chats_continued and
+#   chats_continued_prefill_tokens.
+# - server: --spill-dir, --spill-gib, --spill-min-free-gib, --spill-min-tokens, --spill-quota (TF_SPILL_TURNS, 4);
+#   /health prompt_cache{..., spill{...}}, /metrics prompt_cache_* and spill_*{rank="N"}. A spill flag the backend
+#   does not bind fails the open instead of being ignored.
+# Everything is off by default: with no tier and no grouping the store and the host behave, count and report exactly
+# as before (/health and /metrics byte-identical). Tests: lane_host_tier_test.zig and prompt_cache_tier_test.zig on an
+# in-memory fake tier (prompt_cache_fake_tier.zig, one lock for the engine and test threads), and GLM's
+# tools/chat_continued_check.py translated.
+# The scheduler hooks follow BadAd84's block-tier design (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118);
+# GLM's 0111 builds on its 0089 kept states (Thomas Wade, PR #65), whose place the native prompt cache's conversations
+# take here. By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 1234369f0da4a9584ad347f1bf55e268c5aa08c3..65d8a2bd0be5c00ae1a277ed8da433ddfaef2c1f 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -173,6 +173,131 @@ pub const Open = struct {
+     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
+     device: ?u32 = null,
+     segments: ?u32 = null,
++    /// The prompt cache's disk tier and parked-request scheduling (spill v2); every switch off.
++    spill: Spill = .{},
++};
++
++/// The prompt cache's durable tier and its scheduling (wojo's GLM 0088/0110/0111): --spill-*, with TF_SPILL_* for the
++/// rest. Off unless both a directory and a cap are given; every rank of an engine must be opened with the same values
++/// (the family checks them before any spill command).
++pub const Spill = struct {
++    /// --spill-dir: this rank's local store (a fresh native namespace under it; never the model or Engram mount).
++    dir: ?[]const u8 = null,
++    /// --spill-gib: what the store may hold on this rank (0: off).
++    gib: f64 = 0,
++    /// --spill-min-free-gib: no write leaves less free on the store's file system.
++    min_free_gib: f64 = 50,
++    /// --spill-quota: one conversation's share of the cap (0: none).
++    quota: f64 = 0,
++    /// --spill-min-tokens: shorter kept states are not written.
++    min_tokens: u32 = 8192,
++    /// TF_SPILL_TURNS: old turns kept on a conversation's active path before they go first (0: until room is needed).
++    turns: u32 = 4,
++    /// TF_SPILL_LOAD_MS: one service's budget for every restore together, then staged writes (at least 1).
++    load_ms: u32 = 40,
++    /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore before it is admitted without it.
++    load_wait_ms: u32 = 30_000,
++    /// TF_SPILL_FLUSH_MS: a clean shutdown's bound for draining writes.
++    flush_ms: u32 = 60_000,
++
++    /// The disk tier is on.
++    pub fn enabled(s: Spill) bool {
++        return s.dir != null and s.gib > 0;
++    }
++
++    /// Whether the disk tier was asked for and `engine` did not take it: a backend that wires it configures its lane
++    /// host (LaneHost.configure), whose status then carries the cache's counters.
++    pub fn unbound(s: Spill, engine: Engine) bool {
++        if (!s.enabled()) return false;
++        var st: Status = .{};
++        engine.status(&st, &.{});
++        return st.cache == null;
++    }
++};
++
++/// The prompt cache's counters for /health and /metrics, read from HTTP threads as one copy (LaneHost publishes it on
++/// its engine thread). Null in Status unless a tier or grouping is on. Totals unless in `gauges`.
++pub const CacheStats = struct {
++    memory_hits: u64 = 0,
++    memory_misses: u64 = 0,
++    kept: u64 = 0,
++    evicted: u64 = 0,
++    refused: u64 = 0,
++    failed: u64 = 0,
++    entries: u64 = 0,
++    held_bytes: u64 = 0,
++    disk_lookups: u64 = 0,
++    disk_hits: u64 = 0,
++    disk_hits_committed: u64 = 0,
++    restores_begun: u64 = 0,
++    restores_shared: u64 = 0,
++    restores_failed: u64 = 0,
++    restores_cancelled: u64 = 0,
++    restores_dropped: u64 = 0,
++    restores_refused: u64 = 0,
++    restores_active: u64 = 0,
++    restoring_bytes: u64 = 0,
++    restore_blocks_done: u64 = 0,
++    restore_blocks_total: u64 = 0,
++    restored_tokens: u64 = 0,
++    restore_waits: u64 = 0,
++    restore_wait_timeouts: u64 = 0,
++    restore_wait_ns: u64 = 0,
++    restore_wait_max_ns: u64 = 0,
++    writes_enqueued: u64 = 0,
++    shared_promoted: u64 = 0,
++    flushes: u64 = 0,
++    flush_timeouts: u64 = 0,
++    flush_unpublished: u64 = 0,
++    parked: u64 = 0,
++    chats_continued: u64 = 0,
++    chats_continued_prefill_tokens: u64 = 0,
++    cached_tokens: u64 = 0,
++    computed_tokens: u64 = 0,
++    /// The tier's own counters, each rank's (null: no tier).
++    spill: ?prompt_cache.RankCounts = null,
++
++    pub const gauges = [_][]const u8{ "entries", "held_bytes", "restores_active", "restoring_bytes", "restore_blocks_done", "restore_blocks_total", "parked" };
++
++    /// Each field's /metrics help (a missing one fails the build).
++    pub const help = .{
++        .memory_hits = "Prompt passes that resumed a kept state in memory.",
++        .memory_misses = "Prompt lookups that found no usable kept state.",
++        .kept = "Prompt states kept in memory.",
++        .evicted = "Kept states evicted from memory for room.",
++        .refused = "Prompt states not kept: past the memory budget.",
++        .failed = "Kept states that failed to save or restore.",
++        .entries = "Prompt states kept in memory now.",
++        .held_bytes = "Bytes the kept states hold now.",
++        .disk_lookups = "Lookups that asked the disk tier.",
++        .disk_hits = "Lookups whose durable point was longer than the best usable memory state.",
++        .disk_hits_committed = "Disk restores every rank installed, adopted as kept states.",
++        .restores_begun = "Disk restore jobs started.",
++        .restores_shared = "Requests that joined a disk restore already in flight.",
++        .restores_failed = "Disk restores aborted on every rank (missing, damaged, guarded).",
++        .restores_cancelled = "Disk restores stopped: no request waited for them any more, or shutdown.",
++        .restores_dropped = "Installed disk restores not adopted: no room, or memory already had them.",
++        .restores_refused = "Disk restores not begun: the memory budget could not hold their destination.",
++        .restores_active = "Disk restore jobs in flight.",
++        .restoring_bytes = "Memory the disk restores in flight reserved, charged to the prompt cache's budget.",
++        .restore_blocks_done = "Blocks the restores in flight have copied so far.",
++        .restore_blocks_total = "Blocks the restores in flight copy in all.",
++        .restored_tokens = "Prompt tokens restored from disk.",
++        .restore_waits = "Requests parked on a disk restore.",
++        .restore_wait_timeouts = "Requests admitted without their disk restore after TF_SPILL_LOAD_WAIT_MS.",
++        .restore_wait_ns = "Nanoseconds requests waited for disk restores.",
++        .restore_wait_max_ns = "The longest wait for a disk restore, in nanoseconds.",
++        .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
++        .shared_promoted = "Disk points promoted to shared prefixes.",
++        .flushes = "Clean-shutdown flushes of the disk tier.",
++        .flush_timeouts = "Flushes that reached their deadline with points unpublished.",
++        .flush_unpublished = "Points left unpublished at a flush deadline.",
++        .parked = "Requests parked on a disk restore now (reading it, or deferred to ask again).",
++        .chats_continued = "Streams that continued a conversation without resuming from its own turn state.",
++        .chats_continued_prefill_tokens = "Prompt tokens those streams prefilled.",
++        .cached_tokens = "Prompt tokens passes resumed from kept states.",
++        .computed_tokens = "Prompt tokens passes computed.",
++    };
+ };
+ 
+ /// An opened engine; ``close`` stops its thread and frees its backend.
+@@ -205,6 +330,8 @@ pub const Status = struct {
+     streams: usize = 0,
+     /// Generated tokens held by live streams, excluding their prompts.
+     generation_tokens: u64 = 0,
++    /// The prompt cache's counters, when its tier or grouping is on.
++    cache: ?CacheStats = null,
+ };
+ 
+ pub const SubmitError = error{ Closed, Busy };
+@@ -286,6 +413,7 @@ test {
+     _ = @import("lane_host.zig");
+     _ = @import("lane_host_reuse_test.zig");
+     _ = @import("prompt_cache.zig");
++    _ = @import("lane_host_tier_test.zig");
+     _ = @import("prompt_imprint.zig");
+     _ = @import("keepalive.zig");
+ }
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c172351cd 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -1,4 +1,10 @@
+ //! The lane core served to the HTTP threads: one thread owns ``core`` and steps rounds while any stream lives.
++//!
++//! Pending durable restores and continuation telemetry port wojo's GLM 0110 (PR #124; the scheduler hooks) and 0111
++//! (PR #128). A request may be parked before its prompt pass on a restore job reading a longer kept state from the
++//! prompt cache's tier (shared by every request that wants the same point). Parked requests hold no lane, count as
++//! waiting work and wake back to the front of the queue, where an ordinary lookup runs again. With no tier nothing is
++//! parked, nothing is serviced and nothing else changes.
+ const std = @import("std");
+ const lanes = @import("lanes");
+ const api = @import("engine_api.zig");
+@@ -58,6 +64,15 @@ pub const LaneHost = struct {
+     interleave_ns: i96 = 0,
+     filling: ?*Job = null,
+     between_err: ?anyerror = null,
++    // -- parked requests (0110). The lists are the engine thread's; changes take the lock (status reads their lengths).
++    ready: std.ArrayList(*Job) = .empty, // woken: admitted before the queue, in the order they woke
++    loading: std.ArrayList(Load) = .empty, // each waits for a restore job (several may share one)
++    turn: usize = 0, // which restore a service polls first (one budget, shared fairly)
++    lone_commits: u32 = 0, // the lone driver's commits since its last pump
++    tier: TierPolicy = .{},
++    host_counts: HostCounts = .{},
++    /// What status reports under `cache` (published on the engine thread at each noteLive; null until configured).
++    tele: ?api.CacheStats = null,
+ 
+     const Mark = struct { at: i96, tokens: u64 };
+     const full_retry_ns: i96 = std.time.ns_per_s;
+@@ -65,6 +80,33 @@ pub const LaneHost = struct {
+     const finish_ns: i96 = 5 * std.time.ns_per_s;
+     const finish_left: i64 = 256;
+     const window_ns: i96 = 2 * std.time.ns_per_s;
++    /// How often an idle host polls work in flight (restores, staged writes, deferred retries).
++    const poll_ns: i64 = 2 * std.time.ns_per_ms;
++    /// The lone driver pumps staged writes every this many commits.
++    const lone_pump_commits: u32 = 16;
++
++    const Load = struct { job: *Job, restore: *pc.Restore, since: i96 };
++
++    /// How parked work is serviced (LaneHost.configure; the defaults are off).
++    pub const TierPolicy = struct {
++        /// One elapsed-time budget per service for every restore together, then staged writes (TF_SPILL_LOAD_MS).
++        service_ns: u64 = 40 * std.time.ns_per_ms,
++        /// Staging's share of a service while streams decode (GLM pumped 4 blocks a round); idle, all that is left.
++        pump_ns: u64 = 2 * std.time.ns_per_ms,
++        /// How long a request waits parked on a restore before it is admitted without it (TF_SPILL_LOAD_WAIT_MS).
++        load_wait_ns: i96 = 30 * std.time.ns_per_s,
++        /// A clean shutdown's bound for draining writes (TF_SPILL_FLUSH_MS).
++        flush_ns: u64 = 60 * std.time.ns_per_s,
++    };
++
++    pub const HostCounts = struct {
++        restore_waits: u64 = 0, // requests parked on a restore
++        restore_wait_timeouts: u64 = 0, // of them admitted without it at load_wait_ns
++        restore_wait_ns: u64 = 0,
++        restore_wait_max_ns: u64 = 0,
++        cached_tokens: u64 = 0, // prompt tokens passes resumed (memory or restored)
++        computed_tokens: u64 = 0, // and computed
++    };
+ 
+     const Job = struct {
+         host: *LaneHost,
+@@ -81,13 +123,20 @@ pub const LaneHost = struct {
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
++        tried_disk: bool = false, // it waited for a restore once: a later lookup takes what memory has
++        join: pc.Join = .{}, // its conversation (0111)
++        parent: ?u64 = null, // the durable point its pass resumes from, and where
++        fork: u32 = 0,
++        lineage: []pc.Fork = &.{}, // the computation its pass's rows belong to (gpa-owned; Store.passLineage)
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+             const job: *Job = @ptrCast(@alignCast(ptr));
+             job.reported(); // before a keep can evict the entry the pass restored
+             if (!cacheable(job.request)) return;
+-            if (job.host.cache) |store| _ = store.keep(keyOf(job.request), at, s, job.request.chunks);
++            const h = job.host;
++            const store = h.cache orelse return;
++            _ = store.keepWith(keyOf(job.request), at, s, job.request.chunks, .{ .group = job.join.group, .images = job.request.images.len > 0, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+@@ -97,7 +146,17 @@ pub const LaneHost = struct {
+             const store = job.host.cache orelse return;
+             if (!job.started) return;
+             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
+-            if (job.stream.reuse_failed) store.resumed(e, keyOf(job.request), false) else if (job.stream.cached == e.at) store.resumed(e, keyOf(job.request), true);
++            const ok = !job.stream.reuse_failed and job.stream.cached == e.at;
++            if (!ok) { // it did not compute from that state's rows: a lineage of its own
++                job.parent = null;
++                job.fork = 0;
++                if (job.lineage.len > 0) {
++                    const fresh: []pc.Fork = store.passLineage(null) catch &.{};
++                    job.host.gpa.free(job.lineage);
++                    job.lineage = fresh;
++                }
++            }
++            if (job.stream.reuse_failed) store.resumed(e, keyOf(job.request), false) else if (ok) store.resumed(e, keyOf(job.request), true);
+         }
+     };
+ 
+@@ -121,6 +180,17 @@ pub const LaneHost = struct {
+         return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms };
+     }
+ 
++    /// The tier's switches (before start). Telemetry is published from here on when either is on: a tier on the cache
++    /// (Store.setTier), or grouping.
++    pub fn configure(h: *LaneHost, sp: api.Spill) void {
++        h.tier.service_ns = @as(u64, @max(sp.load_ms, 1)) * std.time.ns_per_ms;
++        h.tier.pump_ns = @min(h.tier.pump_ns, h.tier.service_ns);
++        h.tier.load_wait_ns = @as(i96, @max(sp.load_wait_ms, 1)) * std.time.ns_per_ms;
++        h.tier.flush_ns = @as(u64, sp.flush_ms) * std.time.ns_per_ms;
++        const store_on = if (h.cache) |s| s.tier != null or s.groups else false;
++        h.tele = if (store_on) .{} else null;
++    }
++
+     pub fn start(h: *LaneHost) !void {
+         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+     }
+@@ -138,6 +208,8 @@ pub const LaneHost = struct {
+         h.cancels.deinit(h.gpa);
+         h.decoded.deinit(h.gpa);
+         h.live_tokens.deinit(h.gpa);
++        h.ready.deinit(h.gpa);
++        h.loading.deinit(h.gpa);
+     }
+ 
+     pub fn engine(h: *LaneHost) Engine {
+@@ -200,12 +272,13 @@ pub const LaneHost = struct {
+         @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
+         out.* = .{
+             .running = @intCast(h.admitted.items.len),
+-            .waiting = @intCast(h.queued.items.len),
++            .waiting = @intCast(h.queued.items.len + h.ready.items.len + h.loading.items.len),
+             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
+             .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
+             .preemptions = 0,
+             .streams = n,
+             .generation_tokens = h.live_generated,
++            .cache = h.tele,
+         };
+     }
+ 
+@@ -253,6 +326,7 @@ pub const LaneHost = struct {
+     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
+         job.reported();
+         h.gpa.free(job.marks);
++        h.gpa.free(job.lineage);
+         const s = &job.stream;
+         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
+@@ -289,13 +363,33 @@ pub const LaneHost = struct {
+         h.cancels.clearRetainingCapacity();
+         if (keep) |k| if (std.mem.indexOfScalar(Id, ids, k) != null) h.cancels.append(h.gpa, k) catch {};
+         var dropped: std.ArrayList(*Job) = .empty;
++        var unloaded: std.ArrayList(*pc.Restore) = .empty; // restores a cancelled job waited for
+         for (ids) |id| {
+             for (h.queued.items, 0..) |job, i| if (job.id == id) {
+                 dropped.append(h.gpa, h.queued.orderedRemove(i)) catch {};
+                 break;
+             };
++            for (h.ready.items, 0..) |job, i| if (job.id == id) {
++                dropped.append(h.gpa, h.ready.orderedRemove(i)) catch {};
++                break;
++            };
++            for (h.loading.items, 0..) |l, i| if (l.job.id == id) {
++                _ = h.loading.orderedRemove(i);
++                dropped.append(h.gpa, l.job) catch {};
++                unloaded.append(h.gpa, l.restore) catch {};
++                break;
++            };
+         }
+         h.mutex.unlock(h.io);
++        // a restore no request waits for any more stops (its reads, DMA and reservations go), exactly once
++        for (unloaded.items, 0..) |r, k| {
++            if (std.mem.indexOfScalar(*pc.Restore, unloaded.items[0..k], r) != null) continue;
++            const wanted = for (h.loading.items) |l| {
++                if (l.restore == r) break true;
++            } else false;
++            if (!wanted) if (h.cache) |store| store.restoreCancel(r);
++        }
++        unloaded.deinit(h.gpa);
+         for (dropped.items) |job| h.finish(job, .cancelled, "");
+         dropped.deinit(h.gpa);
+         for (ids) |id| {
+@@ -323,7 +417,7 @@ pub const LaneHost = struct {
+     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+     fn admitOne(h: *LaneHost) bool {
+         h.lock();
+-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
++        if ((h.queued.items.len == 0 and h.ready.items.len == 0) or h.admitted.items.len >= h.info_.lanes) {
+             h.unlock();
+             return false;
+         }
+@@ -342,7 +436,12 @@ pub const LaneHost = struct {
+             }
+             h.finish_until = null;
+         }
+-        const job = h.queued.orderedRemove(0);
++        const job = if (h.ready.items.len > 0) h.ready.orderedRemove(0) else h.queued.orderedRemove(0);
++        if (h.parking()) {
++            h.unlock();
++            if (h.park(job)) return true; // waits for a restore, holding no lane
++            h.lock();
++        }
+         h.admitted.append(h.gpa, job) catch {
+             h.unlock();
+             h.finish(job, .failed, "out of memory");
+@@ -357,6 +456,13 @@ pub const LaneHost = struct {
+             job.kept0 = store.counts.kept;
+             job.marks = l.marks;
+             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
++            if (store.groups) job.join = store.join(keyOf(r), l.entry, r.images.len == 0 and r.drafts);
++            if (l.entry) |e| {
++                job.parent = e.point;
++                job.fork = e.at;
++            }
++            // its rows' computation: the resumed state's forked at its position (written or not), else its own
++            job.lineage = store.passLineage(l.entry) catch &.{};
+         } else |_| {};
+         job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
+         job.stream = lanes.Stream.init(h.gpa, .{
+@@ -393,7 +499,9 @@ pub const LaneHost = struct {
+         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         job.began = began;
+         if (h.loneFits(job)) return h.runLone(job, began);
+-        if (h.interleave_ns > 0 and r.images.len == 0) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
++        // between two prompt chunks: the other streams' rounds (interleave), and parked work's service, which runs
++        // with the interleave off too
++        if (r.images.len == 0 and (h.interleave_ns > 0 or h.servicing())) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
+         h.filling = job;
+         defer h.filling = null;
+         h.core.addStream(&job.stream) catch |e| {
+@@ -414,36 +522,44 @@ pub const LaneHost = struct {
+ 
+     fn betweenWanted(ptr: *anyopaque) bool {
+         const h: *LaneHost = @ptrCast(@alignCast(ptr));
+-        return h.core.log == null and h.core.runnableCount() > 0;
++        if (h.core.log != null) return false;
++        return (h.interleave_ns > 0 and h.core.runnableCount() > 0) or h.pending();
+     }
+ 
+     /// Stream.between: decode rounds for the other live streams, interleave_ns at most, between two of the filling
+-    /// job's prompt chunks; their tokens go out as they land. Engine thread only (inside the filling job's addStream).
++    /// job's prompt chunks; their tokens go out as they land. Then parked work's service. Engine thread only (inside
++    /// the filling job's addStream).
+     fn between(ptr: *anyopaque) anyerror!void {
+         const h: *LaneHost = @ptrCast(@alignCast(ptr));
+         if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
+-        const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+-        while (true) {
+-            h.takeCancelsKeeping(if (h.filling) |f| f.id else null);
+-            if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
+-            h.core.step() catch |e| {
+-                h.between_err = e; // the pass fails with it; run() then fails the streams the round held
+-                return e;
+-            };
+-            var i: usize = 0;
+-            while (i < h.admitted.items.len) {
+-                const job = h.admitted.items[i];
+-                if (job == h.filling or job.prefilled == null) {
+-                    i += 1;
+-                    continue;
++        if (h.interleave_ns > 0) {
++            const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
++            while (true) {
++                h.takeCancelsKeeping(if (h.filling) |f| f.id else null);
++                if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
++                h.core.step() catch |e| {
++                    h.between_err = e; // the pass fails with it; run() then fails the streams the round held
++                    return e;
++                };
++                var i: usize = 0;
++                while (i < h.admitted.items.len) {
++                    const job = h.admitted.items[i];
++                    if (job == h.filling or job.prefilled == null) {
++                        i += 1;
++                        continue;
++                    }
++                    if (h.deliver(job)) {
++                        h.lock();
++                        _ = h.admitted.orderedRemove(i);
++                        h.unlock();
++                    } else i += 1;
+                 }
+-                if (h.deliver(job)) {
+-                    h.lock();
+-                    _ = h.admitted.orderedRemove(i);
+-                    h.unlock();
+-                } else i += 1;
++                h.noteLive();
+             }
+-            h.noteLive();
++        }
++        if (h.servicing()) {
++            if (h.filling) |f| f.reported(); // its restore is done (a chunk ran): a restore's room may evict that entry now
++            h.service(h.tier.service_ns);
+         }
+     }
+ 
+@@ -461,7 +577,12 @@ pub const LaneHost = struct {
+         job.prefilled = done;
+         h.unlock();
+         job.reported();
+-        if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
++        h.host_counts.cached_tokens += job.stream.cached;
++        h.host_counts.computed_tokens += job.request.prompt.len -| job.stream.cached;
++        if (h.cache) |store| {
++            store.continued(job.join, job.stream.cached, job.request.prompt.len);
++            store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
++        }
+         emit(job, .{ .prefilled = job.stream.cached });
+     }
+ 
+@@ -472,7 +593,12 @@ pub const LaneHost = struct {
+         if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
+         h.lock();
+         defer h.unlock();
+-        return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0;
++        return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0 and h.waitingCount() == 0;
++    }
++
++    /// Requests parked or woken (the lock held).
++    fn waitingCount(h: *const LaneHost) usize {
++        return h.ready.items.len + h.loading.items.len;
+     }
+ 
+     /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
+@@ -490,12 +616,18 @@ pub const LaneHost = struct {
+                 }
+                 host.send(j);
+                 host.noteLive();
++                // writes enqueued at keep are staged during a long lone decode too (parked work makes it yield)
++                host.lone_commits += 1;
++                if (host.lone_commits >= lone_pump_commits and host.servicing()) {
++                    host.lone_commits = 0;
++                    if (host.cache) |store| store.pump(host.tier.pump_ns);
++                }
+             }
+             fn yield(ctx: *anyopaque) bool {
+                 const host: *LaneHost = @ptrCast(@alignCast(ctx));
+                 host.lock();
+                 defer host.unlock();
+-                return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing;
++                return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing or host.waitingCount() > 0;
+             }
+         };
+         job.began = began;
+@@ -546,6 +678,11 @@ pub const LaneHost = struct {
+         job.prefilled = null;
+         job.delivered = 0;
+         job.prefill_sent = false;
++        job.join = .{};
++        job.parent = null;
++        job.fork = 0;
++        h.gpa.free(job.lineage);
++        job.lineage = &.{};
+         h.lock();
+         h.queued.insert(h.gpa, 0, job) catch {
+             h.unlock();
+@@ -575,6 +712,7 @@ pub const LaneHost = struct {
+     }
+ 
+     fn noteLive(h: *LaneHost) void {
++        const tele = h.telemetry();
+         h.lock();
+         defer h.unlock();
+         h.live_tokens.clearRetainingCapacity();
+@@ -583,12 +721,14 @@ pub const LaneHost = struct {
+             h.live_tokens.append(h.gpa, @intCast(job.stream.context.items.len)) catch {};
+             h.live_generated += @intCast(job.stream.emitted().len);
+         };
++        if (tele) |t| h.tele = t;
+     }
+ 
+     fn run(h: *LaneHost) void {
+         while (true) {
+             h.takeCancels();
+             while (h.admitOne()) {}
++            if (h.servicing()) h.service(h.tier.service_ns); // restores, staged writes and deferred retries, between rounds and at idle
+             if (h.between_err) |e| {
+                 h.between_err = null;
+                 h.failAll(@errorName(e));
+@@ -597,15 +737,17 @@ pub const LaneHost = struct {
+             h.noteLive();
+             h.lock();
+             if (h.closing) {
+-                const left = h.queued.items.len + h.admitted.items.len;
++                const left = h.queued.items.len + h.admitted.items.len + h.waitingCount();
+                 h.unlock();
+-                if (left == 0) return;
++                if (left == 0) return h.shutdownTier();
+                 h.closeAll();
+                 continue;
+             }
+             if (h.core.activeCount() == 0) {
+-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
+-                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
++                if (h.cancels.items.len == 0 and ((h.queued.items.len == 0 and h.ready.items.len == 0) or h.admitted.items.len >= h.info_.lanes)) {
++                    const ms: i64 = if (h.pending()) poll_ns / std.time.ns_per_ms else 100; // work in flight: poll it
++                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }) catch {};
++                }
+                 h.unlock();
+                 continue;
+             }
+@@ -643,11 +785,217 @@ pub const LaneHost = struct {
+         h.lock();
+         for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+         for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
++        for (h.ready.items) |job| h.cancels.append(h.gpa, job.id) catch {};
++        for (h.loading.items) |l| h.cancels.append(h.gpa, l.job.id) catch {};
+         h.unlock();
+         h.takeCancels();
+     }
++
++    // -- parked work (0110) ---------------------------------------------------------------------------------------
++
++    /// Whether admission may park a request: the cache has a tier.
++    fn parking(h: *const LaneHost) bool {
++        const store = h.cache orelse return false;
++        return store.tier != null;
++    }
++
++    /// Whether the engine thread services parked work (restores, staged writes, deferred retries).
++    fn servicing(h: *const LaneHost) bool {
++        return h.parking();
++    }
++
++    /// Work in flight the host must poll (engine thread): restores, writes to stage, requests parked or woken.
++    fn pending(h: *const LaneHost) bool {
++        if (h.loading.items.len > 0 or h.ready.items.len > 0) return true;
++        const store = h.cache orelse return false;
++        return store.busy();
++    }
++
++    /// Before `job`'s pass (engine thread, no lock): park it on a restore of a longer durable point (once). False:
++    /// admit it now.
++    fn park(h: *LaneHost, job: *Job) bool {
++        const store = h.cache orelse return false;
++        const r = job.request;
++        if (!cacheable(r)) return false;
++        const key = keyOf(r);
++        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        const probe = store.probe(key, r.chunks);
++        if (!job.tried_disk) if (probe.durable) |p| {
++            job.tried_disk = true;
++            h.lock();
++            const room = h.loading.ensureUnusedCapacity(h.gpa, 1);
++            h.unlock();
++            if (room) |_| {
++                if (store.restoreBegin(p, key)) |rs| {
++                    h.lock();
++                    h.loading.appendAssumeCapacity(.{ .job = job, .restore = rs, .since = now });
++                    h.unlock();
++                    h.host_counts.restore_waits += 1;
++                    return true;
++                } else |err| note("reading {d} kept tokens from disk did not start ({s}); prefilling", .{ p.at, @errorName(err) });
++            } else |_| {}
++        };
++        return false;
++    }
++
++    /// A woken job to the ready list (the lock held; released here). Out of memory fails it alone.
++    fn toReady(h: *LaneHost, job: *Job) void {
++        h.ready.append(h.gpa, job) catch {
++            h.unlock();
++            return h.finish(job, .failed, "out of memory");
++        };
++        h.unlock();
++    }
++
++    /// Parked work's service (engine thread): restores progress under one elapsed-time budget shared fairly (each gets
++    /// an equal share of what is left, a different one first each time); writes are staged with what remains. Restores
++    /// that end wake every request waiting for them; deferred restores whose retry came ask again.
++    /// Called inside a fill's `between` too, so a family's restore commands there must keep the follower's ordered
++    /// stream valid (dsv41 joins Engram read-ahead before `between`, as recipe 0005 requires).
++    fn service(h: *LaneHost, budget_ns: u64) void {
++        const store = h.cache orelse return;
++        const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        h.expireLoads(t0);
++        const n = store.restoring.items.len;
++        if (n > 0) { // at most 64 a service, a different first one each time: every restore is polled in turn
++            var buf: [64]*pc.Restore = undefined;
++            const m = @min(n, buf.len);
++            h.turn = (h.turn + 1) % n;
++            for (0..m) |k| buf[k] = store.restoring.items[(h.turn + k) % n];
++            for (buf[0..m], 0..) |r, k| {
++                const spent: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.io).toNanoseconds() - t0));
++                if (spent >= budget_ns and k > 0) break;
++                const share = (budget_ns -| spent) / (m - k);
++                const st = store.restorePoll(r, share);
++                if (st != .pending) h.restoreEnded(r);
++            }
++        }
++        const spent: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.io).toNanoseconds() - t0));
++        const idle = h.filling == null and h.core.activeCount() == 0; // nothing decodes: staging takes what is left
++        store.pump(if (idle) budget_ns -| spent else @min(budget_ns -| spent, h.tier.pump_ns));
++    }
++
++    /// Requests parked on a restore longer than load_wait_ns are admitted without it (they look up what memory holds);
++    /// a restore no request waits for any more stops, once.
++    fn expireLoads(h: *LaneHost, now: i96) void {
++        const store = h.cache orelse return;
++        var any = false;
++        var i: usize = 0;
++        while (i < h.loading.items.len) {
++            const l = h.loading.items[i];
++            if (now - l.since < h.tier.load_wait_ns) {
++                i += 1;
++                continue;
++            }
++            any = true;
++            h.lock();
++            _ = h.loading.orderedRemove(i);
++            const waited: u64 = @intCast(@max(0, now - l.since));
++            h.host_counts.restore_wait_timeouts += 1;
++            h.host_counts.restore_wait_ns += waited;
++            h.host_counts.restore_wait_max_ns = @max(h.host_counts.restore_wait_max_ns, waited);
++            h.toReady(l.job); // (releases the lock)
++            const wanted = for (h.loading.items) |o| {
++                if (o.restore == l.restore) break true;
++            } else false;
++            if (!wanted) store.restoreCancel(l.restore);
++        }
++        if (!any) return;
++        h.lock();
++        h.wake.signal(h.io);
++        h.unlock();
++    }
++
++    /// Restore `r` ended (adopted, dropped or failed; `r` is already freed, only its address is compared): its
++    /// waiters wake in arrival order, to look up what memory holds now.
++    fn restoreEnded(h: *LaneHost, r: *pc.Restore) void {
++        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        while (true) {
++            h.lock();
++            const i = for (h.loading.items, 0..) |l, i| {
++                if (l.restore == r) break i;
++            } else {
++                h.wake.signal(h.io);
++                return h.unlock();
++            };
++            const l = h.loading.orderedRemove(i);
++            const waited: u64 = @intCast(@max(0, now - l.since));
++            h.host_counts.restore_wait_ns += waited;
++            h.host_counts.restore_wait_max_ns = @max(h.host_counts.restore_wait_max_ns, waited);
++            h.toReady(l.job);
++        }
++    }
++
++    /// Clean shutdown on the engine thread, nothing left to serve: restores stopped, writes drained within flush_ns.
++    fn shutdownTier(h: *LaneHost) void {
++        const store = h.cache orelse return;
++        if (store.tier == null) return;
++        _ = store.flush(h.tier.flush_ns);
++        if (h.telemetry()) |t| {
++            h.lock();
++            h.tele = t;
++            h.unlock();
++        }
++    }
++
++    /// The cache's counters for status (engine thread); null while telemetry is off.
++    fn telemetry(h: *LaneHost) ?api.CacheStats {
++        if (h.tele == null) return null;
++        var t: api.CacheStats = .{};
++        if (h.cache) |store| {
++            const c = store.counts;
++            const s = store.stats;
++            t.memory_hits = c.hits;
++            t.memory_misses = c.misses;
++            t.kept = c.kept;
++            t.evicted = c.evicted;
++            t.refused = c.refused;
++            t.failed = c.failed;
++            t.entries = store.entries.items.len;
++            t.held_bytes = store.held;
++            t.disk_lookups = s.disk_lookups;
++            t.disk_hits = s.disk_hits;
++            t.disk_hits_committed = s.disk_hits_committed;
++            t.restores_begun = s.restores_begun;
++            t.restores_shared = s.restores_shared;
++            t.restores_failed = s.restores_failed;
++            t.restores_cancelled = s.restores_cancelled;
++            t.restores_dropped = s.restores_dropped;
++            t.restores_refused = s.restores_refused;
++            t.restores_active = store.restoring.items.len;
++            t.restoring_bytes = store.restoring_bytes;
++            for (store.restoring.items) |r| {
++                t.restore_blocks_done += r.done;
++                t.restore_blocks_total += r.total;
++            }
++            t.restored_tokens = s.restored_tokens;
++            t.writes_enqueued = s.writes_enqueued;
++            t.shared_promoted = s.shared_promoted;
++            t.flushes = s.flushes;
++            t.flush_timeouts = s.flush_timeouts;
++            t.flush_unpublished = s.flush_unpublished;
++            t.chats_continued = s.chats_continued;
++            t.chats_continued_prefill_tokens = s.chats_continued_prefill_tokens;
++            t.spill = store.tierCounts();
++        }
++        const hc = h.host_counts;
++        t.restore_waits = hc.restore_waits;
++        t.restore_wait_timeouts = hc.restore_wait_timeouts;
++        t.restore_wait_ns = hc.restore_wait_ns;
++        t.restore_wait_max_ns = hc.restore_wait_max_ns;
++        t.cached_tokens = hc.cached_tokens;
++        t.computed_tokens = hc.computed_tokens;
++        t.parked = h.loading.items.len;
++        return t;
++    }
+ };
+ 
++/// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr).
++fn note(comptime fmt: []const u8, args: anytype) void {
++    if (@import("builtin").is_test) return;
++    std.log.warn("lane host: " ++ fmt, args);
++}
++
+ test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
+     const gpa = std.testing.allocator;
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+@@ -827,4 +1175,7 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
+     try std.testing.expectEqual(Reason.cancelled, a.wait());
+ }
+ 
+-test { _ = @import("lane_host_test.zig"); }
++test {
++    _ = @import("lane_host_test.zig");
++    _ = @import("lane_host_tier_test.zig");
++}
+diff --git a/zig/src/core/lane_host_tier_test.zig b/zig/src/core/lane_host_tier_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a8a4241e6e07a5a5cbd7f17783ffcf0904fa58c
+--- /dev/null
++++ b/zig/src/core/lane_host_tier_test.zig
+@@ -0,0 +1,440 @@
++//! LaneHost with a durable tier (wojo's GLM 0110's scheduler hooks): requests parked on restores, their service
++//! between rounds, between prompt chunks (the interleave off) and at idle, cancellation and shutdown, through the fake
++//! lane backend and an in-memory tier.
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const pc = @import("prompt_cache.zig");
++const lh = @import("lane_host.zig");
++const ft = @import("prompt_cache_fake_tier.zig");
++const LaneHost = lh.LaneHost;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++const Reason = api.Reason;
++const gpa = std.testing.allocator;
++const io = std.testing.io;
++
++const Box = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: std.ArrayList(u32) = .empty,
++    cached: ?u32 = null,
++    done: ?Reason = null,
++
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *Box = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(io);
++        defer b.mutex.unlock(io);
++        switch (e.*) {
++            .prefilled => |c| b.cached = c,
++            .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++            .finished => |f| b.done = f.reason,
++        }
++    }
++    fn sink(b: *Box) api.Sink {
++        return .{ .ctx = b, .event = event };
++    }
++    fn wait(b: *Box) Reason {
++        while (true) {
++            b.mutex.lockUncancelable(io);
++            const d = b.done;
++            b.mutex.unlock(io);
++            if (d) |r| return r;
++            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++        }
++    }
++    fn deinit(b: *Box) void {
++        b.tokens.deinit(gpa);
++    }
++    fn finished(b: *Box) ?Reason {
++        b.mutex.lockUncancelable(io);
++        defer b.mutex.unlock(io);
++        return b.done;
++    }
++    fn count(b: *Box) usize {
++        b.mutex.lockUncancelable(io);
++        defer b.mutex.unlock(io);
++        return b.tokens.items.len;
++    }
++    /// The reply equals the fake target's over `prompt` (any slip in the restored history changes it).
++    fn exact(b: *Box, prompt: []const u32) !void {
++        var history: std.ArrayList(u32) = .empty;
++        defer history.deinit(gpa);
++        try history.appendSlice(gpa, prompt);
++        for (b.tokens.items) |t| {
++            try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++            try history.append(gpa, t);
++        }
++    }
++};
++
++/// The fake backend, a prompt cache over its states, an in-memory tier and the host, at stable addresses.
++const Rig = struct {
++    cfg: lanes.Config,
++    target: lanes.fake.Fake,
++    clock: lanes.fake.FixedClock = .{},
++    core: lanes.Engine,
++    store: pc.Store,
++    tier: ft.FakeTier,
++    host: LaneHost,
++    stopped: bool = false,
++
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 64 + 4 * @as(u64, at);
++    }
++    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        return f.save(@ptrCast(@alignCast(owner.?)), at);
++    }
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++        return error.BackendRestores;
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        f.drop(saved);
++    }
++    fn pack(_: *anyopaque, a: std.mem.Allocator, saved: pc.Saved) anyerror![]u8 {
++        const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
++        return a.dupe(u8, std.mem.sliceAsBytes(kept.items));
++    }
++    fn unpack(_: *anyopaque, b: []const u8) anyerror!pc.Saved {
++        const kept = try gpa.create(std.ArrayList(u32));
++        kept.* = .empty;
++        const n = b.len / 4;
++        try kept.resize(gpa, n);
++        @memcpy(std.mem.sliceAsBytes(kept.items), b[0 .. n * 4]);
++        return kept;
++    }
++
++    fn create(sp: api.Spill) !*Rig {
++        const r = try gpa.create(Rig);
++        errdefer gpa.destroy(r);
++        r.* = .{ .cfg = undefined, .target = .{ .gpa = gpa }, .core = undefined, .store = undefined, .tier = .{ .gpa = gpa, .codec = .{ .ctx = r, .pack = pack, .unpack = unpack } }, .host = undefined };
++        r.cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        r.core = lanes.Engine.init(gpa, &r.cfg, r.target.backend(), r.clock.clock());
++        r.store = pc.Store.init(gpa, .{ .ptr = &r.target, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++        r.store.setTier(r.tier.tier(), 0);
++        r.host = LaneHost.init(gpa, io, &r.core, .{ .lanes = 2 });
++        r.host.interleave_ns = 0;
++        r.host.cache = &r.store;
++        r.host.configure(sp);
++        try r.host.start();
++        return r;
++    }
++
++    fn stop(r: *Rig) void {
++        if (r.stopped) return;
++        r.stopped = true;
++        r.host.stop();
++    }
++
++    fn destroy(r: *Rig) void {
++        r.stop();
++        r.store.deinit();
++        r.tier.deinit();
++        r.core.deinit();
++        r.target.deinit();
++        r.cfg.deinit(gpa);
++        gpa.destroy(r);
++    }
++
++    /// A published point of `key[0..at]` whose state is those tokens (the fake backend's state is its history).
++    fn point(r: *Rig, key: []const u32, at: u32) !u64 {
++        return r.tier.put(key[0..at], at, std.mem.sliceAsBytes(key[0..at]), 0, 0, false);
++    }
++
++    fn stats(r: *Rig) api.CacheStats {
++        var st: api.Status = .{};
++        r.host.engine().status(&st, &.{});
++        return st.cache.?;
++    }
++
++    /// Waits (5 s at most) until the published counters satisfy `ok`.
++    fn until(r: *Rig, comptime ok: fn (api.CacheStats) bool) !void {
++        for (0..5000) |_| {
++            if (ok(r.stats())) return;
++            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.Timeout;
++    }
++};
++
++const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++const t2 = t1 ++ [_]u32{ 7, 7, 5, 3, 8, 8 };
++
++test "a turn whose state left memory waits parked for its restore, resumes it exactly, and writes its own keeps forked from it" {
++    const r = try Rig.create(.{ .load_ms = 5, .flush_ms = 1000 });
++    defer r.destroy();
++    r.tier.polls = 3;
++    const id = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached);
++    try b.exact(&t2);
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.writes_enqueued == 1;
++        }
++    }.ok);
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 1), s.restore_waits);
++    try std.testing.expectEqual(@as(u64, 1), s.disk_hits_committed);
++    try std.testing.expectEqual(@as(u64, 8), s.restored_tokens);
++    try std.testing.expectEqual(@as(u64, 1), s.memory_hits);
++    try std.testing.expectEqual(@as(u64, 8), s.cached_tokens);
++    try std.testing.expectEqual(@as(u64, 8), s.computed_tokens);
++    try std.testing.expectEqual(@as(u64, 0), s.parked);
++    try std.testing.expect(s.spill != null);
++    r.stop();
++    try std.testing.expectEqual(@as(u64, 1), r.tier.flushed); // the clean shutdown drained the tier
++    const kept = for (r.tier.points.items) |p| {
++        if (p.at == 14) break p;
++    } else return error.TestUnexpectedResult;
++    try std.testing.expectEqual(id, kept.parent.?); // its lineage forks the restored point at the resume point
++    try std.testing.expectEqual(@as(u32, 8), kept.fork);
++    try std.testing.expect(kept.group != 0); // a conversation of its own (the restored state is no turn's own)
++    try std.testing.expectEqual(@as(usize, 1), kept.lineage.len); // the point carried none: a lineage of its own
++}
++
++test "two requests on one point share its restore; it stops once, when the last of them is cancelled" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.tier.gate.store(false, .release);
++    _ = try r.point(&t2, 8);
++    var a: Box = .{};
++    defer a.deinit();
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    const e = r.host.engine();
++    try e.submit(1, &req, a.sink());
++    try e.submit(2, &req, b.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restore_waits == 2;
++        }
++    }.ok);
++    var st: api.Status = .{};
++    e.status(&st, &.{});
++    try std.testing.expectEqual(@as(u32, 2), st.waiting);
++    try std.testing.expectEqual(@as(u32, 0), st.running);
++    try std.testing.expectEqual(@as(u64, 1), st.cache.?.restores_begun);
++    try std.testing.expectEqual(@as(u64, 1), st.cache.?.restores_shared);
++    try std.testing.expectEqual(@as(u64, 2), st.cache.?.parked);
++    e.cancel(1);
++    try std.testing.expectEqual(Reason.cancelled, a.wait());
++    try std.testing.expectEqual(@as(u64, 1), r.stats().restores_active); // still wanted by the other
++    e.cancel(2);
++    try std.testing.expectEqual(Reason.cancelled, b.wait());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restores_cancelled == 1 and s.restores_active == 0 and s.parked == 0;
++        }
++    }.ok);
++    r.stop();
++    try std.testing.expectEqual(@as(u64, 1), r.tier.cancels);
++    try std.testing.expectEqual(@as(u64, 0), r.tier.misuse);
++    try std.testing.expectEqual(@as(usize, 0), r.tier.jobs.items.len);
++}
++
++test "a restore that fails on any rank prefills from the start, exactly" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.tier.fail_next = error.CrcMismatch;
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b.cached);
++    try b.exact(&t2);
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 1), s.restores_failed);
++    try std.testing.expectEqual(@as(u64, 0), s.disk_hits_committed);
++}
++
++test "restores progress between another request's prompt chunks with the interleave off, then their request resumes" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.tier.gate.store(false, .release);
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    const e = r.host.engine();
++    try e.submit(1, &req, b.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restore_waits == 1;
++        }
++    }.ok);
++    const Watch = struct {
++        tier: *ft.FakeTier,
++        seen: [6]u64 = @splat(0),
++        fn call(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
++            const w: *@This() = @ptrCast(@alignCast(ctx));
++            if (s.prompt_len == 12 and chunk < w.seen.len) w.seen[chunk] = w.tier.polled; // (the engine thread's)
++        }
++    };
++    var watch: Watch = .{ .tier = &r.tier };
++    r.target.prefill_chunks = 6;
++    r.target.prefill_hook = Watch.call;
++    r.target.prefill_hook_ctx = &watch;
++    const other = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
++    var o: Box = .{};
++    defer o.deinit();
++    const oreq: Request = .{ .prompt = &other, .max_tokens = 1 };
++    try e.submit(2, &oreq, o.sink());
++    try std.testing.expectEqual(Reason.length, o.wait());
++    try std.testing.expect(watch.seen[5] > watch.seen[0]); // polled inside the other's pass, between its chunks
++    r.tier.gate.store(true, .release);
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached);
++    try b.exact(&t2);
++}
++
++test "shutdown with requests parked on a restore that never ends: they are cancelled, the restore stops once, the tier flushes" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.tier.gate.store(false, .release);
++    _ = try r.point(&t2, 8);
++    var a: Box = .{};
++    defer a.deinit();
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, a.sink());
++    try r.host.engine().submit(2, &req, b.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restore_waits == 2;
++        }
++    }.ok);
++    r.stop();
++    try std.testing.expectEqual(Reason.cancelled, a.wait());
++    try std.testing.expectEqual(Reason.cancelled, b.wait());
++    try std.testing.expectEqual(@as(u64, 1), r.tier.cancels);
++    try std.testing.expectEqual(@as(u64, 0), r.tier.misuse);
++    try std.testing.expectEqual(@as(u64, 1), r.tier.flushed);
++}
++
++test "without a tier nothing is parked and status carries no cache counters" {
++    const gpa_ = gpa;
++    var cfg = try lanes.Config.init(gpa_, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa_);
++    var target: lanes.fake.Fake = .{ .gpa = gpa_ };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa_, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var store = pc.Store.init(gpa_, .{ .ptr = &target, .vtable = &.{ .bytes = Rig.bytes, .save = Rig.save, .restore = Rig.restore, .drop = Rig.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++    defer store.deinit();
++    var host = LaneHost.init(gpa_, io, &core, .{ .lanes = 2 });
++    host.cache = &store;
++    host.configure(.{});
++    try host.start();
++    defer host.stop();
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 3, .history_len = 14 };
++    try host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    var st: api.Status = .{};
++    host.engine().status(&st, &.{});
++    try std.testing.expect(st.cache == null);
++    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
++    try std.testing.expectEqual(@as(u64, 0), store.entries.items[0].group);
++}
++
++test "a request parked on a restore past TF_SPILL_LOAD_WAIT_MS is admitted without it, and the restore stops" {
++    const r = try Rig.create(.{ .load_ms = 5, .load_wait_ms = 5 });
++    defer r.destroy();
++    r.tier.gate.store(false, .release);
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b.cached);
++    try b.exact(&t2);
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restore_wait_timeouts == 1 and s.restores_cancelled == 1 and s.restores_active == 0 and s.restoring_bytes == 0;
++        }
++    }.ok);
++    r.stop();
++    try std.testing.expectEqual(@as(u64, 1), r.tier.cancels);
++    try std.testing.expectEqual(@as(u64, 0), r.tier.misuse);
++}
++
++test "restores are serviced between decode rounds while another stream decodes" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    const e = r.host.engine();
++    const along = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
++    var a: Box = .{};
++    defer a.deinit();
++    const areq: Request = .{ .prompt = &along, .max_tokens = 100000 };
++    try e.submit(1, &areq, a.sink());
++    while (a.count() == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    r.tier.gate.store(false, .release);
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try e.submit(2, &req, b.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restore_waits == 1;
++        }
++    }.ok);
++    const p0 = @atomicLoad(u64, &r.tier.polled, .monotonic);
++    const n0 = a.count();
++    var grew = false;
++    for (0..5000) |_| {
++        if (a.count() > n0 + 32 and @atomicLoad(u64, &r.tier.polled, .monotonic) > p0 + 8) {
++            grew = true;
++            break;
++        }
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    try std.testing.expect(grew); // polled round after round while the core is never idle
++    try std.testing.expect(a.finished() == null);
++    r.tier.gate.store(true, .release);
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached);
++    try b.exact(&t2);
++    e.cancel(1);
++    try std.testing.expectEqual(Reason.cancelled, a.wait());
++}
++
++test "spill switches a backend never bound are refused, not ignored" {
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var tier: ft.FakeTier = .{ .gpa = gpa, .codec = .{ .ctx = &target, .pack = Rig.pack, .unpack = Rig.unpack } };
++    defer tier.deinit();
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Rig.bytes, .save = Rig.save, .restore = Rig.restore, .drop = Rig.drop } }, .{}, 1 << 20);
++    defer store.deinit();
++    var host = LaneHost.init(gpa, io, &core, .{ .lanes = 2 });
++    const disk: api.Spill = .{ .dir = "/x", .gib = 1 };
++    try std.testing.expect(!(api.Spill{}).unbound(host.engine())); // nothing asked
++    try std.testing.expect(disk.unbound(host.engine())); // asked, never configured
++    host.configure(disk);
++    try std.testing.expect(disk.unbound(host.engine())); // configured without a prompt cache: no tier to serve it
++    host.cache = &store;
++    host.configure(disk);
++    try std.testing.expect(disk.unbound(host.engine())); // a prompt cache the backend bound no tier to
++    store.setTier(tier.tier(), 0);
++    host.configure(disk);
++    try std.testing.expect(!disk.unbound(host.engine()));
++}
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbcd5587e52 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -1,4 +1,8 @@
+ //! Exact prompt reuse for any family and backend: states kept at prompt-pass chunk ends, found by their tokens.
++//!
++//! The durable tier (`Tier`) and continuation grouping (`join`) port wojo's GLM 0088 (PR #78), 0110 (PR #124;
++//! BadAd84's block-tier design) and 0111 (PR #128). Every hook is off until a tier is set (`setTier`) or grouping is
++//! turned on (`groups`); with both off the store behaves and counts exactly as before.
+ const std = @import("std");
+ const Allocator = std.mem.Allocator;
+ const imprint = @import("prompt_imprint.zig");
+@@ -33,9 +37,270 @@ pub const Snapshots = struct {
+         read: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!Saved = null,
+         /// Learned state `key`'s files under `dir` removed (the cap needs room, or they no longer read back).
+         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
++        /// Whether `saved` still restores for a prompt of `len` tokens (not stale: the family's own rule); null: always.
++        /// dsv41 hands Lanes.usable here with its tier (snaps list membership, `stale`, its grid and window).
++        /// Lookups pass the rest over before comparing lengths, so a stale long state never shadows a usable one.
++        usable: ?*const fn (ptr: *anyopaque, saved: Saved, len: u32) bool = null,
+     };
+ };
+ 
++// -- the durable tier (spill v2) --------------------------------------------------------------------------------------
++// A Tier keeps kept states past the memory budget and past the process (dsv41's spill_tier glues core/spill's per-rank
++// block store and the family's packing to it). The store calls it on the engine thread only and never waits on disk:
++// `lookup` reads the tier's own index, a restore is a job polled between rounds and prompt chunks, a write is enqueued
++// at keep and staged by `pump`. All-rank agreement (presence, validation, commit) is the family's, inside `begin` and
++// `poll`: a job is ready only once every rank installed its copy, and failed everywhere when any rank's copy fails.
++// families/dsv41/spill_tier.zig implements this vtable over core/spill's store and spill_state's packing; the wire
++// commands (has, reserve, copied-block boundary, validate, commit/abort) ride rank_wire's ordered stream inside
++// begin/poll/cancel, and native/cuda.zig openWith calls Store.setTier with the backend's tier, grid, window and
++// Snapshots.usable.
++
++/// A durable point the tier holds and found for a prompt (its ids are the store's keyed ids, pictures' keys included).
++pub const Point = struct {
++    /// The tier's name for the point while it lives (a digest of the point on disk).
++    id: u64,
++    /// Prompt tokens the state stands after, and the ids it covers (`at` plus the store's lookahead).
++    at: u32,
++    tokens: u32,
++    /// Memory a restored copy takes in the store (0: the family's `bytes(at)`).
++    bytes: u64 = 0,
++    /// The conversation that wrote it and whether it is a shared prefix (persisted with the point).
++    group: u64 = 0,
++    shared: bool = false,
++};
++
++/// A durable lookup: the longest point whose ids are a prefix of `key`, `beyond < at <= max_at`, and on `grid` when
++/// set (the native eligibility rule; the store checks the answer again).
++pub const Want = struct {
++    key: []const u32,
++    beyond: u32,
++    max_at: u32,
++    grid: u32 = 0,
++    lookahead: u32 = 0,
++};
++
++/// A kept state the tier writes (enqueued at keep). `saved` stays the family's: the tier reads it until `release`.
++pub const Kept = struct {
++    saved: Saved,
++    /// Its ids (`at` plus lookahead), valid during the call only.
++    key: []const u32,
++    at: u32,
++    bytes: u64,
++    group: u64 = 0,
++    shared: bool = false,
++    images: bool = false,
++    /// The point its rows' computation forks from (the state its pass resumed from; null: a fresh prefill, or a resumed
++    /// state that was never written), and where.
++    parent: ?u64 = null,
++    fork: u32 = 0,
++    /// The computation its rows belong to (0110's lineage; block names are salted with it), valid during the call:
++    /// set whether or not the resumed state was ever written, so sibling forks name their shared blocks alike.
++    lineage: []const Fork = &.{},
++};
++
++/// One step of a state's lineage: computation `name` produced the rows from `at` on (the first step's `at` is 0). A
++/// pass that resumes a state at `at` forks that state's lineage there (GLM 0110 `fork`: the same names for the blocks
++/// before `at`, its own from the block holding `at` on); a fresh prefill starts a lineage of its own.
++pub const Fork = struct { name: u64, at: u32 };
++
++/// A restore job after a poll.
++pub const Poll = union(enum) {
++    /// Still reading or copying: blocks copied so far of its total.
++    pending: struct { done: u64 = 0, total: u64 = 0 },
++    /// Installed on every rank: a family state the store adopts (it owns it from here; `bytes` of memory, 0: bytes(at)),
++    /// and the point's lineage (valid during the call; the store copies it).
++    ready: struct { saved: Saved, bytes: u64 = 0, lineage: []const Fork = &.{} },
++    /// Aborted everywhere (absent on a rank, CRC/size, a guard): the tier released what it reserved.
++    failed: anyerror,
++};
++
++/// The tier's own counters (core/spill fills them; totals unless marked a gauge).
++pub const TierCounts = struct {
++    points: u64 = 0, // gauge: published points
++    blocks: u64 = 0, // gauge: unique blocks on disk
++    stored_bytes: u64 = 0, // gauge: unique bytes on disk (blocks, point files, temporaries)
++    cap_bytes: u64 = 0, // gauge: --spill-gib
++    disk_free_bytes: u64 = 0, // gauge: free bytes on the store's file system
++    staging_bytes: u64 = 0, // gauge: host staging held now (writes, reads, small states)
++    staging_peak: u64 = 0, // gauge: its peak
++    writes_pending: u64 = 0, // gauge: queued points not yet published
++    writes_queued: u64 = 0,
++    writes_committed: u64 = 0,
++    writes_cancelled: u64 = 0, // unpublished points cancelled, for any of the reasons below
++    writes_cancelled_guard: u64 = 0, // their source was about to change and staging could not finish in budget
++    writes_cancelled_staging: u64 = 0, // the staging cap had no room
++    writes_cancelled_shutdown: u64 = 0, // the flush deadline passed
++    writes_failed: u64 = 0,
++    forced_staging: u64 = 0, // ranges staged at once because their source was about to change
++    no_space: u64 = 0, // writes refused by the cap or the free-disk floor
++    dedup_blocks: u64 = 0,
++    dedup_bytes: u64 = 0,
++    written_bytes: u64 = 0,
++    presence_refused: u64 = 0, // a rank lacked the point: no rank restored it
++    compatible_misses: u64 = 0, // lookups with no compatible point
++    crc_errors: u64 = 0,
++    size_errors: u64 = 0, // truncated or oversized files, manifest bounds broken
++    reads: u64 = 0,
++    read_bytes: u64 = 0,
++    read_failed: u64 = 0,
++    evicted_turns: u64 = 0,
++    evicted_forks: u64 = 0,
++    evicted_conversations: u64 = 0,
++    evicted_shared: u64 = 0,
++    quota_trims: u64 = 0,
++    recovered_points: u64 = 0, // published points found at start
++    dropped_temporaries: u64 = 0, // incomplete records removed at start
++
++    pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending" };
++
++    /// Each field's /metrics help (a missing one fails the build).
++    pub const help = .{
++        .points = "Published points in this rank's disk tier.",
++        .blocks = "Unique blocks on this rank's disk.",
++        .stored_bytes = "Unique bytes the disk tier holds (blocks, point files, temporaries).",
++        .cap_bytes = "The disk tier's cap (--spill-gib).",
++        .disk_free_bytes = "Free bytes on the disk tier's file system.",
++        .staging_bytes = "Host staging the disk tier holds now.",
++        .staging_peak = "The most host staging the disk tier has held.",
++        .writes_pending = "Kept states queued for the disk, not yet published.",
++        .writes_queued = "Kept states queued for the disk.",
++        .writes_committed = "Points published on disk (manifest last).",
++        .writes_cancelled = "Unpublished points cancelled (a guard could not stage, staging full, shutdown).",
++        .writes_cancelled_guard = "Unpublished points cancelled because their source was about to change.",
++        .writes_cancelled_staging = "Unpublished points cancelled because staging had no room.",
++        .writes_cancelled_shutdown = "Unpublished points cancelled at the flush deadline.",
++        .writes_failed = "Disk writes that failed.",
++        .forced_staging = "Ranges staged at once because their source was about to change.",
++        .no_space = "Writes refused by the cap or the free-disk floor.",
++        .dedup_blocks = "Blocks linked to equal bytes already on disk.",
++        .dedup_bytes = "Bytes those links saved.",
++        .written_bytes = "Bytes written to disk.",
++        .presence_refused = "Restores refused because a rank lacked the point.",
++        .compatible_misses = "Durable lookups with no compatible point.",
++        .crc_errors = "Blocks or sections that failed their CRC.",
++        .size_errors = "Files truncated or past their manifest's bounds.",
++        .reads = "Points read for restores.",
++        .read_bytes = "Bytes read for restores.",
++        .read_failed = "Restore reads that failed.",
++        .evicted_turns = "Old turns evicted from disk.",
++        .evicted_forks = "Abandoned forks evicted from disk.",
++        .evicted_conversations = "Whole conversations evicted from disk.",
++        .evicted_shared = "Shared-prefix points evicted from disk.",
++        .quota_trims = "Writes that trimmed their conversation to its quota.",
++        .recovered_points = "Published points found at start.",
++        .dropped_temporaries = "Incomplete records removed at start.",
++    };
++};
++
++/// The ranks a tier reports counters for (TP ranks; more are not reported).
++pub const max_ranks = 8;
++
++/// Each rank's TierCounts (rank 0 first): `n` of `ranks` are filled.
++pub const RankCounts = struct {
++    n: u32 = 0,
++    ranks: [max_ranks]TierCounts = @splat(.{}),
++
++    pub fn slice(r: *const RankCounts) []const TierCounts {
++        return r.ranks[0..r.n];
++    }
++};
++
++/// Lifetime and cost (the store relies on both): the tier outlives the Store (Store.deinit cancels restores and
++/// releases written entries through it, so the backend deinitializes the tier after the store). `lookup` and
++/// `counts` run on every admission and every round: O(1)-ish, from memory, no I/O and no CUDA. `poll`, `pump` and
++/// `release` run between rounds, between a fill's prompt chunks (inside Stream.between, with any Engram read-ahead
++/// already joined) and inside the lone driver's commit hook (`pump` only), so each must be bounded per call: by its
++/// `budget_ns` and by a block cap of its own (GLM's PUMP_BLOCKS).
++pub const Tier = struct {
++    ptr: *anyopaque,
++    vtable: *const VTable,
++
++    pub const VTable = struct {
++        /// The longest durable point `want` allows, from the tier's own index (no disk I/O, no CUDA); null: none.
++        lookup: *const fn (ptr: *anyopaque, want: *const Want) ?Point,
++        /// Start restoring `point` into a new family state (reserve on every rank, then read): a job for `poll`.
++        begin: *const fn (ptr: *anyopaque, point: *const Point) anyerror!u64,
++        /// Progress the job by at most `budget_ns` of engine-thread copies; after ready or failed the job is gone.
++        poll: *const fn (ptr: *anyopaque, job: u64, budget_ns: u64) Poll,
++        /// Stop a pending job: reads stop, issued DMA is waited for, reservations go (called once per job at most).
++        cancel: *const fn (ptr: *anyopaque, job: u64) void,
++        /// Enqueue the write of a state just kept: the point's name (null: not written, e.g. under the minimum).
++        keep: *const fn (ptr: *anyopaque, kept: *const Kept) ?u64,
++        /// The point's memory twin is about to be dropped: stage what the write still reads from `saved`, or cancel it.
++        release: ?*const fn (ptr: *anyopaque, point: u64, saved: Saved) void = null,
++        /// The point became a shared prefix: persist the flag (atomically; never resurrecting a deleted point).
++        share: ?*const fn (ptr: *anyopaque, point: u64) void = null,
++        /// The point's state was resumed: its last use, for eviction order.
++        touch: ?*const fn (ptr: *anyopaque, point: u64) void = null,
++        /// The point is unusable (a peer failed it, its install failed): drop it.
++        forget: *const fn (ptr: *anyopaque, point: u64) void,
++        /// Stage queued writes for at most `budget_ns` (engine thread: between rounds and chunks, and at idle).
++        pump: ?*const fn (ptr: *anyopaque, budget_ns: u64) void = null,
++        /// Whether writes still wait for `pump` (the host keeps servicing while idle).
++        busy: ?*const fn (ptr: *anyopaque) bool = null,
++        /// Clean shutdown: stage and drain within `budget_ns`; returns the points left unpublished.
++        flush: *const fn (ptr: *anyopaque, budget_ns: u64) u64,
++        /// Each rank's counters into `out` (rank 0 first; the peers' as their last replies carried them): how many.
++        counts: *const fn (ptr: *anyopaque, out: []TierCounts) usize,
++    };
++};
++
++/// A restore in flight: one job per point, shared by every request waiting for it (0110's duplicate-load avoidance).
++pub const Restore = struct {
++    point: Point,
++    job: u64,
++    key: []u32, // the point's ids (store-owned)
++    done: u64 = 0, // blocks copied so far of `total` (its last poll)
++    total: u64 = 0,
++    bytes: u64 = 0, // the memory its destination holds from begin (charged to the budget until it ends)
++};
++
++/// How a polled restore stands.
++pub const Restored = enum { pending, adopted, dropped, failed };
++
++/// The store's own counters for the tier and continuation (totals).
++pub const Stats = struct {
++    disk_lookups: u64 = 0,
++    disk_hits: u64 = 0, // lookups that found a durable point longer than the best usable memory state
++    disk_hits_committed: u64 = 0, // restores adopted as memory states (every rank agreed)
++    restores_begun: u64 = 0,
++    restores_shared: u64 = 0, // requests that joined a restore already in flight
++    restores_failed: u64 = 0,
++    restores_cancelled: u64 = 0,
++    restores_dropped: u64 = 0, // adopted nothing: the budget cannot hold it, or memory had it meanwhile
++    restores_refused: u64 = 0, // not begun: the budget could not hold its destination
++    restored_tokens: u64 = 0,
++    writes_enqueued: u64 = 0,
++    shared_promoted: u64 = 0,
++    flushes: u64 = 0,
++    flush_timeouts: u64 = 0,
++    flush_unpublished: u64 = 0,
++    chats_continued: u64 = 0,
++    chats_continued_prefill_tokens: u64 = 0,
++};
++
++// -- continuation (0111) ----------------------------------------------------------------------------------------------
++
++/// A conversation's first reply: the tokens of it a later prompt must repeat to continue that conversation.
++pub const chat_match: u32 = 32;
++/// A continued conversation's prefill from this many tokens on is logged.
++pub const chat_log_tokens: u32 = 4096;
++
++/// The conversation a request's kept states belong to (Store.join).
++pub const Join = struct {
++    group: u64 = 0, // 0: grouping off
++    /// It continues `group` without resuming that conversation's own turn state (0111's counted case).
++    continued: bool = false,
++    /// The matched state's ids (`at` plus lookahead), and where the prompt left its evidence (the last prompt that kept
++    /// or resumed it): `back < prior_len` is a rewind before the state itself.
++    prior_len: u32 = 0,
++    back: u32 = 0,
++    /// What the lookup resumed from.
++    source: Source = .nothing,
++
++    pub const Source = enum { nothing, shared, other };
++};
++
+ /// What a family's states depend on beyond their position.
+ pub const Rules = struct {
+     /// Tokens past the position a state read (Flash Next's MTP head keys row at-1 with token at: 1).
+@@ -46,6 +311,31 @@ pub const Rules = struct {
+     min_gap: u32 = 256,
+     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
+     min_prompt: u32 = 4096,
++    /// The family's own resume grid (dsv41: its 2048-row chunk; 0: none): durable points and shared marks stand on it.
++    grid: u32 = 0,
++    /// The rows a resumed pass replays at its end (dsv41: the window): a state is usable only this far from the end.
++    window: u32 = 0,
++
++    /// The native rule (Lanes.usable): 0 < at < len, on the grid, at most len - window, its lookahead inside the prompt.
++    pub fn eligible(r: Rules, at: u32, len: usize) bool {
++        if (at == 0 or at >= len) return false;
++        if (r.grid > 0 and at % r.grid != 0) return false;
++        return @as(usize, at) + r.window <= len and @as(usize, at) + r.lookahead <= len;
++    }
++
++    /// The grid point at or before `at` (`at` itself without a grid).
++    pub fn floorGrid(r: Rules, at: u32) u32 {
++        return if (r.grid == 0) at else at / r.grid * r.grid;
++    }
++
++    /// The largest position `eligible` allows for a prompt of `len` tokens (null: none).
++    pub fn maxAt(r: Rules, len: usize) ?u32 {
++        if (len < 2) return null;
++        var hi: usize = len - 1;
++        hi = @min(hi, len -| @max(r.window, r.lookahead));
++        const at = r.floorGrid(@intCast(@min(hi, std.math.maxInt(u32))));
++        return if (r.eligible(at, len)) at else null;
++    }
+ };
+ 
+ pub const Entry = struct {
+@@ -57,6 +347,11 @@ pub const Entry = struct {
+     used: u64, // the store's clock at its last keep or resume
+     last: []u32, // the last prompt that kept or resumed it
+     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
++    group: u64 = 0, // the conversation that kept it (0111; 0: grouping off)
++    point: ?u64 = null, // its durable point in the tier (written at keep, or restored from)
++    images: bool = false, // its key holds pictures' keys
++    restored: bool = false, // read back from the tier: not a turn's own state (it counts against no conversation)
++    lineage: []Fork = &.{}, // the computation its rows belong to (store-owned; empty without a tier)
+ };
+ 
+ pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
+@@ -67,6 +362,18 @@ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+ /// The entry a backend restores itself (null: the pass starts at 0) and the pass's marks.
+ pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
+ 
++/// A side-effect-free look at what a prompt would resume: the best usable memory state, and a longer durable point.
++pub const Probe = struct { memory: ?*Entry = null, durable: ?Point = null };
++
++/// What a keep records beyond the state: its conversation, pictures and lineage (the tier writes them with it).
++pub const KeepInfo = struct {
++    group: u64 = 0,
++    images: bool = false,
++    parent: ?u64 = null,
++    fork: u32 = 0,
++    lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
++};
++
+ pub const Store = struct {
+     gpa: Allocator,
+     family: Snapshots,
+@@ -78,6 +385,14 @@ pub const Store = struct {
+     counts: Counts = .{},
+     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
+     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
++    tier: ?Tier = null, // spill v2: kept states written at keep, read back by restore jobs (setTier)
++    groups: bool = false, // 0111: kept states carry their conversation (setTier turns it on)
++    next_group: u64 = 0,
++    roots: std.AutoHashMapUnmanaged(u64, u32) = .empty, // each conversation's first prompt length (join)
++    restoring: std.ArrayList(*Restore) = .empty,
++    restoring_bytes: u64 = 0, // destinations the restores in flight reserved (charged like kept states)
++    next_lineage: u64 = 0,
++    stats: Stats = .{},
+ 
+     const SHARED_KEYS = 64;
+ 
+@@ -86,16 +401,32 @@ pub const Store = struct {
+     }
+ 
+     pub fn deinit(s: *Store) void {
++        while (s.restoring.items.len > 0) s.restoreCancel(s.restoring.items[s.restoring.items.len - 1]);
++        s.restoring.deinit(s.gpa);
+         for (s.entries.items) |e| s.free(e);
+         s.entries.deinit(s.gpa);
+         s.shared_keys.deinit(s.gpa);
++        s.roots.deinit(s.gpa);
+         s.held = 0;
+     }
+ 
++    /// The durable tier from here (null: none); a tier turns continuation grouping on (its quotas count conversations).
++    /// Conversation ids continue from `group_seed << 32` so they do not repeat a previous process's on disk.
++    pub fn setTier(s: *Store, tier: ?Tier, group_seed: u32) void {
++        s.tier = tier;
++        if (tier != null) {
++            s.groups = true;
++            if (s.next_group == 0) s.next_group = @as(u64, group_seed) << 32;
++            if (s.next_lineage == 0) s.next_lineage = @as(u64, group_seed) << 32;
++        }
++    }
++
+     fn free(s: *Store, e: *Entry) void {
++        if (e.point) |p| if (s.tier) |t| if (t.vtable.release) |f| f(t.ptr, p, e.saved); // a write still reading it stages first
+         s.family.vtable.drop(s.family.ptr, e.saved);
+         s.gpa.free(e.tokens);
+         s.gpa.free(e.last);
++        s.gpa.free(e.lineage);
+         s.gpa.destroy(e);
+     }
+ 
+@@ -112,7 +443,25 @@ pub const Store = struct {
+ 
+     /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
+     pub fn room(s: *const Store) u64 {
+-        return s.budget -| s.held -| s.spare();
++        return s.budget -| s.held -| s.restoring_bytes -| s.spare();
++    }
++
++    /// Room for `bytes` of new storage beside the kept states, the restores in flight and the spare storage: spare that
++    /// is in the way trimmed first, then states evicted (never `skip`; `prompt`'s superseded ones first), trimming
++    /// again after each since a dropped state's storage may come back spare. False: the budget cannot hold it.
++    fn makeRoom(s: *Store, bytes: u64, skip: ?*Entry, prompt: []const u32) bool {
++        // never evict for room that evicting everything evictable could not make
++        if (s.restoring_bytes + bytes + (if (skip) |e| e.bytes else 0) > s.budget) return false;
++        while (true) {
++            const free_ = s.spare();
++            if (s.held + s.restoring_bytes + free_ + bytes <= s.budget) return true;
++            if (free_ > 0) if (s.family.vtable.trim) |f| {
++                f(s.family.ptr, s.budget -| s.held -| s.restoring_bytes -| bytes);
++                if (s.spare() < free_) continue;
++            };
++            s.remove(s.victimBut(skip, prompt) orelse return false);
++            s.counts.evicted += 1;
++        }
+     }
+ 
+     /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
+@@ -120,6 +469,14 @@ pub const Store = struct {
+         return at > 0 and (!s.rules.planned or std.mem.indexOfScalar(u32, starts, at) != null);
+     }
+ 
++    /// Whether a kept state still restores for a prompt of `len` tokens: the family's own rule, then the native one
++    /// (both only where set: a family without them keeps the old behaviour).
++    fn live(s: *const Store, e: *const Entry, len: usize) bool {
++        if (s.family.vtable.usable) |f| if (!f(s.family.ptr, e.saved, @intCast(@min(len, std.math.maxInt(u32))))) return false;
++        if (s.rules.grid == 0 and s.rules.window == 0) return true;
++        return s.rules.eligible(e.at, len);
++    }
++
+     /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left.
+     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
+         var best: ?*Entry = null;
+@@ -128,11 +485,216 @@ pub const Store = struct {
+             if (best != null and e.at <= best.?.at) continue;
+             const n = e.tokens.len;
+             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
++            if (!s.live(e, prompt.len)) continue; // stale or ineligible: never shadows a shorter usable state or a point
+             best = e;
+         }
+         return best;
+     }
+ 
++    /// What `key` would resume, changing nothing in memory: the best usable kept state, and the tier's longer point.
++    pub fn probe(s: *Store, key: []const u32, starts: []const u32) Probe {
++        const m = s.find(key, starts);
++        const t = s.tier orelse return .{ .memory = m };
++        const have: u32 = if (m) |e| e.at else 0;
++        s.stats.disk_lookups += 1;
++        const max_at = s.rules.maxAt(key.len) orelse return .{ .memory = m };
++        if (max_at <= have) return .{ .memory = m };
++        const want: Want = .{ .key = key, .beyond = have, .max_at = max_at, .grid = s.rules.grid, .lookahead = s.rules.lookahead };
++        const p = t.vtable.lookup(t.ptr, &want) orelse return .{ .memory = m };
++        if (!s.pointFits(p, key, starts, have)) return .{ .memory = m };
++        s.stats.disk_hits += 1;
++        return .{ .memory = m, .durable = p };
++    }
++
++    /// A durable answer checked again: past the memory hit, eligible here, its ids inside the key, inside the budget.
++    fn pointFits(s: *const Store, p: Point, key: []const u32, starts: []const u32, have: u32) bool {
++        if (p.at <= have or @as(u64, p.at) + s.rules.lookahead != p.tokens or p.tokens > key.len) return false;
++        if (!s.rules.eligible(p.at, key.len) or !s.usable(p.at, starts)) return false;
++        return s.pointBytes(p) <= s.budget;
++    }
++
++    fn pointBytes(s: *const Store, p: Point) u64 {
++        return if (p.bytes > 0) p.bytes else s.family.vtable.bytes(s.family.ptr, p.at);
++    }
++
++    /// A restore of `p` (found by `probe` for `key`): the job already in flight for it, or a new one. A new job's
++    /// destination is charged to the budget from here until it ends (room made first, as for a keep; nobody holds a
++    /// looked-up entry at admission, so any state may go): error.NoRoom when the budget cannot hold it.
++    pub fn restoreBegin(s: *Store, p: Point, key: []const u32) !*Restore {
++        for (s.restoring.items) |r| if (r.point.id == p.id) {
++            s.stats.restores_shared += 1;
++            return r;
++        };
++        const t = s.tier orelse return error.NoTier;
++        if (p.tokens > key.len) return error.BadPoint;
++        const bytes = s.pointBytes(p);
++        if (!s.makeRoom(bytes, null, key)) {
++            s.stats.restores_refused += 1;
++            return error.NoRoom;
++        }
++        const r = try s.gpa.create(Restore);
++        errdefer s.gpa.destroy(r);
++        const k = try s.gpa.dupe(u32, key[0..p.tokens]);
++        errdefer s.gpa.free(k);
++        try s.restoring.ensureUnusedCapacity(s.gpa, 1);
++        const job = try t.vtable.begin(t.ptr, &p);
++        r.* = .{ .point = p, .job = job, .key = k, .bytes = bytes };
++        s.restoring.appendAssumeCapacity(r);
++        s.restoring_bytes += bytes;
++        s.stats.restores_begun += 1;
++        return r;
++    }
++
++    /// Progress `r` by at most `budget_ns`; once it is no longer pending `r` is freed. An installed state becomes a
++    /// shared or restored memory entry that the next lookup of its prompt finds (adopted).
++    pub fn restorePoll(s: *Store, r: *Restore, budget_ns: u64) Restored {
++        const t = s.tier.?;
++        switch (t.vtable.poll(t.ptr, r.job, budget_ns)) {
++            .pending => |p| {
++                r.done = p.done;
++                r.total = p.total;
++                return .pending;
++            },
++            .failed => |err| {
++                s.stats.restores_failed += 1;
++                note("restoring {d} tokens from disk failed ({s}); its prompt prefills", .{ r.point.at, @errorName(err) });
++                s.endRestore(r);
++                return .failed;
++            },
++            .ready => |rd| {
++                const ok = s.adopt(r, rd.saved, rd.bytes, rd.lineage);
++                s.endRestore(r);
++                return if (ok) .adopted else .dropped;
++            },
++        }
++    }
++
++    /// Stop `r` (its last waiter went, or shutdown): the tier releases its reservations; `r` is freed.
++    pub fn restoreCancel(s: *Store, r: *Restore) void {
++        if (s.tier) |t| t.vtable.cancel(t.ptr, r.job);
++        s.stats.restores_cancelled += 1;
++        s.endRestore(r);
++    }
++
++    fn endRestore(s: *Store, r: *Restore) void {
++        if (std.mem.indexOfScalar(*Restore, s.restoring.items, r)) |i| {
++            _ = s.restoring.orderedRemove(i);
++            s.restoring_bytes -= r.bytes;
++        }
++        s.gpa.free(r.key);
++        s.gpa.destroy(r);
++    }
++
++    /// An installed restore as a memory entry, room made as for any keep; false: dropped (no room, or memory had it).
++    /// Its reservation moves from the restores' charge to the kept states'. A memory twin of the same point that is
++    /// no longer usable (the family staled it: KV sharding's placements give a kept state's rows away, an overwrite) is
++    /// what made the lookup go to the tier: it is replaced, never a reason to drop the restore and recompute.
++    fn adopt(s: *Store, r: *Restore, saved: Saved, bytes0: u64, lineage: []const Fork) bool {
++        const bytes = if (bytes0 > 0) bytes0 else s.pointBytes(r.point);
++        s.restoring_bytes -= r.bytes; // (zeroed: endRestore then releases nothing more)
++        r.bytes = 0;
++        for (s.entries.items, 0..) |e, i| if (e.at == r.point.at and std.mem.eql(u32, e.tokens, r.key)) {
++            if (s.live(e, r.key.len)) return s.unadopted(saved); // a usable copy came meanwhile: it wins
++            s.remove(i); // the stale twin goes (its storage back to the family), the restore takes its place
++            break;
++        };
++        if (!s.makeRoom(bytes, null, r.key)) return s.unadopted(saved);
++        const e = s.gpa.create(Entry) catch return s.unadopted(saved);
++        const tokens = s.gpa.dupe(u32, r.key) catch {
++            s.gpa.destroy(e);
++            return s.unadopted(saved);
++        };
++        const last = s.gpa.dupe(u32, r.key) catch {
++            s.gpa.free(tokens);
++            s.gpa.destroy(e);
++            return s.unadopted(saved);
++        };
++        const lin = s.gpa.dupe(Fork, lineage) catch {
++            s.gpa.free(last);
++            s.gpa.free(tokens);
++            s.gpa.destroy(e);
++            return s.unadopted(saved);
++        };
++        s.clock += 1;
++        e.* = .{ .tokens = tokens, .at = r.point.at, .saved = saved, .bytes = bytes, .born = @intCast(r.key.len), .used = s.clock, .last = last, .shared = r.point.shared, .group = r.point.group, .point = r.point.id, .restored = true, .lineage = lin };
++        s.entries.append(s.gpa, e) catch {
++            e.point = null; // the point stays the tier's; only the memory copy goes
++            s.free(e);
++            s.stats.restores_dropped += 1;
++            return false;
++        };
++        s.held += bytes;
++        s.stats.disk_hits_committed += 1;
++        s.stats.restored_tokens += r.point.at;
++        if (!@import("builtin").is_test) std.log.info("prompt cache: restored {d} tokens from disk", .{r.point.at});
++        return true;
++    }
++
++    fn unadopted(s: *Store, saved: Saved) bool {
++        s.family.vtable.drop(s.family.ptr, saved);
++        s.stats.restores_dropped += 1;
++        return false;
++    }
++
++    /// Writes staged for at most `budget_ns` (engine thread).
++    pub fn pump(s: *Store, budget_ns: u64) void {
++        const t = s.tier orelse return;
++        if (t.vtable.pump) |f| f(t.ptr, budget_ns);
++    }
++
++    /// Whether the tier has restores in flight or writes to stage (the host keeps servicing it).
++    pub fn busy(s: *const Store) bool {
++        const t = s.tier orelse return false;
++        if (s.restoring.items.len > 0) return true;
++        return if (t.vtable.busy) |f| f(t.ptr) else false;
++    }
++
++    /// Clean shutdown, engine thread: every restore stopped, writes drained within `budget_ns`; the points left
++    /// unpublished at the deadline (counted, never published to make the count).
++    pub fn flush(s: *Store, budget_ns: u64) u64 {
++        const t = s.tier orelse return 0;
++        while (s.restoring.items.len > 0) s.restoreCancel(s.restoring.items[s.restoring.items.len - 1]);
++        const left = t.vtable.flush(t.ptr, budget_ns);
++        s.stats.flushes += 1;
++        if (left > 0) {
++            s.stats.flush_timeouts += 1;
++            s.stats.flush_unpublished += left;
++            note("{d} kept states were still unpublished at the flush deadline; a restart misses them", .{left});
++        }
++        return left;
++    }
++
++    /// Durable point `id` is unusable (the family's all-rank abort, or its install failed): the tier drops it.
++    pub fn forgetPoint(s: *Store, id: u64) void {
++        const t = s.tier orelse return;
++        for (s.entries.items) |e| if (e.point == id) {
++            e.point = null;
++        };
++        t.vtable.forget(t.ptr, id);
++    }
++
++    /// Each rank's tier counters, when a tier is set.
++    pub fn tierCounts(s: *const Store) ?RankCounts {
++        const t = s.tier orelse return null;
++        var out: RankCounts = .{};
++        out.n = @intCast(@min(t.vtable.counts(t.ptr, &out.ranks), max_ranks));
++        return out;
++    }
++
++    /// The lineage of a pass that resumes `from` (null: a fresh prefill) and computes its own rows from there: `from`'s
++    /// forked at its position, or a new one (gpa-owned; empty without a tier, whose block names are its only use).
++    pub fn passLineage(s: *Store, from: ?*const Entry) ![]Fork {
++        if (s.tier == null) return &.{};
++        s.next_lineage += 1;
++        const own: Fork = .{ .name = s.next_lineage, .at = if (from) |e| e.at else 0 };
++        const base: []const Fork = if (from) |e| e.lineage else &.{};
++        if (base.len == 0) return s.gpa.dupe(Fork, &.{.{ .name = own.name, .at = 0 }});
++        const out = try s.gpa.alloc(Fork, base.len + 1);
++        @memcpy(out[0..base.len], base);
++        out[base.len] = own;
++        return out;
++    }
++
+     /// Before a prompt pass: restore the longest state `prompt` resumes (from 0: none or a failed copy) and plan its marks.
+     pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque) !Plan {
+         const l = try s.lookup(a, prompt, history_len, shared, starts);
+@@ -153,8 +715,12 @@ pub const Store = struct {
+         if (e == null) s.counts.misses += 1;
+         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
+         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
+-            const at = if (s.rules.planned) floorStart(starts, w) else w;
+-            if (std.mem.indexOfScalar(u32, marks_, at) != null) s.noteShared(prompt[0 .. at + s.rules.lookahead]);
++            // the mark as `marks` computed it (a chunk start, or the cut itself), and the state the family keeps for
++            // it (a chunk start, or the cut on the family's grid: dsv41 keeps an off-grid mark at its chunk end)
++            const m = if (s.rules.planned) floorStart(starts, w) else w;
++            if (std.mem.indexOfScalar(u32, marks_, m) == null) continue;
++            const at = if (s.rules.planned) m else s.rules.floorGrid(w);
++            if (at > 0) s.noteShared(prompt[0 .. at + s.rules.lookahead]);
+         }
+         s.reserve(prompt, e, marks_);
+         return .{ .entry = e, .marks = marks_ };
+@@ -164,7 +730,7 @@ pub const Store = struct {
+     fn reserve(s: *Store, prompt: []const u32, from: ?*Entry, marks_: []const u32) void {
+         var need: u64 = 0;
+         for (marks_) |at| need += s.family.vtable.bytes(s.family.ptr, at);
+-        while (s.held + need > s.budget) {
++        while (s.held + s.restoring_bytes + need > s.budget) {
+             const i = s.victimBut(from, prompt) orelse return;
+             s.remove(i);
+             s.counts.evicted += 1;
+@@ -214,6 +780,7 @@ pub const Store = struct {
+         s.clock += 1;
+         e.used = s.clock;
+         s.counts.hits += 1;
++        if (e.point) |p| if (s.tier) |t| if (t.vtable.touch) |f| f(t.ptr, p);
+         const last = s.gpa.dupe(u32, prompt) catch return;
+         s.gpa.free(e.last);
+         e.last = last;
+@@ -249,13 +816,23 @@ pub const Store = struct {
+ 
+     /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
+     pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
++        return s.keepWith(prompt, at, owner, starts, .{});
++    }
++
++    /// keep, recording the state's conversation, pictures and lineage; with a tier its write is enqueued here.
++    pub fn keepWith(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, info: KeepInfo) bool {
+         const n = @as(usize, at) + s.rules.lookahead;
+         if (at == 0 or n > prompt.len) return false;
+         s.clock += 1;
+         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
+         for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
+             e.used = s.clock; // the same state again: no copy
++            if (shared and !e.shared) if (e.point) |p| if (s.tier) |t| if (t.vtable.share) |f| { // now a shared prefix, on disk too
++                f(t.ptr, p);
++                s.stats.shared_promoted += 1;
++            };
+             e.shared = e.shared or shared;
++            if (e.group == 0) e.group = info.group;
+             return true;
+         };
+         const bytes = s.family.vtable.bytes(s.family.ptr, at);
+@@ -267,15 +844,23 @@ pub const Store = struct {
+         while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
+             if (s.family.vtable.reuses) |f| if (f(s.family.ptr, at)) break;
+             const free_ = s.spare();
+-            if (s.held + free_ + bytes <= s.budget) break;
++            if (s.held + s.restoring_bytes + free_ + bytes <= s.budget) break;
+             if (free_ > 0) {
+-                if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
++                if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| s.restoring_bytes -| bytes); // spare that cannot take this state goes before any state
+                 if (s.spare() < free_) continue;
+             }
+             s.remove(s.victimBut(null, prompt).?); // its storage may come back spare and take this state
+             s.counts.evicted += 1;
+         }
+-        if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
++        if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.restoring_bytes -| bytes);
++        if (s.restoring_bytes > 0 and s.held + s.restoring_bytes + bytes > s.budget) { // restores in flight hold the rest
++            const reuses = if (s.family.vtable.reuses) |f| f(s.family.ptr, at) else false;
++            if (!reuses) {
++                s.counts.refused += 1;
++                note("kept nothing at {d} tokens: restores in flight hold {d} MiB of the {d} MiB budget", .{ at, s.restoring_bytes >> 20, s.budget >> 20 });
++                return false;
++            }
++        }
+         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
+         const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
+             s.gpa.destroy(e);
+@@ -292,16 +877,27 @@ pub const Store = struct {
+             s.gpa.destroy(e);
+             return s.fail(at, err);
+         };
++        const lin = s.gpa.dupe(Fork, info.lineage) catch {
++            s.family.vtable.drop(s.family.ptr, saved);
++            s.gpa.free(last);
++            s.gpa.free(tokens);
++            s.gpa.destroy(e);
++            return s.fail(at, error.OutOfMemory);
++        };
+         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
+-        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
++        e.* = .{ .tokens = tokens, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .group = info.group, .images = info.images, .lineage = lin };
+         s.entries.append(s.gpa, e) catch {
+             s.free(e);
+             return s.fail(at, error.OutOfMemory);
+         };
+         s.held += charged;
+         s.counts.kept += 1;
++        if (s.tier) |t| { // write at keep: the tier stages the state's bytes between rounds
++            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = info.group, .shared = shared, .images = info.images, .parent = info.parent, .fork = info.fork, .lineage = lin });
++            if (e.point != null) s.stats.writes_enqueued += 1;
++        }
+         if (shared) s.learn(e, starts);
+-        if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
++        if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| s.restoring_bytes); // spare storage only inside what the budget leaves
+         return true;
+     }
+ 
+@@ -329,11 +925,7 @@ pub const Store = struct {
+         const read = s.family.vtable.read orelse return have;
+         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
+         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
+-        while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
+-            s.remove(s.victimBut(have, prompt) orelse return have);
+-            s.counts.evicted += 1;
+-        }
+-        if (bytes > s.budget) return have;
++        if (!s.makeRoom(bytes, have, prompt)) return have;
+         const e = s.gpa.create(Entry) catch return have;
+         e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
+         e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
+@@ -390,8 +982,109 @@ pub const Store = struct {
+         };
+         return oldest;
+     }
++
++    // -- 0111: continuation ---------------------------------------------------------------------------------------
++
++    /// The conversation a request belongs to, decided at its lookup (`hit`: the state it resumes, null: none). A hit on
++    /// one of a conversation's own turn states keeps that conversation, when the prompt shows it is that conversation
++    /// (`ownHit`); otherwise (a shared prefix, a state read back from disk, an own state of another conversation, or
++    /// nothing) the most recently used own state the prompt repeats past its conversation's first prompt and the first
++    /// chat_match reply tokens names it (`matchable`: no pictures and drafted, as the source requires); else a new
++    /// conversation. Deterministic in the entries' use order. Off (group 0) unless `groups`.
++    pub fn join(s: *Store, prompt: []const u32, hit: ?*const Entry, matchable: bool) Join {
++        if (!s.groups) return .{};
++        const source: Join.Source = if (hit) |e| (if (e.shared) .shared else .other) else .nothing;
++        if (hit) |e| if (s.ownHit(e, prompt)) return .{ .group = e.group, .source = .other };
++        if (matchable) if (s.continuedChat(prompt)) |c| return .{
++            .group = c.group,
++            .continued = true,
++            .prior_len = @intCast(c.tokens.len),
++            .back = @intCast(commonPrefix(c.last, prompt)),
++            .source = source,
++        };
++        s.next_group += 1;
++        const g = s.next_group;
++        s.roots.put(s.gpa, g, @intCast(prompt.len)) catch {};
++        if (s.roots.count() > 4 * @max(16, s.entries.items.len)) s.pruneRoots(g); // conversations no kept state is in
++        return .{ .group = g, .source = source };
++    }
++
++    /// Whether resuming `e` keeps `e`'s conversation: one of its own states (not shared, not read back), and the prompt
++    /// repeats its evidence (the last prompt that kept or resumed it) up to its conversation's first prompt and first
++    /// chat_match reply tokens, or all of it when shorter. GLM's own states always hold conversation-specific tokens;
++    /// a native state on the grid or at last_end can lie wholly inside a system prompt other conversations share, so
++    /// the hit alone is no evidence. A conversation whose first prompt was forgotten keeps the hit-alone rule.
++    fn ownHit(s: *const Store, e: *const Entry, prompt: []const u32) bool {
++        if (e.shared or e.restored or e.group == 0) return false;
++        const root = s.roots.get(e.group) orelse return true;
++        return commonPrefix(e.last, prompt) >= @min(e.last.len, @as(usize, root) + chat_match);
++    }
++
++    /// The own kept state whose conversation `prompt` continues (continued_chat): most recently used first; a later
++    /// entry wins a tie of use. Shared, restored, pictured and forgotten conversations' states are passed over.
++    pub fn continuedChat(s: *const Store, prompt: []const u32) ?*Entry {
++        var best: ?*Entry = null;
++        for (s.entries.items) |c| {
++            if (c.shared or c.restored or c.images or c.group == 0) continue;
++            const root = s.roots.get(c.group) orelse continue;
++            const n = @as(usize, root) + chat_match;
++            if (c.last.len < n or prompt.len < n or c.last[n - 1] != prompt[n - 1] or !std.mem.eql(u32, c.last[0..n], prompt[0..n])) continue;
++            if (best == null or c.used >= best.?.used) best = c;
++        }
++        return best;
++    }
++
++    fn pruneRoots(s: *Store, keep_: u64) void {
++        var gone: std.ArrayList(u64) = .empty;
++        defer gone.deinit(s.gpa);
++        var it = s.roots.keyIterator();
++        while (it.next()) |k| {
++            if (k.* == keep_) continue;
++            const held = for (s.entries.items) |e| {
++                if (e.group == k.*) break true;
++            } else false;
++            if (!held) gone.append(s.gpa, k.*) catch return;
++        }
++        for (gone.items) |k| _ = s.roots.remove(k);
++    }
++
++    /// After a continued request's pass resumed at `cut` of `len` tokens: counted, and a large prefill logged with where
++    /// the prompt left the kept state and what it resumed from (only rank 0 runs the host).
++    pub fn continued(s: *Store, j: Join, cut: u32, len: usize) void {
++        if (!j.continued) return;
++        s.stats.chats_continued += 1;
++        s.stats.chats_continued_prefill_tokens += len -| cut;
++        if (!shouldLog(j, cut, len) or @import("builtin").is_test) return;
++        var buf: [512]u8 = undefined;
++        std.log.info("{s}", .{continuedLine(&buf, j, cut, len)});
++    }
+ };
+ 
++/// Whether `continued` logs a continued request's pass (from `cut` of `len` tokens): its prefill is large.
++pub fn shouldLog(j: Join, cut: u32, len: usize) bool {
++    return j.continued and len -| cut >= chat_log_tokens;
++}
++
++/// continued's log line.
++pub fn continuedLine(buf: []u8, j: Join, cut: u32, len: usize) []const u8 {
++    const source = switch (j.source) {
++        .nothing => "nothing",
++        .shared => "a shared prefix",
++        .other => "a state that is not a turn's own (read back from disk)",
++    };
++    var why_buf: [256]u8 = undefined;
++    const why = (if (j.back < j.prior_len)
++        std.fmt.bufPrint(&why_buf, "it went back to token {d}, before that conversation's newest kept state ({d} tokens)", .{ j.back, j.prior_len })
++    else
++        std.fmt.bufPrint(&why_buf, "its kept state of {d} tokens could not serve it (stale, off the grid or past the replay cut)", .{j.prior_len})) catch "";
++    return std.fmt.bufPrint(buf, "prompt cache: conversation {d}: resumed at {d} of {d} tokens from {s}, prefilling {d}; {s}", .{ j.group, cut, len, source, len -| cut, why }) catch buf[0..0];
++}
++
++/// The tokens two id lists share from the start.
++pub fn commonPrefix(a: []const u32, b: []const u32) usize {
++    return std.mem.indexOfDiff(u32, a, b) orelse @min(a.len, b.len);
++}
++
+ /// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr).
+ fn note(comptime fmt: []const u8, args: anytype) void {
+     if (@import("builtin").is_test) return;
+@@ -409,4 +1102,5 @@ fn floorStart(starts: []const u32, at: u32) u32 {
+ 
+ test {
+     _ = @import("prompt_cache_test.zig");
++    _ = @import("prompt_cache_tier_test.zig");
+ }
+diff --git a/zig/src/core/prompt_cache_fake_tier.zig b/zig/src/core/prompt_cache_fake_tier.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..919b31f1a23a645da5f0e3f5b7948e635d4b64fe
+--- /dev/null
++++ b/zig/src/core/prompt_cache_fake_tier.zig
+@@ -0,0 +1,316 @@
++//! An in-memory prompt-cache Tier for tests (no disk, no CUDA; one lock for the engine thread and the test's): writes are queued at keep and published
++//! by `pump`, a restore needs `polls` polls, and every misuse (a job cancelled twice, a poll of a gone job) is recorded.
++const std = @import("std");
++const pc = @import("prompt_cache.zig");
++const Allocator = std.mem.Allocator;
++
++/// How the fake turns a family's state into bytes and back (the family's packing, in round 2).
++pub const Codec = struct {
++    ctx: *anyopaque,
++    pack: *const fn (ctx: *anyopaque, a: Allocator, saved: pc.Saved) anyerror![]u8,
++    unpack: *const fn (ctx: *anyopaque, bytes: []const u8) anyerror!pc.Saved,
++};
++
++pub const FakeTier = struct {
++    gpa: Allocator,
++    codec: Codec,
++    points: std.ArrayList(Pt) = .empty,
++    queue: std.ArrayList(Pending) = .empty,
++    jobs: std.ArrayList(Job) = .empty,
++    next_id: u64 = 1,
++    next_job: u64 = 1,
++    /// Polls a restore takes before it is ready (1: the first).
++    polls: u32 = 1,
++    /// The next restore fails with this error (on its first poll).
++    fail_next: ?anyerror = null,
++    /// Shorter states are not written.
++    min_tokens: u32 = 0,
++    /// A flush cannot drain: its queue is left unpublished.
++    stuck: bool = false,
++    /// Lookups ignore `beyond`, `max_at` and `grid` (the store must check the answer itself).
++    lax: bool = false,
++    /// While false every poll stays pending (another thread opens it).
++    gate: std.atomic.Value(bool) = .init(true),
++    c: pc.TierCounts = .{},
++    polled: u64 = 0,
++    cancels: u64 = 0,
++    misuse: u64 = 0, // a cancel or poll of a job that is not pending
++    touched: u64 = 0,
++    released: u64 = 0,
++    shared_marks: u64 = 0,
++    flushed: u64 = 0,
++    /// Ranks whose counters `counts` reports (rank r's `crc_errors` is r, to tell them apart).
++    ranks: u32 = 1,
++    /// The engine thread's calls and the test thread's `put`/`point` (a test adds a point while the host still
++    /// publishes an earlier keep: two appends at once lost one list, a leak the allocator caught now and then).
++    mu: std.Io.Mutex = .init,
++
++    pub const Pt = struct { id: u64, key: []u32, at: u32, group: u64, shared: bool, bytes: []u8, parent: ?u64, fork: u32, size: u64, lineage: []pc.Fork = &.{} };
++    pub const Pending = struct { id: u64, key: []u32, at: u32, group: u64, shared: bool, saved: pc.Saved, parent: ?u64, fork: u32, size: u64, lineage: []pc.Fork };
++    const Job = struct { id: u64, point: u64, left: u32, fail: ?anyerror };
++
++    pub fn deinit(t: *FakeTier) void {
++        for (t.points.items) |p| {
++            t.gpa.free(p.key);
++            t.gpa.free(p.bytes);
++            t.gpa.free(p.lineage);
++        }
++        for (t.queue.items) |q| {
++            t.gpa.free(q.key);
++            t.gpa.free(q.lineage);
++        }
++        t.points.deinit(t.gpa);
++        t.queue.deinit(t.gpa);
++        t.jobs.deinit(t.gpa);
++    }
++
++    pub fn tier(t: *FakeTier) pc.Tier {
++        return .{ .ptr = t, .vtable = &.{ .lookup = lookup, .begin = begin, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts } };
++    }
++
++    fn lock(t: *FakeTier) void {
++        t.mu.lockUncancelable(std.testing.io);
++    }
++
++    fn unlock(t: *FakeTier) void {
++        t.mu.unlock(std.testing.io);
++    }
++
++    fn of(ptr: *anyopaque) *FakeTier {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    /// A published point of `key` (its ids, `at` plus lookahead) whose state packs to `bytes`: its name.
++    pub fn put(t: *FakeTier, key: []const u32, at: u32, bytes: []const u8, size: u64, group: u64, shared: bool) !u64 {
++        t.lock();
++        defer t.unlock();
++        const k = try t.gpa.dupe(u32, key);
++        errdefer t.gpa.free(k);
++        const b = try t.gpa.dupe(u8, bytes);
++        errdefer t.gpa.free(b);
++        const id = t.next_id;
++        try t.points.append(t.gpa, .{ .id = id, .key = k, .at = at, .group = group, .shared = shared, .bytes = b, .parent = null, .fork = 0, .size = size });
++        t.next_id += 1;
++        return id;
++    }
++
++    /// The published point named `id`, if any.
++    pub fn point(t: *FakeTier, id: u64) ?*Pt {
++        t.lock();
++        defer t.unlock();
++        return t.find(id);
++    }
++
++    fn find(t: *FakeTier, id: u64) ?*Pt {
++        for (t.points.items) |*p| if (p.id == id) return p;
++        return null;
++    }
++
++    fn lookup(ptr: *anyopaque, want: *const pc.Want) ?pc.Point {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        var best: ?*Pt = null;
++        for (t.points.items) |*p| {
++            if (p.key.len > want.key.len or !std.mem.eql(u32, p.key, want.key[0..p.key.len])) continue;
++            if (!t.lax and (p.at <= want.beyond or p.at > want.max_at or (want.grid > 0 and p.at % want.grid != 0))) continue;
++            if (best == null or p.at > best.?.at) best = p;
++        }
++        const p = best orelse {
++            t.c.compatible_misses += 1;
++            return null;
++        };
++        return .{ .id = p.id, .at = p.at, .tokens = @intCast(p.key.len), .bytes = p.size, .group = p.group, .shared = p.shared };
++    }
++
++    fn begin(ptr: *anyopaque, p: *const pc.Point) anyerror!u64 {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        if (t.find(p.id) == null) {
++            t.c.presence_refused += 1;
++            return error.PointMissing;
++        }
++        const id = t.next_job;
++        t.next_job += 1;
++        try t.jobs.append(t.gpa, .{ .id = id, .point = p.id, .left = @max(t.polls, 1), .fail = t.fail_next });
++        t.fail_next = null;
++        return id;
++    }
++
++    fn job(t: *FakeTier, id: u64) ?usize {
++        for (t.jobs.items, 0..) |j, i| if (j.id == id) return i;
++        return null;
++    }
++
++    fn poll(ptr: *anyopaque, id: u64, _: u64) pc.Poll {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        t.polled += 1;
++        const i = t.job(id) orelse {
++            t.misuse += 1;
++            return .{ .failed = error.NoSuchJob };
++        };
++        const j = &t.jobs.items[i];
++        if (j.fail) |err| {
++            _ = t.jobs.orderedRemove(i);
++            t.c.read_failed += 1;
++            if (err == error.CrcMismatch) t.c.crc_errors += 1;
++            return .{ .failed = err };
++        }
++        if (!t.gate.load(.acquire)) return .{ .pending = .{ .total = @max(t.polls, 1) } };
++        j.left -= 1;
++        if (j.left > 0) return .{ .pending = .{ .done = @max(t.polls, 1) - j.left, .total = @max(t.polls, 1) } };
++        const pid = j.point;
++        _ = t.jobs.orderedRemove(i);
++        const p = t.find(pid) orelse return .{ .failed = error.PointMissing };
++        const saved = t.codec.unpack(t.codec.ctx, p.bytes) catch |err| return .{ .failed = err };
++        t.c.reads += 1;
++        t.c.read_bytes += p.bytes.len;
++        return .{ .ready = .{ .saved = saved, .bytes = p.size, .lineage = p.lineage } };
++    }
++
++    fn cancel(ptr: *anyopaque, id: u64) void {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        t.cancels += 1;
++        const i = t.job(id) orelse {
++            t.misuse += 1;
++            return;
++        };
++        _ = t.jobs.orderedRemove(i);
++    }
++
++    fn keep(ptr: *anyopaque, k: *const pc.Kept) ?u64 {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        if (k.at < t.min_tokens) return null;
++        const key = t.gpa.dupe(u32, k.key) catch return null;
++        const lin = t.gpa.dupe(pc.Fork, k.lineage) catch {
++            t.gpa.free(key);
++            return null;
++        };
++        const id = t.next_id;
++        t.queue.append(t.gpa, .{ .id = id, .key = key, .at = k.at, .group = k.group, .shared = k.shared, .saved = k.saved, .parent = k.parent, .fork = k.fork, .size = k.bytes, .lineage = lin }) catch {
++            t.gpa.free(key);
++            t.gpa.free(lin);
++            return null;
++        };
++        t.next_id += 1;
++        t.c.writes_queued += 1;
++        return id;
++    }
++
++    /// Queued write `i` published (its state packed now).
++    fn publish(t: *FakeTier, i: usize) void {
++        const q = t.queue.orderedRemove(i);
++        const bytes = t.codec.pack(t.codec.ctx, t.gpa, q.saved) catch {
++            t.gpa.free(q.key);
++            t.gpa.free(q.lineage);
++            t.c.writes_failed += 1;
++            return;
++        };
++        t.points.append(t.gpa, .{ .id = q.id, .key = q.key, .at = q.at, .group = q.group, .shared = q.shared, .bytes = bytes, .parent = q.parent, .fork = q.fork, .size = q.size, .lineage = q.lineage }) catch {
++            t.gpa.free(q.key);
++            t.gpa.free(q.lineage);
++            t.gpa.free(bytes);
++            t.c.writes_failed += 1;
++            return;
++        };
++        t.c.writes_committed += 1;
++        t.c.written_bytes += bytes.len;
++    }
++
++    fn release(ptr: *anyopaque, id: u64, _: pc.Saved) void {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        t.released += 1;
++        for (t.queue.items, 0..) |q, i| if (q.id == id) {
++            t.c.forced_staging += 1;
++            return t.publish(i);
++        };
++    }
++
++    fn share(ptr: *anyopaque, id: u64) void {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        t.shared_marks += 1;
++        if (t.find(id)) |p| p.shared = true;
++        for (t.queue.items) |*q| if (q.id == id) {
++            q.shared = true;
++        };
++    }
++
++    fn touch(ptr: *anyopaque, _: u64) void {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        t.touched += 1;
++    }
++
++    fn forget(ptr: *anyopaque, id: u64) void {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        for (t.points.items, 0..) |p, i| if (p.id == id) {
++            t.gpa.free(p.key);
++            t.gpa.free(p.bytes);
++            t.gpa.free(p.lineage);
++            _ = t.points.orderedRemove(i);
++            return;
++        };
++    }
++
++    fn pump(ptr: *anyopaque, _: u64) void {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        while (t.queue.items.len > 0) t.publish(0);
++    }
++
++    fn busy(ptr: *anyopaque) bool {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        return t.queue.items.len > 0;
++    }
++
++    fn flush(ptr: *anyopaque, _: u64) u64 {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        t.flushed += 1;
++        if (!t.stuck) {
++            while (t.queue.items.len > 0) t.publish(0); // (pump's, under this lock)
++            return 0;
++        }
++        const left = t.queue.items.len;
++        for (t.queue.items) |q| {
++            t.gpa.free(q.key);
++            t.gpa.free(q.lineage);
++        }
++        t.queue.clearRetainingCapacity();
++        t.c.writes_cancelled += left;
++        return left;
++    }
++
++    fn counts(ptr: *anyopaque, out: []pc.TierCounts) usize {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        var c = t.c;
++        c.points = t.points.items.len;
++        c.writes_pending = t.queue.items.len;
++        const n = @min(out.len, t.ranks);
++        for (out[0..n], 0..) |*o, r| {
++            o.* = c;
++            if (r > 0) o.crc_errors = r;
++        }
++        return n;
++    }
++};
+diff --git a/zig/src/core/prompt_cache_tier_test.zig b/zig/src/core/prompt_cache_tier_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8780ffa4a66186d7d855bfa696b63f2f0870320
+--- /dev/null
++++ b/zig/src/core/prompt_cache_tier_test.zig
+@@ -0,0 +1,744 @@
++//! The prompt cache's durable tier and 0111 continuation (wojo's GLM 0110/0111): a fake in-memory tier, and a family
++//! whose state is a running hash of the prompt, so a restored state equals a fresh pass exactly when it should.
++//! The continuation cases translate tools/chat_continued_check.py at fork main 8641c90.
++const std = @import("std");
++const pc = @import("prompt_cache.zig");
++const FakeTier = @import("prompt_cache_fake_tier.zig").FakeTier;
++const Allocator = std.mem.Allocator;
++const Store = pc.Store;
++const Entry = pc.Entry;
++const gpa = std.testing.allocator;
++
++/// A family over host memory: its live state is a position and a running hash of the prompt's tokens.
++const Sum = struct {
++    at: u32 = 0,
++    sum: u64 = 0,
++    live: usize = 0,
++    stale: ?pc.Saved = null, // `usable` refuses this state
++
++    const State = struct { at: u32, sum: u64 };
++
++    fn snapshots(f: *Sum) pc.Snapshots {
++        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .usable = usableFn } };
++    }
++    fn of(ptr: *anyopaque) *Sum {
++        return @ptrCast(@alignCast(ptr));
++    }
++    fn bytesFn(_: *anyopaque, at: u32) u64 {
++        return 100 + @as(u64, at);
++    }
++    fn saveFn(ptr: *anyopaque, _: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f = of(ptr);
++        if (f.at != at) return error.NotAtMark;
++        const st = try gpa.create(State);
++        st.* = .{ .at = f.at, .sum = f.sum };
++        f.live += 1;
++        return st;
++    }
++    fn restoreFn(ptr: *anyopaque, _: ?*anyopaque, saved: pc.Saved) anyerror!void {
++        const st: *State = @ptrCast(@alignCast(saved));
++        of(ptr).at = st.at;
++        of(ptr).sum = st.sum;
++    }
++    fn dropFn(ptr: *anyopaque, saved: pc.Saved) void {
++        of(ptr).live -= 1;
++        gpa.destroy(@as(*State, @ptrCast(@alignCast(saved))));
++    }
++    fn usableFn(ptr: *anyopaque, saved: pc.Saved, _: u32) bool {
++        return of(ptr).stale != saved;
++    }
++    /// The live state run on to `to` tokens of `prompt` (a fresh pass's arithmetic).
++    fn feed(f: *Sum, prompt: []const u32, to: u32) void {
++        for (prompt[f.at..to]) |t| f.sum = f.sum *% 31 +% t;
++        f.at = to;
++    }
++    fn reset(f: *Sum) void {
++        f.at = 0;
++        f.sum = 0;
++    }
++    fn fresh(prompt: []const u32, to: u32) u64 {
++        var x: Sum = .{};
++        x.feed(prompt, to);
++        return x.sum;
++    }
++
++    fn codec(f: *Sum) @import("prompt_cache_fake_tier.zig").Codec {
++        return .{ .ctx = f, .pack = pack, .unpack = unpack };
++    }
++    fn pack(_: *anyopaque, a: Allocator, saved: pc.Saved) anyerror![]u8 {
++        return a.dupe(u8, std.mem.asBytes(@as(*State, @ptrCast(@alignCast(saved)))));
++    }
++    fn unpack(ctx: *anyopaque, bytes: []const u8) anyerror!pc.Saved {
++        if (bytes.len != @sizeOf(State)) return error.SizeMismatch;
++        const st = try gpa.create(State);
++        @memcpy(std.mem.asBytes(st), bytes);
++        of(ctx).live += 1;
++        return st;
++    }
++};
++
++fn seq(comptime n: usize, base: u32) [n]u32 {
++    var out: [n]u32 = undefined;
++    for (&out, 0..) |*t, i| t.* = base + @as(u32, @intCast(i));
++    return out;
++}
++
++/// Keep `prompt`'s state at `at` as a pass would: the family stands there.
++fn keepAt(s: *Store, f: *Sum, prompt: []const u32, at: u32, info: pc.KeepInfo) bool {
++    f.reset();
++    f.feed(prompt, at);
++    return s.keepWith(prompt, at, null, &.{}, info);
++}
++
++/// Poll `r` until it is no longer pending.
++fn settle(s: *Store, r: *pc.Restore) pc.Restored {
++    while (true) {
++        const st = s.restorePoll(r, 1000);
++        if (st != .pending) return st;
++    }
++}
++
++test "without a tier the store asks nothing and counts nothing new" {
++    var f: Sum = .{};
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    const p = seq(40, 1);
++    try std.testing.expect(keepAt(&s, &f, &p, 16, .{}));
++    const pr = s.probe(&p, &.{});
++    try std.testing.expectEqual(@as(u32, 16), pr.memory.?.at);
++    try std.testing.expect(pr.durable == null);
++    try std.testing.expectEqual(pc.Stats{}, s.stats);
++    try std.testing.expect(s.entries.items[0].point == null and s.entries.items[0].group == 0);
++    try std.testing.expectEqual(pc.Join{}, s.join(&p, null, true)); // grouping off: group 0, no roots
++    try std.testing.expectEqual(@as(u32, 0), s.roots.count());
++    try std.testing.expectEqual(@as(u64, 0), s.flush(0));
++}
++
++test "a keep enqueues its write with conversation and lineage; a state that left memory restores, equal to a fresh pass" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec(), .polls = 3 };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 150); // room for one state
++    defer s.deinit();
++    s.setTier(tier.tier(), 7);
++    try std.testing.expect(s.groups);
++    const a = seq(40, 1);
++    const g = s.join(&a, null, true).group;
++    try std.testing.expectEqual(@as(u64, 7 << 32) + 1, g);
++    try std.testing.expect(keepAt(&s, &f, &a, 16, .{ .group = g }));
++    try std.testing.expectEqual(@as(usize, 1), tier.queue.items.len);
++    try std.testing.expectEqual(g, tier.queue.items[0].group);
++    try std.testing.expectEqual(@as(?u64, null), tier.queue.items[0].parent);
++    s.pump(1000);
++    try std.testing.expectEqual(@as(usize, 1), tier.points.items.len);
++    const b = seq(40, 1000); // another conversation's state takes the only room
++    try std.testing.expect(keepAt(&s, &f, &b, 16, .{}));
++    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
++    var a2: [48]u32 = undefined;
++    @memcpy(a2[0..40], &a);
++    for (a2[40..], 0..) |*t, i| t.* = 500 + @as(u32, @intCast(i));
++    const pr = s.probe(&a2, &.{});
++    try std.testing.expect(pr.memory == null);
++    const p = pr.durable.?;
++    try std.testing.expectEqual(@as(u32, 16), p.at);
++    try std.testing.expectEqual(g, p.group);
++    const r = try s.restoreBegin(p, &a2);
++    try std.testing.expectEqual(pc.Restored.pending, s.restorePoll(r, 1000));
++    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, r));
++    try std.testing.expectEqual(@as(usize, 0), s.restoring.items.len);
++    const e = s.find(&a2, &.{}).?; // the restored state, `b`'s evicted for its room
++    try std.testing.expect(e.restored and e.point.? == p.id and e.group == g and !e.shared);
++    try s.family.vtable.restore(s.family.ptr, null, e.saved);
++    f.feed(&a2, 48);
++    try std.testing.expectEqual(Sum.fresh(&a2, 48), f.sum);
++    s.resumed(e, &a2, true);
++    try std.testing.expectEqual(@as(u64, 1), tier.touched);
++    // a later keep of this pass forks the restored point's lineage at the resume point
++    try std.testing.expect(keepAt(&s, &f, &a2, 32, .{ .group = g, .parent = e.point, .fork = 16 }));
++    try std.testing.expectEqual(p.id, tier.queue.items[0].parent.?);
++    try std.testing.expectEqual(@as(u32, 16), tier.queue.items[0].fork);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.disk_hits_committed);
++    try std.testing.expectEqual(@as(u64, 16), s.stats.restored_tokens);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_begun);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.disk_hits);
++}
++
++test "a stale long memory state never shadows a durable point; ineligible points are not offered" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .grid = 8, .window = 4 }, 1 << 20);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(64, 1);
++    try std.testing.expect(keepAt(&s, &f, &a, 16, .{}));
++    try std.testing.expect(keepAt(&s, &f, &a, 32, .{}));
++    s.pump(0);
++    try std.testing.expect(keepAt(&s, &f, &a, 48, .{})); // memory only (never pumped)
++    // the 48 state goes stale: the lookup takes 32 from memory, and the durable 48 is not on disk yet
++    f.stale = s.entries.items[2].saved;
++    var pr = s.probe(&a, &.{});
++    try std.testing.expectEqual(@as(u32, 32), pr.memory.?.at);
++    try std.testing.expect(pr.durable == null);
++    s.pump(0);
++    pr = s.probe(&a, &.{});
++    try std.testing.expectEqual(@as(u32, 48), pr.durable.?.at); // not shadowed by its stale memory twin
++    // eligibility: a prompt whose replay rows reach past 48 (len 50, window 4) gets 32 from memory, no point
++    pr = s.probe(a[0..50], &.{});
++    try std.testing.expectEqual(@as(u32, 32), pr.memory.?.at);
++    try std.testing.expect(pr.durable == null);
++    // a lax tier offering off-grid or ineligible points: the store checks them itself
++    tier.lax = true;
++    _ = try tier.put(a[0..20], 20, std.mem.asBytes(&Sum.State{ .at = 20, .sum = 0 }), 0, 0, false);
++    pr = s.probe(a[0..50], &.{});
++    try std.testing.expect(pr.durable == null); // 48 is past the replay rows of 50, 20 is off the grid
++    try std.testing.expect(!pc.Rules.eligible(.{ .grid = 8, .window = 4 }, 47, 64));
++    try std.testing.expect(pc.Rules.eligible(.{ .grid = 8, .window = 4 }, 48, 52));
++    try std.testing.expect(!pc.Rules.eligible(.{ .grid = 8, .window = 4 }, 48, 51));
++    try std.testing.expectEqual(@as(?u32, 48), pc.Rules.maxAt(.{ .grid = 8, .window = 4 }, 52));
++    try std.testing.expectEqual(@as(?u32, null), pc.Rules.maxAt(.{ .grid = 8, .window = 4 }, 9));
++    try std.testing.expectEqual(@as(?u32, 9), pc.Rules.maxAt(.{}, 10));
++}
++
++test "one restore per point: a second request joins it, and it is cancelled once" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec(), .polls = 5 };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(40, 1);
++    _ = try tier.put(a[0..16], 16, std.mem.asBytes(&Sum.State{ .at = 16, .sum = Sum.fresh(&a, 16) }), 0, 3, true);
++    const p = s.probe(&a, &.{}).durable.?;
++    try std.testing.expect(p.shared and p.group == 3);
++    const r1 = try s.restoreBegin(p, &a);
++    const r2 = try s.restoreBegin(p, a[0..30]);
++    try std.testing.expectEqual(r1, r2);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_shared);
++    try std.testing.expectEqual(@as(usize, 1), tier.jobs.items.len);
++    s.restoreCancel(r1);
++    try std.testing.expectEqual(@as(usize, 0), tier.jobs.items.len);
++    try std.testing.expectEqual(@as(u64, 1), tier.cancels);
++    try std.testing.expectEqual(@as(u64, 0), tier.misuse);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_cancelled);
++    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
++    // an adopted shared point is a shared entry: other conversations resume it, its own never supersedes it
++    const r3 = try s.restoreBegin(p, &a);
++    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, r3));
++    try std.testing.expect(s.entries.items[0].shared and s.entries.items[0].restored);
++    try std.testing.expectEqual(@as(usize, 1), f.live);
++}
++
++test "a restore that fails anywhere leaves nothing; one memory already holds is dropped, its copy freed" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(40, 1);
++    _ = try tier.put(a[0..16], 16, std.mem.asBytes(&Sum.State{ .at = 16, .sum = Sum.fresh(&a, 16) }), 0, 0, false);
++    const p = s.probe(&a, &.{}).durable.?;
++    tier.fail_next = error.CrcMismatch;
++    try std.testing.expectEqual(pc.Restored.failed, settle(&s, try s.restoreBegin(p, &a)));
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_failed);
++    try std.testing.expectEqual(@as(u64, 1), tier.c.crc_errors);
++    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
++    const r = try s.restoreBegin(p, &a);
++    try std.testing.expect(keepAt(&s, &f, &a, 16, .{})); // a pass kept the same state meanwhile
++    try std.testing.expectEqual(pc.Restored.dropped, settle(&s, r));
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_dropped);
++    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
++    try std.testing.expectEqual(@as(usize, 1), f.live);
++    // too large for the whole budget: never offered
++    s.budget = 100;
++    try std.testing.expect(s.probe(&a, &.{}).durable == null);
++}
++
++test "a stale memory twin of a durable point is replaced by its restore; an evicted state restores too" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec(), .polls = 2 };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(40, 1);
++    try std.testing.expect(keepAt(&s, &f, &a, 16, .{}));
++    s.pump(1000); // on disk too
++    // the family stales the kept state (KV sharding gave its rows to a placement): the entry stays in memory
++    f.stale = s.entries.items[0].saved;
++    const pr = s.probe(&a, &.{});
++    try std.testing.expect(pr.memory == null); // never resumed
++    const p = pr.durable.?;
++    try std.testing.expectEqual(@as(u32, 16), p.at);
++    // the restore of the same point replaces the stale twin instead of being dropped (a recompute)
++    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, try s.restoreBegin(p, &a)));
++    try std.testing.expectEqual(@as(u64, 1), s.stats.disk_hits_committed);
++    try std.testing.expectEqual(@as(u64, 0), s.stats.restores_dropped);
++    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
++    try std.testing.expect(s.entries.items[0].restored and s.entries.items[0].saved != f.stale.?);
++    try std.testing.expectEqual(@as(usize, 1), f.live); // the stale state was given back to the family
++    const e = s.find(&a, &.{}).?;
++    try s.family.vtable.restore(s.family.ptr, null, e.saved);
++    f.feed(&a, 40);
++    try std.testing.expectEqual(Sum.fresh(&a, 40), f.sum); // the restored state is the prompt's
++    f.stale = null;
++    // a usable copy kept while the restore ran still wins: that restore is dropped, its copy freed
++    const c = seq(40, 2000);
++    try std.testing.expect(keepAt(&s, &f, &c, 16, .{}));
++    s.pump(1000);
++    f.stale = s.entries.items[s.entries.items.len - 1].saved;
++    const pcp = s.probe(&c, &.{}).durable.?;
++    const r = try s.restoreBegin(pcp, &c);
++    f.stale = null; // (the same state usable again: as if a pass kept it anew meanwhile)
++    try std.testing.expectEqual(pc.Restored.dropped, settle(&s, r));
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_dropped);
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++    try std.testing.expectEqual(@as(usize, 2), f.live);
++    // an evicted state (its entry gone from memory for another's room): its restore is adopted, nothing dropped
++    var g: Sum = .{};
++    var tier2: FakeTier = .{ .gpa = gpa, .codec = g.codec(), .polls = 2 };
++    defer tier2.deinit();
++    var s2 = Store.init(gpa, g.snapshots(), .{ .min_prompt = 0 }, 150); // room for one state
++    defer s2.deinit();
++    s2.setTier(tier2.tier(), 0);
++    const b = seq(40, 1000);
++    try std.testing.expect(keepAt(&s2, &g, &b, 16, .{}));
++    s2.pump(1000);
++    try std.testing.expect(keepAt(&s2, &g, &c, 16, .{})); // evicts b's
++    try std.testing.expectEqual(@as(u64, 1), s2.counts.evicted);
++    const pb = s2.probe(&b, &.{}).durable.?;
++    try std.testing.expectEqual(pc.Restored.adopted, settle(&s2, try s2.restoreBegin(pb, &b)));
++    try std.testing.expectEqual(@as(u64, 1), s2.stats.disk_hits_committed);
++    try std.testing.expectEqual(@as(u64, 0), s2.stats.restores_dropped);
++}
++
++test "a write still queued is staged before its memory state is dropped; a new shared prefix is marked on disk" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .min_gap = 4 }, 150);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(40, 1);
++    const b = seq(40, 900);
++    try std.testing.expect(keepAt(&s, &f, &a, 16, .{}));
++    try std.testing.expect(keepAt(&s, &f, &b, 16, .{})); // evicts a's state before its write was staged
++    try std.testing.expectEqual(@as(u64, 1), tier.c.forced_staging);
++    try std.testing.expectEqual(@as(usize, 1), tier.points.items.len);
++    const st: *const Sum.State = @ptrCast(@alignCast(tier.points.items[0].bytes.ptr));
++    try std.testing.expectEqual(Sum.fresh(&a, 16), st.sum); // the bytes it wrote are a's, staged in time
++    // b's state turns out to be a shared cut: kept again, it is promoted on disk (made stale first so the lookup plans it)
++    f.stale = s.entries.items[0].saved;
++    s.budget = 1 << 20; // (room for the lookup's marks: it evicts nothing)
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    _ = try s.lookup(arena.allocator(), &b, 30, &.{16}, &.{});
++    f.stale = null;
++    try std.testing.expect(keepAt(&s, &f, &b, 16, .{}));
++    try std.testing.expect(s.entries.items[0].shared);
++    try std.testing.expectEqual(@as(u64, 1), tier.shared_marks);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.shared_promoted);
++    try std.testing.expect(tier.queue.items[0].shared);
++}
++
++test "flush stops restores, drains writes, and reports what its deadline left unpublished" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec(), .polls = 100 };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(40, 1);
++    const b = seq(40, 300);
++    try std.testing.expect(keepAt(&s, &f, &a, 16, .{}));
++    try std.testing.expect(s.busy());
++    try std.testing.expectEqual(@as(u64, 0), s.flush(1000));
++    try std.testing.expect(!s.busy());
++    try std.testing.expectEqual(@as(usize, 1), tier.points.items.len);
++    const c = seq(40, 600);
++    _ = try tier.put(c[0..16], 16, std.mem.asBytes(&Sum.State{ .at = 16, .sum = Sum.fresh(&c, 16) }), 0, 0, false);
++    _ = try s.restoreBegin(s.probe(&c, &.{}).durable orelse return error.TestUnexpectedResult, &c);
++    try std.testing.expect(keepAt(&s, &f, &b, 16, .{}));
++    tier.stuck = true;
++    try std.testing.expectEqual(@as(u64, 1), s.flush(1000));
++    try std.testing.expectEqual(@as(usize, 0), s.restoring.items.len);
++    try std.testing.expectEqual(@as(u64, 1), tier.cancels);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.flush_timeouts);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.flush_unpublished);
++    try std.testing.expectEqual(@as(u64, 2), s.stats.flushes);
++}
++
++test "forgetting a point drops it on disk and unlinks its memory twin" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(40, 1);
++    try std.testing.expect(keepAt(&s, &f, &a, 16, .{}));
++    s.pump(0);
++    const id = s.entries.items[0].point.?;
++    s.forgetPoint(id);
++    try std.testing.expect(s.entries.items[0].point == null);
++    try std.testing.expect(tier.point(id) == null);
++    try std.testing.expectEqual(@as(u64, 0), tier.released);
++}
++
++// -- 0111: chat_continued_check.py -----------------------------------------------------------------------------------
++
++const system = seq(900, 100000); // a 900-token system prompt every conversation shares
++const opening = seq(100, 200000); // and the same 100-token opening message
++
++/// A conversation's prompts: the first, then each turn appending a reply and a tool result of its own (50 tokens).
++fn convo(a: Allocator, seed: u32, turns: usize) ![][]u32 {
++    const out = try a.alloc([]u32, turns + 1);
++    var ids: std.ArrayList(u32) = .empty;
++    try ids.appendSlice(a, &system);
++    try ids.appendSlice(a, &opening);
++    out[0] = try a.dupe(u32, ids.items);
++    for (0..turns) |t| {
++        for (0..50) |k| try ids.append(a, seed * 1000 + @as(u32, @intCast(t)) * 50 + @as(u32, @intCast(k)));
++        out[t + 1] = try a.dupe(u32, ids.items);
++    }
++    return out;
++}
++
++const Kind = struct { own: bool = true, images: bool = false, restored: bool = false, at: ?u32 = null };
++
++/// A kept state with `last` as its evidence (as the store records it at keep), in use order; it stands at `kind.at`
++/// (default: one short of its evidence's end).
++fn state(s: *Store, f: *Sum, last: []const u32, group: u64, kind: Kind) !*Entry {
++    const e = try gpa.create(Entry);
++    errdefer gpa.destroy(e);
++    const at: u32 = kind.at orelse @intCast(last.len - 1);
++    f.at = at;
++    const saved = try Sum.saveFn(f, null, at);
++    s.clock += 1;
++    e.* = .{ .tokens = try gpa.dupe(u32, last[0..at]), .at = at, .saved = saved, .bytes = 0, .born = @intCast(last.len), .used = s.clock, .last = try gpa.dupe(u32, last), .shared = !kind.own, .group = group, .images = kind.images, .restored = kind.restored };
++    try s.entries.append(gpa, e);
++    return e;
++}
++
++fn cat(a: Allocator, x: []const u32, y: []const u32) ![]u32 {
++    const out = try a.alloc(u32, x.len + y.len);
++    @memcpy(out[0..x.len], x);
++    @memcpy(out[x.len..], y);
++    return out;
++}
++
++test "common prefix" {
++    const big = try gpa.alloc(u32, 500000);
++    defer gpa.free(big);
++    for (big, 0..) |*t, i| t.* = @intCast(i);
++    const other = try gpa.dupe(u32, big);
++    defer gpa.free(other);
++    other[123457] = std.math.maxInt(u32);
++    try std.testing.expectEqual(@as(usize, 2), pc.commonPrefix(&.{ 1, 2, 3, 4 }, &.{ 1, 2, 9 }));
++    try std.testing.expectEqual(@as(usize, 3), pc.commonPrefix(&.{ 1, 2, 3 }, &.{ 1, 2, 3, 4 }));
++    try std.testing.expectEqual(@as(usize, 0), pc.commonPrefix(&.{}, &.{1}));
++    try std.testing.expectEqual(@as(usize, 123457), pc.commonPrefix(big, other));
++}
++
++test "continued conversations: a rewind continues, another conversation or an edit starts its own, the newest match wins" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const ar = arena.allocator();
++    var f: Sum = .{};
++    var s = Store.init(gpa, f.snapshots(), .{}, 1 << 30);
++    defer s.deinit();
++    s.groups = true;
++    const a = try convo(ar, 7, 6);
++    const b = try convo(ar, 8, 6);
++    try s.roots.put(gpa, 1, @intCast(a[0].len));
++    _ = try state(&s, &f, &system, 0, .{ .own = false });
++    _ = try state(&s, &f, a[5], 1, .{});
++    const newest = try state(&s, &f, a[6], 1, .{});
++    // issue #104: a rewind before the kept turns continues its conversation
++    try std.testing.expectEqual(newest, s.continuedChat(try cat(ar, a[3], &.{ 9, 9, 9 })).?);
++    // another conversation behind the same system prompt and opening starts its own
++    try std.testing.expect(s.continuedChat(b[2]) == null);
++    // a prompt that has not repeated the first reply yet starts its own
++    const fives: [10]u32 = @splat(5);
++    try std.testing.expect(s.continuedChat(try cat(ar, a[0], &fives)) == null);
++    // an edit of the first message starts a new conversation
++    var edited: std.ArrayList(u32) = .empty;
++    try edited.appendSlice(ar, &system);
++    try edited.appendSlice(ar, opening[0..50]);
++    try edited.appendNTimes(ar, 0, 50);
++    try edited.appendSlice(ar, a[2][a[0].len..]);
++    try std.testing.expect(s.continuedChat(edited.items) == null);
++}
++
++test "continued conversations skip shared, pictured, restored and forgotten conversations' states" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const ar = arena.allocator();
++    const a = try convo(ar, 7, 6);
++    const prompt = try cat(ar, a[2], &.{1});
++    const kinds = [_]struct { group: u64, kind: Kind }{ .{ .group = 1, .kind = .{ .own = false } }, .{ .group = 1, .kind = .{ .images = true } }, .{ .group = 1, .kind = .{ .restored = true } }, .{ .group = 2, .kind = .{} } };
++    for (kinds) |k| {
++        var f: Sum = .{};
++        var s = Store.init(gpa, f.snapshots(), .{}, 1 << 30);
++        defer s.deinit();
++        s.groups = true;
++        try s.roots.put(gpa, 1, @intCast(a[0].len));
++        _ = try state(&s, &f, a[4], k.group, k.kind);
++        try std.testing.expect(s.continuedChat(prompt) == null);
++    }
++    var f: Sum = .{};
++    var s = Store.init(gpa, f.snapshots(), .{}, 1 << 30);
++    defer s.deinit();
++    s.groups = true;
++    try s.roots.put(gpa, 1, @intCast(a[0].len));
++    try s.roots.put(gpa, 2, @intCast(a[0].len));
++    _ = try state(&s, &f, a[3], 1, .{});
++    _ = try state(&s, &f, a[4], 2, .{});
++    try std.testing.expectEqual(@as(u64, 2), s.continuedChat(prompt).?.group); // the most recently used match wins
++    s.entries.items[0].used = s.entries.items[1].used; // a tie of use: the later entry, both ranks alike
++    try std.testing.expectEqual(@as(u64, 2), s.continuedChat(prompt).?.group);
++}
++
++test "join: an own turn keeps its conversation, a continuation names it, anything else starts one" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const ar = arena.allocator();
++    var f: Sum = .{};
++    var s = Store.init(gpa, f.snapshots(), .{}, 1 << 30);
++    defer s.deinit();
++    s.groups = true;
++    s.next_group = 40;
++    const a = try convo(ar, 7, 6);
++    const shared = try state(&s, &f, &system, 0, .{ .own = false });
++    const first = s.join(a[0], shared, true); // a new conversation behind a shared prefix
++    try std.testing.expectEqual(@as(u64, 41), first.group);
++    try std.testing.expect(!first.continued);
++    try std.testing.expectEqual(@as(u32, @intCast(a[0].len)), s.roots.get(41).?);
++    const own = try state(&s, &f, a[3], 41, .{});
++    const turn = s.join(a[4], own, true); // its own turn state: the conversation, not counted
++    try std.testing.expectEqual(@as(u64, 41), turn.group);
++    try std.testing.expect(!turn.continued);
++    const rewound = s.join(try cat(ar, a[2], &.{9}), shared, true); // back before its kept turn, from the shared prefix
++    try std.testing.expectEqual(@as(u64, 41), rewound.group);
++    try std.testing.expect(rewound.continued and rewound.source == .shared);
++    const pictured = s.join(try cat(ar, a[2], &.{9}), shared, false); // pictures or draft:false: never matched
++    try std.testing.expectEqual(@as(u64, 42), pictured.group);
++    // conversations no kept state is in are forgotten once there are many
++    for (0..80) |_| _ = s.join(&.{ 1, 2, 3 }, null, true);
++    try std.testing.expect(s.roots.count() <= 4 * 16 + 1);
++    try std.testing.expect(s.roots.contains(41)); // a kept state still names it
++}
++
++test "a continued request is counted with its prefill; a large one's line says where it resumed and why" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const ar = arena.allocator();
++    var f: Sum = .{};
++    var s = Store.init(gpa, f.snapshots(), .{}, 1 << 30);
++    defer s.deinit();
++    s.groups = true;
++    const long = try convo(ar, 7, 200);
++    try s.roots.put(gpa, 1, @intCast(long[0].len));
++    _ = try state(&s, &f, long[200], 1, .{});
++    const shared = try state(&s, &f, &system, 0, .{ .own = false });
++    const prompt = try cat(ar, long[150], &.{9});
++    const j = s.join(prompt, shared, true);
++    try std.testing.expect(j.continued and j.group == 1);
++    s.continued(j, system.len, prompt.len);
++    try std.testing.expectEqual(@as(u64, 1), s.stats.chats_continued);
++    try std.testing.expectEqual(@as(u64, prompt.len - system.len), s.stats.chats_continued_prefill_tokens);
++    var buf: [512]u8 = undefined;
++    const line = pc.continuedLine(&buf, j, system.len, prompt.len);
++    try std.testing.expect(std.mem.indexOf(u8, line, "conversation 1: resumed at 900 of") != null);
++    try std.testing.expect(std.mem.indexOf(u8, line, "from a shared prefix") != null);
++    const back = try std.fmt.allocPrint(ar, "went back to token {d}", .{long[150].len});
++    try std.testing.expect(std.mem.indexOf(u8, line, back) != null);
++    try std.testing.expectEqual(@as(u32, @intCast(long[200].len - 1)), j.prior_len); // the state's own ids, not its evidence's
++    // a prompt that repeats the state's ids but leaves its evidence after them: not a rewind (stale, off the grid...)
++    const past = s.join(try cat(ar, long[200][0 .. long[200].len - 1], &.{ 9, 9 }), shared, true);
++    try std.testing.expect(past.continued and past.back >= past.prior_len);
++    try std.testing.expect(std.mem.indexOf(u8, pc.continuedLine(&buf, past, system.len, 9000), "could not serve it") != null);
++    // a small prefill: counted (the log threshold is chat_log_tokens); a request that did not continue: not counted
++    s.continued(j, @intCast(prompt.len - 10), prompt.len);
++    s.continued(.{ .group = 5 }, 0, prompt.len);
++    try std.testing.expectEqual(@as(u64, 2), s.stats.chats_continued);
++    try std.testing.expectEqual(@as(u64, prompt.len - system.len + 10), s.stats.chats_continued_prefill_tokens);
++    const nothing = pc.continuedLine(&buf, .{ .group = 3, .continued = true, .prior_len = 50, .back = 50 }, 0, 9000);
++    try std.testing.expect(std.mem.indexOf(u8, nothing, "from nothing") != null and std.mem.indexOf(u8, nothing, "could not serve it") != null);
++}
++
++test "the log threshold: a continued request's prefill of chat_log_tokens or more" {
++    const j: pc.Join = .{ .group = 1, .continued = true };
++    try std.testing.expect(!pc.shouldLog(j, 100, 100 + pc.chat_log_tokens - 1));
++    try std.testing.expect(pc.shouldLog(j, 100, 100 + pc.chat_log_tokens));
++    try std.testing.expect(!pc.shouldLog(.{ .group = 1 }, 0, 1 << 20)); // not continued
++    try std.testing.expect(!pc.shouldLog(j, 9000, 100)); // nothing prefilled
++}
++
++test "join: a hit on another conversation's state inside the shared system prompt is no evidence of that conversation" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const ar = arena.allocator();
++    var f: Sum = .{};
++    var s = Store.init(gpa, f.snapshots(), .{}, 1 << 30);
++    defer s.deinit();
++    s.groups = true;
++    s.next_group = 10;
++    const a = try convo(ar, 7, 3);
++    const ga = s.join(a[0], null, true).group;
++    // A's turn-1 state on the grid inside the system prompt (as dsv41 keeps a 2048 floor), its evidence A's prompt
++    const inside = try state(&s, &f, a[0], ga, .{ .at = 800 });
++    // B: the same system prompt, its own opening; it resumes A's state, and is a conversation of its own
++    const b0 = try cat(ar, &system, &seq(100, 300000));
++    const jb = s.join(b0, inside, true);
++    try std.testing.expect(jb.group != ga and !jb.continued);
++    // A's next turn resuming the same state is A's own turn
++    const ja = s.join(a[1], inside, true);
++    try std.testing.expectEqual(ga, ja.group);
++    try std.testing.expect(!ja.continued);
++    // a conversation whose first prompt was forgotten keeps the hit-alone rule
++    _ = s.roots.remove(ga);
++    try std.testing.expectEqual(ga, s.join(b0, inside, true).group);
++}
++
++test "with a grid an off-grid shared cut marks the state the family keeps on the grid as shared, on disk too" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .min_gap = 4, .grid = 8 }, 1 << 20);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const p = seq(40, 1);
++    const l = try s.lookup(arena.allocator(), &p, 30, &.{21}, &.{});
++    try std.testing.expectEqualSlices(u32, &.{ 21, 30 }, l.marks);
++    try std.testing.expectEqual(@as(usize, 1), s.shared_keys.items.len);
++    try std.testing.expect(keepAt(&s, &f, &p, 16, .{})); // dsv41 keeps the mark at 21 at its chunk end, 16
++    try std.testing.expect(s.entries.items[0].shared);
++    try std.testing.expect(tier.queue.items[0].shared);
++}
++
++/// Sum with spare storage: a dropped state's bytes stay spare, a save takes spare first, trim frees it.
++const Pool = struct {
++    sum: Sum = .{},
++    spare_: u64 = 0,
++
++    fn snapshots(p: *Pool) pc.Snapshots {
++        return .{ .ptr = p, .vtable = &.{ .bytes = Sum.bytesFn, .save = save, .restore = restore, .drop = drop, .spare = spare, .trim = trim, .reuses = reuses } };
++    }
++    fn of(ptr: *anyopaque) *Pool {
++        return @ptrCast(@alignCast(ptr));
++    }
++    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const p = of(ptr);
++        if (p.spare_ >= Sum.bytesFn(ptr, at)) p.spare_ -= Sum.bytesFn(ptr, at);
++        return Sum.saveFn(&p.sum, owner, at);
++    }
++    fn restore(ptr: *anyopaque, owner: ?*anyopaque, saved: pc.Saved) anyerror!void {
++        return Sum.restoreFn(&of(ptr).sum, owner, saved);
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const st: *Sum.State = @ptrCast(@alignCast(saved));
++        of(ptr).spare_ += Sum.bytesFn(ptr, st.at);
++        Sum.dropFn(&of(ptr).sum, saved);
++    }
++    fn spare(ptr: *anyopaque) u64 {
++        return of(ptr).spare_;
++    }
++    fn trim(ptr: *anyopaque, room: u64) void {
++        of(ptr).spare_ = @min(of(ptr).spare_, room);
++    }
++    fn reuses(ptr: *anyopaque, at: u32) bool {
++        return of(ptr).spare_ >= Sum.bytesFn(ptr, at);
++    }
++};
++
++test "a restore's destination is charged to the budget while it runs; spare storage in its way is trimmed, not every state" {
++    var pool: Pool = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = pool.sum.codec(), .polls = 2 };
++    defer tier.deinit();
++    var s = Store.init(gpa, pool.snapshots(), .{ .min_prompt = 0 }, 400); // states of 100 + at bytes
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(40, 1);
++    const b = seq(40, 300);
++    const c = seq(40, 600);
++    pool.sum.reset();
++    pool.sum.feed(&a, 10);
++    try std.testing.expect(s.keepWith(&a, 10, null, &.{}, .{}));
++    pool.sum.reset();
++    pool.sum.feed(&b, 10);
++    try std.testing.expect(s.keepWith(&b, 10, null, &.{}, .{}));
++    pool.sum.reset();
++    pool.sum.feed(&c, 10);
++    try std.testing.expect(s.keepWith(&c, 10, null, &.{}, .{}));
++    try std.testing.expectEqual(@as(u64, 330), s.held);
++    const d = seq(40, 900);
++    _ = try tier.put(d[0..20], 20, std.mem.asBytes(&Sum.State{ .at = 20, .sum = Sum.fresh(&d, 20) }), 0, 0, false);
++    const p = s.probe(&d, &.{}).durable.?;
++    const r = try s.restoreBegin(p, &d); // 120 bytes: one state goes, its spare storage is trimmed to fit
++    try std.testing.expectEqual(@as(u64, 120), s.restoring_bytes);
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++    try std.testing.expect(s.held + s.restoring_bytes + s.spare() <= s.budget);
++    try std.testing.expectEqual(@as(u64, 400 - 220 - 120 - s.spare()), s.room());
++    // a second restore the budget cannot hold beside the first and the states it must keep: refused, nothing begun
++    const e2 = seq(400, 2000);
++    _ = try tier.put(e2[0..300], 300, std.mem.asBytes(&Sum.State{ .at = 300, .sum = 0 }), 0, 0, false);
++    const p2 = s.probe(&e2, &.{}).durable.?;
++    try std.testing.expectError(error.NoRoom, s.restoreBegin(p2, &e2));
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_refused);
++    try std.testing.expectEqual(@as(usize, 1), s.restoring.items.len);
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len); // refused before evicting anything
++    // adopted beside both remaining states: no eviction past what the reservation already made
++    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, r));
++    try std.testing.expectEqual(@as(u64, 0), s.restoring_bytes);
++    try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
++    try std.testing.expect(s.held + s.spare() <= s.budget);
++    // a cancelled restore gives its charge back (a's state was staged to disk when it was evicted)
++    const r3 = try s.restoreBegin(s.probe(&a, &.{}).durable.?, &a);
++    try std.testing.expectEqual(@as(u64, 110), s.restoring_bytes);
++    s.restoreCancel(r3);
++    try std.testing.expectEqual(@as(u64, 0), s.restoring_bytes);
++    try std.testing.expectEqual(s.entries.items.len, pool.sum.live);
++}
++
++test "lineage: a fresh pass starts its own, a resumed one forks its state's at the resume point, kept states carry it to disk and back" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec(), .ranks = 2 };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 150); // room for one state
++    defer s.deinit();
++    s.setTier(tier.tier(), 3);
++    const a = seq(48, 1);
++    const fresh = try s.passLineage(null);
++    defer gpa.free(fresh);
++    try std.testing.expectEqual(@as(usize, 1), fresh.len);
++    try std.testing.expectEqual(@as(u32, 0), fresh[0].at);
++    try std.testing.expectEqual(@as(u64, 3) << 32, fresh[0].name >> 32 << 32);
++    try std.testing.expect(keepAt(&s, &f, &a, 16, .{ .lineage = fresh })); // below any write minimum it is still carried
++    const e = s.entries.items[0];
++    try std.testing.expectEqualSlices(pc.Fork, fresh, e.lineage);
++    try std.testing.expectEqualSlices(pc.Fork, fresh, tier.queue.items[0].lineage);
++    const forked = try s.passLineage(e);
++    defer gpa.free(forked);
++    try std.testing.expectEqual(@as(usize, 2), forked.len);
++    try std.testing.expectEqual(fresh[0], forked[0]);
++    try std.testing.expectEqual(@as(u32, 16), forked[1].at);
++    try std.testing.expect(forked[1].name != fresh[0].name);
++    // its state leaves memory (staged to disk first) and comes back with its lineage
++    const b = seq(40, 900);
++    try std.testing.expect(keepAt(&s, &f, &b, 16, .{}));
++    const r = try s.restoreBegin(s.probe(&a, &.{}).durable.?, &a);
++    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, r));
++    try std.testing.expectEqualSlices(pc.Fork, fresh, s.find(&a, &.{}).?.lineage);
++    // without a tier there is no lineage to carry
++    var plain = Store.init(gpa, f.snapshots(), .{}, 1 << 20);
++    defer plain.deinit();
++    try std.testing.expectEqual(@as(usize, 0), (try plain.passLineage(null)).len);
++    // every rank's counters
++    const rc = s.tierCounts().?;
++    try std.testing.expectEqual(@as(u32, 2), rc.n);
++    try std.testing.expectEqual(@as(u64, 1), rc.slice()[1].crc_errors);
++}
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index d0e8c022181477a048d97b7d752ad4f25f78b411..a406ec43ee06bc7c0ca9cc5097376fd307cc882e 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -66,7 +66,12 @@ pub const flags = [_]Flag{
+     .{ .name = "--prompt-cache-gib", .native = true },
+     .{ .name = "--prompt-cache-over-cap", .kind = .store_true, .native = true },
+     .{ .name = "--checkpoint-slots" },
+-    .{ .name = "--spill-gib" },
++    // the prompt cache's disk tier (spill v2): every one off unless given
++    .{ .name = "--spill-gib", .native = true },
++    .{ .name = "--spill-dir", .native = true },
++    .{ .name = "--spill-min-free-gib", .native = true },
++    .{ .name = "--spill-min-tokens", .native = true },
++    .{ .name = "--spill-quota", .native = true },
+     .{ .name = "--snapshot-dir", .native = true, .native_values = &.{"none"} },
+     .{ .name = "--max-snapshots", .native = true, .native_values = &.{"0"} },
+     .{ .name = "--parallel", .native = true },
+@@ -97,8 +102,12 @@ pub const flags = [_]Flag{
+ 
+ /// The variables this binary honours as the Python engine does, then the CUDA build's.
+ pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE" } ++
++    spill_env ++
+     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
+ 
++/// The prompt cache tier's variables (api.Spill): its knobs beyond the flags.
++pub const spill_env = [_][]const u8{ "TF_SPILL_TURNS", "TF_SPILL_LOAD_MS", "TF_SPILL_LOAD_WAIT_MS", "TF_SPILL_FLUSH_MS" };
++
+ pub const Args = struct {
+     model: []const u8 = "",
+     host: []const u8 = "127.0.0.1",
+@@ -135,6 +144,11 @@ pub const Args = struct {
+     backend: []const u8 = "auto",
+     device: ?u32 = null,
+     segments: ?u32 = null,
++    spill_dir: ?[]const u8 = null, // this rank's local store for kept prompt states (with --spill-gib)
++    spill_gib: f64 = 0, // what it may hold (0: off)
++    spill_min_free_gib: f64 = 50, // no write leaves less free on its file system
++    spill_min_tokens: u32 = 8192, // shorter kept states are not written
++    spill_quota: f64 = 0, // one conversation's share of --spill-gib (0: none)
+ };
+ 
+ /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
+@@ -185,6 +199,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
+         try apply(a, &out, name, value, u, &alias, &keys);
+     }
+     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
++    if (out.spill_gib > 0 and out.spill_dir == null) return fail(u, a, "--spill-gib needs --spill-dir: a local directory for this rank's stored prompt states", .{});
+     out.alias = alias.items;
+     out.api_key = keys.items;
+     return out;
+@@ -213,6 +228,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+         }
+     }.f;
+     if (try cudaFlag(a, out, name, v, u)) return;
++    if (try spillFlag(a, out, name, v, u)) return;
+     if (is(name, "--host")) out.host = v else if (is(name, "--port")) {
+         const p = try int(u, a, name, v);
+         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
+@@ -247,6 +263,51 @@ fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage
+     return true;
+ }
+ 
++/// The disk tier's flags; false for any other flag.
++fn spillFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
++    const is = struct {
++        fn f(x: []const u8, y: []const u8) bool {
++            return std.mem.eql(u8, x, y);
++        }
++    }.f;
++    if (is(name, "--spill-gib")) out.spill_gib = try gib(u, a, name, v) else if (is(name, "--spill-dir")) {
++        if (v.len == 0) return fail(u, a, "argument --spill-dir: expected a directory", .{});
++        out.spill_dir = v;
++    } else if (is(name, "--spill-min-free-gib")) out.spill_min_free_gib = try gib(u, a, name, v) else if (is(name, "--spill-min-tokens")) {
++        out.spill_min_tokens = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --spill-min-tokens: a token count from 0: '{s}'", .{v});
++    } else if (is(name, "--spill-quota")) {
++        const q = try float(u, a, name, v);
++        if (!(q >= 0 and q <= 1)) return fail(u, a, "argument --spill-quota: a share of --spill-gib from 0 (none) to 1: '{s}'", .{v});
++        out.spill_quota = q;
++    } else return false;
++    return true;
++}
++
++/// The engine's api.Spill from the flags, then the variables in `env` (`get(name)`: its value or null). An invalid
++/// variable keeps the default, and so does 0 for the restore budgets (a 0 ns budget never progresses a restore).
++pub fn spill(args: Args, env_: anytype) api.Spill {
++    var s: api.Spill = .{ .dir = args.spill_dir, .gib = args.spill_gib, .min_free_gib = args.spill_min_free_gib, .quota = args.spill_quota, .min_tokens = args.spill_min_tokens };
++    if (env_.get("TF_SPILL_TURNS")) |v| s.turns = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.turns;
++    if (env_.get("TF_SPILL_LOAD_MS")) |v| s.load_ms = positive(v) orelse s.load_ms;
++    if (env_.get("TF_SPILL_LOAD_WAIT_MS")) |v| s.load_wait_ms = positive(v) orelse s.load_wait_ms;
++    if (env_.get("TF_SPILL_FLUSH_MS")) |v| s.flush_ms = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.flush_ms;
++    return s;
++}
++
++/// A variable's whole number from 1 (null: invalid or 0).
++fn positive(v: []const u8) ?u32 {
++    const n = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return null;
++    return if (n == 0) null else n;
++}
++
++/// The process environment, for `spill`.
++pub const ProcessEnv = struct {
++    pub fn get(_: ProcessEnv, name: [:0]const u8) ?[]const u8 {
++        const v = std.c.getenv(name) orelse return null;
++        return std.mem.span(v);
++    }
++};
++
+ /// ``--parallel``: "auto" is up to 8 requests at once; a number caps it.
+ pub fn parallel(text: []const u8) ?u32 {
+     const t = std.mem.trim(u8, text, " ");
+@@ -357,3 +418,43 @@ test "--device and --segments: CUDA builds serve them, values checked" {
+     try std.testing.expect(!try cudaFlag(a, &out, "--port", "1", &u));
+     try std.testing.expect(parallelFixed("3") and !parallelFixed("auto") and !parallelFixed("x"));
+ }
++
++test "spill flags and variables: off by default, checked, passed whole" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var u: Usage = .{};
++    const Env = struct {
++        pairs: []const [2][]const u8 = &.{},
++        pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
++            for (e.pairs) |p| if (std.mem.eql(u8, p[0], name)) return p[1];
++            return null;
++        }
++    };
++    const off = spill(try parse(a, &.{"m"}, &u), Env{});
++    try std.testing.expect(!off.enabled());
++    try std.testing.expectEqual(api.Spill{}, off);
++    const args = try parse(a, &.{ "m", "--spill-dir", "/nvme/spill", "--spill-gib", "64", "--spill-min-free-gib=20", "--spill-min-tokens", "4096", "--spill-quota", "0.25" }, &u);
++    const on = spill(args, Env{ .pairs = &.{ .{ "TF_SPILL_TURNS", "2" }, .{ "TF_SPILL_LOAD_MS", "25" }, .{ "TF_SPILL_FLUSH_MS", "x" } } });
++    try std.testing.expect(on.enabled());
++    try std.testing.expectEqualStrings("/nvme/spill", on.dir.?);
++    try std.testing.expectEqual(@as(f64, 64), on.gib);
++    try std.testing.expectEqual(@as(f64, 20), on.min_free_gib);
++    try std.testing.expectEqual(@as(u32, 4096), on.min_tokens);
++    try std.testing.expectEqual(@as(f64, 0.25), on.quota);
++    try std.testing.expectEqual(@as(u32, 2), on.turns);
++    try std.testing.expectEqual(@as(u32, 25), on.load_ms);
++    try std.testing.expectEqual(@as(u32, 60_000), on.flush_ms); // an invalid value keeps the default
++    const zero = spill(try parse(a, &.{"m"}, &u), Env{ .pairs = &.{ .{ "TF_SPILL_LOAD_MS", "0" }, .{ "TF_SPILL_LOAD_WAIT_MS", "250" } } });
++    try std.testing.expectEqual(@as(u32, 40), zero.load_ms); // 0 would never progress a restore: the default
++    try std.testing.expectEqual(@as(u32, 250), zero.load_wait_ms);
++    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-gib", "8" }, &u)); // no directory
++    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-quota", "1.5" }, &u));
++    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-min-tokens", "-1" }, &u));
++    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-dir", "" }, &u));
++    try std.testing.expect(!spill(try parse(a, &.{ "m", "--spill-dir", "/x" }, &u), Env{}).enabled()); // a directory alone stays off
++    var out: std.Io.Writer.Allocating = .init(a);
++    try capabilities(&out.writer, .{ .version = "0.6.5" });
++    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"--spill-gib\": {}") != null);
++    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"TF_SPILL_LOAD_MS\"") != null);
++}
+diff --git a/zig/src/server/engines.zig b/zig/src/server/engines.zig
+index bfe541685b46326d0c1e2ce252c1404cc5d7bf31..c9fc93934637533e230797b17a19ffa43cec8c42 100644
+--- a/zig/src/server/engines.zig
++++ b/zig/src/server/engines.zig
+@@ -14,7 +14,8 @@ pub fn capabilities(a: Allocator) cli.Engines {
+ 
+ /// The engine for the checkpoint in ``dir``, or null with ``problem`` set.
+ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_type: []const u8, args: cli.Args, problem: *[]const u8) !?Opened {
+-    return native.open(a, gpa, io, .{
++    const spill = cli.spill(args, cli.ProcessEnv{});
++    const opened = try native.open(a, gpa, io, .{
+         .dir = dir,
+         .model_type = model_type,
+         .context = args.context,
+@@ -28,5 +29,14 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
+         .learn_gib = args.learn_gib,
+         .device = args.device,
+         .segments = args.segments,
+-    }, problem);
++        // the prompt cache's disk tier (off unless asked); the backend binds a tier to its
++        // cache when it has one (native/cuda.zig openWith binds the family's tier: dsv41's spill_tier)
++        .spill = spill,
++    }, problem) orelse return null;
++    if (spill.unbound(opened.engine)) { // asked for, never silently ignored
++        opened.close(opened.ctx);
++        problem.* = "--spill-dir/--spill-gib are not served by this engine: its backend binds no prompt-cache tier, or its prompt cache is off";
++        return null;
++    }
++    return opened;
+ }
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 7d748cc4f640d321c0fa0aecc528cc75763feb8c..22ccc8e0d101c59b4c0f2d0d4776d45417f3d600 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -141,9 +141,35 @@ pub const Metrics = struct {
+         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
+         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
+         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
++        if (status.cache) |c| try cacheFamilies(w, c);
+     }
+ };
+ 
++/// The prompt cache's counters (its tier or grouping on): the GLM engine's names for continuation, then
++/// tensorfold:prompt_cache_* and the tier's tensorfold:spill_*{rank="N"}.
++pub fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStats) !void {
++    const H = api.CacheStats.help;
++    try gauge(w, "chats_continued", "counter", H.chats_continued, c.chats_continued);
++    try gauge(w, "chats_continued_prefill_tokens", "counter", H.chats_continued_prefill_tokens, c.chats_continued_prefill_tokens);
++    const info = @typeInfo(api.CacheStats).@"struct";
++    inline for (info.field_names, info.field_types) |name, T| if (T == u64) {
++        try gauge(w, "prompt_cache_" ++ name, comptime kindOf(&api.CacheStats.gauges, name), @field(H, name), @field(c, name));
++    };
++    if (c.spill) |rc| { // every rank's, labelled (the disk tiers are per rank)
++        const T = api.prompt_cache.TierCounts;
++        inline for (@typeInfo(T).@"struct".field_names) |name| {
++            try family(w, "spill_" ++ name, comptime kindOf(&T.gauges, name), @field(T.help, name));
++            for (rc.slice(), 0..) |t, r| try w.print("{s}spill_{s}{{rank=\"{d}\"}} {d}\n", .{ prefix, name, r, @field(t, name) });
++        }
++    }
++}
++
++fn kindOf(comptime gauges: []const []const u8, comptime name: []const u8) []const u8 {
++    @setEvalBranchQuota(100_000);
++    for (gauges) |g| if (std.mem.eql(u8, g, name)) return "gauge";
++    return "counter";
++}
++
+ fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8) !void {
+     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });
+ }
+@@ -323,3 +349,31 @@ test "request counter append failure frees its label" {
+     try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
+     try std.testing.expectEqual(allocations, failing.allocations);
+ }
++
++test "cache families: present only with the cache's counters, every field with its kind and help" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    var stub: RenderStub = .{};
++    var plain: std.Io.Writer.Allocating = .init(gpa);
++    defer plain.deinit();
++    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "chats_continued") == null);
++    var ranks: api.prompt_cache.RankCounts = .{ .n = 2 };
++    ranks.ranks[0] = .{ .writes_committed = 9, .staging_peak = 7 };
++    ranks.ranks[1] = .{ .writes_committed = 8, .crc_errors = 1 };
++    stub.status_value.cache = .{ .chats_continued = 1, .restores_active = 2, .spill = ranks };
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    for ([_][]const u8{
++        "tensorfold:chats_continued 1\n",
++        "# TYPE tensorfold:prompt_cache_restores_active gauge\n",
++        "tensorfold:prompt_cache_restores_active 2\n",
++        "# TYPE tensorfold:prompt_cache_disk_hits_committed counter\n",
++        "tensorfold:spill_writes_committed{rank=\"0\"} 9\n",
++        "tensorfold:spill_writes_committed{rank=\"1\"} 8\n",
++        "tensorfold:spill_crc_errors{rank=\"1\"} 1\n",
++        "# TYPE tensorfold:spill_staging_peak gauge\n",
++    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
++}
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index 186a4e1904e71ee5e84b94a029dc0fc0be9e750b..9dddf4ede2ebc86d297b4257c8065ace46b0cc30 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -30,9 +30,33 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     }
+     try o.put(a, "memory", .{ .object = memory });
+     try o.put(a, "live", try live.snapshot(a, srv.engine));
++    if (status.cache) |c| try putCache(a, o, c);
+     routes.sendValue(conn, a, 200, .{ .object = o });
+ }
+ 
++/// The prompt cache's counters, when its tier or grouping is on: the GLM engine's top-level names (chats_continued,
++/// chats_continued_prefill_tokens), then every
++/// counter under prompt_cache, the tier's own under prompt_cache.spill (an array, one object per rank, rank 0 first).
++pub fn putCache(a: Allocator, o: *json.Object, c: api.CacheStats) Allocator.Error!void {
++    try o.put(a, "chats_continued", try json.intValue(a, c.chats_continued));
++    try o.put(a, "chats_continued_prefill_tokens", try json.intValue(a, c.chats_continued_prefill_tokens));
++    const pc = try json.newObject(a);
++    const info = @typeInfo(api.CacheStats).@"struct";
++    inline for (info.field_names, info.field_types) |name, T| if (T == u64) try pc.put(a, name, try json.intValue(a, @field(c, name)));
++    if (c.spill) |rc| {
++        const ranks = rc.slice();
++        const arr = try a.alloc(json.Value, ranks.len);
++        for (ranks, arr, 0..) |t, *v, r| {
++            const sp = try json.newObject(a);
++            try sp.put(a, "rank", try json.intValue(a, r));
++            inline for (@typeInfo(@TypeOf(t)).@"struct".field_names) |name| try sp.put(a, name, try json.intValue(a, @field(t, name)));
++            v.* = .{ .object = sp };
++        }
++        try pc.put(a, "spill", .{ .array = arr });
++    }
++    try o.put(a, "prompt_cache", .{ .object = pc });
++}
++
+ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+     const created = std.Io.Clock.real.now(srv.io).toSeconds();
+     const data = try a.alloc(Value, srv.config.model_ids.len);
+@@ -121,3 +145,25 @@ test "stats snapshot exposes counters and omits unknown memory" {
+         try std.testing.expect(object.contains(key));
+     try std.testing.expectEqual(@as(usize, 0), object.get("memory").?.object.count());
+ }
++
++test "health's prompt cache counters: the GLM names on top, every counter below, the tier's under spill" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const o = try json.newObject(a);
++    var ranks: api.prompt_cache.RankCounts = .{ .n = 2 };
++    ranks.ranks[0].points = 5;
++    ranks.ranks[1].points = 4;
++    try putCache(a, o, .{ .chats_continued = 1, .disk_hits_committed = 3, .spill = ranks });
++    try std.testing.expectEqualStrings("1", o.get("chats_continued").?.int);
++    const pc = o.get("prompt_cache").?.object;
++    try std.testing.expectEqualStrings("3", pc.get("disk_hits_committed").?.int);
++    const spill = pc.get("spill").?.array;
++    try std.testing.expectEqual(@as(usize, 2), spill.len);
++    try std.testing.expectEqualStrings("5", spill[0].object.get("points").?.int);
++    try std.testing.expectEqualStrings("1", spill[1].object.get("rank").?.int);
++    try std.testing.expectEqualStrings("4", spill[1].object.get("points").?.int);
++    const none = try json.newObject(a);
++    try putCache(a, none, .{});
++    try std.testing.expect(none.get("prompt_cache").?.object.get("spill") == null);
++}

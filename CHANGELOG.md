@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- **Rank 0's memory with long prompts:** `zig/patches/0023-server-prepare-memory.patch`, a fix to the base engine after
+  the port's series (also offered alone as its own pull request). A prompt's render and tokenization kept their scratch
+  in the request's memory until the reply ended: a resumed ~948K-token conversation held ~1.3-1.5 GB on rank 0, and
+  eight at once took its MemAvailable from 6 GiB to 0.16 GiB until the memory guard killed it. The tokenizer and the
+  template give their scratch back, a prepare waits while others are in flight and MemAvailable would fall under
+  `TENSORFOLD_PREPARE_FLOOR_GIB` (default 3; `0` off), and a kept-alive connection keeps at most 1 MiB between its
+  requests. Replies are unchanged (`zig build test-golden`). By **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)**.
+- **Port of Robert Wojciechowski's (**[wojo](https://github.com/wojo)** on GitHub, **[@rwojo](https://x.com/rwojo)** on X) GLM-5.3-Flash patches, off by default**
+  ([docs/PORT-RECIPE.md](docs/PORT-RECIPE.md), README "Spill v2 and KV sharding"): the spill tier and its v2 block store
+  with quotas and crash recovery (GLM `0088`/`0110`, PRs #78 and #124, on **[BadAd84](https://github.com/BadAd84)**'s
+  block-tier design, #118), chat continuation (`0111`, #128), KV sharding with prompt borrowing and the ring exchange
+  (`0118`, #152) and the parked-page startup budget (`0119`, #149), ported to the native engine as twelve
+  patches, `zig/patches/0011` to `0022`, one per feature with a header in the GLM recipe's style (each checked with
+  `git apply --check` on a clean `TF_REF` after `0001`-`0010` and the ones before it; the new `scripts/port-patches.sh`
+  exports later engine work on top). **KV sharding builds on `0008`'s pool:** one `POOL` setting; with
+  `KV_SHARD=1` the same pool is cut into one part a Spark, each holding a whole window (empty `POOL`: the pool that
+  needs, 2,101,248 at the 1M window), and each Spark keeps only its part's compressed KV, about half the KV memory a
+  Spark for the same `POOL` (measured at 2,101,248: 1,062 MiB a rank against 1,783 MiB replicated; decode 1-4%
+  slower). Settings `SPILL_GIB`, `SPILL_DIR`, `WORKER_SPILL_DIR`, `SPILL_FLOOR_GIB`, `SPILL_QUOTA_GIB`, `KV_SHARD`,
+  `KV_SHARD_DECODE` and friends, mapped in one place (`scripts/port.sh`) and passed to both ranks alike; each Spark's
+  own spill folder checked on both (local disk, outside the NFS export, the model folders and archives, not
+  root-owned, above the floor) and mounted at `/spill`; a set setting that cannot run refuses the start. With
+  everything off the only change in the docker commands is a `tf.recipe.port=off` label. Also: a broken rank pair
+  ends rank 0 with status 75 instead of hanging it (`0020`; on with two ranks whatever the settings, since it acts only
+  after a failure; `TF_DS_PAIR_BROKEN=degrade` opts out), for a supervisor such as the systemd service below to restart,
+  and `start.sh` hands an exited container to `stop.sh`, which saves its log before it is removed; spill files are
+  handed back to the folder's owner by a minimal container (only the marked folder, root-owned files and directories
+  only, no symlinks, no network, `CHOWN` + `DAC_READ_SEARCH` only); `MIN_AVAIL_GIB` counts parked per-CPU pages
+  (`scripts/memavail.sh`); the end-to-end tools in `tools/` read an API key only from `API_KEY` or `--api-key-file`
+  and never write it to receipts; `ZIG_MIRRORS` for the compiler download. Validated on the pair:
+  replies byte-identical to the stock engine in every configuration; resuming a 237k-token conversation from disk
+  after a restart takes 1.7 s against 118 s recomputed. By **Robert Wojciechowski** ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), pull request
+  [#30](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/30).
+
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,

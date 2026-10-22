@@ -1,0 +1,2542 @@
+# dsv41: KV-sharded decode exchanges on the family's RDMA ring. 0015's decode ran its exchanges as NCCL collectives on
+# the main stream (fetch: two all-gathers of R x 512 rows a compressed layer; owner: a query all-gather plus an
+# exchange), where the replicated engine rides the GPU-driven RDMA ring inside its graphs. Now, with the ring
+# configured (TF_RDMA_DEVICES; the recipe's RDMA=1), each decode exchange rides it, sized to the rows that really cross
+# (shard_ring.zig: explicit row lists, the same on both ranks, uploaded each round to one fixed block so captured
+# graphs stay valid; stage and collect kernels in dsv41_shard.cu), owner decode's own-head pass and early query stage
+# run on a side stream of their own (TF_DS_KV_SHARD_OVERLAP), and TF_DS_KV_SHARD_DECODE=auto chooses fetch or owner each
+# round from a cost model (shard_ring.decide, a pure function of what both ranks hold). Shard phase clocks and
+# counters (ring rounds, auto's choices, rows sent) for profiles (tf-dsv41-lanes); a ring transfer out of its fixed
+# order or rows refuses on both ranks and ends the pair (round.pair_ending, 0020). The parts' stats behind /health
+# are rebuilt at most every 250 ms (they were rebuilt every engine-loop pass).
+# Switches (both ranks, agreed unless noted): TF_DS_KV_SHARD_RING 1 (0: NCCL), TF_DS_KV_SHARD_DECODE fetch, owner or
+# auto, TF_DS_KV_SHARD_COST (auto's nine costs, ns), TF_DS_KV_SHARD_OVERLAP on (per rank, not agreed). All inert
+# without TF_DS_KV_SHARD=1.
+# Measured on the pair: with the ring and the cached stats a sharded decode round (a row fetch every round) costs ~1-4 %
+# against the base at 1 to 8 streams (bench.py, 3 reps; round 2's NCCL fetch cost 10.6-12.3 %); the daily config
+# (KV_SHARD=1, pool 2,101,248, SPILL_GIB=64; engine 569bdd1, before the rebase onto 0008) exact.py 39/39 identical, and
+# identical again on the rebased engine (this series' tip, with the display-reserve patch beside it, pool 5,218,304).
+# Builds on 0018 and 0020. By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/tools/dsv41_shard_emulate/device/cuda_runtime.h b/tools/dsv41_shard_emulate/device/cuda_runtime.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..db6a84d1006f22bc7427f1c8bbb9311daac968e4
+--- /dev/null
++++ b/tools/dsv41_shard_emulate/device/cuda_runtime.h
+@@ -0,0 +1,22 @@
++// A syntax-only stand-in for the CUDA runtime header: clang's CUDA front end (no SDK, no NVPTX backend on macOS) checks
++// dsv41_shard.cu's device code, the inline PTX included:
++//   clang++ -x cuda -nocudainc -nocudalib --cuda-device-only --cuda-gpu-arch=sm_90 -fms-extensions \
++//     -I tools/dsv41_shard_emulate/device -fsyntax-only zig/kernels/cuda/dsv41_shard.cu
++#pragma once
++#define __global__ __attribute__((global))
++#define __device__ __attribute__((device))
++#define __host__ __attribute__((host))
++#define __shared__ __attribute__((shared))
++#define __forceinline__ __attribute__((always_inline)) inline
++#define __launch_bounds__(...) __attribute__((launch_bounds(__VA_ARGS__)))
++typedef unsigned long long uint64_t; typedef unsigned uint32_t;
++struct uint4 { unsigned x, y, z, w; };
++struct __cuda_builtin_threadIdx_t { __declspec(property(get = __fetch_builtin_x)) unsigned x; static __device__ unsigned __fetch_builtin_x() { return __nvvm_read_ptx_sreg_tid_x(); } };
++struct __cuda_builtin_blockIdx_t { __declspec(property(get = __fetch_builtin_x)) unsigned x; __declspec(property(get = __fetch_builtin_y)) unsigned y; static __device__ unsigned __fetch_builtin_x() { return __nvvm_read_ptx_sreg_ctaid_x(); } static __device__ unsigned __fetch_builtin_y() { return __nvvm_read_ptx_sreg_ctaid_y(); } };
++struct __cuda_builtin_blockDim_t { __declspec(property(get = __fetch_builtin_x)) unsigned x; static __device__ unsigned __fetch_builtin_x() { return __nvvm_read_ptx_sreg_ntid_x(); } };
++struct __cuda_builtin_gridDim_t { __declspec(property(get = __fetch_builtin_x)) unsigned x; static __device__ unsigned __fetch_builtin_x() { return __nvvm_read_ptx_sreg_nctaid_x(); } };
++extern const __device__ __cuda_builtin_threadIdx_t threadIdx; extern const __device__ __cuda_builtin_blockIdx_t blockIdx; extern const __device__ __cuda_builtin_blockDim_t blockDim; extern const __device__ __cuda_builtin_gridDim_t gridDim;
++__device__ unsigned atomicAdd(unsigned* p, unsigned v) { return __nvvm_atom_add_gen_i((int*)p, (int)v); }
++__device__ uint4 __ldcv(const uint4* p) { return *p; }
++typedef unsigned long size_t;
++__device__ inline void __threadfence_system() { __nvvm_membar_sys(); }
+diff --git a/tools/dsv41_shard_emulate/emulate.cpp b/tools/dsv41_shard_emulate/emulate.cpp
+index 796fa982eb1b29e5eab75cc1a62f0356cc637346..f0ec0c24a93dac4b3216a3ffb1ac55adeba6a380 100644
+--- a/tools/dsv41_shard_emulate/emulate.cpp
++++ b/tools/dsv41_shard_emulate/emulate.cpp
+@@ -5,6 +5,7 @@
+ #include <cstring>
+ #include <vector>
+ #include <random>
++#define TF_DS_EMULATE 1 // the ring kernels' protocol needs a GPU; their row packing runs here
+ #include "../../zig/kernels/cuda/dsv41_shard.cu"
+ static void launch_fetch(int rows, long long kos, const uint8_t* c, const uint8_t* s, long long cb, long long sb, const long long* idx, long long ks, int kk, const long long* sbase, const long long* own, int copy, uint8_t* dc, uint8_t* ds, long long dk, long long* out, int how) {
+   gridDim = {(unsigned)rows, (unsigned)((kos + 15) / 16), 1}; blockDim = {256, 1, 1};
+@@ -79,6 +80,41 @@ int main() {
+     for (int r = 0; r < rows; r++) for (int j = 0; j < kk; j++) { long long v = idx[r * kk + j]; if (v < 0 || v >= limit) continue; long long o = out[r * kos + j];
+       if (memcmp(&dc[o * cb], &pc[v * cb], cb) || memcmp(&ds[o * sb], &ps[v * sb], sb)) { fails++; printf("union reads trial %d differ\n", trial); r = rows; break; } }
+   }
++  // the ring exchanges' row packing (tf_ds_ring_pack / unpack, the stage and collect kernels' copies): any grid's
++  // threads together give shard_ring.zig's stageRef / collectRef slot and rows
++  for (int trial = 0; trial < 200; trial++) {
++    TfDsRingRows s{}; int nseg = 1 + g() % TF_DS_RING_SEGS; int rows = 1 + g() % 48;
++    // a host-made list (shard_ring.lists: the count, then rows in slot order; any order the host gives is kept)
++    int list[TF_DS_RING_ROWS + 1] = {0}; int n = 0;
++    for (int r = 0; r < rows; r++) if (g() % 3 == 0) list[1 + n++] = r;
++    if (g() % 4 == 0) for (int i = n - 1; i > 0; i--) { int j = g() % (i + 1); int t = list[1 + i]; list[1 + i] = list[1 + j]; list[1 + j] = t; }
++    list[0] = n;
++    std::vector<std::vector<uint4>> src(nseg), dst(nseg), exp(nseg);
++    long long row_total = 0;
++    for (int k = 0; k < nseg; k++) {
++      s.row16[k] = 1 + g() % 40; s.src16[k] = s.row16[k] + g() % 3; s.dst16[k] = s.row16[k] + g() % 3; row_total += s.row16[k];
++      src[k].resize(rows * s.src16[k]); dst[k].resize(rows * s.dst16[k]);
++      for (auto& w : src[k]) w = {(unsigned)g(), (unsigned)g(), (unsigned)g(), (unsigned)g()};
++      for (auto& w : dst[k]) w = {(unsigned)g(), (unsigned)g(), (unsigned)g(), (unsigned)g()};
++      exp[k] = dst[k]; s.src[k] = src[k].data(); s.dst[k] = dst[k].data();
++    }
++    const int* lr = list + 1;
++    if (tf_ds_ring_count(list) != n || tf_ds_ring_words(s, nseg, n) != n * row_total) { fails++; printf("ring count trial %d differs\n", trial); continue; }
++    std::vector<uint4> slot(rows * row_total + 1), ref(rows * row_total + 1);
++    long long off = 0;
++    for (int k = 0; k < nseg; k++) { for (int c = 0; c < n; c++) for (int w = 0; w < s.row16[k]; w++) ref[off + c * s.row16[k] + w] = src[k][lr[c] * s.src16[k] + w]; off += (long long)n * s.row16[k]; }
++    const unsigned T = 1 + g() % 3000; // a grid's threads
++    for (unsigned t = 0; t < T; t++) tf_ds_ring_pack(s, nseg, lr, n, slot.data(), t, T);
++    if (memcmp(slot.data(), ref.data(), n * row_total * 16)) { fails++; printf("ring pack trial %d differs\n", trial); continue; }
++    off = 0;
++    for (int k = 0; k < nseg; k++) { for (int c = 0; c < n; c++) for (int w = 0; w < s.row16[k]; w++) exp[k][lr[c] * s.dst16[k] + w] = ref[off + c * s.row16[k] + w]; off += (long long)n * s.row16[k]; }
++    const unsigned U = 1 + g() % 3000;
++    for (unsigned t = 0; t < U; t++) tf_ds_ring_unpack(s, nseg, lr, n, ref.data(), t, U);
++    for (int k = 0; k < nseg; k++) if (memcmp(dst[k].data(), exp[k].data(), dst[k].size() * 16)) { fails++; printf("ring unpack trial %d seg %d differs\n", trial, k); break; }
++  }
++  // a list count out of range is clamped (never indexes past the list)
++  { int bad[TF_DS_RING_ROWS + 1] = {0}; bad[0] = -3; int a = tf_ds_ring_count(bad); bad[0] = 1000; int b = tf_ds_ring_count(bad);
++    if (a != 0 || b != TF_DS_RING_ROWS) { fails++; printf("ring count clamp differs\n"); } }
+   printf("%s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
+   return fails != 0;
+ }
+diff --git a/zig/kernels/cuda/dsv41_shard.cu b/zig/kernels/cuda/dsv41_shard.cu
+index 4bc85c7e1c5f296523fd9c616bdcdad37378df60..ce1bce2b8f87b2b9306d66cf7678b534a6940cfb 100644
+--- a/zig/kernels/cuda/dsv41_shard.cu
++++ b/zig/kernels/cuda/dsv41_shard.cu
+@@ -142,3 +142,215 @@ extern "C" __global__ void __launch_bounds__(256) tf_ds_union_renumber_kernel(co
+     const long long v = j < kk ? idx[r * ks + j] : -1;
+     out[r * kos + j] = v >= 0 && v < limit ? (long long)cum[v] - 1 : -1;
+ }
++
++// ---- TF_DS_KV_SHARD's decode exchanges on the family's RDMA ring (shard_ring.zig; rdma.zig Ring.sendRows/recvRows) --
++// A sized one-hop transfer of a round's listed rows, each row one run of row16 16-byte words in every one of nseg
++// segments. The host lists the rows (shard_ring.lists, from the replicated owners: rank r's send list
++// is rank 1-r's receive list) and uploads them each round to a fixed block (int [1 + TF_DS_RING_ROWS]: the count, then
++// the rows in slot order), so a captured launch serves every round. The stage kernel packs segment s of the n listed
++// rows after the segments before it into this rank's ring slot and publishes the slot's size (n x the row words) with
++// the doorbell, as dsv41/rdma_gather.cu's stage does (the same slot, sequence, sent, staged, abort and probe words);
++// the proxy writes exactly those bytes to the peer; the collect kernel waits for the peer's flag at the sequence and
++// puts each received row at its listed row in the destinations. shard_ring.zig's stageRef / collectRef are the host
++// models; tools/dsv41_shard_emulate runs the packing below against them.
++// PORT(kit): written without nvcc (never compiled or run); compile with the image, then docs/port/shard-ring.md's
++// GPU checks.
++#define TF_DS_RING_SEGS 8
++#define TF_DS_RING_ROWS 64
++#define TF_DS_STAGE_THREADS 512
++#define TF_DS_COLLECT_THREADS 256
++
++// rdma.zig RowSegs (extern struct, the same layout): a segment's source and destination, their row strides and a
++// row's words (16-byte units). The stage reads src, the collect writes dst.
++struct TfDsRingRows {
++    const uint4* src[TF_DS_RING_SEGS];
++    uint4* dst[TF_DS_RING_SEGS];
++    long long src16[TF_DS_RING_SEGS];
++    long long dst16[TF_DS_RING_SEGS];
++    int row16[TF_DS_RING_SEGS];
++};
++
++#ifdef TF_DS_EMULATE
++#define TF_DS_HD static inline
++#define TF_DS_LDCV(p) (*(p))
++#else
++#define TF_DS_HD __device__ __forceinline__
++#define TF_DS_LDCV(p) __ldcv(p)
++#endif
++
++// A list's count (the host writes 0 .. TF_DS_RING_ROWS; clamped so a bad block can never index past the list).
++TF_DS_HD int tf_ds_ring_count(const int* list) {
++    const int n = list[0];
++    return n < 0 ? 0 : (n > TF_DS_RING_ROWS ? TF_DS_RING_ROWS : n);
++}
++
++// The slot's words for n listed rows (every segment's).
++TF_DS_HD long long tf_ds_ring_words(const TfDsRingRows& s, int nseg, int n) {
++    long long t = 0;
++    for (int g = 0; g < nseg; ++g) t += (long long)n * s.row16[g];
++    return t;
++}
++
++// This thread's share (word tid, tid + step, ...) of packing the listed rows (rows[0 .. n)) into the slot. 32-bit word
++// indices: a slot is at most the ring's max_bytes (4.25 MiB, 2^18 words).
++TF_DS_HD void tf_ds_ring_pack(const TfDsRingRows& s, int nseg, const int* rows, int n, uint4* slot, unsigned tid, unsigned step) {
++    size_t off = 0;
++    for (int g = 0; g < nseg; ++g) {
++        const unsigned r16 = (unsigned)s.row16[g], words = (unsigned)n * r16;
++        const uint4* src = s.src[g];
++        const long long st = s.src16[g];
++        for (unsigned i = tid; i < words; i += step) {
++            const unsigned c = i / r16;
++            slot[off + i] = src[(long long)rows[c] * st + (i - c * r16)];
++        }
++        off += words;
++    }
++}
++
++// This thread's share of putting a received slot's rows at their listed rows: up to four slot loads in flight before
++// their stores (as rdma_gather.cu's collect: the first reads after the flag wait out the pinned memory's latency).
++TF_DS_HD void tf_ds_ring_unpack(const TfDsRingRows& s, int nseg, const int* rows, int n, const uint4* slot, unsigned tid, unsigned step) {
++    size_t off = 0;
++    for (int g = 0; g < nseg; ++g) {
++        const unsigned r16 = (unsigned)s.row16[g], words = (unsigned)n * r16;
++        uint4* dst = s.dst[g];
++        const long long st = s.dst16[g];
++        for (unsigned b = tid; b < words; b += 4 * step) {
++            uint4 v[4];
++            for (unsigned u = 0; u < 4; ++u)
++                if (b + u * step < words) v[u] = TF_DS_LDCV(slot + off + b + u * step);
++            for (unsigned u = 0; u < 4; ++u) {
++                const unsigned i = b + u * step;
++                if (i < words) {
++                    const unsigned c = i / r16;
++                    dst[(long long)rows[c] * st + (i - c * r16)] = v[u];
++                }
++            }
++        }
++        off += words;
++    }
++}
++
++#ifndef TF_DS_EMULATE
++namespace {
++__device__ __forceinline__ uint64_t tf_ds_load_sys(const uint64_t* p) {
++    uint64_t v;
++    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
++    return v;
++}
++
++__device__ __forceinline__ void tf_ds_store_sys(uint64_t* p, uint64_t v) {
++    asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
++}
++
++__device__ __forceinline__ void tf_ds_store_relaxed_sys(uint64_t* p, uint64_t v) {
++    asm volatile("st.relaxed.sys.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
++}
++
++__device__ __forceinline__ uint64_t tf_ds_now_ns() {
++    uint64_t t;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++    return t;
++}
++
++// rdma_gather.cu's v7 PDL entry: wait for the kernel before (its memory visible), then let the next one launch.
++__device__ __forceinline__ void tf_ds_pdl_enter(int pdl) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++    if (pdl) {
++        asm volatile("griddepcontrol.wait;" ::: "memory");
++        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++    }
++#endif
++}
++
++// The block's copy of a row list (the count then the rows), every thread loading a part of it.
++__device__ __forceinline__ void tf_ds_ring_load_list(const int* list, int* s_list) {
++    for (int i = threadIdx.x; i <= TF_DS_RING_ROWS; i += blockDim.x) s_list[i] = list[i];
++}
++}  // namespace
++
++// dsv41_rdma_stage's protocol over the listed rows: every block waits until the slot's previous writes are sent,
++// copies its share in, counts itself in; the last block advances the sequence and rings the doorbell. Block 0 writes
++// the slot's size (fence_mode 1: before the blocks' releases, as dsv41_rdma_stage). The list loads overlap the slot
++// wait (thread 0 waits, the others load).
++extern "C" __global__ void __launch_bounds__(TF_DS_STAGE_THREADS) tf_ds_ring_stage_rows(TfDsRingRows s, int nseg,
++        const int* list, char* send_ring, uint64_t* sizes, uint64_t* doorbell, const uint64_t* sent, uint64_t* seq,
++        int slots, uint64_t max_bytes, uint64_t* probe, const uint64_t* abort_word, unsigned* staged, int fence_mode,
++        int pdl) {
++    __shared__ uint64_t s_seq;
++    __shared__ int s_last;
++    __shared__ int s_list[TF_DS_RING_ROWS + 1];
++    tf_ds_pdl_enter(pdl);                        // before anything reads the rows, their list or the sequence
++    const uint64_t t0 = tf_ds_now_ns();
++    tf_ds_ring_load_list(list, s_list);
++    if (threadIdx.x == 0) {
++        const uint64_t q = *seq + 1;
++        const int slot = (int)(q % slots);
++        if (q > (uint64_t)slots)
++            for (uint32_t i = 1; tf_ds_load_sys(sent + slot) + slots < q; ++i)
++                if ((i & 1023) == 0 && tf_ds_load_sys(abort_word)) break;
++        s_seq = q;
++    }
++    __syncthreads();
++    const int n = tf_ds_ring_count(s_list);
++    const uint64_t q = s_seq;
++    const int slot = (int)(q % slots);
++    if (fence_mode && blockIdx.x == 0 && threadIdx.x == 0) tf_ds_store_relaxed_sys(sizes + slot, (uint64_t)tf_ds_ring_words(s, nseg, n) * 16);
++    uint4* dst = reinterpret_cast<uint4*>(send_ring + (size_t)slot * max_bytes);
++    tf_ds_ring_pack(s, nseg, s_list + 1, n, dst, blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x);
++    if (fence_mode) {
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            __threadfence_system();
++            s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
++        }
++    } else {
++        __threadfence_system();
++        __syncthreads();
++        if (threadIdx.x == 0) s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0 && s_last) {
++        __threadfence_system();
++        *staged = 0;
++        *seq = q;
++        if (fence_mode) {
++            tf_ds_store_relaxed_sys(doorbell, q);
++        } else {
++            tf_ds_store_sys(sizes + slot, (uint64_t)tf_ds_ring_words(s, nseg, n) * 16);
++            tf_ds_store_sys(doorbell, q);
++        }
++        if (probe) {
++            probe[0] += tf_ds_now_ns() - t0;
++            probe[4] = tf_ds_now_ns();
++        }
++    }
++}
++
++// dsv41_rdma_collect_into's wait (rank `from`'s flag at this rank's latest sequence), then the slot's rows put at
++// their listed rows (the rows `from` sent, in its send list's order). The list loads overlap the flag wait.
++extern "C" __global__ void __launch_bounds__(TF_DS_COLLECT_THREADS) tf_ds_ring_collect_rows(TfDsRingRows s, int nseg,
++        const int* list, const char* recv_ring, const uint64_t* flags, const uint64_t* seq, int from, int world,
++        int slots, uint64_t max_bytes, uint64_t* probe, const uint64_t* abort_word, int pdl) {
++    __shared__ int s_list[TF_DS_RING_ROWS + 1];
++    tf_ds_pdl_enter(pdl);                        // the stage kernel's sequence is written
++    const uint64_t q = *seq;
++    const int slot = (int)(q % slots);
++    tf_ds_ring_load_list(list, s_list);
++    if (threadIdx.x == 0)
++        for (uint32_t i = 1; tf_ds_load_sys(flags + (size_t)slot * world + from) < q; ++i)
++            if ((i & 1023) == 0 && tf_ds_load_sys(abort_word)) break;
++    __syncthreads();
++    const uint64_t t2 = tf_ds_now_ns();
++    const uint4* in = reinterpret_cast<const uint4*>(recv_ring + ((size_t)slot * world + from) * max_bytes);
++    tf_ds_ring_unpack(s, nseg, s_list + 1, tf_ds_ring_count(s_list), in, blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x);
++    if (probe && blockIdx.x == 0) {
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            probe[1] += t2 - probe[4];
++            probe[2] += tf_ds_now_ns() - t2;
++            probe[3] += 1;
++        }
++    }
++}
++#endif  // TF_DS_EMULATE
+diff --git a/zig/src/families/dsv41/comm.zig b/zig/src/families/dsv41/comm.zig
+index 8f5b165a6b6d780cd3e00cbf054f1489329321a4..a591e49f0221c1d5ed6b8dca48e795cf77acd88b 100644
+--- a/zig/src/families/dsv41/comm.zig
++++ b/zig/src/families/dsv41/comm.zig
+@@ -165,6 +165,20 @@ pub const Comm = struct {
+     pub fn allGatherInPlace(c: *const Comm, buf: u64, count: usize, stream: cuda.Stream) !void {
+         try c.allGather(buf + c.rank * count, buf, count, .u8, stream);
+     }
++
++    /// Two in-place all-gathers (allGatherInPlace of `a` then of `b`, `a_count` and `b_count` bytes a rank) in one NCCL
++    /// group: one launch, the same bytes (TF_DS_KV_SHARD's NCCL fetch of codes and scales). Holds the enqueue gate
++    /// against `abort` like every collective here.
++    pub fn allGatherInPlace2(c: *const Comm, a: u64, a_count: usize, b: u64, b_count: usize, stream: cuda.Stream) !void {
++        try c.enter();
++        defer leave();
++        try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
++        const x = c.lib.api.ncclAllGather(a + c.rank * a_count, a, a_count, .u8, c.comm, stream.handle);
++        const y = c.lib.api.ncclAllGather(b + c.rank * b_count, b, b_count, .u8, c.comm, stream.handle);
++        try c.lib.check(c.lib.api.ncclGroupEnd(), "ncclGroupEnd");
++        try c.lib.check(x, "ncclAllGather");
++        try c.lib.check(y, "ncclAllGather");
++    }
+ };
+ 
+ /// The gate every collective's NCCL calls hold against `Comm.abort` (process-wide: one engine thread enqueues, the
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 33b4122f67475d9af99f789c64eb8bd89a3c912e..847b4b29b902379dccf1290bc8b4097d488fb800 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -55,6 +55,7 @@ pub const kv_lanes = @import("kv_lanes.zig");
+ pub const rank_wire = @import("rank_wire.zig");
+ pub const fingerprint = @import("fingerprint.zig");
+ pub const rank_identity = @import("rank_identity.zig");
++pub const shard_ring = @import("shard_ring.zig");
+ 
+ test {
+     // every declaration of every file, so functions no test calls are still compiled
+@@ -107,6 +108,7 @@ test {
+     refAll(rank_wire);
+     refAll(fingerprint);
+     refAll(rank_identity);
++    refAll(shard_ring);
+     // rank_identity.gather over the real Options and Model (it takes them as anytype to stay host-testable alone)
+     _ = &struct {
+         fn f(gpa: @import("std").mem.Allocator, io: @import("std").Io, o: model.Options, m: *model.Model, x: rank_identity.Extra) !rank_identity.Gathered {
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index a18a7f92bd6bec8fd9d93eb6f4679d74359b7191..e2e341e8a64b444df5518703f99ac7ca5bb75bce 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -454,6 +454,8 @@ pub const Lanes = struct {
+     next_snap: u64 = 1,
+     spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
+     kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
++    kv_stats: lanes.kv_parts.Stats = .{}, // the last parts' stats kvPartsFn built (the engine loop reads them every
++    kv_stats_at: u64 = 0, //   iteration: rebuilt at most each kv_stats_ns, Model.now; 0: never built)
+     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
+     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
+     rw: ?*rank_wire.Leader = null,
+@@ -714,10 +716,18 @@ pub const Lanes = struct {
+         try k.round(vs[0..windows.len]);
+     }
+ 
+-    /// The parts' stats for /health and /metrics (native.Loaded.kv_parts: the host reads them on its engine thread).
++    /// The parts' stats for /health and /metrics (native.Loaded.kv_parts: the host reads them on its engine thread,
++    /// in noteLive, every engine-loop iteration). Rebuilt at most each kv_stats_ns: a rebuild scans the planner and
++    /// sorts every part's spans (allocating), which base rounds never pay and a round should not wait for.
+     pub fn kvPartsFn(ptr: *anyopaque, out: *lanes.kv_parts.Stats) void {
+         const self = of(ptr);
+         const k = self.kv orelse return;
++        const now = self.m.now();
++        if (self.kv_stats_at != 0 and now -| self.kv_stats_at < kv_stats_ns) {
++            out.* = self.kv_stats;
++            return;
++        }
++        self.kv_stats_at = now;
+         k.stats(out);
+         k.wantStats(); // (the followers' rows are asked for again at the next round, at most each stats_ms)
+         if (self.m.kvs) |x| {
+@@ -733,8 +743,12 @@ pub const Lanes = struct {
+             out.copy_bytes = st.carry_bytes;
+             shardRank(self.m, &out.rank[0]); // (rank 0's own row; the followers' ride their stats replies)
+         }
++        self.kv_stats = out.*;
+     }
+ 
++    /// How stale /health's parts' stats may be (kvPartsFn).
++    const kv_stats_ns: u64 = 250 * std.time.ns_per_ms;
++
+     // -- the vtable ---------------------------------------------------------------------------------------------
+ 
+     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
+@@ -1461,6 +1475,15 @@ fn refused(err: anyerror) void {
+     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
+ }
+ 
++/// A round this rank could not finish: refused as above, unless the error means the ranks cannot go on together
++/// (round.pair_ending: the ring's order or rows broken, a sized send or the peer's collect pending, the ring or the
++/// communicator dead). Then the follower ends with it (rank 0 ends the pair for the same error, native.pair_fatal, or
++/// sees this rank's link go down) instead of taking the next frame.
++fn roundRefused(err: anyerror) !void {
++    refused(err);
++    if (round.endsPair(err)) return err;
++}
++
+ /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
+ pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
+ 
+@@ -1783,7 +1806,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+                 }
+                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
+                 if (spill) |sd| for (wins[0..nw]) |w| sd.bump(w.base + w.start, w.base + w.start + w.ids.len);
+-                m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
++                m.verify(rows, built.absorb[0..nw]) catch |err| try roundRefused(err);
+                 if (m.prof) {
+                     follow_prof.rounds += 1;
+                     follow_prof.enqueue += m.t_enqueue;
+@@ -1802,7 +1825,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+                     q0[i] = try r.int(i64);
+                     slots[i] = try r.int(i64);
+                 }
+-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
++                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| try roundRefused(err);
+             },
+             .fill_images => {
+                 const count = try r.int(u32);
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index 4a790c2a7afed51672ca062ea6d3d7aa179265ec..e61e4861e9f5b1b9421a9ea1a79220697330726e 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -117,7 +117,8 @@ pub fn main(init: std.process.Init) !u8 {
+     var arena_gib: ?usize = null;
+     var profile = false;
+     // TF_DS_CLOCK_MARKS=1 with --profile: a GPU clock at every round phase mark (in the graphs too; it splits their
+-    // PDL chains, so the stretch totals run long), else only around the stretches
++    // PDL chains, so the stretch totals run long), else only around the stretches; 4: only a_q, a_idx, a_core
++    // and TF_DS_KV_SHARD's parts between them (round.PhaseTimer.shardMark: sh_* per compressed layer)
+     const clock_marks: u8 = if (std.c.getenv("TF_DS_CLOCK_MARKS")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0 else 0;
+     var phases = false; // --profile 2: also the rounds' GPU time by phase (eager rounds)
+     var serial = false; // --serial 1: every stream without drafts (one row a round)
+@@ -233,6 +234,7 @@ pub fn main(init: std.process.Init) !u8 {
+             if (m.eh) |eh| w.print(", \"engram_read_ms\": {d:.3}, \"engram_hash_ms\": {d:.3}", .{ @as(f64, @floatFromInt(eh.t_read)) / r / 1e6, @as(f64, @floatFromInt(eh.t_hash)) / r / 1e6 }) catch {};
+             w.print("}}}}\n", .{}) catch {};
+             printClock(w, o.rank, m) catch {};
++            printKvShard(w, o.rank, m) catch {};
+             if (m.ptimer) |tm| {
+                 w.print("{{\"rank\": {d}, \"prefill_phases_ms\": {{", .{o.rank}) catch {};
+                 for (dsv41.round.PhaseTimer.phases, 0..) |name, i| w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, if (tm.rounds == 0) 0 else tm.ms[i] / @as(f64, @floatFromInt(tm.rounds)) }) catch {};
+@@ -411,6 +413,7 @@ pub fn main(init: std.process.Init) !u8 {
+         try w.print("{{\"rank\": 0, \"profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"step_ms\": {d:.2}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.2}, \"forward_ms\": {d:.2}, \"absorb_ms\": {d:.2}, \"logits_ms\": {d:.2}, \"sample_ms\": {d:.2}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.2}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{ p.rounds, ms(p.rows * 1000000, p.rounds), ms(step_ns, core.steps), ms(p.send, p.rounds), ms(p.enqueue, p.rounds), ms(p.forward, p.rounds), ms(p.absorb, p.rounds), ms(p.logits, p.rounds), ms(p.sample, p.rounds), p.passes, ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes), p.prefills, ms(p.prefill, p.prefills) });
+         try w.flush();
+         try printClock(w, 0, m);
++        try printKvShard(w, 0, m);
+         if (m.eh) |eh| if (eh.p_calls > 0) {
+             const pc: f64 = @floatFromInt(eh.p_calls);
+             try w.print("{{\"rank\": 0, \"prefill_engram_ms\": {{\"calls\": {d}, \"rows\": {d:.2}, \"upload\": {d:.2}, \"mm\": {d:.2}, \"exchange\": {d:.2}, \"gate\": {d:.2}}}}}\n", .{ eh.p_calls, @as(f64, @floatFromInt(eh.p_rows)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_upload)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_mm)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_x)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_gate)) / pc / 1e6 });
+@@ -489,6 +492,16 @@ fn tokenSha(a: std.mem.Allocator, ids: []const u32) ![]const u8 {
+     return hex[0..12];
+ }
+ 
++/// TF_DS_KV_SHARD's counters on this rank (a profile): the rounds by decode mode, auto's choices, the rounds whose
++/// exchanges rode the RDMA ring, the rows sent, the prompt fetches and carries.
++fn printKvShard(w: *std.Io.Writer, rank: u32, m: *const dsv41.model.Model) !void {
++    const kv = m.kvs orelse return;
++    try w.print("{{\"rank\": {d}, \"kv_shard\": {{\"mode\": \"{s}\", \"ring\": {}, \"overlap\": {}", .{ rank, @tagName(kv.mode), kv.use_ring, kv.overlap });
++    inline for (@typeInfo(@TypeOf(kv.stats)).@"struct".field_names) |f| try w.print(", \"{s}\": {d}", .{ f, @field(kv.stats, f) });
++    try w.print("}}}}\n", .{});
++    try w.flush();
++}
++
+ /// A profile's round GPU clock gaps (us a round): start to the first stretch, then each stretch and the wait after it.
+ fn printClock(w: *std.Io.Writer, rank: u32, m: *const dsv41.model.Model) !void {
+     if (m.clk_rounds == 0) return;
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 2027b3bfb2d6a207eac184de0cf9b16dd2365a04..62b939ae6141ec318e423f419cef37b6d1d86b4b 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -510,6 +510,7 @@ pub const Model = struct {
+         }
+         m.rd.dropSide(&m.eng);
+         m.rd.dropPrefetch();
++        m.rd.dropShard();
+         if (m.aio) |x| x.deinit();
+         if (m.paio) |x| x.deinit();
+         if (m.paio2) |x| x.deinit();
+@@ -1265,6 +1266,7 @@ pub const Model = struct {
+     /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
+     pub fn useClock(m: *Model, marks: u8) !void {
+         m.rd.clk_marks = marks == 1 or marks == 3;
++        m.rd.clk_shard = marks == 4; // the sharded attention's parts alone (round.PhaseTimer.shardMark)
+         m.rd.clk_ratio = if (marks == 3) 2 else null;
+         m.rd.clk_layers = marks == 2 or marks == 3;
+         if (m.rd.clk == 0) m.rd.clk = try m.arena.take((1 + 2 * round.Round.max_clocks) * 8);
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index c63efef4a7a49f7e96f41108eae2bead66312055..a0516fcaadb4cb86e53c6741e518d634c79d3804 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -282,8 +282,9 @@ pub fn pairMode(env: *const fn ([:0]const u8) ?[]const u8) !PairMode {
+ 
+ /// The errors from a prompt pass or a round that mean the pair broke (rank_wire's PairBroken; kv_lanes' transfers;
+ /// a follower's StaleExtent/ShardDiverged reach rank 0 as its link going down; an aborted communicator; an RDMA ring
+-/// that saw a dead peer or was aborted, RingFailed). None of them drains: the next round's collective would wait on
+-/// the peer.
++/// that saw a dead peer or was aborted, RingFailed; a decode round's ring order or row lists broken,
++/// round.pair_ending: a sized send may be in flight with no receive, the peer spinning in its collect). None of them
++/// drains: the next round's collective would wait on the peer.
+ pub const pair_fatal = [_]api.LaneHost.Fatal{
+     .{ .err = error.PairBroken, .drain = false },
+     .{ .err = error.TransferTimeout, .drain = false },
+@@ -292,6 +293,9 @@ pub const pair_fatal = [_]api.LaneHost.Fatal{
+     .{ .err = error.PeerDown, .drain = false },
+     .{ .err = error.CommAborted, .drain = false },
+     .{ .err = error.RingFailed, .drain = false },
++    .{ .err = error.RingOrder, .drain = false },
++    .{ .err = error.ShardRingOrder, .drain = false },
++    .{ .err = error.BadRingRows, .drain = false },
+ };
+ 
+ /// Loaded.pair: the hooks the server wires to its lane host (native/cuda.zig).
+@@ -620,7 +624,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.BadPool => "TF_DS_POOL (rank 1: --pool): the pool's positions, a whole number of at least the context (unset: the context)",
+         error.BadWindow => "TF_DS_WINDOW: the positions one request may use, a whole number; on rank 0 it must be --context (start.sh sets both from CONTEXT)",
+         error.BadKvShard => "TF_DS_KV_SHARD: 1 (on) or 0 (off)",
+-        error.BadKvShardDecode => "TF_DS_KV_SHARD_DECODE: fetch (the default) or owner",
++        error.BadKvShardDecode => "TF_DS_KV_SHARD_DECODE: fetch (the default), owner or auto (per round by TF_DS_KV_SHARD_COST)",
+         error.KvShardNeedsTwoRanks => "TF_DS_KV_SHARD=1 shards the compressed latents over the two TP2 ranks: TF_TP_WORLD=2",
+         error.KvShardMismatch => "the ranks disagree on TF_DS_KV_SHARD, the pool (TF_DS_POOL, else rank 1's --pool), TF_DS_ROUND_ROWS or the window, or the other rank could not read one of them: give every rank the same TF_DS_* environment (start.sh's ENGINE_ENV) and settings",
+         error.BadPart => "TF_DS_KV_SHARD=1: a round row whose part is not its extent's (a placement bug): restart with TF_DS_KV_SHARD=0",
+@@ -644,6 +648,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.StagingTooSmall => "the spill staging cap (TF_DS_SPILL_STAGING_MIB) holds too few slots for this model's blocks and small state: raise it",
+         error.BadKvShardSetting => "TF_DS_KV_SHARD_CARRY and TF_DS_KV_SHARD_TWINS: 1 (on, the default) or 0; TF_DS_KV_SHARD_CHECK: decode rounds between the ranks' planner checks (0: at start only); TF_DS_KV_SHARD_STATS_MS: 0 (the default, rank 0's own kv_shard row only) up to 3600000 ms between asks for the followers' rows (only while /health or /metrics read them)",
+         error.ShardLayoutMismatch => "TF_DS_KV_SHARD=1: the ranks cut the pool into different parts or plan with other switches (another TF_DS_POOL, --pool, TF_DS_KV_SHARD_CARRY, TF_DS_KV_SHARD_TWINS or build on rank 1): give every rank the same TF_DS_* environment and build",
++        error.KvShardSettingsMismatch => "TF_DS_KV_SHARD=1: the ranks disagree on the decode exchanges' transport or cost model (TF_DS_KV_SHARD_RING, TF_DS_KV_SHARD_COST, or one rank has the RDMA ring, or the ring kernels in its dsv41_shard image, and the other not), or the other rank could not read one of them or set its decode buffers up (its log names why): give every rank the same TF_DS_* environment, RDMA setting and image",
++        error.BadKvShardRing => "TF_DS_KV_SHARD_RING must be 1 (the decode exchanges ride the RDMA ring when there is one; the default) or 0 (NCCL)",
++        error.BadKvShardCost => "TF_DS_KV_SHARD_COST must be nine non-negative integers, fetch_fixed,fetch_row,owner_fixed,owner_row,pass_fixed,pass_row,mask_row,copy_fixed,copy_kib (ns; docs/port/shard-ring.md), or unset",
++        error.ShardRingOrder, error.BadRingRows, error.RingOrder => "TF_DS_KV_SHARD=1: a decode round's ring transfers left their fixed order or row lists (an engine bug; the ranks would part, so the pair ends): restart with TF_DS_KV_SHARD_RING=0 (NCCL), or TF_DS_KV_SHARD=0",
+         error.ShardDiverged, error.StaleExtent => "TF_DS_KV_SHARD=1: the ranks' KV-part planners disagree (an engine bug; the pair stops rather than read the wrong rows): restart with TF_DS_KV_SHARD=0",
+         error.TransferFailed => "TF_DS_KV_SHARD=1: a KV transfer between the ranks failed on one rank only: restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
+         error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
+@@ -660,8 +668,14 @@ test "refusals name what to set" {
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
+-    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart, error.ShardDiverged, error.StaleExtent, error.TransferFailed, error.TransferTimeout, error.KvShardNotStarted, error.BadPlan }) |err|
++    for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart, error.ShardDiverged, error.StaleExtent, error.TransferFailed, error.TransferTimeout, error.KvShardNotStarted, error.BadPlan, error.ShardRingOrder, error.BadRingRows }) |err|
+         try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
++    for ([_]anyerror{ error.KvShardSettingsMismatch, error.BadKvShardRing }) |err|
++        try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD_RING") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadKvShardCost).?, "TF_DS_KV_SHARD_COST") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadKvShardDecode).?, "auto") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadKvShardDecode).?, "owner") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.RingOrder).?, "TF_DS_KV_SHARD_RING") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
+     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
+ }
+@@ -690,6 +704,23 @@ test "TF_DS_PAIR_BROKEN: exit by default (spill and KV sharding off), degrade th
+     for (pair_fatal) |f| try std.testing.expect(!f.drain);
+ }
+ 
++test "a round's pair-ending errors end the pair on rank 0 (none drains) and are named" {
++    // the ring-order refusals and BadRingRows leave a sized send or a peer's collect pending: a refusal that
++    // only failed the request would stop every later sharded round (RowPairing open) with the server still up
++    for (round.pair_ending) |err| {
++        var found = false;
++        for (pair_fatal) |f| if (f.err == err) {
++            found = true;
++            try std.testing.expect(!f.drain);
++        };
++        try std.testing.expect(found);
++        try std.testing.expect(explain(null, err) != null);
++    }
++    for ([_]anyerror{ error.RingOrder, error.ShardRingOrder, error.BadRingRows, error.RingFailed }) |err| try std.testing.expect(round.endsPair(err));
++    try std.testing.expect(!round.endsPair(error.NoFreeSlot));
++    try std.testing.expect(!round.endsPair(error.ContextFull));
++}
++
+ test "the spill tier's refusals from the environment come before anything loads, and each says what to set" {
+     const E = struct {
+         var kv: ?[]const u8 = null;
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index 5e4f564fb8ccba010156bdf5bb122569fedee033..8ee634a65999c05bf47ff35b3ea507a9024ad1ea 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -30,7 +30,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
+ 
+ extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
+ 
+-pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
++pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, RingOrder, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+ 
+ /// The served ring has its own GID selection, independent of NCCL's.
+ pub fn parseGidIndex(text: ?[]const u8) error{InvalidRdmaGidIndex}!u8 {
+@@ -195,6 +195,29 @@ const Peer = struct {
+     recv: u64 = 0,
+ };
+ 
++/// The host's check that every sized send (Ring.sendRows) is the ring transfer directly before its receive
++/// (Ring.recvRows): the collect kernel waits on the latest sequence this rank staged, so a gather, a gatherInto or
++/// another sendRows slipped in between would pair the receive with the wrong slot (silently, on both ranks). Host
++/// order is the order the launches are issued in (and captured in), so the check holds for graphs too.
++pub const RowPairing = struct {
++    open: bool = false,
++
++    /// Before any ring transfer but a recvRows: none may be pending.
++    pub fn idle(p: *const RowPairing) error{RingOrder}!void {
++        if (p.open) return error.RingOrder;
++    }
++
++    pub fn send(p: *RowPairing) error{RingOrder}!void {
++        try p.idle();
++        p.open = true;
++    }
++
++    pub fn recv(p: *RowPairing) error{RingOrder}!void {
++        if (!p.open) return error.RingOrder;
++        p.open = false;
++    }
++};
++
+ pub const Ring = struct {
+     d: *const cuda.Driver,
+     verbs: Verbs,
+@@ -218,6 +241,9 @@ pub const Ring = struct {
+     /// The proxy's idle back-off: quiet for `idle_ns` (0: never nap), then sleep `nap_ns` between looks.
+     idle_ns: u64 = default_idle_ns,
+     nap_ns: u64 = default_nap_ns,
++    // TF_DS_KV_SHARD's sized transfers (sendRows / recvRows): a sendRows not yet paired with its recvRows. Their
++    // collect waits on the latest sequence this rank staged, so no other ring transfer may be issued in between.
++    rows: RowPairing = .{},
+ 
+     // the metadata block: flags [slots][world], doorbell, sizes [slots], sent [slots], abort word
+     fn flags(r: *const Ring) [*]u64 {
+@@ -499,6 +525,7 @@ pub const Ring = struct {
+     /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`.
+     pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
+         if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
++        try r.rows.idle();
+         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
+         const own: DevicePtr = if (r.s.own_early) recv + @as(u64, r.rank) * n4 * 16 else 0;
+         try r.stage(stream, send, n4, own, n4, n4);
+@@ -528,6 +555,7 @@ pub const Ring = struct {
+     /// names the same widths, so each peer's ring slot holds rows x w_p floats.
+     pub fn gatherInto(r: *Ring, stream: cuda.Stream, send: DevicePtr, rows: u32, own_row4: u32, dsts: []const Dst) Error!void {
+         if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
++        try r.rows.idle();
+         if (dsts.len != r.world) return error.BadInfo;
+         const n4 = rows * own_row4;
+         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
+@@ -561,6 +589,102 @@ pub const Ring = struct {
+         const blocks = std.math.clamp((copy4 + per - 1) / per, 1, r.s.collect_blocks);
+         try cuda.launch.launch(r.k.collect_into, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+     }
++    /// A sized row transfer's segments (dsv41_shard.cu's TfDsRingRows, the same layout): each selected row's run of
++    /// row16 16-byte words from src[s] + row * src16[s] words (the sender's) to dst[s] + row * dst16[s] (the
++    /// receiver's), segment after segment in the slot.
++    pub const RowSegs = extern struct {
++        src: [max_row_segs]u64 = @splat(0),
++        dst: [max_row_segs]u64 = @splat(0),
++        src16: [max_row_segs]i64 = @splat(0),
++        dst16: [max_row_segs]i64 = @splat(0),
++        row16: [max_row_segs]c_int = @splat(0),
++
++        /// The slot's most bytes: every one of `rows` rows selected.
++        pub fn capacity(s: RowSegs, nseg: u32, rows: u32) u64 {
++            var t: u64 = 0;
++            for (s.row16[0..@min(nseg, max_row_segs)]) |w| t += @intCast(@max(w, 0));
++            return t * 16 * rows;
++        }
++    };
++    pub const max_row_segs = 8; // TF_DS_RING_SEGS
++    pub const max_sel_rows = 64; // TF_DS_RING_ROWS
++    /// The sized transfer's kernel pair (dsv41_shard.cu: tf_ds_ring_stage_rows, tf_ds_ring_collect_rows), which speak
++    /// this ring's protocol: its slots, sequence, sent words, staged counter, abort word and probes.
++    pub const RowKernels = struct { stage: cuda.Function, collect: cuda.Function };
++
++    /// Whether a sized transfer of `nseg` segments over `rows` rows always fits a slot.
++    pub fn rowsFit(r: *const Ring, segs: RowSegs, nseg: u32, rows: u32) bool {
++        return nseg >= 1 and nseg <= max_row_segs and rows >= 1 and rows <= max_sel_rows and segs.capacity(nseg, rows) <= r.s.max_bytes;
++    }
++
++    /// TF_DS_KV_SHARD's sized one-hop send: the rows of `list` (int32 [1 + max_sel_rows] on the device: the count, then
++    /// the rows in slot order; shard_ring.Lists, uploaded each round, so a captured launch serves every round), each
++    /// segment's run of them one after another into this rank's next slot, its size the listed rows' (read on the
++    /// device), published with the doorbell as `stage` does. `cap` rows at most (the grid and the slot bound). TP2: the
++    /// peer's `recvRows` of the same exchange, whose list is this one, takes them, and this rank's next ring transfer
++    /// must be that recvRows (RingOrder otherwise). `probing` false leaves the probe words alone (a send issued early,
++    /// e.g. owner decode's queries at q, would count the compressor's time as flight).
++    pub fn sendRows(r: *Ring, k: RowKernels, stream: cuda.Stream, segs: RowSegs, nseg: u32, list: DevicePtr, cap: u32, probing: bool) Error!void {
++        if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
++        if (r.world != 2 or list == 0) return error.BadInfo;
++        if (!r.rowsFit(segs, nseg, cap)) return error.TooLarge;
++        try r.rows.idle();
++        var a: cuda.Args = .{};
++        a.add(segs);
++        a.add(@as(c_int, @intCast(nseg)));
++        a.add(list);
++        a.add(r.send.dev);
++        a.add(r.metaDev(r.sizes()));
++        a.add(r.metaDev(r.doorbell()));
++        a.add(r.metaDev(r.sent()));
++        a.add(r.scalar(0));
++        a.add(@as(c_int, @intCast(r.s.slots)));
++        a.add(@as(u64, r.s.max_bytes));
++        a.add(if (probing) r.probe() else 0);
++        a.add(r.metaDev(r.abortWord()));
++        a.add(r.scalar(8));
++        a.add(@as(c_int, @intFromBool(r.s.fence)));
++        a.add(@as(c_int, @intFromBool(r.s.pdl)));
++        const words = segs.capacity(nseg, cap) / 16;
++        const blocks = std.math.clamp((words + 1023) / 1024, 1, r.s.stage_blocks);
++        try cuda.launch.launch(k.stage, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = stage_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
++        try r.rows.send();
++    }
++
++    /// The receive of a `sendRows` from rank `from`: waits for its slot at this rank's latest sequence (the sendRows
++    /// this rank staged just before, the pair's), then puts the received rows at the rows of `list` (this rank's
++    /// receive list: the sender's send list). Between this rank's sendRows and this call other kernels may run (owner
++    /// decode's compressor and indexer while the queries travel); no other ring transfer may (RowPairing).
++    pub fn recvRows(r: *Ring, k: RowKernels, stream: cuda.Stream, segs: RowSegs, nseg: u32, list: DevicePtr, cap: u32, from: u32, probing: bool) Error!void {
++        if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
++        if (r.world != 2 or list == 0 or from >= r.world or from == r.rank) return error.BadInfo;
++        if (!r.rowsFit(segs, nseg, cap)) return error.TooLarge;
++        if (!r.rows.open) return error.RingOrder;
++        var a: cuda.Args = .{};
++        a.add(segs);
++        a.add(@as(c_int, @intCast(nseg)));
++        a.add(list);
++        a.add(r.recv.dev);
++        a.add(r.metaDev(r.flags()));
++        a.add(r.scalar(0));
++        a.add(@as(c_int, @intCast(from)));
++        a.add(@as(c_int, @intCast(r.world)));
++        a.add(@as(c_int, @intCast(r.s.slots)));
++        a.add(@as(u64, r.s.max_bytes));
++        a.add(if (probing) r.probe() else 0);
++        a.add(r.metaDev(r.abortWord()));
++        a.add(@as(c_int, @intFromBool(r.s.pdl)));
++        const per = collect_threads * r.s.collect_grain;
++        const words = segs.capacity(nseg, cap) / 16;
++        const blocks = std.math.clamp((words + per - 1) / per, 1, r.s.collect_blocks);
++        try cuda.launch.launch(k.collect, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
++        try r.rows.recv();
++    }
++
++    /// Whether a sendRows awaits its recvRows (a round starting with one open is refused: round.shardRound).
++    pub fn rowsOpen(r: *const Ring) bool {
++        return r.rows.open;
++    }
+     fn probe(r: *const Ring) DevicePtr {
+         return if (r.s.probing) r.scalar(16) else 0;
+     }
+@@ -693,3 +817,34 @@ test "RDMA idle nap bounds keep requests and shutdown responsive" {
+     try std.testing.expectEqual(@as(u64, 3600 * std.time.ns_per_s), try parseIdleNs("3600"));
+     try std.testing.expectError(error.BadRdmaIdle, parseIdleNs("3600.1"));
+ }
++
++test "RowPairing: a sized send must be followed by its receive before any other ring transfer" {
++    var p: RowPairing = .{};
++    try p.idle();
++    try std.testing.expectError(error.RingOrder, p.recv()); // a receive with no send
++    try p.send();
++    try std.testing.expectError(error.RingOrder, p.idle()); // a gather / gatherInto between the pair
++    try std.testing.expectError(error.RingOrder, p.send()); // a second send before the first's receive
++    try p.recv();
++    try p.idle();
++    try p.send();
++    try p.recv();
++    try std.testing.expectError(error.RingOrder, p.recv());
++}
++test "a sized transfer's segments are dsv41_shard.cu's TfDsRingRows (passed by value) and bound the slot" {
++    try std.testing.expectEqual(@as(usize, 8 * 8 * 4 + 8 * 4), @sizeOf(Ring.RowSegs));
++    try std.testing.expectEqual(@as(usize, 64), @offsetOf(Ring.RowSegs, "dst"));
++    try std.testing.expectEqual(@as(usize, 128), @offsetOf(Ring.RowSegs, "src16"));
++    try std.testing.expectEqual(@as(usize, 192), @offsetOf(Ring.RowSegs, "dst16"));
++    try std.testing.expectEqual(@as(usize, 256), @offsetOf(Ring.RowSegs, "row16"));
++    var s: Ring.RowSegs = .{};
++    s.row16[0] = 8192; // a fetch row's codes (512 picks x 256 bytes)
++    s.row16[1] = 1024; // and scales
++    try std.testing.expectEqual(@as(u64, 16 * 512 * 288), s.capacity(2, 16));
++    var r: Ring = undefined;
++    r.s = .{ .max_bytes = 4456448 };
++    try std.testing.expect(r.rowsFit(s, 2, 16));
++    try std.testing.expect(!r.rowsFit(s, 2, 48));
++    try std.testing.expect(!r.rowsFit(s, 0, 1));
++    try std.testing.expect(!r.rowsFit(s, 2, 65));
++}
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index 1ac576fca723268fb932ce56a4d40ec1ea4e0f89..196fc673d5846225acd1dcc5de2b656dc40a51b4 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -29,6 +29,7 @@ const exact = @import("exact.zig");
+ const ops_mod = @import("ops.zig");
+ const shard = @import("shard.zig");
+ const shard_ops = @import("shard_ops.zig");
++const shard_ring = @import("shard_ring.zig");
+ 
+ const Engine = prompt.Engine;
+ const Chunk = prompt.Chunk;
+@@ -207,6 +208,7 @@ pub const Round = struct {
+     launch_mark: u64 = 0,
+     clk_layers: bool = false, // a clock at each layer's end alone (tag 64 + the layer), TF_DS_CLOCK_MARKS=2
+     clk_marks: bool = false,
++    clk_shard: bool = false, // clocks only at the sharded attention's marks (and a_q, a_idx, a_core), TF_DS_CLOCK_MARKS=4
+     clk_ratio: ?u8 = null, // phase clocks only in the layers of this compress ratio (TF_DS_CLOCK_MARKS=3: ratio 2)
+     cur_ratio: u8 = 0, // the layer a stretch is on (its compress ratio) // clocks at every phase mark too (Model.useClock(true)), not only around the stretches
+     clk: u64 = 0, // [1 + 2 * max_clocks] u64: the count, then each clock and its phase (PhaseTimer.Phase or clock_*)
+@@ -225,6 +227,28 @@ pub const Round = struct {
+     xh_recv: u64 = 0,
+     peer_sink: []u64 = &.{},
+     peer_suh: []u64 = &.{},
++    // the round's decode mode (forward: the switch's, or auto's choice from the rows each rank holds; off unsharded)
++    // and whether its exchanges ride the RDMA ring (KvShard.use_ring and every exchange of R rows fits a slot)
++    smode: shard.Mode = .off,
++    sring: bool = false,
++    // on the ring (KvShard.use_ring, useShard): the round's row lists (shard_ring.Lists, i32, uploaded each ring
++    // round by shardRound), the most rows whose every exchange fits a slot in each mode (the model's sizes: every
++    // compressed layer's), and the check of each layer's ring order
++    rlist: u64 = 0,
++    fit_fetch: usize = 0,
++    fit_owner: usize = 0,
++    rcur: shard_ring.Cursor = .{},
++    // owner decode's own-head pass (and its early query stage) on a stream of their own (KvShard.overlap): the pass's
++    // split partials, the fork and the two joins (the query stage's, before its collect; the pass's, before the outputs'
++    // collect, as the pass writes every xhwo row)
++    ss: ?cuda.Stream = null,
++    ss_fork: ?cuda.Event = null,
++    ss_jq: ?cuda.Event = null,
++    ss_jo: ?cuda.Event = null,
++    ss_q_out: bool = false,
++    pm2: u64 = 0,
++    pl2: u64 = 0,
++    po2: u64 = 0,
+ 
+     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
+         const c = e.c;
+@@ -244,6 +268,7 @@ pub const Round = struct {
+         rd.launch_mark = 0;
+         rd.clk_layers = false;
+         rd.clk_marks = false;
++        rd.clk_shard = false;
+         rd.clk_ratio = null;
+         rd.cur_ratio = 0;
+         rd.clk = 0;
+@@ -260,6 +285,20 @@ pub const Round = struct {
+         rd.xh_recv = 0;
+         rd.peer_sink = &.{};
+         rd.peer_suh = &.{};
++        rd.smode = .off;
++        rd.sring = false;
++        rd.rlist = 0;
++        rd.fit_fetch = 0;
++        rd.fit_owner = 0;
++        rd.rcur = .{};
++        rd.ss = null;
++        rd.ss_fork = null;
++        rd.ss_jq = null;
++        rd.ss_jo = null;
++        rd.ss_q_out = false;
++        rd.pm2 = 0;
++        rd.pl2 = 0;
++        rd.po2 = 0;
+         rd.glue = try a.take(glue_n * max_rows * 8); // glue rows at max_rows apart
+         rd.inputs = try a.take(5 * R * 8);
+         rd.ids = rd.inputs;
+@@ -374,47 +413,158 @@ pub const Round = struct {
+ 
+     /// TF_DS_KV_SHARD (e.kv): the sharded decode's buffers, every one allocated here, before any graph capture (a
+     /// round's rows change their contents, never their addresses); owner decode also gathers the other rank's sinks and
+-    /// wo_a suh of every layer once (an all-gather of each: both ranks call this at the same point of open).
++    /// wo_a suh of every layer once (an all-gather of each: both ranks call this at the same point of open). Every
++    /// rank-local step (the kernels' presence, the buffers, the overlap stream and events) comes first, and its outcome
++    /// rides the exchanges' settings gather (agreeExchanges: the RDMA ring or NCCL, auto's cost model): a rank that cannot
++    /// set up refuses with its own error and every other rank with KvShardSettingsMismatch at the same point, so no rank
++    /// waits in the sinks' gather for one that left.
+     pub fn useShard(rd: *Round, e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator) !void {
+         const kv = e.kv orelse return error.NoKvShard;
++        errdefer rd.dropShard();
++        const want = exchangeSettings(e, kv);
++        const ready = rd.shardLocal(e, a, gpa, kv, want.ring);
++        try agreeExchanges(e, a, kv, want, ready);
++        if (kv.mode != .owner and kv.mode != .auto) return;
++        const hl = e.heads();
++        const wo_k = woK(e.w.layers[0]);
++        const peer = kv.sh.peer();
++        for (e.w.layers, 0..) |lay, li| {
++            // the other rank's slice of each, gathered in rank order (shardLocal took both buffers: rd.peer_* hold
++            // their bases until here): its own heads' sinks, its groups' suh
++            const sinks = rd.peer_sink[li];
++            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(sinks + kv.sh.rank * hl * 4, lay.sink, hl * 4, e.s.handle), "cuMemcpyDtoDAsync");
++            try e.comm.allGatherInPlace(sinks, hl * 4, e.s);
++            rd.peer_sink[li] = sinks + peer * hl * 4;
++            const suh = rd.peer_suh[li];
++            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(suh + kv.sh.rank * wo_k * 2, rd.wo_suh[li], wo_k * 2, e.s.handle), "cuMemcpyDtoDAsync");
++            try e.comm.allGatherInPlace(suh, wo_k * 2, e.s);
++            rd.peer_suh[li] = suh + peer * wo_k * 2;
++        }
++        try e.s.synchronize();
++    }
++
++    fn woK(lay: weights.Layer) usize {
++        var k: usize = 0;
++        for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
++        return k;
++    }
++
++    /// useShard's rank-local half (no collective): what this rank's sharded decode needs, checked and allocated.
++    /// `ring`: this rank's own wish for the ring (exchangeSettings), which the gather then makes every rank's.
++    fn shardLocal(rd: *Round, e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, kv: *shard_ops.KvShard, ring: bool) !void {
+         const c = e.c;
+         const R = e.round_rows;
+         const K = c.index_topk;
+         const world: usize = kv.sh.world;
++        if (world > 2) return error.KvShardNeedsTwoRanks;
+         rd.sglue = try a.take(sglue_n * max_rows * 8);
+         rd.fidx = try a.take(R * (K + 16) * 8);
+-        if (kv.mode == .fetch) {
++        if (ring) try rd.useShardRing(e, a, kv);
++        if (kv.mode == .fetch or kv.mode == .auto) {
+             rd.fc = try a.take(world * R * K * c.head_dim / 2);
+             rd.fs = try a.take(world * R * K * c.head_dim / 16);
+         }
+-        if (kv.mode != .owner) return;
++        if (kv.mode != .owner and kv.mode != .auto) return;
+         const hl = e.heads();
+         const hd = c.head_dim;
+-        const l0 = e.w.layers[0];
+-        var wo_k: usize = 0;
+-        for (l0.wo_a[0..l0.groups]) |wo| wo_k += wo.k;
++        const wo_k = woK(e.w.layers[0]);
++        for (e.w.layers) |lay| if (woK(lay) != wo_k) return error.UnevenWoA; // (the exchange's rows: every layer's wo_a alike)
+         rd.qall = try a.take(world * R * hl * hd * 2);
+         rd.o_peer = try a.take(R * hl * hd * 2);
+         rd.xh_peer = try a.take(R * wo_k * 2);
+         rd.xh_recv = try a.take(R * wo_k * 2);
+         rd.peer_sink = try gpa.alloc(u64, e.w.layers.len);
+         rd.peer_suh = try gpa.alloc(u64, e.w.layers.len);
+-        const peer = kv.sh.peer();
+-        for (e.w.layers, 0..) |lay, li| {
+-            var k: usize = 0;
+-            for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
+-            if (k != wo_k) return error.UnevenWoA; // (the exchange's rows: every layer's wo_a alike)
+-            // the other rank's slice of each, gathered in rank order: its own heads' sinks, its groups' suh
+-            const sinks = try a.take(world * hl * 4);
+-            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(sinks + kv.sh.rank * hl * 4, lay.sink, hl * 4, e.s.handle), "cuMemcpyDtoDAsync");
+-            try e.comm.allGatherInPlace(sinks, hl * 4, e.s);
+-            rd.peer_sink[li] = sinks + peer * hl * 4;
+-            const suh = try a.take(world * wo_k * 2);
+-            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(suh + kv.sh.rank * wo_k * 2, rd.wo_suh[li], wo_k * 2, e.s.handle), "cuMemcpyDtoDAsync");
+-            try e.comm.allGatherInPlace(suh, wo_k * 2, e.s);
+-            rd.peer_suh[li] = suh + peer * wo_k * 2;
++        for (rd.peer_sink, rd.peer_suh) |*sk, *su| {
++            sk.* = try a.take(world * hl * 4);
++            su.* = try a.take(world * wo_k * 2);
++        }
++    }
++
++    /// The ring path's buffers and limits: the row lists' block, each mode's most rows whose every exchange fits a slot
++    /// (from the model's sizes, every compressed layer's outputs: the same on both ranks), and, for owner decode with
++    /// TF_DS_KV_SHARD_OVERLAP not "0", the own-head pass's stream, events and split partials (per rank: it moves where
++    /// kernels run, never the ring order or a byte).
++    fn useShardRing(rd: *Round, e: *const Engine, a: *prompt.Arena, kv: *shard_ops.KvShard) !void {
++        const c = e.c;
++        const R = e.round_rows;
++        const hd = c.head_dim;
++        const max = (e.ring orelse return error.NoKvShard).s.max_bytes;
++        rd.rlist = try a.take(shard_ring.Lists.bytes);
++        try prompt.fill(e, rd.rlist, 0, shard_ring.Lists.bytes);
++        const K = c.index_topk;
++        rd.fit_fetch = shard_ring.fitRows(shard_ring.fetchXfer(0, 0, kv.sh.rank, 1, K, K, hd / 2, hd / 16).rowBytes(), max);
++        var fit = shard_ring.fitRows(shard_ring.qXfer(0, 0, kv.sh.rank, 1, e.heads(), hd).rowBytes(), max);
++        for (e.w.layers) |lay| {
++            if (lay.ratio == 0) continue;
++            const o = shard_ring.outXfer(0, 0, 1, lay.groups, lay.wo_a[0].k) catch {
++                fit = 0;
++                break;
++            };
++            fit = @min(fit, shard_ring.fitRows(o.rowBytes(), max));
++        }
++        rd.fit_owner = fit;
++        if (kv.mode != .owner and kv.mode != .auto) return;
++        const ov = getenv("TF_DS_KV_SHARD_OVERLAP");
++        kv.overlap = if (ov) |v| !std.mem.eql(u8, v, "0") else true;
++        if (!kv.overlap) return;
++        const hl = e.heads();
++        rd.pm2 = try a.take(R * hl * tri_attn.attn_splits * 4);
++        rd.pl2 = try a.take(R * hl * tri_attn.attn_splits * 4);
++        rd.po2 = try a.take(R * hl * tri_attn.attn_splits * hd * 4);
++        var s = try cuda.Stream.init(e.d, true);
++        errdefer s.deinit();
++        rd.ss_fork = try cuda.Event.init(e.d, false);
++        rd.ss_jq = try cuda.Event.init(e.d, false);
++        rd.ss_jo = try cuda.Event.init(e.d, false);
++        rd.ss = s;
++    }
++
++    pub fn dropShard(rd: *Round) void {
++        inline for (.{ &rd.ss_fork, &rd.ss_jq, &rd.ss_jo }) |ev| {
++            if (ev.*) |*x| x.deinit();
++            ev.* = null;
+         }
++        if (rd.ss) |*s| s.deinit();
++        rd.ss = null;
++    }
++
++    /// This rank's own exchange settings, before any agreement: the RDMA ring when this rank has one, its image has the
++    /// ring kernels (shard_ops.Kernels.ringRows) and TF_DS_KV_SHARD_RING is not "0"; TF_DS_KV_SHARD_COST (auto's cost
++    /// model), or the parse error.
++    const Want = struct { ring: bool, cost: anyerror!shard_ring.Cost };
++
++    fn exchangeSettings(e: *const Engine, kv: *const shard_ops.KvShard) Want {
++        const ring_env = getenv("TF_DS_KV_SHARD_RING");
++        const ring_ok: anyerror!bool = if (ring_env) |v| (if (v.len == 0 or std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else error.BadKvShardRing) else true;
++        const kernels = kv.k.hasRingRows();
++        const on = ring_ok catch false;
++        if (e.ring != null and on and !kernels) std.log.warn("dsv41: TF_DS_KV_SHARD: this dsv41_shard image has no ring kernels (tf_ds_ring_stage_rows, tf_ds_ring_collect_rows): the decode exchanges take NCCL (rebuild the image for the ring)", .{});
++        return .{ .ring = e.ring != null and on and kernels, .cost = if (ring_ok) |_| shard_ring.Cost.parse(getenv("TF_DS_KV_SHARD_COST")) else |err| err };
++    }
++
++    /// The exchanges' settings on every rank alike (shard_ring.Agreed): this rank's (exchangeSettings), gathered and
++    /// compared. A rank whose own settings do not parse, or whose rank-local setup failed (`ready`: shardLocal), sends
++    /// the sentinel and refuses with its own error after the gather (as Model.agree does), so no rank waits in a
++    /// collective the other never joins; a difference is KvShardSettingsMismatch on every other rank.
++    fn agreeExchanges(e: *const Engine, a: *prompt.Arena, kv: *shard_ops.KvShard, want: Want, ready: anyerror!void) !void {
++        const mine = shard_ring.Agreed.of(want.ring, if (ready) |_| want.cost else |err| err);
++        const per = @sizeOf(shard_ring.Agreed);
++        const world: usize = kv.sh.world;
++        if (world > 2) return error.KvShardNeedsTwoRanks;
++        const buf = try a.take(world * per);
++        try prompt.upload(e, buf + kv.sh.rank * per, &mine, per);
++        try e.comm.allGatherInPlace(buf, per, e.s);
+         try e.s.synchronize();
++        var all: [2]shard_ring.Agreed = undefined;
++        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, buf, world * per), "cuMemcpyDtoH");
++        if (!mine.same(all[0..world])) {
++            try ready; // this rank's own refusal first
++            _ = try want.cost;
++            return error.KvShardSettingsMismatch;
++        }
++        kv.use_ring = want.ring;
++        kv.cost = want.cost catch unreachable;
+     }
+ 
+     fn sgl(rd: *const Round, k: SGlue) u64 {
+@@ -504,7 +654,8 @@ pub const Round = struct {
+     }
+ 
+     fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
+-        if (rd.clk != 0 and rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio)) {
++        const all = rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio);
++        if (rd.clk != 0 and (all or (rd.clk_shard and PhaseTimer.shardMark(p)))) {
+             const now = cuda.launch.count;
+             rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
+             rd.launch_mark = now;
+@@ -594,6 +745,56 @@ fn setShardGlue(e: *const Engine, rd: *Round, rows: Rows, sh: shard.Shard) !void
+     try prompt.upload(e, rd.sglue, &hg, hg.len * 8);
+ }
+ 
++/// TF_DS_KV_SHARD: the round's decode (shard_ring.decide, a pure function of what every rank holds alike, tested
++/// there for both ranks): its mode (the switch's, or auto's choice from the round's row counts), whether its exchanges
++/// ride the RDMA ring (the round's rows fit a slot: Round.fit_*), its row lists uploaded for the ring kernels, and
++/// the counters. A round must start with no sized ring send pending (RowPairing) and the layer cursor reset.
++fn shardRound(e: *const Engine, rd: *Round, rows: Rows, kv: *shard_ops.KvShard) !void {
++    const R = rows.ids.len;
++    if (e.ring) |r| if (r.rowsOpen()) return error.ShardRingOrder;
++    if (!rd.rcur.done() or rd.ss_q_out) return error.ShardRingOrder;
++    rd.rcur.reset();
++    var owners: [max_rows]u32 = undefined;
++    for (0..R) |i| owners[i] = try rows.ownerOf(i, kv.sh);
++    const view: shard_ring.View = .{ .owners = owners[0..R] };
++    const d = try shard_ring.decide(.{
++        .view = view,
++        .mode = kv.mode,
++        .cost = kv.cost,
++        .sizes = ringSizes(e),
++        .decode_rows = tri.decode_rows,
++        .ring = kv.use_ring and rd.rlist != 0,
++        .fit_fetch = rd.fit_fetch,
++        .fit_owner = rd.fit_owner,
++    });
++    rd.smode = d.mode;
++    rd.sring = d.ring;
++    switch (d.mode) {
++        .fetch => kv.stats.fetch_rounds += 1,
++        .owner => kv.stats.owner_rounds += 1,
++        .off, .auto => unreachable,
++    }
++    if (kv.mode == .auto) {
++        if (d.mode == .fetch) kv.stats.auto_fetch += 1 else kv.stats.auto_owner += 1;
++    }
++    const ls = (try shard_ring.roundLists(d, view, kv.sh.rank)) orelse return;
++    kv.stats.ring_rounds += 1;
++    kv.stats.sent_rows += if (d.mode == .fetch) ls.get(.fetch, .send).n else ls.get(.q, .send).n + ls.get(.out, .send).n;
++    var dev: [shard_ring.Lists.words]i32 = undefined;
++    ls.encode(&dev);
++    try prompt.upload(e, rd.rlist, &dev, shard_ring.Lists.bytes);
++}
++
++/// A listed row's bytes in each decode exchange (auto's cost model): every pick of a fetched row, a row's queries, a
++/// row's rotated wo_a inputs.
++fn ringSizes(e: *const Engine) shard_ring.Sizes {
++    const c = e.c;
++    const l0 = e.w.layers[0];
++    var wo_k: usize = 0;
++    for (l0.wo_a[0..l0.groups]) |wo| wo_k += wo.k;
++    return .{ .fetch_row = c.index_topk * (c.head_dim / 2 + c.head_dim / 16), .q_row = e.heads() * c.head_dim * 2, .out_row = wo_k * 2 };
++}
++
+ /// The layer's RoPE table rows (model.py _cs: the compressed table for a compressed layer).
+ fn ropeOf(e: *const Engine, lay: weights.Layer) prompt.Rope {
+     return if (lay.ratio != 0) e.compressed else e.plain;
+@@ -684,6 +885,16 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches,
+         try rd.prefetch(e, &r, prefetch_budget);
+     }
+     try rd.mark(e, .a_q);
++    // TF_DS_KV_SHARD owner decode on the RDMA ring: q is final here, so this rank's queries of the rows the peer holds
++    // go out now and travel behind the compressor and the indexer (ownerDecode takes the peer's). Whether this layer's
++    // attention is sharded is known already: the picks it will have (the indexer's min(index_topk, nb), or the
++    // selection an indexless layer reuses)
++    const q_sent = ratio != 0 and e.kv != null and rd.smode == .owner and rd.sring and (if (lay.idx_wq_b != null) @min(c.index_topk, rd.bucket / ratio) else rd.kk) > 0;
++    if (q_sent) {
++        try rd.rcur.begin(.owner);
++        try sendQueries(e, rd, rd.q, true);
++        try rd.mark(e, .sh_q);
++    }
+     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
+     var comp: tri_attn.Comp = .none;
+     var cbase: ?u64 = null;
+@@ -813,13 +1024,17 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches,
+         .rot = .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
+         .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },
+     };
+-    // TF_DS_KV_SHARD: a compressed layer's picked rows are on each row's owner only
+-    const mode: shard.Mode = if (e.kv) |kv| (if (ratio != 0 and attn.n_idx > 0) kv.mode else .off) else .off;
++    // TF_DS_KV_SHARD: a compressed layer's picked rows are on each row's owner only; the round's mode (rd.smode: the
++    // switch's, or auto's choice; shardRound)
++    const mode: shard.Mode = if (e.kv != null and ratio != 0 and attn.n_idx > 0) rd.smode else .off;
++    if (q_sent and mode != .owner) return error.ShardRingOrder; // (a sent query no pass takes: the ranks would part)
+     switch (mode) {
+         .off => try tri_attn.sparseAttn(t, attn),
+         .fetch => try fetchDecode(e, rd, attn, ratio),
+-        .owner => try ownerDecode(e, rd, attn, ratio, li),
++        .owner => try ownerDecode(e, rd, attn, ratio, li, q_sent),
++        .auto => return error.NoKvShard, // (forward resolves auto a round)
+     }
++    if (!rd.rcur.done()) return error.ShardRingOrder; // (every stage of the layer collected)
+     try rd.mark(e, .a_core);
+     var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
+     const uw = lay.groups * lay.wo_a[0].n;
+@@ -843,10 +1058,14 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches,
+ 
+ /// TF_DS_KV_SHARD's decode attention by sparse fetch (the reference): each rank packs the picks of the rows it holds
+ /// (codes and scales from its plane at the row's local base, pick order) into its slot of the gathered buffer
+-/// ([world][R][index_topk] rows), renumbers every row's picks to its row there (relative: j), the slots all-gathered in
+-/// place; then both ranks attend every row for their own heads over the gathered rows at the row's fetch base. The
+-/// same schedule on both ranks whoever holds the rows (an all-gather of fixed size a round's rows), every buffer the
+-/// round's own (graph-safe); each row reads the replicated bytes in the replicated order (shard.zig's tests).
++/// ([world][R][index_topk] rows), renumbers every row's picks to its row there (relative: j), and the other rank gets
++/// them; then both ranks attend every row for their own heads over the gathered rows at the row's fetch base. On the
++/// RDMA ring (rd.sring) a rank sends only its send list's rows (the rows only it holds), kk picks each, and the peer
++/// puts them at its receive list's rows of the sender's slot (shard_ring.fetchXfer: one sized transfer for codes and
++/// scales); on NCCL the slots are all-gathered in
++/// place at their fixed size (one NCCL group). The same schedule on both ranks whoever holds the rows, every buffer
++/// the round's own (graph-safe); each row reads the replicated bytes in the replicated order (shard.zig's and
++/// shard_ring.zig's tests).
+ fn fetchDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize) !void {
+     const c = e.c;
+     const R = rd.r;
+@@ -877,8 +1096,17 @@ fn fetchDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize) !vo
+         .kos = kos,
+         .how = .relative,
+     });
+-    try e.comm.allGatherInPlace(rd.fc, sl.slot_c, e.s);
+-    try e.comm.allGatherInPlace(rd.fs, sl.slot_s, e.s);
++    try rd.mark(e, .sh_fetch);
++    const kv = e.kv.?;
++    if (rd.sring) {
++        const x = shard_ring.fetchXfer(rd.fc, rd.fs, kv.sh.rank, R, K, kk, cb, sb);
++        try rd.rcur.begin(.fetch);
++        try rd.rcur.take(.stage_fetch);
++        try shard_ops.ringSend(&kv.k, e.ring.?, e.s, x, rd.rlist + shard_ring.Lists.offset(.fetch, .send), R, true);
++        try rd.rcur.take(.collect_fetch);
++        try shard_ops.ringRecv(&kv.k, e.ring.?, e.s, x, rd.rlist + shard_ring.Lists.offset(.fetch, .recv), R, kv.sh.peer(), true);
++    } else try e.comm.allGatherInPlace2(rd.fc, sl.slot_c, rd.fs, sl.slot_s, e.s);
++    try rd.mark(e, .sh_rows);
+     var b = a;
+     b.comp = .{ .fp4 = .{ .codes = rd.fc, .scales = rd.fs } };
+     b.idx = rd.fidx;
+@@ -886,6 +1114,27 @@ fn fetchDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize) !vo
+     try tri_attn.sparseAttn(e.t, b);
+ }
+ 
++/// Owner decode on the RDMA ring: this rank's queries q [R][hl][hd] of the rows only the peer holds to the peer's
++/// gathered queries (shard_ring.qXfer, its q send list); ownerRing's receive takes the peer's. No other ring transfer
++/// runs between the two (Ring's RowPairing). Sent early (at q, behind the compressor and the indexer) on the shard
++/// side stream when there is one, so its copy overlaps them too (joined before the collect), and kept out of the ring
++/// probes (its doorbell-to-flag time would include the compressor and the indexer).
++fn sendQueries(e: *const Engine, rd: *Round, q: u64, early: bool) !void {
++    const kv = e.kv.?;
++    const x = shard_ring.qXfer(q, rd.qall, kv.sh.rank, rd.r, e.heads(), e.c.head_dim);
++    const list = rd.rlist + shard_ring.Lists.offset(.q, .send);
++    try rd.rcur.take(.stage_q);
++    if (early) if (rd.ss) |ss| {
++        try rd.ss_fork.?.record(e.s);
++        try ss.wait(rd.ss_fork.?);
++        try shard_ops.ringSend(&kv.k, e.ring.?, ss, x, list, rd.r, false);
++        try rd.ss_jq.?.record(ss);
++        rd.ss_q_out = true;
++        return;
++    };
++    try shard_ops.ringSend(&kv.k, e.ring.?, e.s, x, list, rd.r, !early);
++}
++
+ /// TF_DS_KV_SHARD's owner-computed decode: the ranks' queries gathered; each rank attends the rows it holds (the
+ /// others' picks masked to none) for its own heads (its sinks, its wo_a rotation: the replicated call over its own
+ /// plane at the row's local base) and then for the other rank's heads with that rank's queries, sinks and wo_a suh
+@@ -893,9 +1142,10 @@ fn fetchDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize) !vo
+ /// takes the returned rows for the rows it does not hold. Every head of a row is computed by the kernel, keys and
+ /// order its own rank would use, so the bits are the replicated ones (GPU validation: docs/port/shard-attn.md).
+ /// Rounds of the split path only (the merge applies the rotation; tri.decode_rows is the round's bound).
++/// On the RDMA ring (rd.sring) the exchanges are sized by the round's row lists and overlapped: ownerRing.
+ /// PORT(kit): a 64-head variant of _sparse_attn_part and its merge with per-head sinks and both ranks' suh (an
+ /// explicitly audited kit; the recorded one has none) would make the two 32-head passes one.
+-fn ownerDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li: usize) !void {
++fn ownerDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li: usize, q_sent: bool) !void {
+     const c = e.c;
+     const kv = e.kv.?;
+     const R = rd.r;
+@@ -909,27 +1159,108 @@ fn ownerDecode(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li:
+     const gk = lay.wo_a[0].k;
+     const wo_k = lay.groups * gk;
+     const peer = kv.sh.peer();
++    const own = rd.sgl(.own);
++    if (q_sent and !rd.sring) return error.ShardRingOrder;
++    if (rd.sring) return ownerRing(e, rd, a, ratio, li, q_sent);
+     // both ranks' queries, rank after rank: [world][R][hl][hd]
+     try e.comm.allGather(a.q, rd.qall, R * hl * hd, .bf16, e.s);
++    try rd.mark(e, .sh_q);
+     // the picks of the rows this rank holds, none for the others'
+-    try shard_ops.fetch(&kv.k, e.s, .{ .cb = hd / 2, .sb = hd / 16, .idx = a.idx, .ks = kk, .kk = kk, .rows = R, .own = rd.sgl(.own), .copy = false, .dk = 0, .out = rd.fidx, .kos = kk, .how = .mask });
++    try shard_ops.fetch(&kv.k, e.s, .{ .cb = hd / 2, .sb = hd / 16, .idx = a.idx, .ks = kk, .kk = kk, .rows = R, .own = own, .copy = false, .dk = 0, .out = rd.fidx, .kos = kk, .how = .mask });
++    try rd.mark(e, .sh_fetch);
+     var mine = a;
+     mine.idx = rd.fidx;
+     mine.cbase = rd.sgl(if (ratio == 1) .lbase1 else .lbase2);
+     try tri_attn.sparseAttn(e.t, mine);
++    try rd.mark(e, .sh_own);
++    try tri_attn.sparseAttn(e.t, peerPass(e, rd, mine, rot, li));
++    try rd.mark(e, .sh_peer);
++    // the other rank's heads of my rows to it, mine of its rows from it; then its rows' inputs in place
++    try e.comm.exchange(rd.xh_peer, R * wo_k, rd.xh_recv, R * wo_k, .f16, peer, e.s);
++    try rd.mark(e, .sh_out);
++    const x = shard.xhPlanes(R, lay.groups, gk);
++    try shard_ops.select(&kv.k, e.s, rd.xh_recv, rot.xh, own, 0, R, x.row_bytes, x.planes, x.plane_bytes);
++    try rd.mark(e, .sh_sel);
++}
++
++/// The peer-head pass's call: `mine` with the other rank's queries, sinks and wo_a suh, into o_peer / xh_peer.
++fn peerPass(e: *const Engine, rd: *const Round, mine: tri_attn.Attn, rot: tri_attn.Rot, li: usize) tri_attn.Attn {
++    const kv = e.kv.?;
+     var theirs = mine;
+-    theirs.q = rd.qall + peer * R * hl * hd * 2;
++    theirs.q = rd.qall + kv.sh.peer() * rd.r * e.heads() * e.c.head_dim * 2;
+     theirs.out = rd.o_peer;
+     theirs.sink = rd.peer_sink[li];
+     var prot = rot;
+     prot.suh = rd.peer_suh[li];
+     prot.xh = rd.xh_peer;
+     theirs.rot = prot;
+-    try tri_attn.sparseAttn(e.t, theirs);
+-    // the other rank's heads of my rows to it, mine of its rows from it; then its rows' inputs in place
+-    try e.comm.exchange(rd.xh_peer, R * wo_k, rd.xh_recv, R * wo_k, .f16, peer, e.s);
+-    const x = shard.xhPlanes(R, lay.groups, gk);
+-    try shard_ops.select(&kv.k, e.s, rd.xh_recv, rot.xh, rd.sgl(.own), 0, R, x.row_bytes, x.planes, x.plane_bytes);
++    return theirs;
++}
++
++/// Owner decode on the RDMA ring (rd.sring, shard_ring.zig): the exchanges sized by the round's lists (the rows only
++/// one rank holds) and overlapped. In ring order: the queries' stage (at q, `q_sent`, on the side stream when there is
++/// one; else here) and collect, then the outputs' stage and collect, nothing else of the ring between a stage and its
++/// collect (rd.rcur, Ring's RowPairing). Around them, on this rank:
++/// 1. the mask of the picks (the rows this rank holds keep theirs);
++/// 2. with the side stream (KvShard.overlap): the own-head pass forked onto it, its own split partials (pm2, pl2,
++///    po2), so it runs while the queries are collected and the peer-head pass runs; without: it runs at step 5;
++/// 3. the peer's queries of this rank's rows collected (the early stage joined first);
++/// 4. the peer-head pass, and its outputs of the rows only this rank holds staged at once, straight for the peer's xhwo;
++/// 5. the own-head pass joined (or run: it hides the outputs' flight) before
++/// 6. the peer's outputs of the rows only it holds are collected into xhwo (the own pass writes every xhwo row first).
++/// The passes are the same launches over the same inputs as on NCCL, each with its own outputs and partials, so each
++/// pass's eight-split reduction and every bit are unchanged; only which stream and when they run differ.
++fn ownerRing(e: *const Engine, rd: *Round, a: tri_attn.Attn, ratio: usize, li: usize, q_sent: bool) !void {
++    const c = e.c;
++    const kv = e.kv.?;
++    const ring = e.ring.?;
++    const R = rd.r;
++    const kk = a.n_idx;
++    const hl = e.heads();
++    const hd = c.head_dim;
++    const rot = a.rot orelse return error.NoRotation;
++    const lay = e.w.layers[li];
++    const peer = kv.sh.peer();
++    const L = shard_ring.Lists;
++    if (!q_sent) {
++        try rd.rcur.begin(.owner);
++        try sendQueries(e, rd, a.q, false);
++        try rd.mark(e, .sh_q);
++    }
++    try shard_ops.fetch(&kv.k, e.s, .{ .cb = hd / 2, .sb = hd / 16, .idx = a.idx, .ks = kk, .kk = kk, .rows = R, .own = rd.sgl(.own), .copy = false, .dk = 0, .out = rd.fidx, .kos = kk, .how = .mask });
++    try rd.mark(e, .sh_fetch);
++    var mine = a;
++    mine.idx = rd.fidx;
++    mine.cbase = rd.sgl(if (ratio == 1) .lbase1 else .lbase2);
++    if (rd.ss) |ss| {
++        var side = mine;
++        side.parts = .{ .pm = rd.pm2, .pl = rd.pl2, .po = rd.po2 };
++        var t2 = e.t;
++        t2.stream = ss;
++        try rd.ss_fork.?.record(e.s);
++        try ss.wait(rd.ss_fork.?);
++        try tri_attn.sparseAttn(t2, side);
++        try rd.ss_jo.?.record(ss);
++    }
++    if (rd.ss_q_out) {
++        try e.s.wait(rd.ss_jq.?);
++        rd.ss_q_out = false;
++    }
++    const qx = shard_ring.qXfer(a.q, rd.qall, kv.sh.rank, R, hl, hd);
++    try rd.rcur.take(.collect_q);
++    try shard_ops.ringRecv(&kv.k, ring, e.s, qx, rd.rlist + L.offset(.q, .recv), R, peer, !q_sent);
++    try rd.mark(e, .sh_qwait);
++    try tri_attn.sparseAttn(e.t, peerPass(e, rd, mine, rot, li));
++    try rd.mark(e, .sh_peer);
++    const ox = try shard_ring.outXfer(rd.xh_peer, rot.xh, R, lay.groups, lay.wo_a[0].k);
++    try rd.rcur.take(.stage_out);
++    try shard_ops.ringSend(&kv.k, ring, e.s, ox, rd.rlist + L.offset(.out, .send), R, true);
++    try rd.mark(e, .sh_out);
++    if (rd.ss != null) try e.s.wait(rd.ss_jo.?) else try tri_attn.sparseAttn(e.t, mine);
++    try rd.mark(e, .sh_own);
++    try rd.rcur.take(.collect_out);
++    try shard_ops.ringRecv(&kv.k, ring, e.s, ox, rd.rlist + L.offset(.out, .recv), R, peer, true);
++    try rd.mark(e, .sh_owait);
+ }
+ 
+ /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
+@@ -979,8 +1310,20 @@ fn hcFnBytes(c: anytype) u64 {
+ /// A round's GPU time by phase (tf-dsv41-lanes --profile 2): a timing event on the main stream at each phase's end,
+ /// the elapsed times read after the round. Eager rounds only (in a graph the events would be captured).
+ pub const PhaseTimer = struct {
+-    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head, a_in, a_q, a_idx, a_core, a_woa, a_x, m_rt, m_gu, m_x };
++    // (sh_*: the sharded attention's parts, TF_DS_KV_SHARD: the fetch or mask kernel, the fetch's row exchange, owner
++    // decode's query send (on the ring: at q, before the indexer), own-head pass, query wait, peer-head pass, output
++    // send (NCCL: the exchange), output wait (the ring), the NCCL path's select)
++    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head, a_in, a_q, a_idx, a_core, a_woa, a_x, m_rt, m_gu, m_x, sh_fetch, sh_rows, sh_q, sh_own, sh_qwait, sh_peer, sh_out, sh_owait, sh_sel };
+     pub const phases = @typeInfo(Phase).@"enum".field_names;
++    comptime {
++        std.debug.assert(phases.len <= 32); // Round.launches
++    }
++
++    /// The marks TF_DS_CLOCK_MARKS=4 clocks: q's end (the rest of the layer before it), the compressor and indexer's
++    /// end, the attention core's end and the sharded parts between (the early query send sits between a_q and a_idx).
++    pub fn shardMark(p: Phase) bool {
++        return @intFromEnum(p) >= @intFromEnum(Phase.sh_fetch) or p == .a_q or p == .a_idx or p == .a_core;
++    }
+     const max_marks = 1024;
+     events: []cuda.Event,
+     phase: [max_marks]Phase = undefined,
+@@ -1048,7 +1391,7 @@ pub const Graphs = struct {
+     gpa: std.mem.Allocator,
+     map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
+ 
+-    pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
++    pub const Key = struct { rows: u32, bucket: u64, stretch: u32, mode: u8 = 0 }; // mode: the round's shard.Mode (auto's choice)
+     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
+ 
+     pub fn init(gpa: std.mem.Allocator) Graphs {
+@@ -1095,6 +1438,18 @@ pub const Graphs = struct {
+     }
+ };
+ 
++/// A round's errors after which the ranks cannot go on together: the ring or the communicator dead (RingFailed,
++/// CommAborted), a decode round's ring transfers out of their fixed order or row lists (RingOrder, ShardRingOrder,
++/// BadRingRows: a sized send may be in flight with no receive, or the peer waits in a collect). Rank 0 ends the pair
++/// on each (native.pair_fatal: TF_DS_PAIR_BROKEN=exit exits 75, both ranks restart); a follower stops following
++/// (lanes.followPair) instead of taking the next frame.
++pub const pair_ending = [_]anyerror{ error.RingFailed, error.CommAborted, error.RingOrder, error.ShardRingOrder, error.BadRingRows };
++
++pub fn endsPair(err: anyerror) bool {
++    for (pair_ending) |x| if (x == err) return true;
++    return false;
++}
++
+ /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
+ /// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
+ /// hashed from `seq`, the whole sequence's ids through the rows'). With `graphs` each stretch runs as its graph and a
+@@ -1115,11 +1470,16 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
+     rd.has_cblk = false;
+     rd.kk = 0;
+     try setGlue(e, rd, rows);
+-    if (e.kv) |kv| switch (kv.mode) {
+-        .off => {},
+-        .fetch => kv.stats.fetch_rounds += 1,
+-        .owner => kv.stats.owner_rounds += 1,
+-    };
++    rd.smode = .off;
++    rd.sring = false;
++    // a round that fails part way leaves the layer cursor and the early-q flag clean for the next (a ring send still
++    // awaiting its receive is left open on purpose: every later ring transfer refuses, RingOrder, and the round's
++    // error ends the pair, native.pair_fatal)
++    errdefer {
++        rd.rcur.reset();
++        rd.ss_q_out = false;
++    }
++    if (e.kv) |kv| try shardRound(e, rd, rows, kv);
+     var cy: Carry = .{ .h = rd.h, .spare = rd.h_alt, .pre = rd.pre, .pre_f = rd.pre_f };
+     // the round's Engram reads, every layer's at once (AIO): hashed and submitted once the first stretch is issued
+     // (its GPU time covers the reads), landed on the host before each Engram layer's stretch
+@@ -1140,7 +1500,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
+         }
+         try rd.clock(e, Round.clock_wait);
+         if (graphs) |g| {
+-            try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn }, e, rd, ch, cs, rings, &cy, li, end);
++            try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn, .mode = @intFromEnum(rd.smode) }, e, rd, ch, cs, rings, &cy, li, end);
+         } else try stretch(e, rd, ch, cs, rings, &cy, li, end, probe);
+         try rd.clock(e, Round.clock_tail);
+         if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
+@@ -1337,6 +1697,10 @@ test "context buckets as graph.py makes them" {
+     try std.testing.expectEqual(@as(usize, 4096), bucketFor(5000, 4096));
+ }
+ 
++fn getenv(name: [*:0]const u8) ?[]const u8 {
++    return std.mem.span(std.c.getenv(name) orelse return null);
++}
++
+ /// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).
+ fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
+     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
+diff --git a/zig/src/families/dsv41/shard.zig b/zig/src/families/dsv41/shard.zig
+index 494de44d80a39b8385dc6fd2262f1e3cfa1e61f3..afb25a86d3d251726dac70ccb0011beebe301b0c 100644
+--- a/zig/src/families/dsv41/shard.zig
++++ b/zig/src/families/dsv41/shard.zig
+@@ -20,13 +20,16 @@ const std = @import("std");
+ /// The switch: off (the replicated planes, byte for byte today's engine), or sharded with the decode rounds' attention
+ /// by sparse fetch (the reference: the owner sends each row's picked latents, both ranks attend their own heads) or
+ /// owner-computed (queries gathered, the owner attends both ranks' heads, the other rank's rotated wo_a inputs sent
+-/// back). Prompt chunks always fetch.
++/// back), or chosen a round between the two (auto: shard_ring.Cost, from the rows each rank holds). Prompt chunks
++/// always fetch.
+ pub const Mode = enum(u8) {
+     off = 0,
+     fetch = 1,
+     owner = 2,
++    auto = 3,
+ 
+-    /// TF_DS_KV_SHARD ("1": on) and TF_DS_KV_SHARD_DECODE ("owner", else the fetch reference), as every rank reads them.
++    /// TF_DS_KV_SHARD ("1": on) and TF_DS_KV_SHARD_DECODE ("owner", "auto", else the fetch reference), as every rank
++    /// reads them.
+     pub fn parse(on: ?[]const u8, decode: ?[]const u8) !Mode {
+         const v = on orelse return .off;
+         if (v.len == 0 or std.mem.eql(u8, v, "0")) return .off;
+@@ -34,6 +37,7 @@ pub const Mode = enum(u8) {
+         const d = decode orelse return .fetch;
+         if (d.len == 0 or std.mem.eql(u8, d, "fetch")) return .fetch;
+         if (std.mem.eql(u8, d, "owner")) return .owner;
++        if (std.mem.eql(u8, d, "auto")) return .auto;
+         return error.BadKvShardDecode;
+     }
+ };
+@@ -546,6 +550,8 @@ test "Mode: TF_DS_KV_SHARD and TF_DS_KV_SHARD_DECODE" {
+     try testing.expectEqual(Mode.fetch, try Mode.parse("1", null));
+     try testing.expectEqual(Mode.fetch, try Mode.parse("1", "fetch"));
+     try testing.expectEqual(Mode.owner, try Mode.parse("1", "owner"));
++    try testing.expectEqual(Mode.auto, try Mode.parse("1", "auto"));
++    try testing.expectEqual(Mode.off, try Mode.parse("0", "auto"));
+     try testing.expectError(error.BadKvShard, Mode.parse("yes", null));
+     try testing.expectError(error.BadKvShardDecode, Mode.parse("1", "both"));
+ }
+diff --git a/zig/src/families/dsv41/shard_ops.zig b/zig/src/families/dsv41/shard_ops.zig
+index 77c515d3de5b5dbcc22c2e21c6e5092dc982371e..7bb06e8773ab4c22475058408ad604084ce32178 100644
+--- a/zig/src/families/dsv41/shard_ops.zig
++++ b/zig/src/families/dsv41/shard_ops.zig
+@@ -6,6 +6,8 @@
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const shard = @import("shard.zig");
++const shard_ring = @import("shard_ring.zig");
++const rdma = @import("rdma.zig");
+ 
+ pub const Kernels = struct {
+     module: cuda.Module,
+@@ -17,6 +19,11 @@ pub const Kernels = struct {
+     scan_fn: cuda.Function,
+     compact_fn: cuda.Function,
+     renumber_fn: cuda.Function,
++    /// The decode exchanges on the RDMA ring (shard_ring.zig): its sized stage and collect. An image built before
++    /// them has neither: that rank then asks for NCCL (round.Round.exchangeSettings), which the ranks' settings
++    /// gather makes every rank's or refuses (KvShardSettingsMismatch) when another rank has them.
++    ring_stage_fn: ?cuda.Function = null,
++    ring_collect_fn: ?cuda.Function = null,
+ 
+     /// dsv41_shard.cu's image (cuda.kernels.dsv41_shard, or a fatbin's bytes).
+     pub fn load(d: *const cuda.Driver, image: []const u8) !Kernels {
+@@ -33,9 +40,20 @@ pub const Kernels = struct {
+             .scan_fn = try m.function("tf_ds_union_scan_kernel"),
+             .compact_fn = try m.function("tf_ds_union_compact_kernel"),
+             .renumber_fn = try m.function("tf_ds_union_renumber_kernel"),
++            .ring_stage_fn = m.function("tf_ds_ring_stage_rows") catch null,
++            .ring_collect_fn = m.function("tf_ds_ring_collect_rows") catch null,
+         };
+     }
+ 
++    /// The sized ring transfer's kernel pair, as rdma.Ring.sendRows / recvRows take it.
++    pub fn ringRows(k: *const Kernels) !rdma.Ring.RowKernels {
++        return .{ .stage = k.ring_stage_fn orelse return error.NoKvShard, .collect = k.ring_collect_fn orelse return error.NoKvShard };
++    }
++
++    pub fn hasRingRows(k: *const Kernels) bool {
++        return k.ring_stage_fn != null and k.ring_collect_fn != null;
++    }
++
+     pub fn unload(k: *Kernels) void {
+         k.module.unload();
+         k.* = undefined;
+@@ -164,11 +182,44 @@ pub fn unionRenumber(k: *const Kernels, s: cuda.Stream, idx: u64, ks: usize, kk:
+     try cuda.launch.launch(k.renumber_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((kos + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
+ }
+ 
++/// An exchange's segments in the ring kernels' form (16-byte words; shard_ring.Xfer.check has refused anything else).
++pub fn rowSegs(x: shard_ring.Xfer) rdma.Ring.RowSegs {
++    var o: rdma.Ring.RowSegs = .{};
++    for (x.slice(), 0..) |g, i| {
++        o.src[i] = g.src;
++        o.dst[i] = g.dst;
++        o.src16[i] = @intCast(g.src_stride / 16);
++        o.dst16[i] = @intCast(g.dst_stride / 16);
++        o.row16[i] = @intCast(g.row_bytes / 16);
++    }
++    return o;
++}
++
++/// One exchange of a decode round on the RDMA ring: this rank's listed rows sent (`list`: the device address of its
++/// send list, shard_ring.Lists.offset(.., .send) into Round.rlist), or the peer's received at the rows of its receive
++/// list. `cap` the round's rows (the slot and grid bound); `probing` false keeps an early send out of the ring probes.
++pub fn ringSend(k: *const Kernels, ring: *rdma.Ring, s: cuda.Stream, x: shard_ring.Xfer, list: u64, cap: usize, probing: bool) !void {
++    try x.check(cap, ring.s.max_bytes);
++    try ring.sendRows(try k.ringRows(), s, rowSegs(x), @intCast(x.n), list, @intCast(cap), probing);
++}
++
++pub fn ringRecv(k: *const Kernels, ring: *rdma.Ring, s: cuda.Stream, x: shard_ring.Xfer, list: u64, cap: usize, from: u32, probing: bool) !void {
++    try x.check(cap, ring.s.max_bytes);
++    try ring.recvRows(try k.ringRows(), s, rowSegs(x), @intCast(x.n), list, @intCast(cap), from, probing);
++}
++
+ /// What one rank's sharded attention carries (prompt.Engine.kv): the parts, the decode mode and the kernels.
+ pub const KvShard = struct {
+     sh: shard.Shard,
+     mode: shard.Mode,
+     k: Kernels,
++    // the decode exchanges' transport and auto's cost model (round.Round.useShard: agreed by every rank before the
++    // first round): the RDMA ring when the engine has one and TF_DS_KV_SHARD_RING is not 0, else NCCL
++    use_ring: bool = false,
++    cost: shard_ring.Cost = .{},
++    // owner decode's two 32-head passes on two streams on the ring path (Round.useShard: TF_DS_KV_SHARD_OVERLAP, not
++    // "0"; per rank, it changes no ring order and no byte)
++    overlap: bool = false,
+     // counters (the health/metrics a status line reads; round 2 exports them): prompt fetches (a layer's) and their
+     // rows and bytes, rounds by fetch and by owner decode (each of a round's compressed layers fetches or exchanges once;
+     // counted when the round is issued, graphs or not), carried extents (copyExtent across parts) and their bytes
+@@ -185,5 +236,13 @@ pub const KvShard = struct {
+         owner_rounds: u64 = 0,
+         carries: u64 = 0,
+         carry_bytes: u64 = 0,
++        // the decode exchanges (shard_ring.zig): rounds whose exchanges rode the RDMA ring (the rest NCCL), auto's
++        // choices, and the rows this rank sent a compressed layer on the ring, summed over the rounds (its send lists:
++        // fetch, the rows only it holds; owner decode, the queries of the rows only the peer holds and the outputs of
++        // the rows only it holds)
++        ring_rounds: u64 = 0,
++        auto_fetch: u64 = 0,
++        auto_owner: u64 = 0,
++        sent_rows: u64 = 0,
+     };
+ };
+diff --git a/zig/src/families/dsv41/shard_ring.zig b/zig/src/families/dsv41/shard_ring.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..7bbd37e4b0c3bfd7a5375b2fd425fd57a79295e2
+--- /dev/null
++++ b/zig/src/families/dsv41/shard_ring.zig
+@@ -0,0 +1,936 @@
++//! Port of wojo's GLM 0118 (PR #152) follow-up: TF_DS_KV_SHARD's decode exchanges sized to what the other rank needs
++//! and carried by the family's RDMA ring (rdma.zig) instead of NCCL, host half and plans, host-only (std and shard.zig:
++//! `zig test` runs it alone).
++//!
++//! A decode exchange moves whole rows of a round, each row one run of bytes in every one of up to `max_segs` segments
++//! (codes and scales of a fetch; a row's q; a row's rotated wo_a inputs in each group's plane). Which rows a rank sends
++//! and which it receives are explicit lists (`List`), computed on the host each round from the replicated row owners
++//! (`lists`: the same inputs on both ranks), uploaded with the round's glue (`Lists.encode`, one fixed device block,
++//! so captured graphs stay valid) and read by the kernels. The sender's stage kernel packs its send
++//! list's rows' segments one after another into its ring slot (segment s of `n` rows at n x the row bytes of the
++//! segments before it) and publishes the slot's size; the proxy writes exactly those bytes to the peer (split over the
++//! rails as every gather is); the receiver's collect kernel waits for the slot and puts the received rows, in its
++//! receive list's order, at their rows. Rank r's send list of an exchange IS rank 1-r's receive list (`lists`'s tests),
++//! so the two sides agree on order and size without anything but the bytes crossing the wire.
++//!
++//! The three exchanges (one a compressed layer): the fetch (the sender's rows' picked codes and scales from its slot
++//! of the fetch buffer into the peer's slot rows: `fetchXfer`), owner decode's queries (this rank's q of the rows the
++//! peer holds, to the peer's gathered-q rows) and owner decode's outputs (the peer's heads of the rows this rank
++//! holds, straight into the peer's xhwo rows, so no select pass). Each puts the bytes the fixed-size NCCL path put at
++//! the same places for every row the receiver reads (the tests below).
++//!
++//! The ring order of a layer's transfers is fixed per mode (`steps`, checked as round.zig issues them: `Cursor`), every
++//! stage directly followed in ring order by its collect, and rdma.Ring refuses any other ring transfer in between.
++//!
++//! TF_DS_KV_SHARD_DECODE=auto chooses each round between fetch and owner decode from the round's row counts (a cost
++//! model in ns, `Cost`, over the replicated counts: both ranks pick the same and capture the same graphs; the round's
++//! graph key carries the choice). Rounds wider than the split path (`decode_rows`) always fetch: owner decode has no
++//! one-pass variant. While a round runs the split path's bound is the round bound (round.forward sets tri.decode_rows
++//! to TF_DS_ROUND_ROWS), so every decode round takes the split path and auto may pick owner at any of its widths.
++const std = @import("std");
++const shard = @import("shard.zig");
++
++/// Segments a row of one exchange at most (dsv41_shard.cu TF_DS_RING_SEGS; owner decode's outputs take one a wo_a
++/// group).
++pub const max_segs = 8;
++/// Rows one exchange lists at most (dsv41_shard.cu TF_DS_RING_ROWS: the kernels' row list; round.max_rows fits).
++pub const max_rows = 64;
++
++/// One segment of an exchange: a listed row r's `row_bytes` from src + r * src_stride (the sender's) to
++/// dst + r * dst_stride (the receiver's). Every value whole 16-byte words.
++pub const Seg = struct { src: u64 = 0, dst: u64 = 0, row_bytes: usize = 0, src_stride: usize = 0, dst_stride: usize = 0 };
++
++/// An exchange as a rank names it: its segments (src: where this rank's sent rows are; dst: where the rows it
++/// receives go). Which rows: the round's `Lists`.
++pub const Xfer = struct {
++    segs: [max_segs]Seg = @splat(.{}),
++    n: usize = 0,
++
++    pub fn slice(x: *const Xfer) []const Seg {
++        return x.segs[0..x.n];
++    }
++
++    /// A listed row's bytes over every segment.
++    pub fn rowBytes(x: Xfer) usize {
++        var t: usize = 0;
++        for (x.segs[0..x.n]) |s| t += s.row_bytes;
++        return t;
++    }
++
++    /// The most bytes a slot of this exchange holds (`rows` rows listed).
++    pub fn capacity(x: Xfer, rows: usize) usize {
++        return rows * x.rowBytes();
++    }
++
++    /// Refused before any launch: no segment or too many, too many rows, a size or address not in whole 16-byte
++    /// words, a slot that could exceed the ring's.
++    pub fn check(x: Xfer, rows: usize, max_bytes: usize) !void {
++        if (x.n == 0 or x.n > max_segs or rows == 0 or rows > max_rows) return error.BadRingRows;
++        for (x.segs[0..x.n]) |s| if ((s.src | s.dst) % 16 != 0 or (s.row_bytes | s.src_stride | s.dst_stride) % 16 != 0 or s.row_bytes == 0) return error.BadRingRows;
++        if (x.capacity(rows) > max_bytes) return error.TooLarge;
++    }
++};
++
++/// Rows a rank sends or receives in one exchange, in slot order: indices into the segments' row strides.
++pub const List = struct {
++    n: usize = 0,
++    rows: [max_rows]u8 = @splat(0),
++
++    pub fn slice(l: *const List) []const u8 {
++        return l.rows[0..l.n];
++    }
++
++    fn push(l: *List, r: usize) void {
++        l.rows[l.n] = @intCast(r);
++        l.n += 1;
++    }
++
++    pub fn eql(a: List, b: List) bool {
++        return std.mem.eql(u8, a.slice(), b.slice());
++    }
++};
++
++pub const Which = enum(u8) { fetch = 0, q = 1, out = 2 };
++pub const Dir = enum(u8) { send = 0, recv = 1 };
++
++/// A round's lists on one rank, every exchange's both ways. On the device (Round.rlist, uploaded each ring round):
++/// i32 [3 exchanges][2 directions][1 + max_rows]: the count, then the rows.
++pub const Lists = struct {
++    l: [3][2]List = @splat(@splat(.{})),
++
++    pub const stride = 1 + max_rows;
++    pub const words = 3 * 2 * stride;
++    pub const bytes = words * 4;
++
++    pub fn get(ls: *const Lists, w: Which, d: Dir) *const List {
++        return &ls.l[@intFromEnum(w)][@intFromEnum(d)];
++    }
++
++    /// A list's byte offset in the device block.
++    pub fn offset(w: Which, d: Dir) usize {
++        return (@as(usize, @intFromEnum(w)) * 2 + @intFromEnum(d)) * stride * 4;
++    }
++
++    pub fn encode(ls: *const Lists, out: *[words]i32) void {
++        out.* = @splat(0);
++        for (0..3) |w| for (0..2) |d| {
++            const l = &ls.l[w][d];
++            const at = (w * 2 + d) * stride;
++            out[at] = @intCast(l.n);
++            for (l.slice(), 0..) |r, i| out[at + 1 + i] = r;
++        };
++    }
++};
++
++/// A round's rows as both ranks see them (the same on every rank): each row's owner (rows.ownerOf).
++pub const View = struct {
++    owners: []const u32,
++
++    fn checked(v: View) !void {
++        if (v.owners.len > max_rows) return error.BadRingRows;
++        for (v.owners) |o| if (o > 1) return error.BadRingRows; // TP2
++    }
++};
++
++/// A round's row counts: x[r] the rows rank r holds (the rows its exchanges move).
++pub const Counts = struct {
++    x: [2]usize = .{ 0, 0 },
++
++    pub fn rows(c: Counts) usize {
++        return c.x[0] + c.x[1];
++    }
++
++    /// The rows rank r attends with picks (its own extent's).
++    pub fn held(c: Counts, r: usize) usize {
++        return c.x[r];
++    }
++};
++
++pub fn counts(v: View) !Counts {
++    try v.checked();
++    var c: Counts = .{};
++    for (v.owners) |o| c.x[o] += 1;
++    return c;
++}
++
++/// Every exchange's send and receive lists on `rank`.
++pub fn lists(v: View, rank: u32) !Lists {
++    try v.checked();
++    if (rank > 1) return error.BadRingRows;
++    var mine: List = .{}; // rows this rank holds
++    var theirs: List = .{}; // rows the peer holds
++    for (v.owners, 0..) |o, i| {
++        if (o == rank) mine.push(i) else theirs.push(i);
++    }
++    var ls: Lists = .{};
++    const f = @intFromEnum(Which.fetch);
++    const q = @intFromEnum(Which.q);
++    const o = @intFromEnum(Which.out);
++    ls.l[f] = .{ mine, theirs };
++    ls.l[q] = .{ theirs, mine };
++    ls.l[o] = .{ mine, theirs };
++    return ls;
++}
++
++/// Where segment `s` of `n` listed rows starts in the slot (the stage's packing order), and the slot's bytes.
++pub fn segOffset(x: Xfer, n: usize, s: usize) usize {
++    var off: usize = 0;
++    for (x.segs[0..s]) |g| off += n * g.row_bytes;
++    return off;
++}
++
++pub fn slotBytes(x: Xfer, n: usize) usize {
++    return segOffset(x, n, x.n);
++}
++
++/// The host model of dsv41_shard.cu's tf_ds_ring_stage_rows: the slot's bytes as the proxy writes them, from the
++/// sender's memory `mem` (addresses are offsets into it). Returns the size it publishes.
++pub fn stageRef(x: Xfer, mem: []const u8, list: *const List, slot: []u8) usize {
++    const n = list.n;
++    for (x.segs[0..x.n], 0..) |g, s| {
++        const off = segOffset(x, n, s);
++        for (list.slice(), 0..) |r, c| {
++            const from: usize = @intCast(g.src + r * g.src_stride);
++            @memcpy(slot[off + c * g.row_bytes ..][0..g.row_bytes], mem[from..][0..g.row_bytes]);
++        }
++    }
++    return slotBytes(x, n);
++}
++
++/// The host model of tf_ds_ring_collect_rows: the received slot's rows into the receiver's memory at their rows.
++pub fn collectRef(x: Xfer, slot: []const u8, list: *const List, mem: []u8) void {
++    const n = list.n;
++    for (x.segs[0..x.n], 0..) |g, s| {
++        const off = segOffset(x, n, s);
++        for (list.slice(), 0..) |r, c| {
++            const to: usize = @intCast(g.dst + r * g.dst_stride);
++            @memcpy(mem[to..][0..g.row_bytes], slot[off + c * g.row_bytes ..][0..g.row_bytes]);
++        }
++    }
++}
++
++// -- the three decode exchanges -------------------------------------------------------------------------------------
++
++/// The fetch's exchange on rank `rank`: its listed rows' kk picked rows (codes, then scales) from its slot of the
++/// fetch buffers (fc codes, fs scales: [world][R][K] rows of cb, sb bytes, round.fetchDecode) into the peer's slot
++/// rows on the peer. Only the first kk of a row's K are sent (kk <= K).
++pub fn fetchXfer(fc: u64, fs: u64, rank: u32, R: usize, K: usize, kk: usize, cb: usize, sb: usize) Xfer {
++    const me = shard.decodeSlots(rank, R, K, cb, sb);
++    const peer = shard.decodeSlots(1 - rank, R, K, cb, sb);
++    var x: Xfer = .{ .n = 2 };
++    x.segs[0] = .{ .src = fc + me.codes, .dst = fc + peer.codes, .row_bytes = kk * cb, .src_stride = K * cb, .dst_stride = K * cb };
++    x.segs[1] = .{ .src = fs + me.scales, .dst = fs + peer.scales, .row_bytes = kk * sb, .src_stride = K * sb, .dst_stride = K * sb };
++    return x;
++}
++
++/// Owner decode's queries: this rank's q [R][hl][hd] bf16 of the listed rows, into the peer's slot of the gathered
++/// queries (qall [world][R][hl][hd]: rank `rank`'s slot on the peer) at the same rows.
++pub fn qXfer(q: u64, qall: u64, rank: u32, R: usize, hl: usize, hd: usize) Xfer {
++    const row = hl * hd * 2;
++    var x: Xfer = .{ .n = 1 };
++    // the receiver's destination is the sender's slot: on the receiving rank that is its peer's, so name it from the
++    // receiver's side (dst is only read by the receiver: qall + peer * R * row)
++    x.segs[0] = .{ .src = q, .dst = qall + @as(u64, 1 - rank) * R * row, .row_bytes = row, .src_stride = row, .dst_stride = row };
++    return x;
++}
++
++/// Owner decode's outputs: the peer's heads' rotated wo_a inputs of the listed rows (xh_peer, [groups][R][gk] fp16)
++/// straight into the peer's own xhwo rows (the same layout), one segment a group.
++pub fn outXfer(xh_peer: u64, xhwo: u64, R: usize, groups: usize, gk: usize) !Xfer {
++    if (groups == 0 or groups > max_segs) return error.BadRingRows;
++    const x = shard.xhPlanes(R, groups, gk);
++    var o: Xfer = .{ .n = groups };
++    for (0..groups) |g| o.segs[g] = .{ .src = xh_peer + g * x.plane_bytes, .dst = xhwo + g * x.plane_bytes, .row_bytes = x.row_bytes, .src_stride = x.row_bytes, .dst_stride = x.row_bytes };
++    return o;
++}
++
++/// The most rows whose every listed row fits a slot of `max_bytes` (0: none), capped at max_rows.
++pub fn fitRows(row_bytes: usize, max_bytes: usize) usize {
++    if (row_bytes == 0) return 0;
++    return @min(max_rows, max_bytes / row_bytes);
++}
++
++// -- a layer's ring order -------------------------------------------------------------------------------------------
++
++/// One ring transfer of a compressed layer's sharded attention.
++pub const Step = enum(u8) {
++    stage_fetch,
++    collect_fetch,
++    stage_q,
++    collect_q,
++    stage_out,
++    collect_out,
++
++    pub fn which(s: Step) Which {
++        return switch (s) {
++            .stage_fetch, .collect_fetch => .fetch,
++            .stage_q, .collect_q => .q,
++            .stage_out, .collect_out => .out,
++        };
++    }
++
++    pub fn dir(s: Step) Dir {
++        return switch (s) {
++            .stage_fetch, .stage_q, .stage_out => .send,
++            .collect_fetch, .collect_q, .collect_out => .recv,
++        };
++    }
++};
++
++/// The ring transfers a compressed layer issues, in ring order, the same on both ranks: each stage directly followed
++/// by its collect. Owner decode's early query send (at q, or on the shard side stream) moves where the stage is
++/// issued among the layer's other kernels, not its ring order.
++pub fn steps(mode: shard.Mode) []const Step {
++    return switch (mode) {
++        .fetch => &.{ .stage_fetch, .collect_fetch },
++        .owner => &.{ .stage_q, .collect_q, .stage_out, .collect_out },
++        .off, .auto => &.{},
++    };
++}
++
++/// round.zig's check of the ring order as it issues a layer's transfers: `begin` at the layer's first, `take` before
++/// each, `done` at the attention's end. Any other order is ShardRingOrder (before a launch, so neither rank's ring
++/// parts from the other's).
++pub const Cursor = struct {
++    s: []const Step = &.{},
++    i: usize = 0,
++
++    pub fn begin(c: *Cursor, mode: shard.Mode) !void {
++        if (!c.done()) return error.ShardRingOrder;
++        c.* = .{ .s = steps(mode) };
++    }
++
++    pub fn take(c: *Cursor, s: Step) !void {
++        if (c.i >= c.s.len or c.s[c.i] != s) return error.ShardRingOrder;
++        c.i += 1;
++    }
++
++    pub fn done(c: *const Cursor) bool {
++        return c.i == c.s.len;
++    }
++
++    pub fn reset(c: *Cursor) void {
++        c.* = .{};
++    }
++};
++
++// -- auto: fetch or owner decode a round ----------------------------------------------------------------------------
++
++/// A listed row's bytes in each exchange (the model's: kk picks x 288 B; hl x hd x 2; wo_k x 2).
++pub const Sizes = struct { fetch_row: usize, q_row: usize, out_row: usize };
++
++/// What a round's decode exchanges cost beyond the replicated engine's attention, a compressed layer, in ns. The
++/// defaults are estimates, not measurements (~11 us a ring round trip, ~22 GB/s over the dual rails, ~128 GB/s for a
++/// stage or collect copy, a 32-head pass's launches); TF_DS_KV_SHARD_COST sets them, the same on both ranks, from
++/// the TF_DS_CLOCK_MARKS=4 profile at 1, 2, 4 and 8 streams (docs/port/shard-ring.md "Setting the cost model").
++/// - fetch: fixed + a row's flight for the busier sender's rows, plus its stage and collect copies.
++/// - owner: fixed + a row's output flight (the part the own pass does not hide), plus four copies (q and outputs,
++///   staged and collected), plus the second 32-head pass on the busier rank: its launches, a pass term a picked row
++///   (two passes over the held rows against one over every row) and a term a masked row (each pass still runs the
++///   window attention of the rows it masks).
++pub const Cost = struct {
++    fetch_fixed: u32 = 13_000,
++    fetch_row: u32 = 7_000,
++    owner_fixed: u32 = 8_000,
++    owner_row: u32 = 1_600,
++    pass_fixed: u32 = 6_000,
++    pass_row: u32 = 600,
++    mask_row: u32 = 200,
++    copy_fixed: u32 = 2_000,
++    copy_kib: u32 = 8,
++
++    pub const fields = @typeInfo(Cost).@"struct".field_names;
++
++    /// TF_DS_KV_SHARD_COST: nine comma-separated integers in the field order (null or empty: the defaults).
++    pub fn parse(text: ?[]const u8) !Cost {
++        var c: Cost = .{};
++        const t = text orelse return c;
++        if (t.len == 0) return c;
++        var it = std.mem.splitScalar(u8, t, ',');
++        inline for (fields) |f| {
++            const v = it.next() orelse return error.BadKvShardCost;
++            @field(c, f) = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadKvShardCost;
++        }
++        if (it.next() != null) return error.BadKvShardCost;
++        return c;
++    }
++
++    fn copies(c: Cost, kernels: u64, bytes: u64) u64 {
++        return kernels * c.copy_fixed + @as(u64, c.copy_kib) * bytes / 1024;
++    }
++
++    /// The fetch's and owner decode's extra ns a compressed layer for a round of these counts.
++    pub fn fetchNs(c: Cost, n: Counts, z: Sizes) u64 {
++        const m = @max(n.x[0], n.x[1]);
++        const moved: u64 = n.x[0] + n.x[1]; // each rank stages its rows and collects the other's
++        return @as(u64, c.fetch_fixed) + @as(u64, c.fetch_row) * m + c.copies(2, moved * z.fetch_row);
++    }
++
++    pub fn ownerNs(c: Cost, n: Counts, z: Sizes) u64 {
++        const m = @max(n.x[0], n.x[1]);
++        const moved: u64 = n.x[0] + n.x[1];
++        const R: i64 = @intCast(n.rows());
++        var pass: i64 = 0;
++        for (0..2) |r| {
++            const h: i64 = @intCast(n.held(r));
++            const p = @as(i64, c.pass_fixed) + @as(i64, c.pass_row) * (2 * h - R) + 2 * @as(i64, c.mask_row) * (R - h);
++            pass = @max(pass, p);
++        }
++        return @as(u64, c.owner_fixed) + @as(u64, c.owner_row) * m + c.copies(4, moved * (z.q_row + z.out_row)) + @as(u64, @intCast(pass));
++    }
++
++    /// The round's decode mode: fetch for a round wider than the split path (`decode_rows`: owner decode has no
++    /// one-pass variant), else owner decode unless the fetch costs less (a tie goes to owner decode). round.forward
++    /// sets the split path's bound (tri.decode_rows) to the round bound (TF_DS_ROUND_ROWS) for the round, so every
++    /// decode round is on the split path and may go owner: the wide-round rule binds only a smaller bound.
++    pub fn choose(c: Cost, n: Counts, z: Sizes, decode_rows: usize) shard.Mode {
++        if (n.rows() > decode_rows) return .fetch;
++        return if (c.fetchNs(n, z) < c.ownerNs(n, z)) .fetch else .owner;
++    }
++};
++
++// -- a round's decision (round.shardRound) ---------------------------------------------------------------------------
++
++/// What round.shardRound decides a round from, every input the same on both ranks: the round's view (owners) and the
++/// settings the ranks agreed at useShard (the switch, auto's cost model, the ring, each mode's fit from the model's
++/// sizes).
++pub const RoundIn = struct {
++    view: View,
++    /// TF_DS_KV_SHARD_DECODE: fetch, owner or auto.
++    mode: shard.Mode,
++    cost: Cost = .{},
++    sizes: Sizes,
++    /// The split path's rows at most (tri.decode_rows while a round runs: the round bound, Engine.round_rows).
++    decode_rows: usize,
++    /// The agreed ring (KvShard.use_ring) with its row-list block allocated (Round.rlist).
++    ring: bool,
++    fit_fetch: usize = 0,
++    fit_owner: usize = 0,
++};
++
++/// A round's decode, as shardRound applies it (Round.smode, sring).
++pub const Decision = struct {
++    /// fetch or owner.
++    mode: shard.Mode,
++    /// The round's exchanges ride the RDMA ring (roundLists then makes its row lists).
++    ring: bool,
++};
++
++/// The round's decode from what every rank holds alike (so both ranks decide the same): the switch's mode or auto's
++/// choice from the view's counts, and the ring iff the round's rows fit a slot of the mode's exchanges.
++pub fn decide(in: RoundIn) !Decision {
++    const R = in.view.owners.len;
++    const n = try counts(in.view);
++    const m: shard.Mode = switch (in.mode) {
++        .fetch, .owner => in.mode,
++        .auto => in.cost.choose(n, in.sizes, in.decode_rows),
++        .off => return error.NoKvShard,
++    };
++    const fit = if (m == .fetch) in.fit_fetch else in.fit_owner;
++    return .{ .mode = m, .ring = in.ring and R <= fit };
++}
++
++/// The ring round's row lists on `rank` (null: the round is not on the ring).
++pub fn roundLists(d: Decision, v: View, rank: u32) !?Lists {
++    if (!d.ring) return null;
++    return try lists(v, rank);
++}
++
++/// The settings both ranks must share before the first round (round.Round.useShard gathers them): whether the
++/// exchanges ride the RDMA ring, and the cost model. `bad` marks a rank whose own settings did not parse.
++pub const Agreed = extern struct {
++    ring: u64,
++    cost: [Cost.fields.len]u64,
++
++    pub const bad = std.math.maxInt(u64);
++
++    pub fn of(ring: bool, cost: anyerror!Cost) Agreed {
++        var a: Agreed = .{ .ring = @intFromBool(ring), .cost = undefined };
++        if (cost) |c| {
++            inline for (Cost.fields, 0..) |f, i| a.cost[i] = @field(c, f);
++        } else |_| {
++            a.ring = bad;
++            a.cost = @splat(bad);
++        }
++        return a;
++    }
++
++    /// Every rank's (gathered in rank order) equal to this one's; a sentinel refuses (KvShardSettingsMismatch on the
++    /// ranks that parsed, their own parse error on the one that did not).
++    pub fn same(mine: Agreed, all: []const Agreed) bool {
++        for (all) |o| if (o.ring == bad or !std.meta.eql(o, mine)) return false;
++        return true;
++    }
++};
++
++// -- tests ----------------------------------------------------------------------------------------------------------
++
++const testing = std.testing;
++
++fn randomOwners(rng: std.Random, owners: []u32) void {
++    const how = rng.uintLessThan(u8, 4);
++    for (owners) |*o| o.* = switch (how) {
++        0 => 0, // every row on rank 0 (one stream)
++        1 => 1,
++        else => rng.uintLessThan(u32, 2),
++    };
++}
++
++/// A rank's `own` glue: 1 where it holds the row (its owner's).
++fn ownOf(v: View, rank: u32, out: []i64) void {
++    for (v.owners, out) |o, *x| x.* = @intFromBool(o == rank);
++}
++
++test "lists: rank r's send list of every exchange is rank 1-r's receive list, in order" {
++    var prng = std.Random.DefaultPrng.init(0x11575);
++    const rng = prng.random();
++    for (0..3000) |_| {
++        const R = 1 + rng.uintLessThan(usize, 48);
++        var owners: [max_rows]u32 = undefined;
++        randomOwners(rng, owners[0..R]);
++        const v: View = .{ .owners = owners[0..R] };
++        const n = try counts(v);
++        try testing.expectEqual(R, n.rows());
++        const ls = [2]Lists{ try lists(v, 0), try lists(v, 1) };
++        for (0..2) |r| for ([_]Which{ .fetch, .q, .out }) |w| {
++            const s = ls[r].get(w, .send).*;
++            const g = ls[1 - r].get(w, .recv).*;
++            try testing.expect(s.eql(g));
++            // sized: the fetch and the outputs carry the sender's own rows, the queries the receiver's
++            const want = if (w == .q) n.x[1 - r] else n.x[r];
++            try testing.expectEqual(want, s.n);
++            for (s.slice()) |row| try testing.expectEqual(@as(u32, @intCast(if (w == .q) 1 - r else r)), owners[row]);
++            for (1..@max(s.n, 1)) |i| try testing.expect(s.rows[i - 1] < s.rows[i]); // in row order
++        };
++    }
++    try testing.expectError(error.BadRingRows, lists(.{ .owners = &.{ 0, 2 } }, 0));
++    try testing.expectError(error.BadRingRows, lists(.{ .owners = &.{0} }, 2));
++}
++
++test "Lists.encode: i32 [3][2][1 + max_rows], the count then the rows, at Lists.offset" {
++    const owners = [_]u32{ 0, 1, 1, 0, 1 };
++    const ls = try lists(.{ .owners = &owners }, 0);
++    var dev: [Lists.words]i32 = undefined;
++    ls.encode(&dev);
++    try testing.expectEqual(@as(usize, 3 * 2 * 65 * 4), Lists.bytes);
++    const at = struct {
++        fn f(d: []const i32, w: Which, dr: Dir) []const i32 {
++            return d[Lists.offset(w, dr) / 4 ..][0..Lists.stride];
++        }
++    }.f;
++    try testing.expectEqualSlices(i32, &.{ 2, 0, 3 }, at(&dev, .fetch, .send)[0..3]);
++    try testing.expectEqualSlices(i32, &.{ 3, 1, 2, 4 }, at(&dev, .fetch, .recv)[0..4]);
++    try testing.expectEqualSlices(i32, &.{ 3, 1, 2, 4 }, at(&dev, .q, .send)[0..4]);
++    try testing.expectEqualSlices(i32, &.{ 2, 0, 3 }, at(&dev, .q, .recv)[0..3]);
++    try testing.expectEqualSlices(i32, &.{ 2, 0, 3 }, at(&dev, .out, .send)[0..3]);
++    try testing.expectEqualSlices(i32, &.{ 3, 1, 2, 4 }, at(&dev, .out, .recv)[0..4]);
++    try testing.expectEqual(@as(i32, 0), at(&dev, .out, .recv)[4]); // the rest zero
++}
++
++test "slot layout: segments one after another, each n rows of its row bytes; sized by the listed rows" {
++    var x: Xfer = .{ .n = 3 };
++    x.segs[0] = .{ .row_bytes = 256 * 4, .src_stride = 256 * 8, .dst_stride = 256 * 8 };
++    x.segs[1] = .{ .row_bytes = 32 * 4, .src_stride = 32 * 8, .dst_stride = 32 * 8 };
++    x.segs[2] = .{ .row_bytes = 16, .src_stride = 16, .dst_stride = 16 };
++    try testing.expectEqual(@as(usize, 0), segOffset(x, 5, 0));
++    try testing.expectEqual(@as(usize, 5 * 1024), segOffset(x, 5, 1));
++    try testing.expectEqual(@as(usize, 5 * (1024 + 128)), segOffset(x, 5, 2));
++    try testing.expectEqual(@as(usize, 5 * (1024 + 128 + 16)), slotBytes(x, 5));
++    try testing.expectEqual(@as(usize, 0), slotBytes(x, 0)); // a rank that holds no row sends an empty slot
++    try testing.expectEqual(@as(usize, 7 * 1168), x.capacity(7));
++    try x.check(7, 7 * 1168);
++    try testing.expectError(error.TooLarge, x.check(7, 7 * 1168 - 16));
++    try testing.expectError(error.BadRingRows, x.check(max_rows + 1, 1 << 30));
++    var y = x;
++    y.segs[1].row_bytes = 24;
++    try testing.expectError(error.BadRingRows, y.check(1, 1 << 20));
++    y = x;
++    y.segs[0].src = 8;
++    try testing.expectError(error.BadRingRows, y.check(1, 1 << 20));
++    try testing.expectEqual(@as(usize, 7), fitRows(1168, 7 * 1168 + 1167));
++    try testing.expectEqual(@as(usize, max_rows), fitRows(16, 1 << 30));
++    try testing.expectEqual(@as(usize, 0), fitRows(0, 1 << 30));
++}
++
++test "the served sizes fit the ring's 4.25 MiB slot at 16 rows (fetch, queries, outputs); 48 fetch rows do not" {
++    const slot: usize = 4456448; // model.ring_bytes
++    const K = 512;
++    const f = fetchXfer(0, 1 << 30, 0, 16, K, K, 256, 32);
++    try f.check(16, slot);
++    try testing.expectEqual(@as(usize, 16 * 512 * 288), f.capacity(16));
++    try testing.expectError(error.TooLarge, f.check(48, slot));
++    try testing.expectEqual(@as(usize, 30), fitRows(f.rowBytes(), slot));
++    const q = qXfer(0, 1 << 30, 1, 16, 32, 512);
++    try q.check(16, slot);
++    try q.check(48, slot);
++    const o = try outXfer(0, 1 << 30, 16, 4, 4096);
++    try o.check(16, slot);
++    try testing.expectEqual(@as(usize, 16 * 16384 * 2), o.capacity(16));
++    try testing.expectError(error.BadRingRows, outXfer(0, 0, 16, 9, 4096));
++}
++
++test "fetch over the ring: each row reads the replicated plane's bytes in pick order; only held rows are sent" {
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(0x5eed);
++    const rng = prng.random();
++    const cb = 256;
++    const sb = 32;
++    for (0..60) |trial| {
++        const R = 1 + rng.uintLessThan(usize, 16);
++        const K = 16 * (1 + rng.uintLessThan(usize, 4));
++        const kk = 1 + rng.uintLessThan(usize, K);
++        const part = 4096;
++        var owners: [max_rows]u32 = undefined;
++        randomOwners(rng, owners[0..R]);
++        const v: View = .{ .owners = owners[0..R] };
++        // the pool-wide plane (what the replicated engine reads) and each owner's part of it
++        const plane_rows = 2 * part;
++        const codes = try gpa.alloc(u8, plane_rows * cb);
++        defer gpa.free(codes);
++        const scales = try gpa.alloc(u8, plane_rows * sb);
++        defer gpa.free(scales);
++        rng.bytes(codes);
++        rng.bytes(scales);
++        var bases: [max_rows]i64 = undefined;
++        var idx: [max_rows * 64]i64 = undefined;
++        for (0..R) |r| {
++            bases[r] = @intCast(owners[r] * part + 2048 * rng.uintLessThan(usize, 2));
++            for (0..kk) |j| idx[r * kk + j] = if (rng.uintLessThan(u8, 8) == 0) -1 else @intCast(rng.uintLessThan(usize, 2048));
++        }
++        // each rank's memory: its local plane (its part's rows from 0), then the fetch buffers fc, fs
++        const fc_off = part * cb;
++        const fs_off = fc_off + 2 * R * K * cb;
++        const mem_len = fs_off + 2 * R * K * sb;
++        var mem: [2][]u8 = undefined;
++        var fixed: [2][]u8 = undefined; // the NCCL path's buffers after the in-place all-gather
++        var slots: [2][]u8 = undefined;
++        var sent: [2]usize = undefined;
++        var outs: [2][]i64 = undefined;
++        for (0..2) |k| {
++            mem[k] = try gpa.alloc(u8, mem_len);
++            fixed[k] = try gpa.alloc(u8, mem_len);
++            slots[k] = try gpa.alloc(u8, R * K * (cb + sb));
++            outs[k] = try gpa.alloc(i64, R * kk);
++            @memset(mem[k], 0xAA);
++        }
++        defer for (0..2) |k| {
++            gpa.free(mem[k]);
++            gpa.free(fixed[k]);
++            gpa.free(slots[k]);
++            gpa.free(outs[k]);
++        };
++        var own: [2][max_rows]i64 = undefined;
++        var ls: [2]Lists = undefined;
++        for (0..2) |k| {
++            const rank: u32 = @intCast(k);
++            ownOf(v, rank, own[k][0..R]);
++            ls[k] = try lists(v, rank);
++            @memcpy(mem[k][0 .. part * cb], codes[k * part * cb ..][0 .. part * cb]);
++            var lbase: [max_rows]i64 = undefined;
++            for (0..R) |r| lbase[r] = if (owners[r] == rank) bases[r] - @as(i64, @intCast(k * part)) else 0;
++            const sl = shard.decodeSlots(rank, R, K, cb, sb);
++            shard.FetchRef.run(.{
++                .codes = mem[k][0 .. part * cb],
++                .scales = scales[k * part * sb ..][0 .. part * sb],
++                .cb = cb,
++                .sb = sb,
++                .idx = idx[0 .. R * kk],
++                .ks = kk,
++                .kk = kk,
++                .rows = R,
++                .sbase = lbase[0..R],
++                .own = own[k][0..R],
++                .copy = true,
++                .dcodes = mem[k][fc_off + sl.codes ..][0..sl.slot_c],
++                .dscales = mem[k][fs_off + sl.scales ..][0..sl.slot_s],
++                .dk = K,
++                .out = outs[k],
++                .kos = kk,
++                .how = .relative,
++            });
++        }
++        for (0..2) |k| @memcpy(fixed[k], mem[k]);
++        for (0..2) |k| for (0..2) |p| {
++            const sl = shard.decodeSlots(@intCast(p), R, K, cb, sb);
++            @memcpy(fixed[k][fc_off + sl.codes ..][0..sl.slot_c], mem[p][fc_off + sl.codes ..][0..sl.slot_c]);
++            @memcpy(fixed[k][fs_off + sl.scales ..][0..sl.slot_s], mem[p][fs_off + sl.scales ..][0..sl.slot_s]);
++        };
++        const n = try counts(v);
++        for (0..2) |k| {
++            const x = fetchXfer(fc_off, fs_off, @intCast(k), R, K, kk, cb, sb);
++            sent[k] = stageRef(x, mem[k], ls[k].get(.fetch, .send), slots[k]);
++            try testing.expectEqual(n.x[k] * kk * (cb + sb), sent[k]);
++        }
++        for (0..2) |k| {
++            const x = fetchXfer(fc_off, fs_off, @intCast(k), R, K, kk, cb, sb);
++            collectRef(x, slots[1 - k][0..sent[1 - k]], ls[k].get(.fetch, .recv), mem[k]);
++        }
++        for (0..2) |k| for (0..R) |r| {
++            var want: std.ArrayList(u8) = .empty;
++            defer want.deinit(gpa);
++            var got: std.ArrayList(u8) = .empty;
++            defer got.deinit(gpa);
++            var old: std.ArrayList(u8) = .empty;
++            defer old.deinit(gpa);
++            var abs: [64]i64 = undefined;
++            for (0..kk) |j| abs[j] = if (idx[r * kk + j] < 0) -1 else idx[r * kk + j];
++            try shard.attnReads(gpa, codes, scales, cb, sb, bases[r], abs[0..kk], &want);
++            const fb: i64 = @intCast(shard.fetchBase(owners[r], R, r, K));
++            const nfc = 2 * R * K;
++            try shard.attnReads(gpa, mem[k][fc_off..][0 .. nfc * cb], mem[k][fs_off..][0 .. nfc * sb], cb, sb, fb, outs[k][r * kk ..][0..kk], &got);
++            try shard.attnReads(gpa, fixed[k][fc_off..][0 .. nfc * cb], fixed[k][fs_off..][0 .. nfc * sb], cb, sb, fb, outs[k][r * kk ..][0..kk], &old);
++            testing.expectEqualSlices(u8, want.items, got.items) catch |err| {
++                std.debug.print("fetch trial {d} rank {d} row {d}\n", .{ trial, k, r });
++                return err;
++            };
++            try testing.expectEqualSlices(u8, old.items, got.items);
++        };
++    }
++}
++
++test "owner decode over the ring: the owner's gathered queries and the receiver's xhwo rows equal the NCCL path's" {
++    const gpa = testing.allocator;
++    var prng = std.Random.DefaultPrng.init(0x0e1d);
++    const rng = prng.random();
++    for (0..120) |_| {
++        const R = 1 + rng.uintLessThan(usize, 16);
++        const hl = 2;
++        const hd = 8 * (1 + rng.uintLessThan(usize, 4)); // rows of hl * hd * 2 bytes, whole words
++        const groups = 1 + rng.uintLessThan(usize, 4);
++        const gk = 8 * (1 + rng.uintLessThan(usize, 8));
++        var owners: [max_rows]u32 = undefined;
++        randomOwners(rng, owners[0..R]);
++        const v: View = .{ .owners = owners[0..R] };
++        const cnt = try counts(v);
++        const qrow = hl * hd * 2;
++        const q_off: usize = 0;
++        const qall_off = R * qrow;
++        const xp_off = qall_off + 2 * R * qrow;
++        const xh_off = xp_off + groups * R * gk * 2;
++        const len = xh_off + groups * R * gk * 2;
++        var mem: [2][]u8 = undefined;
++        var slot: [2][]u8 = undefined;
++        var n: [2]usize = undefined;
++        var own: [2][max_rows]i64 = undefined;
++        var ls: [2]Lists = undefined;
++        for (0..2) |k| {
++            mem[k] = try gpa.alloc(u8, len);
++            slot[k] = try gpa.alloc(u8, len);
++            rng.bytes(mem[k]);
++            ownOf(v, @intCast(k), own[k][0..R]);
++            ls[k] = try lists(v, @intCast(k));
++        }
++        defer for (0..2) |k| {
++            gpa.free(mem[k]);
++            gpa.free(slot[k]);
++        };
++        const before = [2][]u8{ try gpa.dupe(u8, mem[0]), try gpa.dupe(u8, mem[1]) };
++        defer for (before) |b| gpa.free(b);
++        // queries: the NCCL path all-gathers q into qall [world][R] (row r of rank p's q at qall + (p R + r) qrow);
++        // the peer-head pass reads the peer's q of the rows this rank holds
++        for (0..2) |k| n[k] = stageRef(qXfer(q_off, qall_off, @intCast(k), R, hl, hd), mem[k], ls[k].get(.q, .send), slot[k]);
++        for (0..2) |k| collectRef(qXfer(q_off, qall_off, @intCast(k), R, hl, hd), slot[1 - k][0..n[1 - k]], ls[k].get(.q, .recv), mem[k]);
++        for (0..2) |k| {
++            const p = 1 - k;
++            try testing.expectEqual(cnt.x[p] * qrow, n[k]); // q of the rows the peer holds
++            for (0..R) |r| {
++                const at = qall_off + (p * R + r) * qrow;
++                if (owners[r] == k) {
++                    try testing.expectEqualSlices(u8, before[p][q_off + r * qrow ..][0..qrow], mem[k][at..][0..qrow]);
++                } else try testing.expectEqualSlices(u8, before[k][at..][0..qrow], mem[k][at..][0..qrow]); // untouched
++            }
++        }
++        // outputs: the NCCL path exchanges every row's xh_peer then selects the rows not held (own == 0) into xhwo
++        var expect: [2][]u8 = undefined;
++        for (0..2) |k| {
++            expect[k] = try gpa.dupe(u8, mem[k][xh_off..][0 .. groups * R * gk * 2]);
++            shard.selectRef(mem[1 - k][xp_off..][0 .. groups * R * gk * 2], expect[k], own[k][0..R], 0, shard.xhPlanes(R, groups, gk));
++        }
++        defer for (expect) |x| gpa.free(x);
++        for (0..2) |k| n[k] = stageRef(try outXfer(xp_off, xh_off, R, groups, gk), mem[k], ls[k].get(.out, .send), slot[k]);
++        for (0..2) |k| collectRef(try outXfer(xp_off, xh_off, R, groups, gk), slot[1 - k][0..n[1 - k]], ls[k].get(.out, .recv), mem[k]);
++        for (0..2) |k| {
++            try testing.expectEqual(cnt.x[k] * groups * gk * 2, n[k]); // the rows this rank holds
++            try testing.expectEqualSlices(u8, expect[k], mem[k][xh_off..][0 .. groups * R * gk * 2]);
++        }
++    }
++}
++
++const served: Sizes = .{ .fetch_row = 512 * 288, .q_row = 32 * 512 * 2, .out_row = 16384 * 2 };
++
++test "auto: both ranks choose the same mode; wide rounds always fetch; balanced rounds go owner; the costs decide" {
++    const c: Cost = .{};
++    var prng = std.Random.DefaultPrng.init(0xa070);
++    const rng = prng.random();
++    for (0..4000) |_| {
++        const R = 1 + rng.uintLessThan(usize, 48);
++        var owners: [max_rows]u32 = undefined;
++        randomOwners(rng, owners[0..R]);
++        const v: View = .{ .owners = owners[0..R] };
++        // each rank holds the same replicated owners, so the same counts and the same choice; the ranks' roles
++        // swapped give the same choice too
++        const n = try counts(v);
++        var swapped = owners;
++        for (swapped[0..R]) |*o| o.* = 1 - o.*;
++        const ns = try counts(.{ .owners = swapped[0..R] });
++        try testing.expectEqual(n.x[0], ns.x[1]);
++        const m = c.choose(n, served, 16);
++        try testing.expectEqual(m, c.choose(ns, served, 16));
++        // rounds wider than the split path's bound (16 here) always fetch, whatever the costs (owner decode refuses
++        // a one-pass round). In the engine the bound is the round bound (round.forward), so no served round is wider
++        const any: Cost = .{ .fetch_fixed = rng.int(u32), .fetch_row = rng.int(u16), .pass_fixed = rng.int(u16) };
++        if (R > 16) {
++            try testing.expectEqual(shard.Mode.fetch, m);
++            try testing.expectEqual(shard.Mode.fetch, any.choose(n, served, 16));
++            try testing.expectEqual(shard.Mode.fetch, any.choose(ns, served, 16));
++        }
++    }
++    try testing.expectEqual(shard.Mode.owner, c.choose(.{ .x = .{ 8, 8 } }, served, 16));
++    try testing.expectEqual(shard.Mode.owner, c.choose(.{ .x = .{ 2, 2 } }, served, 16));
++    try testing.expectEqual(shard.Mode.owner, c.choose(.{ .x = .{ 4, 0 } }, served, 16)); // one stream with drafts
++    try testing.expectEqual(shard.Mode.owner, c.choose(.{ .x = .{ 1, 0 } }, served, 16)); // one stream, one row
++    try testing.expectEqual(shard.Mode.fetch, c.choose(.{ .x = .{ 9, 8 } }, served, 16));
++    // the copy terms: four 2 us stage/collect kernels plus 8 ns a KiB of the 64 KiB a row moves
++    try testing.expectEqual(@as(u64, 8_000 + 1_600 + 8_000 + 8 * 64 + 6_000 + 600 * 1), c.ownerNs(.{ .x = .{ 1, 0 } }, served));
++    try testing.expectEqual(@as(u64, 13_000 + 7_000 + 4_000 + 8 * 144), c.fetchNs(.{ .x = .{ 1, 0 } }, served));
++    // the masked-row term: a one-sided round's rank 1 masks every row in both passes
++    const masked: Cost = .{ .mask_row = 1_000, .pass_row = 0, .pass_fixed = 0 };
++    try testing.expectEqual(@as(u64, 8_000 + 4 * 1_600 + 4 * 2_000 + 8 * 4 * 64 + 2 * 1_000 * 4), masked.ownerNs(.{ .x = .{ 4, 0 } }, served));
++    // a dear attention pass (as measured, say): one-sided rounds of few rows fetch, balanced ones do not
++    const pass: Cost = .{ .pass_fixed = 25_000, .pass_row = 6_000 };
++    try testing.expectEqual(shard.Mode.fetch, pass.choose(.{ .x = .{ 1, 0 } }, served, 16));
++    try testing.expectEqual(shard.Mode.fetch, pass.choose(.{ .x = .{ 0, 1 } }, served, 16));
++    try testing.expectEqual(shard.Mode.owner, pass.choose(.{ .x = .{ 8, 8 } }, served, 16));
++    const cheap: Cost = .{ .fetch_fixed = 0, .fetch_row = 0, .copy_fixed = 0, .copy_kib = 0 };
++    const dear: Cost = .{ .fetch_fixed = 1 << 30 };
++    for (1..17) |m| {
++        try testing.expectEqual(shard.Mode.fetch, cheap.choose(.{ .x = .{ m, 16 - @min(m, 16) } }, served, 16));
++        try testing.expectEqual(shard.Mode.owner, dear.choose(.{ .x = .{ m, 0 } }, served, 16));
++    }
++}
++
++test "Cost.parse: nine integers in field order, else refused; Agreed refuses any difference or a sentinel" {
++    try testing.expectEqual(Cost{}, try Cost.parse(null));
++    try testing.expectEqual(Cost{}, try Cost.parse(""));
++    const c = try Cost.parse("1,2,3,4,5,6,7,8,9");
++    try testing.expectEqual(Cost{ .fetch_fixed = 1, .fetch_row = 2, .owner_fixed = 3, .owner_row = 4, .pass_fixed = 5, .pass_row = 6, .mask_row = 7, .copy_fixed = 8, .copy_kib = 9 }, c);
++    for ([_][]const u8{ "1,2,3", "1,2,3,4,5,6", "1,2,3,4,5,6,7,8,9,10", "a,2,3,4,5,6,7,8,9", "-1,2,3,4,5,6,7,8,9", "1,,3,4,5,6,7,8,9" }) |t|
++        try testing.expectError(error.BadKvShardCost, Cost.parse(t));
++    const a = Agreed.of(true, c);
++    try testing.expect(a.same(&.{ a, a }));
++    try testing.expect(!a.same(&.{ a, Agreed.of(false, c) }));
++    try testing.expect(!a.same(&.{ a, Agreed.of(true, Cost{}) }));
++    const broken = Agreed.of(true, error.BadKvShardCost);
++    try testing.expect(!a.same(&.{ a, broken }));
++    try testing.expect(!broken.same(&.{ broken, broken })); // a sentinel never agrees, even with itself
++    try testing.expectEqual(@as(usize, 8 * 10), @sizeOf(Agreed));
++}
++
++test "a layer's ring order: each mode's stages paired with their collects, the same on both ranks, sizes agreeing" {
++    var prng = std.Random.DefaultPrng.init(0x0bde);
++    const rng = prng.random();
++    const c: Cost = .{};
++    const K = 512;
++    for (0..2000) |_| {
++        const R = 1 + rng.uintLessThan(usize, 16);
++        var owners: [max_rows]u32 = undefined;
++        randomOwners(rng, owners[0..R]);
++        const v: View = .{ .owners = owners[0..R] };
++        const n = try counts(v);
++        // the configured mode: fetch, owner (with the early query send or without: the same ring order), or auto's
++        // choice, which each rank makes from its own copy of the replicated counts
++        const cfg = rng.uintLessThan(u8, 4);
++        var mode: [2]shard.Mode = undefined;
++        for (0..2) |r| mode[r] = switch (cfg) {
++            0 => .fetch,
++            1, 2 => .owner,
++            else => c.choose(n, served, 16),
++        };
++        try testing.expectEqual(mode[0], mode[1]);
++        const seq = [2][]const Step{ steps(mode[0]), steps(mode[1]) };
++        try testing.expectEqualSlices(Step, seq[0], seq[1]);
++        try testing.expect(seq[0].len % 2 == 0 and seq[0].len > 0);
++        const ls = [2]Lists{ try lists(v, 0), try lists(v, 1) };
++        var i: usize = 0;
++        while (i < seq[0].len) : (i += 2) {
++            const s = seq[0][i];
++            const g = seq[0][i + 1];
++            // a stage, then the collect of the same exchange: adjacent in ring order
++            try testing.expectEqual(Dir.send, s.dir());
++            try testing.expectEqual(Dir.recv, g.dir());
++            try testing.expectEqual(s.which(), g.which());
++            const x: Xfer = switch (s.which()) {
++                .fetch => fetchXfer(0, 1 << 30, 0, R, K, K, 256, 32),
++                .q => qXfer(0, 1 << 30, 0, R, 32, 512),
++                .out => try outXfer(0, 1 << 30, R, 4, 4096),
++            };
++            for (0..2) |r| {
++                // what rank r stages is the size and the rows rank 1-r collects
++                const sent = ls[r].get(s.which(), .send).*;
++                const got = ls[1 - r].get(g.which(), .recv).*;
++                try testing.expect(sent.eql(got));
++                try testing.expectEqual(slotBytes(x, sent.n), slotBytes(x, got.n));
++            }
++        }
++        // the cursor accepts the sequence and refuses anything else
++        var cur: Cursor = .{};
++        try cur.begin(mode[0]);
++        for (seq[0]) |s| try cur.take(s);
++        try testing.expect(cur.done());
++        try cur.begin(mode[0]);
++        const wrong: Step = if (seq[0][0] == .stage_q) .stage_out else .collect_fetch;
++        try testing.expectError(error.ShardRingOrder, cur.take(wrong));
++        try testing.expectError(error.ShardRingOrder, cur.begin(mode[0])); // the layer before it unfinished
++        cur.reset();
++    }
++    var cur: Cursor = .{};
++    try cur.begin(.owner);
++    try cur.take(.stage_q);
++    try testing.expectError(error.ShardRingOrder, cur.take(.stage_out)); // a stage between a stage and its collect
++    try testing.expect(!cur.done());
++}
++
++test "shardRound's decision: both ranks alike, the switch's mode or auto's choice, the ring iff the round fits" {
++    var prng = std.Random.DefaultPrng.init(0xdec1de);
++    const rng = prng.random();
++    var seen: struct { fetch: usize = 0, owner: usize = 0, ring: usize = 0, unfit: usize = 0, auto_owner: usize = 0 } = .{};
++    for (0..3000) |_| {
++        const bound: usize = if (rng.boolean()) 16 else 32; // TF_DS_ROUND_ROWS (tri.decode_rows while the round runs)
++        const R = 1 + rng.uintLessThan(usize, bound);
++        const mode: shard.Mode = switch (rng.uintLessThan(u8, 3)) {
++            0 => .fetch,
++            1 => .owner,
++            else => .auto,
++        };
++        var owners: [max_rows]u32 = undefined;
++        randomOwners(rng, owners[0..R]);
++        const v: View = .{ .owners = owners[0..R] };
++        const cost: Cost = if (rng.boolean()) .{} else .{ .fetch_fixed = rng.uintLessThan(u32, 40_000), .fetch_row = rng.uintLessThan(u32, 10_000), .pass_fixed = rng.uintLessThan(u32, 30_000), .pass_row = rng.uintLessThan(u32, 4_000) };
++        const ring = rng.uintLessThan(u8, 4) != 0;
++        const fit_fetch = rng.uintLessThan(usize, R + 2);
++        const fit_owner = rng.uintLessThan(usize, R + 2);
++        var d: [2]Decision = undefined;
++        for (0..2) |r| d[r] = try decide(.{ .view = v, .mode = mode, .cost = cost, .sizes = served, .decode_rows = bound, .ring = ring, .fit_fetch = fit_fetch, .fit_owner = fit_owner });
++        // both ranks decide alike (the collectives and the ring order follow from it)
++        try testing.expect(std.meta.eql(d[0], d[1]));
++        const n = try counts(v);
++        try testing.expectEqual(if (mode == .auto) cost.choose(n, served, bound) else mode, d[0].mode);
++        if (d[0].mode == .fetch) seen.fetch += 1 else seen.owner += 1;
++        if (mode == .auto and d[0].mode == .owner and n.rows() > 16) seen.auto_owner += 1;
++        const fit = if (d[0].mode == .fetch) fit_fetch else fit_owner;
++        try testing.expectEqual(ring and R <= fit, d[0].ring);
++        if (ring and R > fit) seen.unfit += 1;
++        if (!d[0].ring) {
++            for (0..2) |r| try testing.expect(try roundLists(d[r], v, @intCast(r)) == null);
++            continue;
++        }
++        seen.ring += 1;
++        // every list a ring round sends fits the mode's fit (the stage's cap)
++        for (0..2) |r| {
++            const ls = (try roundLists(d[r], v, @intCast(r))).?;
++            for ([_]Which{ .fetch, .q, .out }) |w| try testing.expect(ls.get(w, .send).n <= fit);
++        }
++    }
++    try testing.expect(seen.fetch > 100 and seen.owner > 100 and seen.ring > 100 and seen.unfit > 100 and seen.auto_owner > 5);
++    try testing.expectError(error.NoKvShard, decide(.{ .view = .{ .owners = &.{0} }, .mode = .off, .sizes = served, .decode_rows = 16, .ring = false }));
++}

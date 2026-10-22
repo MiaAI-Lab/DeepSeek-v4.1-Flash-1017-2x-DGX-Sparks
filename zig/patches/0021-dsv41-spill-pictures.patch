@@ -1,0 +1,2153 @@
+# dsv41 + core: spill v2 for prompts with pictures. Recipe 0006 keys a prompt with pictures by ids made from each
+# picture's content, but those ids are short (31 bits seeded by 8 bytes of the payload's SHA-256), so 0016's tier
+# never wrote such a state. Now a point records each picture's span and full SHA-256 (spill manifest version 3,
+# 48-byte entries; a text point stays version 2, its key, notes and bytes unchanged), a lookup matches a point only
+# when every picture before its cut has the same span, position and digest, and recovery derives the keyed ids from
+# the digests again (a raw id altered on disk drops its point). prompt_cache.Media and Request.cache_media beside
+# 0006's cache_key (the server hands over the digests it already computed), rank_wire v2 keeps carry the pictures to
+# the followers, and /health and /metrics count pictures_kept and pictures_refused on every rank (a follower counts
+# its own keeps and refusals; its stats reply carries them).
+# Switch: 0006's TF_DS_IMAGE_CACHE=0 turns it off together with the key; otherwise on whenever the spill tier is.
+# Without the tier nothing changes.
+# Tests: core/prompt_cache_media_test.zig, the store's picture recovery and a forged same-id payload, spill_tier_test's
+# picture keeps, restores and per-rank counts on two ranks. On the pair (spill_check pictures): the picture point
+# restores from disk on both ranks; exact.py 39/39 identical with the code in (engine 9983b2f, before the rebase onto
+# 0008). Builds on recipe 0006, 0016 and 0019.
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 047ff037fc40c093afa4c60fcf4186d454e3316d..2a50f6f9d1367492557c39cba77ce38160a290d1 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -64,6 +64,9 @@ pub const Request = struct {
+     /// The prompt as the prompt cache keys it, one id for each of its tokens: an image position's id made from the picture's
+     /// content (two pictures never share a kept state, one picture always does); empty: the prompt itself.
+     cache_key: []const u32 = &.{},
++    /// With `cache_key`: each image's identity for the durable tier (its span and the full SHA-256 its cache ids derive
++    /// from, prompt_cache.pictureId), in prompt order; empty: none known (the tier then keeps and finds nothing with them).
++    cache_media: []const prompt_cache.Media = &.{},
+     max_tokens: u32,
+     sampling: ?Sampling = null,
+     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
+@@ -462,6 +465,7 @@ test {
+     _ = @import("lane_host_reuse_test.zig");
+     _ = @import("prompt_cache.zig");
+     _ = @import("lane_host_tier_test.zig");
++    _ = @import("prompt_cache_media_test.zig");
+     _ = @import("prompt_imprint.zig");
+     _ = @import("keepalive.zig");
+ }
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 69be46e248372b3bef16c4c781f2fbd72456123b..3367d54f1467dfd93c0f40518e6a39ec6dae5ca5 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -226,7 +226,9 @@ pub const LaneHost = struct {
+             if (!cacheable(job.request)) return;
+             const h = job.host;
+             const store = h.cache orelse return;
+-            _ = store.keepWith(keyOf(job.request), at, s, job.request.chunks, .{ .group = job.join.group, .images = job.request.images.len > 0, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
++            const r = job.request;
++            const pics = r.images.len > 0; // (the tier records each picture's identity and the prompt's model ids)
++            _ = store.keepWith(keyOf(r), at, s, r.chunks, .{ .group = job.join.group, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{}, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+@@ -250,6 +252,16 @@ pub const LaneHost = struct {
+         }
+     };
+ 
++    /// The pictures' identities the durable tier gets for a request: its `cache_media` only when they name exactly the
++    /// spans the engine runs (`images`: the spans its restored rows and tower work are placed by), one for one; anything
++    /// else gives none, and the tier then misses and keeps nothing for it (a disk hit must not resume pictures placed
++    /// elsewhere than the point recorded them).
++    pub fn tierMedia(r: *const Request) []const pc.Media {
++        if (r.cache_media.len != r.images.len) return &.{};
++        for (r.cache_media, r.images) |m, img| if (m.start != img.at or m.len != img.tokens) return &.{};
++        return r.cache_media;
++    }
++
+     /// The ids the prompt cache keys a request by: its prompt, or with images the prompt with each picture's positions made
+     /// from the picture's content (Request.cache_key).
+     /// Whether the cache may serve or keep a request: without images always; with them only when the server keyed their
+@@ -1020,7 +1032,7 @@ pub const LaneHost = struct {
+         if (!cacheable(r)) return false;
+         const key = keyOf(r);
+         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+-        const probe = store.probe(key, r.chunks);
++        const probe = store.probeMedia(key, r.chunks, r.images.len > 0, tierMedia(r));
+         if (!job.tried_disk) if (probe.durable) |p| {
+             job.tried_disk = true;
+             h.lock();
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 03280c53c46f604c0e32d0a95356607fcfe86aae..172a3763808f9d6901c808b93ba43c8b03ca360c 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -77,8 +77,71 @@ pub const Want = struct {
+     max_at: u32,
+     grid: u32 = 0,
+     lookahead: u32 = 0,
++    /// The prompt holds pictures, and each one's identity (every picture, in prompt order; see `Media`). A point
++    /// holding pictures matches only when every picture before its cut has the same span and payload digest; a prompt
++    /// whose picture ids `media` does not account for (`mediaKeys`) finds nothing.
++    images: bool = false,
++    media: []const Media = &.{},
+ };
+ 
++// -- pictures (recipe patch 0006's content keys; spill v2's disk identity) -------------------------------------------
++
++/// A picture of a prompt as the durable tier names it: its positions [start, start + len) and the full SHA-256 of
++/// its payload. Recipe 0006's per-position cache ids (`pictureId`) are shortened from the digest; disk identity takes
++/// the whole digest and the span. (extern: the same bytes as core/spill's format.Media.)
++pub const Media = extern struct {
++    start: u32,
++    len: u32,
++    digest: [32]u8,
++
++    pub fn eql(a: Media, b: Media) bool {
++        return a.start == b.start and a.len == b.len and std.mem.eql(u8, &a.digest, &b.digest);
++    }
++};
++
++/// TF_DS_IMAGE_CACHE's one reading (the server's content keys, the disk tier and the rank fingerprint alike): on unless
++/// it is exactly "0".
++pub fn imageCacheOn(v: ?[]const u8) bool {
++    return !std.mem.eql(u8, v orelse return true, "0");
++}
++
++test imageCacheOn {
++    try std.testing.expect(!imageCacheOn("0"));
++    try std.testing.expect(imageCacheOn(null) and imageCacheOn("1") and imageCacheOn(""));
++    try std.testing.expect(imageCacheOn(" 0") and imageCacheOn("0 ")); // (exact, as round 2 read it)
++}
++
++/// Cache ids at or above this are pictures' (`pictureId`); a vocabulary id is always below it.
++pub const picture_ids: u32 = 0x8000_0000;
++
++/// The prompt cache's id for position `j` of a picture whose payload's SHA-256 is `digest` (recipe 0006): above every
++/// vocabulary id, so it never equals a text token, and the same for the same picture at any place in any prompt.
++pub fn pictureId(digest: *const [32]u8, j: u32) u32 {
++    const seed = std.mem.readInt(u64, digest[0..8], .little);
++    return picture_ids | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);
++}
++
++/// Whether `media` names every picture in `key[0..n]` and nothing else: spans in order, not overlapping, not empty;
++/// each span position below `n` holds `pictureId(digest, offset)`, every other position below `n` a vocabulary id.
++/// Spans may run past `n` (a picture straddling a cut); spans starting at or past `n` are not looked at. The check
++/// that binds the shortened per-position ids to the full digests a point records.
++pub fn mediaKeys(key: []const u32, n: usize, media: []const Media) bool {
++    if (n > key.len) return false;
++    var at: usize = 0; // positions before it are checked
++    var prev_end: u64 = 0;
++    for (media) |m| {
++        if (m.len == 0 or m.start < prev_end) return false;
++        prev_end = @as(u64, m.start) + m.len;
++        if (m.start >= n) continue;
++        for (key[at..m.start]) |id| if (id >= picture_ids) return false;
++        const stop: usize = @intCast(@min(prev_end, n));
++        for (key[m.start..stop], 0..) |id, j| if (id != pictureId(&m.digest, @intCast(j))) return false;
++        at = stop;
++    }
++    for (key[at..n]) |id| if (id >= picture_ids) return false;
++    return true;
++}
++
+ /// A kept state the tier writes (enqueued at keep). `saved` stays the family's: the tier reads it until `release`.
+ pub const Kept = struct {
+     saved: Saved,
+@@ -89,6 +152,11 @@ pub const Kept = struct {
+     group: u64 = 0,
+     shared: bool = false,
+     images: bool = false,
++    /// With pictures: each one's identity (every picture of the prompt, in order; the tier records those before `at`)
++    /// and the prompt's model ids (the placeholder at a picture's positions; at least `at` of them), valid during the
++    /// call. A picture before `at` that `media` does not name keeps nothing on disk.
++    media: []const Media = &.{},
++    raw: []const u32 = &.{},
+     /// The point its rows' computation forks from (the state its pass resumed from; null: a fresh prefill, or a resumed
+     /// state that was never written), and where.
+     parent: ?u64 = null,
+@@ -150,6 +218,9 @@ pub const TierCounts = struct {
+     quota_trims: u64 = 0,
+     recovered_points: u64 = 0, // published points found at start
+     dropped_temporaries: u64 = 0, // incomplete records removed at start
++    // (appended: the stats wire carries fields in order, and an older peer's reply zero-fills those it lacks)
++    pictures_kept: u64 = 0, // points written with pictures before their cut (rank 0)
++    pictures_refused: u64 = 0, // keeps and lookups with pictures turned away: ids and media disagree, or image cache off (rank 0)
+ 
+     pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending" };
+ 
+@@ -189,6 +260,8 @@ pub const TierCounts = struct {
+         .quota_trims = "Writes that trimmed their conversation to its quota.",
+         .recovered_points = "Published points found at start.",
+         .dropped_temporaries = "Incomplete records removed at start.",
++        .pictures_kept = "Points written to disk with pictures before their cut.",
++        .pictures_refused = "Disk keeps and lookups with pictures turned away (ids and media disagree, or image cache off).",
+     };
+ };
+ 
+@@ -382,6 +455,8 @@ pub const Probe = struct { memory: ?*Entry = null, durable: ?Point = null };
+ pub const KeepInfo = struct {
+     group: u64 = 0,
+     images: bool = false,
++    media: []const Media = &.{}, // with pictures: each one's identity and the prompt's model ids (Kept's, for the tier)
++    raw: []const u32 = &.{},
+     parent: ?u64 = null,
+     fork: u32 = 0,
+     lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
+@@ -507,13 +582,19 @@ pub const Store = struct {
+ 
+     /// What `key` would resume, changing nothing in memory: the best usable kept state, and the tier's longer point.
+     pub fn probe(s: *Store, key: []const u32, starts: []const u32) Probe {
++        return s.probeMedia(key, starts, false, &.{});
++    }
++
++    /// `probe` for a prompt with pictures: `images` (it holds some) and each one's identity go to the tier's lookup
++    /// (Want.images, Want.media), so a point is found only for the same pictures in the same places.
++    pub fn probeMedia(s: *Store, key: []const u32, starts: []const u32, images: bool, media: []const Media) Probe {
+         const m = s.find(key, starts);
+         const t = s.tier orelse return .{ .memory = m };
+         const have: u32 = if (m) |e| e.at else 0;
+         s.stats.disk_lookups += 1;
+         const max_at = s.rules.maxAt(key.len) orelse return .{ .memory = m };
+         if (max_at <= have) return .{ .memory = m };
+-        const want: Want = .{ .key = key, .beyond = have, .max_at = max_at, .grid = s.rules.grid, .lookahead = s.rules.lookahead };
++        const want: Want = .{ .key = key, .beyond = have, .max_at = max_at, .grid = s.rules.grid, .lookahead = s.rules.lookahead, .images = images, .media = media };
+         const p = t.vtable.lookup(t.ptr, &want) orelse return .{ .memory = m };
+         if (!s.pointFits(p, key, starts, have)) return .{ .memory = m };
+         s.stats.disk_hits += 1;
+@@ -945,7 +1026,7 @@ pub const Store = struct {
+         s.held += charged;
+         s.counts.kept += 1;
+         if (s.tier) |t| { // write at keep: the tier stages the state's bytes between rounds
+-            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = info.group, .shared = shared, .images = info.images, .parent = info.parent, .fork = info.fork, .lineage = lin });
++            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = info.group, .shared = shared, .images = info.images, .media = info.media, .raw = info.raw, .parent = info.parent, .fork = info.fork, .lineage = lin });
+             if (e.point != null) s.stats.writes_enqueued += 1;
+         }
+         if (shared) s.learn(e, starts);
+diff --git a/zig/src/core/prompt_cache_media_test.zig b/zig/src/core/prompt_cache_media_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7f9147e697f30ad5ff3941a8989e16f64cd8bca
+--- /dev/null
++++ b/zig/src/core/prompt_cache_media_test.zig
+@@ -0,0 +1,347 @@
++//! Pictures and the durable tier (spill v2 over recipe 0006's content keys): `mediaKeys`, and what the store and the
++//! lane host hand a tier for a prompt with pictures (Want.images/media at lookup, Kept.media/raw at keep), over the
++//! fake backend and the in-memory tier.
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const pc = @import("prompt_cache.zig");
++const ft = @import("prompt_cache_fake_tier.zig");
++const LaneHost = api.LaneHost;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++const Reason = api.Reason;
++const gpa = std.testing.allocator;
++const io = std.testing.io;
++
++fn digestOf(payload: []const u8) [32]u8 {
++    var d: [32]u8 = undefined;
++    std.crypto.hash.sha2.Sha256.hash(payload, &d, .{});
++    return d;
++}
++
++test "mediaKeys: every picture id named by a span and made from its digest, nothing else" {
++    const a = digestOf("a");
++    const b = digestOf("b");
++    var key = [_]u32{ 1, 2, 0, 0, 0, 3, 0, 0, 0, 0, 4 };
++    for (0..3) |j| key[2 + j] = pc.pictureId(&a, @intCast(j));
++    for (0..4) |j| key[6 + j] = pc.pictureId(&b, @intCast(j));
++    const m = [_]pc.Media{ .{ .start = 2, .len = 3, .digest = a }, .{ .start = 6, .len = 4, .digest = b } };
++    try std.testing.expect(pc.mediaKeys(&key, key.len, &m));
++    try std.testing.expect(pc.mediaKeys(&key, 8, &m)); // a cut inside the second picture
++    try std.testing.expect(pc.mediaKeys(&key, 2, &.{})); // a cut before every picture: text
++    try std.testing.expect(!pc.mediaKeys(&key, key.len, m[0..1])); // the second picture unnamed
++    try std.testing.expect(!pc.mediaKeys(&key, key.len, &.{})); // none named
++    try std.testing.expect(!pc.mediaKeys(&key, key.len, &.{ m[1], m[0] })); // out of order
++    try std.testing.expect(!pc.mediaKeys(&key, key.len, &.{ m[0], .{ .start = 4, .len = 2, .digest = b } })); // overlapping
++    try std.testing.expect(!pc.mediaKeys(&key, key.len, &.{ .{ .start = 2, .len = 3, .digest = b }, m[1] })); // another payload
++    try std.testing.expect(!pc.mediaKeys(&key, key.len, &.{ .{ .start = 2, .len = 2, .digest = a }, m[1] })); // a short span
++    try std.testing.expect(!pc.mediaKeys(&key, key.len + 1, &m)); // past the key
++    // a picture id's high bit keeps it off every vocabulary id
++    for (0..1000) |j| try std.testing.expect(pc.pictureId(&a, @intCast(j)) >= pc.picture_ids);
++}
++
++const Box = struct {
++    mutex: std.Io.Mutex = .init,
++    cached: ?u32 = null,
++    done: ?Reason = null,
++
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *Box = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(io);
++        defer b.mutex.unlock(io);
++        switch (e.*) {
++            .prefilled => |c| b.cached = c,
++            .tokens => {},
++            .finished => |f| b.done = f.reason,
++        }
++    }
++    fn sink(b: *Box) api.Sink {
++        return .{ .ctx = b, .event = event };
++    }
++    fn wait(b: *Box) Reason {
++        while (true) {
++            b.mutex.lockUncancelable(io);
++            const d = b.done;
++            b.mutex.unlock(io);
++            if (d) |r| return r;
++            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++        }
++    }
++};
++
++/// The in-memory tier, recording what the store hands it for pictures (lookups and keeps), everything else its own.
++const Rec = struct {
++    inner: *ft.FakeTier,
++    mutex: std.Io.Mutex = .init,
++    lookups: u32 = 0,
++    picture_lookups: u32 = 0, // with Want.images
++    want_media: [4]pc.Media = undefined,
++    want_n: usize = 0,
++    keeps: u32 = 0,
++    kept_media: [4]pc.Media = undefined,
++    kept_n: usize = 0,
++    kept_raw: [64]u32 = undefined,
++    kept_raw_n: usize = 0,
++    kept_images: bool = false,
++    /// The real tier's gate (spill_tier): with pictures, a lookup or keep whose media do not name its picture ids misses
++    /// or keeps nothing.
++    strict: bool = false,
++    refused: u32 = 0,
++
++    fn tier(r: *Rec) pc.Tier {
++        return .{ .ptr = r, .vtable = &.{ .lookup = lookup, .begin = begin, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts } };
++    }
++
++    fn of(p: *anyopaque) *Rec {
++        return @ptrCast(@alignCast(p));
++    }
++    fn in(p: *anyopaque) struct { *anyopaque, *const pc.Tier.VTable } {
++        const t = of(p).inner.tier();
++        return .{ t.ptr, t.vtable };
++    }
++    fn begin(p: *anyopaque, point: *const pc.Point) anyerror!u64 {
++        const x = in(p);
++        return x[1].begin(x[0], point);
++    }
++    fn poll(p: *anyopaque, job: u64, budget: u64) pc.Poll {
++        const x = in(p);
++        return x[1].poll(x[0], job, budget);
++    }
++    fn cancel(p: *anyopaque, job: u64) void {
++        const x = in(p);
++        x[1].cancel(x[0], job);
++    }
++    fn release(p: *anyopaque, point: u64, saved: pc.Saved) void {
++        const x = in(p);
++        x[1].release.?(x[0], point, saved);
++    }
++    fn share(p: *anyopaque, point: u64) void {
++        const x = in(p);
++        x[1].share.?(x[0], point);
++    }
++    fn touch(p: *anyopaque, point: u64) void {
++        const x = in(p);
++        x[1].touch.?(x[0], point);
++    }
++    fn forget(p: *anyopaque, point: u64) void {
++        const x = in(p);
++        x[1].forget(x[0], point);
++    }
++    fn pump(p: *anyopaque, budget: u64) void {
++        const x = in(p);
++        x[1].pump.?(x[0], budget);
++    }
++    fn busy(p: *anyopaque) bool {
++        const x = in(p);
++        return x[1].busy.?(x[0]);
++    }
++    fn flush(p: *anyopaque, budget: u64) u64 {
++        const x = in(p);
++        return x[1].flush(x[0], budget);
++    }
++    fn counts(p: *anyopaque, out: []pc.TierCounts) usize {
++        const x = in(p);
++        return x[1].counts(x[0], out);
++    }
++    fn lookup(p: *anyopaque, want: *const pc.Want) ?pc.Point {
++        const r = of(p);
++        r.mutex.lockUncancelable(io);
++        r.lookups += 1;
++        if (want.images) r.picture_lookups += 1;
++        r.want_n = @min(want.media.len, r.want_media.len);
++        @memcpy(r.want_media[0..r.want_n], want.media[0..r.want_n]);
++        const refuse = r.strict and want.images and !pc.mediaKeys(want.key, want.key.len, want.media);
++        if (refuse) r.refused += 1;
++        r.mutex.unlock(io);
++        if (refuse) return null;
++        const x = in(p);
++        return x[1].lookup(x[0], want);
++    }
++    fn keep(p: *anyopaque, kept: *const pc.Kept) ?u64 {
++        const r = of(p);
++        r.mutex.lockUncancelable(io);
++        r.keeps += 1;
++        r.kept_images = kept.images;
++        r.kept_n = @min(kept.media.len, r.kept_media.len);
++        @memcpy(r.kept_media[0..r.kept_n], kept.media[0..r.kept_n]);
++        r.kept_raw_n = @min(kept.raw.len, r.kept_raw.len);
++        @memcpy(r.kept_raw[0..r.kept_raw_n], kept.raw[0..r.kept_raw_n]);
++        const refuse = r.strict and kept.images and !pc.mediaKeys(kept.key, kept.at, kept.media);
++        if (refuse) r.refused += 1;
++        r.mutex.unlock(io);
++        if (refuse) return null;
++        const x = in(p);
++        return x[1].keep(x[0], kept);
++    }
++};
++
++const Rig = struct {
++    cfg: lanes.Config,
++    target: lanes.fake.Fake,
++    clock: lanes.fake.FixedClock = .{},
++    core: lanes.Engine,
++    store: pc.Store,
++    tier: ft.FakeTier,
++    rec: Rec,
++    host: LaneHost,
++
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 64 + 4 * @as(u64, at);
++    }
++    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        return f.save(@ptrCast(@alignCast(owner.?)), at);
++    }
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++        return error.BackendRestores;
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        f.drop(saved);
++    }
++    fn pack(_: *anyopaque, a: std.mem.Allocator, saved: pc.Saved) anyerror![]u8 {
++        const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
++        return a.dupe(u8, std.mem.sliceAsBytes(kept.items));
++    }
++    fn unpack(_: *anyopaque, b: []const u8) anyerror!pc.Saved {
++        const kept = try gpa.create(std.ArrayList(u32));
++        kept.* = .empty;
++        const n = b.len / 4;
++        try kept.resize(gpa, n);
++        @memcpy(std.mem.sliceAsBytes(kept.items), b[0 .. n * 4]);
++        return kept;
++    }
++
++    fn create() !*Rig {
++        const r = try gpa.create(Rig);
++        errdefer gpa.destroy(r);
++        r.* = .{ .cfg = undefined, .target = .{ .gpa = gpa }, .core = undefined, .store = undefined, .tier = .{ .gpa = gpa, .codec = .{ .ctx = r, .pack = pack, .unpack = unpack } }, .rec = undefined, .host = undefined };
++        r.rec = .{ .inner = &r.tier };
++        r.cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        r.core = lanes.Engine.init(gpa, &r.cfg, r.target.backend(), r.clock.clock());
++        r.store = pc.Store.init(gpa, .{ .ptr = &r.target, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++        r.store.setTier(r.rec.tier(), 0);
++        r.host = LaneHost.init(gpa, io, &r.core, .{ .lanes = 2 });
++        r.host.interleave_ns = 0;
++        r.host.cache = &r.store;
++        r.host.configure(.{ .load_ms = 5, .flush_ms = 1000 });
++        try r.host.start();
++        return r;
++    }
++
++    fn destroy(r: *Rig) void {
++        r.host.stop();
++        r.store.deinit();
++        r.tier.deinit();
++        r.core.deinit();
++        r.target.deinit();
++        r.cfg.deinit(gpa);
++        gpa.destroy(r);
++    }
++};
++
++test "a prompt with pictures: its lookups carry the pictures' identities, its keeps their identities and model ids; a disk hit resumes it" {
++    const r = try Rig.create();
++    defer r.destroy();
++    const d = digestOf("a picture's payload");
++    // the picture's three positions hold the placeholder (99) in the prompt; the cache keys them by the picture
++    const prompt = [_]u32{ 3, 1, 99, 99, 99, 5, 9, 2, 6, 5, 7, 7, 4, 4 };
++    var key = prompt;
++    for (0..3) |j| key[2 + j] = pc.pictureId(&d, @intCast(j));
++    const media = [_]pc.Media{.{ .start = 2, .len = 3, .digest = d }};
++    const img = [_]api.Image{.{ .at = 2, .tokens = 3, .bytes = "" }};
++    // a point of 8 tokens on "disk" (its state the prompt's own tokens: the fake backend's state is its history)
++    _ = try r.tier.put(key[0..8], 8, std.mem.sliceAsBytes(prompt[0..8]), 0, 0, false);
++    var b: Box = .{};
++    const req: Request = .{ .prompt = &prompt, .images = &img, .cache_key = &key, .cache_media = &media, .max_tokens = 4, .history_len = 12 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached); // restored, then resumed
++    r.rec.mutex.lockUncancelable(io);
++    defer r.rec.mutex.unlock(io);
++    try std.testing.expect(r.rec.picture_lookups >= 1);
++    try std.testing.expectEqual(@as(usize, 1), r.rec.want_n);
++    try std.testing.expect(r.rec.want_media[0].eql(media[0]));
++    try std.testing.expect(r.rec.keeps >= 1);
++    try std.testing.expect(r.rec.kept_images);
++    try std.testing.expectEqual(@as(usize, 1), r.rec.kept_n);
++    try std.testing.expect(r.rec.kept_media[0].eql(media[0]));
++    try std.testing.expectEqualSlices(u32, &prompt, r.rec.kept_raw[0..r.rec.kept_raw_n]); // the model's ids, not the key
++}
++
++test "tierMedia: the tier gets a request's media only when they name exactly the spans the engine runs" {
++    const d = digestOf("p");
++    const prompt = [_]u32{ 3, 1, 99, 99, 99, 5, 99, 99, 2 };
++    const img = [_]api.Image{ .{ .at = 2, .tokens = 3, .bytes = "" }, .{ .at = 6, .tokens = 2, .bytes = "" } };
++    const m = [_]pc.Media{ .{ .start = 2, .len = 3, .digest = d }, .{ .start = 6, .len = 2, .digest = d } };
++    const ok: Request = .{ .prompt = &prompt, .images = &img, .cache_media = &m, .max_tokens = 1 };
++    try std.testing.expectEqual(@as(usize, 2), LaneHost.tierMedia(&ok).len);
++    const short: Request = .{ .prompt = &prompt, .images = &img, .cache_media = m[0..1], .max_tokens = 1 };
++    try std.testing.expectEqual(@as(usize, 0), LaneHost.tierMedia(&short).len); // one picture unnamed
++    const moved = [_]pc.Media{ m[0], .{ .start = 5, .len = 2, .digest = d } };
++    const r2: Request = .{ .prompt = &prompt, .images = &img, .cache_media = &moved, .max_tokens = 1 };
++    try std.testing.expectEqual(@as(usize, 0), LaneHost.tierMedia(&r2).len); // a span elsewhere
++    const longer = [_]pc.Media{ m[0], .{ .start = 6, .len = 3, .digest = d } };
++    const r3: Request = .{ .prompt = &prompt, .images = &img, .cache_media = &longer, .max_tokens = 1 };
++    try std.testing.expectEqual(@as(usize, 0), LaneHost.tierMedia(&r3).len); // a span of another length
++    const text: Request = .{ .prompt = &prompt, .max_tokens = 1 };
++    try std.testing.expectEqual(@as(usize, 0), LaneHost.tierMedia(&text).len);
++}
++
++test "a prompt whose cache_media name other spans than its images: no disk hit, nothing kept with pictures" {
++    const r = try Rig.create();
++    defer r.destroy();
++    r.rec.strict = true;
++    const d = digestOf("a picture's payload");
++    const prompt = [_]u32{ 3, 1, 99, 99, 99, 5, 9, 2, 6, 5, 7, 7, 4, 4 };
++    var key = prompt;
++    for (0..3) |j| key[2 + j] = pc.pictureId(&d, @intCast(j));
++    // the key and media agree with each other (a picture at [2, 5)), but the engine is told the picture sits at [1, 4)
++    const media = [_]pc.Media{.{ .start = 2, .len = 3, .digest = d }};
++    const img = [_]api.Image{.{ .at = 1, .tokens = 3, .bytes = "" }};
++    _ = try r.tier.put(key[0..8], 8, std.mem.sliceAsBytes(prompt[0..8]), 0, 0, false);
++    var b: Box = .{};
++    const req: Request = .{ .prompt = &prompt, .images = &img, .cache_key = &key, .cache_media = &media, .max_tokens = 4, .history_len = 12 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b.cached); // the point on disk is not resumed
++    r.rec.mutex.lockUncancelable(io);
++    defer r.rec.mutex.unlock(io);
++    try std.testing.expect(r.rec.picture_lookups >= 1);
++    try std.testing.expectEqual(@as(usize, 0), r.rec.want_n); // the tier was handed no media
++    try std.testing.expect(r.rec.keeps >= 1);
++    try std.testing.expectEqual(@as(usize, 0), r.rec.kept_n);
++    try std.testing.expect(r.rec.refused >= 2); // a lookup and a keep, both turned away
++}
++
++test "a prompt with pictures and no content key (TF_DS_IMAGE_CACHE=0): the tier is never asked, nothing is kept" {
++    const r = try Rig.create();
++    defer r.destroy();
++    const prompt = [_]u32{ 3, 1, 99, 99, 99, 5, 9, 2, 6, 5, 7, 7, 4, 4 };
++    const img = [_]api.Image{.{ .at = 2, .tokens = 3, .bytes = "" }};
++    var b: Box = .{};
++    const req: Request = .{ .prompt = &prompt, .images = &img, .max_tokens = 4, .history_len = 12 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b.cached);
++    r.rec.mutex.lockUncancelable(io);
++    defer r.rec.mutex.unlock(io);
++    try std.testing.expectEqual(@as(u32, 0), r.rec.lookups);
++    try std.testing.expectEqual(@as(u32, 0), r.rec.keeps);
++}
++
++test "a text prompt's lookups and keeps carry no pictures" {
++    const r = try Rig.create();
++    defer r.destroy();
++    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 7, 7, 5, 3 };
++    var b: Box = .{};
++    const req: Request = .{ .prompt = &prompt, .max_tokens = 4, .history_len = 12 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    r.rec.mutex.lockUncancelable(io);
++    defer r.rec.mutex.unlock(io);
++    try std.testing.expect(r.rec.lookups >= 1 and r.rec.keeps >= 1);
++    try std.testing.expectEqual(@as(u32, 0), r.rec.picture_lookups);
++    try std.testing.expect(!r.rec.kept_images and r.rec.kept_n == 0 and r.rec.kept_raw_n == 0);
++}
+diff --git a/zig/src/core/spill/format.zig b/zig/src/core/spill/format.zig
+index a41deb1b64b39550c2d53fd0283e042613073f91..0ab2d4f13225eaa4ab2516ab034b17c472a8d09a 100644
+--- a/zig/src/core/spill/format.zig
++++ b/zig/src/core/spill/format.zig
+@@ -24,13 +24,25 @@ comptime {
+ pub const Digest = [32]u8;
+ pub const zero_digest: Digest = @splat(0);
+ 
+-/// The native spill format (bumped on any byte change below; another value is a foreign store).
+-pub const version: u32 = 2;
++/// The native spill format's manifest version (bumped on any byte change below). Version 3 (pictures): a point with
++/// media writes 48-byte media entries naming the picture-id scheme its keyed ids were made with (`pictureId`); a text
++/// point is still written, byte for byte, as version 2, and version 2 manifests without media stay valid text points.
++pub const version: u32 = 3;
++/// The version a point without media is written as (and the oldest one read).
++pub const text_version: u32 = 2;
++/// The store namespace's version, in the compat digest: unchanged by version 3, so a store's text points survive it.
++/// (A change that cannot read the older points bumps it: the directory name changes and the old store is pruned.)
++pub const namespace_version: u32 = 2;
+ pub const magic = "TFSPILL\x02".*;
+ /// The manifest's fixed header.
+ pub const header_bytes = 256;
+ const fork_bytes = 20;
+-const media_bytes = 40;
++const media_bytes = 48; // version 3: start, len, kind, scheme, SHA-256
++const media_v2_bytes = 40; // version 2 (never written with media: such a manifest is foreign)
++/// A version-3 media entry's kind: a picture (an image's span of the prompt).
++pub const media_picture: u32 = 1;
++/// The scheme a picture's keyed ids are made with: `pictureId` (recipe 0006's ids, seeded by the digest's first 8 bytes).
++pub const picture_scheme: u32 = 1;
+ const block_ref_bytes = 80;
+ const section_bytes = 56;
+ const trailer_bytes = 8;
+@@ -80,8 +92,9 @@ pub const Limits = struct {
+ };
+ 
+ /// A picture inside a point: its prompt positions and the full SHA-256 of its payload (recipe 0006's per-position
+-/// keys are shortened; disk identity takes the whole digest and the span).
+-pub const Media = struct {
++/// keys are shortened; disk identity takes the whole digest and the span). A picture may run past the point's cut
++/// (`start < at < start + len`). (extern: the same bytes as core/prompt_cache's Media, which the tier hands over.)
++pub const Media = extern struct {
+     start: u32,
+     len: u32,
+     digest: Digest,
+@@ -91,6 +104,42 @@ pub const Media = struct {
+     }
+ };
+ 
++/// Keyed ids at or above this are pictures' (`pictureId`); vocabulary ids stay below it.
++pub const picture_ids: u32 = 0x8000_0000;
++
++/// Scheme 1's keyed id for position `j` of a picture whose payload's SHA-256 is `digest` (equal to
++/// core/prompt_cache.pictureId, which the server keys prompts with; the tier's tests check the two agree).
++pub fn pictureId(digest: *const Digest, j: u32) u32 {
++    const seed = std.mem.readInt(u64, digest[0..8], .little);
++    return picture_ids | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);
++}
++
++/// Whether a point's ids agree with its media: spans in order, not overlapping, not empty, each starting inside the
++/// ids; every keyed id in a span is `pictureId(digest, offset)` and every other one a vocabulary id; with media the raw
++/// ids are required, equal the keyed ones outside the spans and hold model ids (below `picture_ids`) inside them.
++/// Bounded by the ids' length; what keep and recovery check before a point with pictures is trusted.
++pub fn mediaIds(keyed: []const u32, raw: ?[]const u32, media: []const Media) bool {
++    if (raw) |r| if (r.len != keyed.len) return false;
++    if (media.len > 0 and raw == null) return false;
++    var at: usize = 0;
++    for (media) |m| {
++        if (m.len == 0 or m.start < at or m.start >= keyed.len) return false;
++        const stop: usize = @intCast(@min(@as(u64, m.start) + m.len, keyed.len));
++        if (!textIds(keyed[at..m.start], if (raw) |r| r[at..m.start] else null)) return false;
++        for (keyed[m.start..stop], 0..) |id, j| if (id != pictureId(&m.digest, @intCast(j))) return false;
++        if (raw) |r| for (r[m.start..stop]) |id| if (id >= picture_ids) return false;
++        at = @intCast(@as(u64, m.start) + m.len); // (past the ids when the picture straddles the cut: the loop ends)
++    }
++    if (at < keyed.len) return textIds(keyed[at..], if (raw) |r| r[at..] else null);
++    return true;
++}
++
++fn textIds(keyed: []const u32, raw: ?[]const u32) bool {
++    for (keyed) |id| if (id >= picture_ids) return false;
++    if (raw) |r| if (!std.mem.eql(u32, keyed, r)) return false;
++    return true;
++}
++
+ /// One fork of a lineage: a computation that resumed at `at` and computed its own rows from there.
+ pub const Fork = struct { name: [16]u8, at: u32 };
+ 
+@@ -255,6 +304,10 @@ fn keyOf(last: Digest, keyed: []const u32, whole: usize, block: u32, media: []co
+     h.update(idsBytes(keyed[whole..]));
+     const m: u32 = @intCast(media.len);
+     h.update(std.mem.asBytes(&m));
++    if (m > 0) { // (version 3: the scheme the keyed ids were made with; a text point's key is unchanged)
++        h.update("|pictures");
++        h.update(std.mem.asBytes(&picture_scheme));
++    }
+     for (media) |x| {
+         h.update(std.mem.asBytes(&x.start));
+         h.update(std.mem.asBytes(&x.len));
+@@ -268,7 +321,7 @@ fn keyOf(last: Digest, keyed: []const u32, whole: usize, block: u32, media: []co
+ pub fn compatDigest(common: Digest, layout: OwnerLayout, block_tokens: u32, block_bytes: u64) Digest {
+     var h = Sha256.init(.{});
+     h.update("tf-spill/compat");
+-    h.update(std.mem.asBytes(&version));
++    h.update(std.mem.asBytes(&namespace_version));
+     h.update(&common);
+     const l: u32 = @intFromEnum(layout);
+     h.update(std.mem.asBytes(&l));
+@@ -361,6 +414,11 @@ pub const Manifest = struct {
+         m.* = undefined;
+     }
+ 
++    /// The version this manifest is written as: 3 with media, else 2 (a text point's bytes as before).
++    pub fn versionOf(m: *const Manifest) u32 {
++        return if (m.media.len > 0) version else text_version;
++    }
++
+     pub fn encodedLen(m: *const Manifest) u64 {
+         return header_bytes + m.lineage.forks.len * fork_bytes + m.media.len * media_bytes +
+             m.blocks.len * block_ref_bytes + m.sections.len * section_bytes + trailer_bytes;
+@@ -372,7 +430,7 @@ pub const Manifest = struct {
+         @memset(out, 0);
+         var w: Cursor = .{ .buf = out };
+         w.bytes(&magic);
+-        w.int(u32, version);
++        w.int(u32, m.versionOf());
+         w.int(u32, header_bytes);
+         w.bytes(&compat);
+         w.bytes(&m.key);
+@@ -406,6 +464,8 @@ pub const Manifest = struct {
+         for (m.media) |x| {
+             w.int(u32, x.start);
+             w.int(u32, x.len);
++            w.int(u32, media_picture);
++            w.int(u32, picture_scheme);
+             w.bytes(&x.digest);
+         }
+         for (m.blocks) |b| {
+@@ -437,7 +497,8 @@ pub const Manifest = struct {
+         if (raw.len < header_bytes + trailer_bytes or raw.len > limits.maxManifest()) return error.Corrupt;
+         var r: Cursor = .{ .buf = @constCast(raw) };
+         if (!std.mem.eql(u8, r.take(8), &magic)) return error.Foreign;
+-        if (r.get(u32) != version or r.get(u32) != header_bytes) return error.Foreign;
++        const ver = r.get(u32);
++        if ((ver != version and ver != text_version) or r.get(u32) != header_bytes) return error.Foreign;
+         if (!std.mem.eql(u8, r.take(32), &compat)) return error.Foreign;
+         var m: Manifest = .{ .key = r.take(32)[0..32].*, .at = 0, .block_tokens = 0, .lineage = .{ .root = @splat(0) }, .ids_bytes = 0, .ids_crc = 0, .small_bytes = 0, .small_crc = 0 };
+         m.at = r.get(u32);
+@@ -467,9 +528,13 @@ pub const Manifest = struct {
+         if (m.at == 0 or m.at > limits.max_tokens) return error.Corrupt;
+         if (n_blocks != std.math.divCeil(u32, m.at, m.block_tokens) catch unreachable) return error.Corrupt;
+         if (n_media > limits.max_media or n_sections > limits.max_sections or n_forks > limits.max_forks) return error.Corrupt;
++        // version 2 points are text points (no build wrote one with media; its ids name no scheme: foreign), version 3
++        // points hold pictures and their raw ids
++        if (ver == text_version and n_media > 0) return error.Foreign;
++        if (ver == version and (n_media == 0 or !m.flags.has_raw)) return error.Corrupt;
+         const ids_want = @as(u64, m.at) * 4 * (if (m.flags.has_raw) @as(u64, 2) else 1);
+         if (m.ids_bytes != ids_want or m.small_bytes > limits.max_small_bytes) return error.Corrupt;
+-        const total = header_bytes + @as(u64, n_forks) * fork_bytes + @as(u64, n_media) * media_bytes +
++        const total = header_bytes + @as(u64, n_forks) * fork_bytes + @as(u64, n_media) * (if (ver == version) @as(u64, media_bytes) else media_v2_bytes) +
+             @as(u64, n_blocks) * block_ref_bytes + @as(u64, n_sections) * section_bytes + trailer_bytes;
+         if (raw.len != total) return error.Corrupt;
+         const body = raw.len - trailer_bytes;
+@@ -488,11 +553,17 @@ pub const Manifest = struct {
+         }
+         const media = try gpa.alloc(Media, n_media);
+         errdefer gpa.free(media);
++        var media_end: u64 = 0;
+         for (media) |*x| {
+             x.start = r.get(u32);
+             x.len = r.get(u32);
++            const kind = r.get(u32);
++            const scheme = r.get(u32);
+             x.digest = r.take(32)[0..32].*;
+-            if (x.len == 0 or x.start >= m.at or @as(u64, x.start) + x.len > limits.max_tokens) return error.Corrupt;
++            if (kind != media_picture or scheme != picture_scheme) return error.Foreign;
++            // in order, not overlapping, starting inside the point (one may run past its cut), inside the window
++            if (x.len == 0 or x.start < media_end or x.start >= m.at or @as(u64, x.start) + x.len > limits.max_tokens) return error.Corrupt;
++            media_end = @as(u64, x.start) + x.len;
+         }
+         // (a part-less point in an owner-sharded store, or a foreign block size where none is kept: damaged)
+         const full = limits.fullBlockBytes(m.lineage.part) orelse return error.Corrupt;
+@@ -766,3 +837,175 @@ test "a huge count in a forged header with a valid CRC is refused before allocat
+     var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+     try testing.expectError(error.Corrupt, Manifest.parse(failing.allocator(), raw, compat, l));
+ }
++
++// -- pictures (version 3) --------------------------------------------------------------------------------------------
++
++/// `sampleManifest` without media: a text point (version 2).
++fn textManifest(gpa: Allocator, l: Limits) !Manifest {
++    var m = try sampleManifest(gpa, l);
++    gpa.free(m.media);
++    m.media = &.{};
++    m.flags.has_raw = false;
++    m.ids_bytes = 37 * 4;
++    return m;
++}
++
++test "manifest versions: a text point is written and read as version 2, a point with pictures as version 3" {
++    const gpa = testing.allocator;
++    const l: Limits = .{ .max_tokens = 1024, .block_tokens = 16, .block_bytes = 4096, .max_small_bytes = 1 << 20 };
++    const compat: Digest = @splat(0x5a);
++    // text: version 2, 40-byte media entries never written, the bytes those of the format before version 3
++    var t = try textManifest(gpa, l);
++    defer t.deinit(gpa);
++    const traw = try t.encode(gpa, compat);
++    defer gpa.free(traw);
++    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, traw[8..12], .little));
++    var tback = try Manifest.parse(gpa, traw, compat, l);
++    tback.deinit(gpa);
++    // pictures: version 3, 48-byte entries (kind, scheme)
++    var p = try sampleManifest(gpa, l);
++    defer p.deinit(gpa);
++    const praw = try p.encode(gpa, compat);
++    defer gpa.free(praw);
++    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, praw[8..12], .little));
++    try testing.expectEqual(traw.len + media_bytes, praw.len);
++    var pback = try Manifest.parse(gpa, praw, compat, l);
++    defer pback.deinit(gpa);
++    try testing.expect(pback.media[0].eql(p.media[0]));
++    // the compat digest names the namespace, not the manifest version: version 3 keeps a store's text points
++    try testing.expectEqual(@as(u32, 2), namespace_version);
++
++    const Fix = struct {
++        fn crc(raw: []u8) void {
++            const body = raw.len - trailer_bytes;
++            std.mem.writeInt(u32, raw[body..][0..4], crc32(raw[0..body]), .little);
++        }
++    };
++    const bad = try gpa.dupe(u8, praw);
++    defer gpa.free(bad);
++    // a version 2 manifest with media (the scheme of its ids unknown): foreign, even with its CRC made good
++    std.mem.writeInt(u32, bad[8..12], 2, .little);
++    Fix.crc(bad);
++    try testing.expectError(error.Foreign, Manifest.parse(gpa, bad, compat, l));
++    // a version 3 manifest without media, or without raw ids: corrupt
++    const t3 = try gpa.dupe(u8, traw);
++    defer gpa.free(t3);
++    std.mem.writeInt(u32, t3[8..12], 3, .little);
++    Fix.crc(t3);
++    try testing.expectError(error.Corrupt, Manifest.parse(gpa, t3, compat, l));
++    @memcpy(bad, praw);
++    const flags_at = 8 + 4 + 4 + 32 + 32 + 4 + 4;
++    var fl: Flags = @bitCast(std.mem.readInt(u32, bad[flags_at..][0..4], .little));
++    fl.has_raw = false;
++    std.mem.writeInt(u32, bad[flags_at..][0..4], @bitCast(fl), .little);
++    Fix.crc(bad);
++    try testing.expectError(error.Corrupt, Manifest.parse(gpa, bad, compat, l));
++    // another kind or scheme: foreign; a span out of order or past the window: corrupt
++    const media_at = header_bytes + p.lineage.forks.len * fork_bytes;
++    @memcpy(bad, praw);
++    std.mem.writeInt(u32, bad[media_at + 8 ..][0..4], 2, .little);
++    Fix.crc(bad);
++    try testing.expectError(error.Foreign, Manifest.parse(gpa, bad, compat, l));
++    @memcpy(bad, praw);
++    std.mem.writeInt(u32, bad[media_at + 12 ..][0..4], 2, .little);
++    Fix.crc(bad);
++    try testing.expectError(error.Foreign, Manifest.parse(gpa, bad, compat, l));
++    @memcpy(bad, praw);
++    std.mem.writeInt(u32, bad[media_at + 4 ..][0..4], 2000, .little);
++    Fix.crc(bad);
++    try testing.expectError(error.Corrupt, Manifest.parse(gpa, bad, compat, l));
++    @memcpy(bad, praw);
++    std.mem.writeInt(u32, bad[media_at..][0..4], 37, .little); // at the cut, not before it
++    Fix.crc(bad);
++    try testing.expectError(error.Corrupt, Manifest.parse(gpa, bad, compat, l));
++}
++
++test "manifest with pictures: two overlapping spans are refused, a span straddling the cut is not" {
++    const gpa = testing.allocator;
++    const l: Limits = .{ .max_tokens = 1024, .block_tokens = 16, .block_bytes = 4096, .max_small_bytes = 1 << 20 };
++    const compat: Digest = @splat(0x5b);
++    var m = try sampleManifest(gpa, l);
++    defer m.deinit(gpa);
++    gpa.free(m.media);
++    const media = try gpa.alloc(Media, 2);
++    m.media = media;
++    media[0] = .{ .start = 4, .len = 3, .digest = @splat(9) };
++    media[1] = .{ .start = 30, .len = 20, .digest = @splat(8) }; // [30, 50) runs past the cut at 37
++    const raw = try m.encode(gpa, compat);
++    defer gpa.free(raw);
++    var back = try Manifest.parse(gpa, raw, compat, l);
++    back.deinit(gpa);
++    media[1].start = 5; // inside the first span
++    const raw2 = try m.encode(gpa, compat);
++    defer gpa.free(raw2);
++    try testing.expectError(error.Corrupt, Manifest.parse(gpa, raw2, compat, l));
++}
++
++test "manifest fuzz: random edits of a version 3 manifest never crash and never parse into an inconsistent point" {
++    const gpa = testing.allocator;
++    const l: Limits = .{ .max_tokens = 1024, .block_tokens = 16, .block_bytes = 4096, .max_small_bytes = 1 << 20 };
++    const compat: Digest = @splat(0x5c);
++    var m = try sampleManifest(gpa, l);
++    defer m.deinit(gpa);
++    const raw = try m.encode(gpa, compat);
++    defer gpa.free(raw);
++    var prng = std.Random.DefaultPrng.init(0x7069637475726573);
++    const rnd = prng.random();
++    const buf = try gpa.alloc(u8, raw.len + 64);
++    defer gpa.free(buf);
++    var parsed: usize = 0;
++    for (0..20_000) |_| {
++        // a copy, a few random bytes changed (in the media entries half the time), a random length, the CRC made good
++        // half the time so the field checks run, not only the trailer's
++        var n = raw.len;
++        @memcpy(buf[0..n], raw);
++        const media_at = header_bytes + m.lineage.forks.len * fork_bytes;
++        for (0..rnd.intRangeAtMost(usize, 1, 4)) |_| {
++            const i = if (rnd.boolean()) media_at + rnd.uintLessThan(usize, media_bytes) else rnd.uintLessThan(usize, n);
++            buf[i] = rnd.int(u8);
++        }
++        if (rnd.uintLessThan(u8, 8) == 0) n = rnd.uintLessThan(usize, raw.len + 64);
++        if (n >= trailer_bytes and rnd.boolean()) {
++            const body = n - trailer_bytes;
++            std.mem.writeInt(u32, buf[body..][0..4], crc32(buf[0..body]), .little);
++            std.mem.writeInt(u32, buf[body + 4 ..][0..4], 0, .little);
++        }
++        var got = Manifest.parse(gpa, buf[0..n], compat, l) catch continue;
++        defer got.deinit(gpa);
++        parsed += 1;
++        // whatever parses is consistent: spans in order inside the point and the window, version and media agree
++        var end: u64 = 0;
++        for (got.media) |x| {
++            try testing.expect(x.len > 0 and x.start >= end and x.start < got.at and @as(u64, x.start) + x.len <= l.max_tokens);
++            end = @as(u64, x.start) + x.len;
++        }
++        try testing.expect(got.media.len == 0 or got.flags.has_raw);
++        try testing.expect(got.at > 0 and got.at <= l.max_tokens and got.blocks.len == std.math.divCeil(u32, got.at, 16) catch unreachable);
++    }
++    try testing.expect(parsed > 0); // (the CRC-made-good edits of unchecked bytes, e.g. a digest, still parse)
++}
++
++test "media ids: keyed ids derive from the digest, raw ids hold model ids there and equal the keyed ones elsewhere" {
++    const d: Digest = @splat(3);
++    var keyed = [_]u32{ 5, 6, 0, 0, 0, 7, 0, 0 };
++    var raw = [_]u32{ 5, 6, 99, 99, 99, 7, 99, 99 };
++    for (2..5) |i| keyed[i] = pictureId(&d, @intCast(i - 2));
++    for (6..8) |i| keyed[i] = pictureId(&d, @intCast(i - 6)); // a second picture straddling the end
++    const m = [_]Media{ .{ .start = 2, .len = 3, .digest = d }, .{ .start = 6, .len = 10, .digest = d } };
++    try testing.expect(mediaIds(&keyed, &raw, &m));
++    try testing.expect(!mediaIds(&keyed, null, &m)); // pictures need their raw ids
++    try testing.expect(!mediaIds(&keyed, &raw, m[0..1])); // a picture the media does not name
++    try testing.expect(!mediaIds(&keyed, &raw, &.{ m[1], m[0] })); // out of order
++    try testing.expect(!mediaIds(&keyed, &raw, &.{ m[0], .{ .start = 4, .len = 1, .digest = d } })); // overlapping
++    var r2 = raw;
++    r2[0] = 4;
++    try testing.expect(!mediaIds(&keyed, &r2, &m)); // raw differs outside a picture
++    r2 = raw;
++    r2[3] = keyed[3];
++    try testing.expect(!mediaIds(&keyed, &r2, &m)); // a picture id where a model id belongs
++    var k2 = keyed;
++    k2[3] +%= 1;
++    try testing.expect(!mediaIds(&k2, &raw, &m)); // an id not made from the digest
++    try testing.expect(mediaIds(&.{ 1, 2, 3 }, null, &.{})); // text
++    try testing.expect(!mediaIds(&.{ 1, picture_ids, 3 }, null, &.{})); // a picture id without its media
++}
+diff --git a/zig/src/core/spill/store.zig b/zig/src/core/spill/store.zig
+index 795555cec8557002b627e5be3baf91946123f8c0..d6d9887aada4b3956726d67bd4cc28aec2b68243 100644
+--- a/zig/src/core/spill/store.zig
++++ b/zig/src/core/spill/store.zig
+@@ -730,6 +730,12 @@ pub const Store = struct {
+         var ch_owned = true;
+         defer if (ch_owned) gpa.free(ch);
+         if (!std.mem.eql(u8, &format.pointKeyChained(ch, keyed, l.block_tokens, m.media), &key)) return error.Corrupt;
++        if (m.media.len > 0) { // a point with pictures: its keyed and raw ids agree with its media (version 3)
++            const raw_ids = try gpa.alloc(u32, m.at);
++            defer gpa.free(raw_ids);
++            @memcpy(std.mem.sliceAsBytes(raw_ids), ids_raw[m.at * 4 ..][0 .. m.at * 4]);
++            if (!format.mediaIds(keyed, raw_ids, m.media)) return error.Corrupt;
++        }
+         const spans = try gpa.alloc(format.Span, m.blocks.len);
+         defer gpa.free(spans);
+         format.blockNames(m.lineage, ch, keyed, l.block_tokens, spans);
+@@ -1440,7 +1446,8 @@ pub const Store = struct {
+         if (k.raw) |r| if (r.len != k.keyed.len) return false;
+         if (k.media.len > l.max_media or k.sections.len > l.max_sections or k.lineage.forks.len > l.max_forks) return false;
+         if (l.fullBlockBytes(k.lineage.part) == null) return false; // (owner-sharded: every point names its part)
+-        for (k.media) |m| if (m.len == 0 or m.start >= k.keyed.len) return false;
++        // pictures: in order, inside the point, the keyed ids made from their digests and the raw ids beside them
++        if (!format.mediaIds(k.keyed, k.raw, k.media)) return false;
+         var total: u64 = 0;
+         for (k.sections) |sec| {
+             if (sec.name.len == 0 or sec.name.len > 32) return false;
+diff --git a/zig/src/core/spill/store_test.zig b/zig/src/core/spill/store_test.zig
+index 93483e297031a42a3c42ed94ee609654520ee33e..57ece3a890e836c728ecf1a2301d40b959b7953a 100644
+--- a/zig/src/core/spill/store_test.zig
++++ b/zig/src/core/spill/store_test.zig
+@@ -225,6 +225,7 @@ const KO = struct {
+     shared: bool = false,
+     group: u64 = 0,
+     media: []const format.Media = &.{},
++    raw: ?[]const u32 = null, // with media: the raw ids (the same length as the keyed ones)
+     capture: bool = true,
+ };
+ 
+@@ -233,7 +234,7 @@ fn keepIds(h: *H, ids: []const u32, o: KO) store.KeepResult {
+     const at = ids.len;
+     const tail_tokens = at % block_tokens;
+     const r = h.s.keep(.{
+-        .keyed = ids, .media = o.media, .lineage = o.lineage, .shared = o.shared, .group = o.group, .sections = &secs,
++        .keyed = ids, .raw = if (o.raw) |r| r[0..ids.len] else null, .media = o.media, .lineage = o.lineage, .shared = o.shared, .group = o.group, .sections = &secs,
+         .tail_bytes = tail_tokens * bpt, .source = .{ .id = o.source, .generation = o.gen },
+     });
+     if (r == .queued) {
+@@ -1343,8 +1344,26 @@ fn checkLookup(gpa: Allocator) !void {
+     const ids = try idsOf(gpa, 5 * block_tokens, 1700);
+     defer gpa.free(ids);
+     const m = [_]format.Media{.{ .start = 3, .len = 4, .digest = @splat(1) }};
+-    const k2 = try write(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m });
+-    const k4 = try write(h, ids[0 .. 4 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m });
++    const raw = try gpa.dupe(u32, ids);
++    defer gpa.free(raw);
++    for (3..7) |i| { // the picture's keyed ids made from its digest, its raw ids the placeholder
++        ids[i] = format.pictureId(&m[0].digest, @intCast(i - 3));
++        raw[i] = 99;
++    }
++    // a point whose ids do not agree with its media is refused at keep (and would be at recovery)
++    try ensure(keepIds(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m }) == .invalid, @src());
++    var forged = m;
++    forged[0].digest[20] ^= 1; // (the first 8 bytes seed the ids: the same ids, another picture past them)
++    const kf = try write(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &forged, .raw = raw });
++    var seeded = m;
++    seeded[0].digest[0] ^= 1; // (a seed byte changed: its ids no longer derive from it)
++    try ensure(keepIds(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &seeded, .raw = raw }) == .invalid, @src());
++    var placeholder = try gpa.dupe(u32, raw);
++    defer gpa.free(placeholder);
++    placeholder[4] = ids[4]; // a raw id inside the picture that is a picture's keyed id, not a model id
++    try ensure(keepIds(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m, .raw = placeholder }) == .invalid, @src());
++    const k2 = try write(h, ids[0 .. 2 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m, .raw = raw });
++    const k4 = try write(h, ids[0 .. 4 * block_tokens], .{ .lineage = lin(70), .source = 70, .media = &m, .raw = raw });
+     const q = struct {
+         fn at(hh: *H, x: store.Query) ?Digest {
+             return if (hh.s.lookup(x)) |hit| hit.key else null;
+@@ -1357,11 +1376,81 @@ fn checkLookup(gpa: Allocator) !void {
+     var other = m;
+     other[0].digest[0] = 2;
+     try ensure(q.at(h, .{ .keyed = ids, .media = &other, .max_at = 80 }) == null, @src());
++    // the same shortened ids from another payload (only the full digest tells them apart): its own point, never m's
++    try ensure(std.meta.eql(q.at(h, .{ .keyed = ids, .media = &forged, .max_at = 80 }), kf), @src());
++    try ensure(!std.meta.eql(kf, k2), @src());
+     try ensure(q.at(h, .{ .keyed = ids, .media = &.{}, .max_at = 80 }) == null, @src());
+     var changed = try gpa.dupe(u32, ids);
+     defer gpa.free(changed);
+     changed[20] +%= 1;
+     try ensure(std.meta.eql(q.at(h, .{ .keyed = changed, .media = &m, .max_at = 80 }), null), @src());
++    // across a restart: the points with pictures recover (their ids checked against their media) and match as before
++    try h.reopen();
++    try ensure(std.meta.eql(q.at(h, .{ .keyed = ids, .media = &m, .max_at = 70 }), k4), @src());
++    try ensure(std.meta.eql(q.at(h, .{ .keyed = ids, .media = &forged, .max_at = 80 }), kf), @src());
++    try ensure(q.at(h, .{ .keyed = ids, .media = &other, .max_at = 80 }) == null, @src());
++}
++
++/// Replace a point file's bytes (same name, truncated first).
++fn rewritePointFile(h: *H, key: Digest, suffix: []const u8, bytes: []const u8) !void {
++    var nb: [96]u8 = undefined;
++    var zb: [96]u8 = undefined;
++    const name = try std.fmt.bufPrintSentinel(&zb, "{s}", .{pointFile(&nb, key, suffix)}, 0);
++    const fd = c.openat(h.s.points_fd, name, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true }, @as(c.mode_t, 0));
++    if (fd < 0) return CheckFailed;
++    defer _ = c.close(fd);
++    if (c.pwrite(fd, bytes.ptr, bytes.len, 0) != @as(isize, @intCast(bytes.len))) return CheckFailed;
++}
++
++/// A picture point's raw ids altered on disk with every CRC made good (the .ids file's in the manifest, the
++/// manifest's trailer): raw ids are not in the point key, so only recovery's `format.mediaIds` check catches it. A
++/// raw id inside the picture made a picture id, and a raw id outside it changed, each drop their point; an untouched
++/// picture point beside them recovers and still matches.
++fn checkPictureRecovery(gpa: Allocator) !void {
++    const h = try H.init(gpa, .{ .tag = "picrecover", .turns = 0 });
++    defer h.deinit();
++    const m = [_]format.Media{.{ .start = 3, .len = 4, .digest = @splat(7) }};
++    const n = 2 * block_tokens;
++    var keys: [3]Digest = undefined;
++    var keyed: [3][]u32 = undefined;
++    for (0..3) |i| {
++        keyed[i] = try idsOf(gpa, n, 1900 + i);
++        const raw = try gpa.dupe(u32, keyed[i]);
++        defer gpa.free(raw);
++        for (3..7) |j| {
++            keyed[i][j] = format.pictureId(&m[0].digest, @intCast(j - 3));
++            raw[j] = 99;
++        }
++        keys[i] = try write(h, keyed[i], .{ .lineage = lin(@intCast(80 + i)), .source = 80 + i, .media = &m, .raw = raw });
++    }
++    defer for (keyed) |k| gpa.free(k);
++    for (0..2) |i| {
++        var nb: [96]u8 = undefined;
++        var zb: [96]u8 = undefined;
++        const ids_raw = try fsio.readSmall(gpa, h.s.points_fd, try std.fmt.bufPrintSentinel(&zb, "{s}", .{pointFile(&nb, keys[i], ".ids")}, 0), 1 << 20);
++        defer gpa.free(ids_raw);
++        try ensure(ids_raw.len >= 2 * n * 4, @src());
++        const raw_ids: []align(1) u32 = std.mem.bytesAsSlice(u32, ids_raw[n * 4 ..][0 .. n * 4]);
++        if (i == 0) raw_ids[4] = keyed[i][4] else raw_ids[10] +%= 1; // a picture id inside, another model id outside
++        try rewritePointFile(h, keys[i], ".ids", ids_raw);
++        const man = try fsio.readSmall(gpa, h.s.points_fd, try std.fmt.bufPrintSentinel(&zb, "{s}", .{pointFile(&nb, keys[i], ".man")}, 0), 1 << 20);
++        defer gpa.free(man);
++        var mf = try format.Manifest.parse(gpa, man, h.cfg.compat, h.cfg.limits);
++        defer mf.deinit(gpa);
++        const same = try mf.encode(gpa, h.cfg.compat);
++        defer gpa.free(same);
++        try ensure(std.mem.eql(u8, same, man), @src()); // (the re-encoding is the manifest's own bytes)
++        mf.ids_crc = format.crc32(ids_raw);
++        const fixed = try mf.encode(gpa, h.cfg.compat);
++        defer gpa.free(fixed);
++        try rewritePointFile(h, keys[i], ".man", fixed);
++    }
++    try h.reopen();
++    try ensure(h.s.counts().recovered_dropped == 2, @src());
++    try ensure(!h.s.presence(keys[0]) and !h.s.presence(keys[1]) and h.s.presence(keys[2]), @src());
++    for (0..2) |i| try ensure(h.s.lookup(.{ .keyed = keyed[i], .media = &m, .max_at = 80 }) == null, @src());
++    const hit = h.s.lookup(.{ .keyed = keyed[2], .media = &m, .max_at = 80 }) orelse return CheckFailed;
++    try ensure(std.mem.eql(u8, &hit.key, &keys[2]), @src());
+ }
+ 
+ /// Disk faults on the write path: ENOSPC fails the point and leaves no temporary file or staging behind; short
+@@ -1642,6 +1731,7 @@ const checks = [_]Check{
+     .{ .name = "owner", .f = checkOwner },
+     .{ .name = "prune", .f = checkPrune },
+     .{ .name = "lookup", .f = checkLookup },
++    .{ .name = "picture recovery", .f = checkPictureRecovery },
+     .{ .name = "write faults", .f = checkWriteFaults },
+     .{ .name = "cancel read", .f = checkCancelRead },
+     .{ .name = "fair reads", .f = checkFairReads },
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 48032ead6c4ee6bfc0f06a37b2b6bb174b293db3..a18a7f92bd6bec8fd9d93eb6f4679d74359b7191 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -213,6 +213,67 @@ fn markEnds(marks: []const u32, at: usize) bool {
+     return false;
+ }
+ 
++// -- pictures in a resumed pass (recipe 0006; spill v2 restores take the same path as memory resumes) ------------------
++
++/// A picture's span [at, at + tokens) of the runtime sequence `seq` (the prompt's ids, each the placeholder `image_id`
++/// there) made dead: negative, so no Engram n-gram reaches into or across it.
++pub fn markPicture(seq: []i32, at: usize, tokens: usize, image_id: u32) !void {
++    if (tokens == 0 or at + tokens > seq.len) return error.BadImageSpan;
++    for (seq[at..][0..tokens]) |*q| {
++        if (q.* != @as(i64, image_id)) return error.BadImageSpan;
++        q.* = -1;
++    }
++}
++
++/// Whether a pass resuming at `resume_at` needs a picture's rows (the tower's run over it): a picture wholly before the
++/// cut is in the resumed state's rows and needs none; one straddling or after it gets all of its rows, of which the
++/// chunks embed only the positions at or past the cut (prompt.overlap).
++pub fn pictureNeedsRows(at: usize, tokens: usize, resume_at: usize) bool {
++    return at + tokens > resume_at;
++}
++
++/// A resumed sequence checked against its request: `ids` everywhere but the pictures' spans, which are negative
++/// (spill_state.checkEngramSeq over the request's own pictures). The tests' oracle for what markPicture builds; a
++/// restored resume needs no run of it (the pass's own comment says why).
++pub fn checkPictureSeq(gpa: std.mem.Allocator, seq: []const i32, ids: []const u32, images: []const lanes.stream.Image) !void {
++    const sp = try gpa.alloc([2]usize, images.len);
++    defer gpa.free(sp);
++    for (images, sp) |img, *x| x.* = .{ img.at, img.tokens };
++    try model.Model.spill.checkEngramSeq(seq, ids, sp);
++}
++
++test "pictures in a resumed pass: spans dead in the sequence, rows only for those the cut does not hold, the Engram check" {
++    const gpa = std.testing.allocator;
++    const ph: u32 = 129264;
++    // a prompt of 40 tokens: a picture at [4, 10), one straddling a cut at 16 ([14, 20)), one after it at [30, 34)
++    var ids: [40]u32 = undefined;
++    for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i);
++    const imgs = [_]lanes.stream.Image{ .{ .at = 4, .tokens = 6, .bytes = "" }, .{ .at = 14, .tokens = 6, .bytes = "" }, .{ .at = 30, .tokens = 4, .bytes = "" } };
++    for (imgs) |img| @memset(ids[img.at..][0..img.tokens], ph);
++    var seq: [40]i32 = undefined;
++    for (&seq, ids) |*q, id| q.* = @intCast(id);
++    for (imgs) |img| try markPicture(&seq, img.at, img.tokens, ph);
++    try checkPictureSeq(gpa, &seq, &ids, &imgs);
++    // resuming at 16: the first picture is in the state, the straddling one and the later one run the tower
++    try std.testing.expect(!pictureNeedsRows(4, 6, 16));
++    try std.testing.expect(pictureNeedsRows(14, 6, 16));
++    try std.testing.expect(pictureNeedsRows(30, 4, 16));
++    try std.testing.expect(!pictureNeedsRows(14, 2, 16)); // (ending exactly at the cut: wholly before it)
++    try std.testing.expect(pictureNeedsRows(4, 6, 0)); // a fresh pass: every picture
++    // a sequence whose picture positions were not made dead, or a text id changed: refused
++    var live = seq;
++    live[15] = @intCast(ph);
++    try std.testing.expectError(error.EngramSeqMismatch, checkPictureSeq(gpa, &live, &ids, &imgs));
++    var other = seq;
++    other[12] += 1;
++    try std.testing.expectError(error.EngramSeqMismatch, checkPictureSeq(gpa, &other, &ids, &imgs));
++    // a picture span that does not hold the placeholder, or runs past the prompt: refused before anything runs
++    var bad = seq;
++    try std.testing.expectError(error.BadImageSpan, markPicture(&bad, 10, 3, ph));
++    try std.testing.expectError(error.BadImageSpan, markPicture(&bad, 38, 4, ph));
++    try std.testing.expectError(error.BadImageSpan, markPicture(&bad, 4, 0, ph));
++}
++
+ /// Room left past a kept state's extent while placements fit so, for its conversation's next turn to resume in place.
+ pub const growth_rows = 16 * model.chunk_rows;
+ 
+@@ -763,12 +824,8 @@ pub const Lanes = struct {
+             // dead in the sequence for Engram's n-grams, but it needs no rows and no run of the tower)
+             const resume_at: usize = if (kept) |sn| sn.at else 0;
+             for (s.images) |img| {
+-                if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
+-                for (seq.items[img.at..][0..img.tokens]) |*q| {
+-                    if (q.* != @as(i64, image_id)) return error.BadImageSpan;
+-                    q.* = -1;
+-                }
+-                if (@as(usize, img.at) + img.tokens <= resume_at) continue;
++                try markPicture(seq.items, img.at, img.tokens, image_id);
++                if (!pictureNeedsRows(img.at, img.tokens, resume_at)) continue;
+                 if (img.rows) {
+                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
+                     try rows.appendSlice(gpa, img.bytes);
+@@ -780,6 +837,11 @@ pub const Lanes = struct {
+                 try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
+                 at_row += img.tokens;
+             }
++            // a state read back from disk resumes with this request's own sequence, built above from its ids and its
++            // pictures' spans (the follower gets it at fill_begin). It is the point's by construction: the tier hit only
++            // because the point's media name exactly these spans (lane_host.tierMedia binds Request.cache_media to
++            // Request.images) and its keyed ids derive from them (format.mediaIds), so no check here could fail;
++            // checkPictureSeq is the tests' oracle for that sequence.
+         }
+         if (try self.begin(.fill_begin)) {
+             try self.wire.int(gpa, u32, @intCast(slot));
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index 3e21f42b214964cbaca231c05f4c5374ef0d8b0b..4a790c2a7afed51672ca062ea6d3d7aa179265ec 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -66,6 +66,10 @@ const Job = struct {
+     entry: ?*pcache.Entry = null,
+     lineage: []pcache.Fork = &.{},
+     restored: u32 = 0,
++    // the ids the cache keys it by (the prompt; with pictures each one's positions made from its rows' SHA-256, as the
++    // server makes them from its payload: recipe 0006) and each picture's identity for the tier
++    key: []const u32 = &.{},
++    media: []const pcache.Media = &.{},
+ };
+ 
+ /// The prompt cache's keep at a chunk end the pass reached (Stream.reuse.hook), with the lane host's lineage rule.
+@@ -73,7 +77,8 @@ fn keepHook(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+     const j: *Job = @ptrCast(@alignCast(ptr));
+     const st = j.store orelse return;
+     const e = if (s.reuse_failed) null else j.entry;
+-    _ = st.keepWith(j.req.prompt, at, s, &.{}, .{ .lineage = j.lineage, .parent = if (e) |x| x.point else null, .fork = if (e) |x| x.at else 0 });
++    const pics = j.media.len > 0;
++    _ = st.keepWith(j.key, at, s, &.{}, .{ .lineage = j.lineage, .parent = if (e) |x| x.point else null, .fork = if (e) |x| x.at else 0, .images = pics, .media = j.media, .raw = if (pics) j.req.prompt else &.{} });
+ }
+ 
+ /// The tier's writes drained (bounded), then every memory state forgotten: the next hit comes from disk.
+@@ -329,11 +334,13 @@ pub fn main(init: std.process.Init) !u8 {
+             const j = &jobs[admitted];
+             j.* = .{ .req = r, .index = admitted, .proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 }), .stream = undefined, .began = std.Io.Timestamp.now(io, .awake), .store = store };
+             var reuse: lanes.stream.Reuse = .{};
++            const images = try imageRows(a, io, r.images, m.cfg.hidden);
+             if (store) |st| {
++                try cacheKey(a, r.prompt, images, j);
+                 if (r.drop_memory) dropMemory(io, st);
+                 // a durable point longer than memory: restored first (the lane host parks the request meanwhile)
+-                const pr = st.probe(r.prompt, &.{});
+-                if (pr.durable) |p| if (st.restoreBegin(p, r.prompt)) |rs| {
++                const pr = st.probeMedia(j.key, &.{}, images.len > 0, j.media);
++                if (pr.durable) |p| if (st.restoreBegin(p, j.key)) |rs| {
+                     var got = st.restorePoll(rs, 40 * std.time.ns_per_ms);
+                     while (got == .pending) : (got = st.restorePoll(rs, 40 * std.time.ns_per_ms)) {
+                         if (core.live.items.len > 0) try core.step();
+@@ -341,7 +348,7 @@ pub fn main(init: std.process.Init) !u8 {
+                     if (got == .adopted) j.restored = p.at;
+                     try w.print("{{\"rank\": 0, \"request\": {d}, \"restore\": \"{s}\", \"at\": {d}}}\n", .{ admitted, @tagName(got), p.at });
+                 } else |err| try w.print("{{\"rank\": 0, \"request\": {d}, \"restore_refused\": \"{s}\"}}\n", .{ admitted, @errorName(err) });
+-                const look = try st.lookup(a, r.prompt, @intCast(r.prompt.len), &.{}, &.{});
++                const look = try st.lookup(a, j.key, @intCast(r.prompt.len), &.{}, &.{});
+                 j.entry = look.entry;
+                 j.lineage = try st.passLineage(look.entry);
+                 reuse = .{ .saved = if (look.entry) |e| e.saved else null, .at = if (look.entry) |e| e.at else 0, .marks = look.marks, .hook = .{ .ptr = j, .at = keepHook } };
+@@ -349,7 +356,7 @@ pub fn main(init: std.process.Init) !u8 {
+             j.stream = try lanes.Stream.init(gpa, .{
+                 .id = r.name,
+                 .prompt = r.prompt,
+-                .images = try imageRows(a, io, r.images, m.cfg.hidden),
++                .images = images,
+                 .max_new = r.max_tokens,
+                 .eos = &eos,
+                 .sampling = if (r.temperature > 0) .{ .seed = r.seed orelse 0, .temperature = r.temperature, .top_k = r.top_k, .top_p = r.top_p } else null,
+@@ -363,7 +370,7 @@ pub fn main(init: std.process.Init) !u8 {
+                 try w.flush();
+                 return 1;
+             };
+-            if (store) |st| if (j.entry) |e| st.resumed(e, r.prompt, !j.stream.reuse_failed);
++            if (store) |st| if (j.entry) |e| st.resumed(e, j.key, !j.stream.reuse_failed);
+             try w.print("{{\"rank\": 0, \"request\": {d}, \"name\": \"{s}\", \"prompt_tokens\": {d}, \"cached\": {d}, \"restored\": {d}, \"prefill_s\": {d:.2}}}\n", .{ j.index, r.name, r.prompt.len, j.stream.cached, j.restored, seconds(j.began, io) });
+             try w.flush();
+         }
+@@ -428,7 +435,7 @@ pub fn main(init: std.process.Init) !u8 {
+         const x = st.stats;
+         const c = (st.tierCounts() orelse pcache.RankCounts{}).slice();
+         const t: pcache.TierCounts = if (c.len > 0) c[0] else .{};
+-        try w.print("{{\"rank\": 0, \"spill\": {{\"disk_lookups\": {d}, \"disk_hits\": {d}, \"disk_hits_committed\": {d}, \"restores_failed\": {d}, \"restored_tokens\": {d}, \"writes_enqueued\": {d}, \"points\": {d}, \"committed\": {d}, \"cancelled\": {d}, \"failed\": {d}, \"presence_refused\": {d}, \"memory_hits\": {d}}}}}\n", .{ x.disk_lookups, x.disk_hits, x.disk_hits_committed, x.restores_failed, x.restored_tokens, x.writes_enqueued, t.points, t.writes_committed, t.writes_cancelled, t.writes_failed, t.presence_refused, st.counts.hits });
++        try w.print("{{\"rank\": 0, \"spill\": {{\"disk_lookups\": {d}, \"disk_hits\": {d}, \"disk_hits_committed\": {d}, \"restores_failed\": {d}, \"restored_tokens\": {d}, \"writes_enqueued\": {d}, \"points\": {d}, \"committed\": {d}, \"cancelled\": {d}, \"failed\": {d}, \"presence_refused\": {d}, \"memory_hits\": {d}, \"pictures_kept\": {d}, \"pictures_refused\": {d}}}}}\n", .{ x.disk_lookups, x.disk_hits, x.disk_hits_committed, x.restores_failed, x.restored_tokens, x.writes_enqueued, t.points, t.writes_committed, t.writes_cancelled, t.writes_failed, t.presence_refused, st.counts.hits, t.pictures_kept, t.pictures_refused });
+     }
+     try w.print("{{\"rank\": 0, \"requests\": {d}, \"tokens\": {d}, \"steps\": {d}, \"shared_rounds\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"seconds\": {d:.2}, \"all_equal\": {}}}\n", .{ reqs.len, tokens_out, core.steps, core.shared_rounds, core.drafted, core.accepted, total_s, all_equal });
+     try w.flush();
+@@ -439,6 +446,23 @@ fn seconds(t: std.Io.Timestamp, io: std.Io) f64 {
+     return @as(f64, @floatFromInt(t.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
+ }
+ 
++/// The cache key of a request with pictures (recipe 0006, the server's rule with the rows as the payload): each
++/// picture's positions the ids made from the SHA-256 of its rows, and its identity for the tier; the prompt without.
++fn cacheKey(a: std.mem.Allocator, prompt: []const u32, images: []const lanes.stream.Image, j: *Job) !void {
++    j.key = prompt;
++    if (images.len == 0) return;
++    const key = try a.dupe(u32, prompt);
++    const media = try a.alloc(pcache.Media, images.len);
++    for (images, media) |img, *md| {
++        if (img.tokens == 0 or @as(usize, img.at) + img.tokens > key.len) return error.BadImageSpan;
++        md.* = .{ .start = img.at, .len = img.tokens, .digest = undefined };
++        std.crypto.hash.sha2.Sha256.hash(img.bytes, &md.digest, .{});
++        for (key[img.at..][0..img.tokens], 0..) |*id, k| id.* = pcache.pictureId(&md.digest, @intCast(k));
++    }
++    j.key = key;
++    j.media = media;
++}
++
+ /// A request's image spans with their rows read (the files kept for the run).
+ fn imageRows(a: std.mem.Allocator, io: std.Io, imgs: []const ImageRows, hidden: usize) ![]const lanes.stream.Image {
+     const out = try a.alloc(lanes.stream.Image, imgs.len);
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 4d5f05b0f3d5e61d752e7b1da28021a5d7520e62..c63efef4a7a49f7e96f41108eae2bead66312055 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -411,6 +411,7 @@ pub fn spillSettings(dir: []const u8, gib: f64, min_free_gib: f64, quota: f64, m
+     var s: spill_tier.Settings = .{ .dir = dir, .gib = gib, .min_free_gib = min_free_gib, .quota = quota, .min_tokens = min_tokens, .turns = turns, .flush_ms = flush_ms };
+     if (getenv("TF_DS_SPILL_STAGING_MIB")) |v| s.staging_mib = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadSpillSetting;
+     if (s.staging_mib < spill_tier.min_staging_mib) return error.BadSpillSetting;
++    s.image_cache = spill_tier.Settings.imageCache(getenv("TF_DS_IMAGE_CACHE")); // (pictures' points: the fingerprint's reading)
+     return s;
+ }
+ 
+@@ -438,7 +439,7 @@ pub fn getenvFn(name: [:0]const u8) ?[]const u8 {
+ pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *model.Model, s: ?spill_tier.Settings, layout: *const model.Model.spill.StateLayout) !@import("fingerprint.zig").Exchange {
+     const envp = try rank_identity.Extra.envFor(getenvFn, s != null);
+     var fbuf: [256]u8 = undefined;
+-    const image_cache = if (getenv("TF_DS_IMAGE_CACHE")) |v| !std.mem.eql(u8, v, "0") else true;
++    const image_cache = spill_tier.Settings.imageCache(getenv("TF_DS_IMAGE_CACHE"));
+     // TF_DS_KV_SHARD's switches every rank's planner takes (carry, twins) and its part size: agreed in `features`
+     const kvs: kv_lanes.Settings = if (m.kvs != null) try kv_lanes.Settings.fromEnv(getenvFn) else .{ .carry = false, .twins = false };
+     const part_rows: u64 = if (m.caches.shard) |x| x.part else 0;
+@@ -457,7 +458,10 @@ pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *m
+         .rank_cache_sha = envp.rank_cache_sha,
+         .engram_revision = envp.engram_revision,
+         .features = features,
+-        .native_format = core.spill.format.version,
++        // the store's namespace version, not its newest format: version-3 points (pictures) came with no change to a
++        // version-2 text point, so a v3 reader shares round 2's namespace and its text points (a v2 reader drops v3
++        // manifests as foreign); a format change that breaks old points bumps namespace_version
++        .native_format = core.spill.format.namespace_version,
+         .chunk_rows = model.chunk_rows,
+         .replay_floor = prompt.replay_floor,
+         .idx_split = prompt.idx_split,
+diff --git a/zig/src/families/dsv41/spill_tier.zig b/zig/src/families/dsv41/spill_tier.zig
+index 6b26dced9388c94ae17aabee1fe8d93407448cb0..6254b3158eb091f0a8037867dcadfaa4867b224c 100644
+--- a/zig/src/families/dsv41/spill_tier.zig
++++ b/zig/src/families/dsv41/spill_tier.zig
+@@ -58,6 +58,9 @@ pub const Settings = struct {
+     restores: u32 = 2,
+     readers: u32 = 4,
+     direct: bool = true,
++    /// Pictures' points kept and found (TF_DS_IMAGE_CACHE, on unless "0"; the fingerprint's features carry it, so
++    /// every rank agrees). Off: a prompt with pictures keeps nothing on disk and finds nothing there.
++    image_cache: bool = true,
+ 
+     pub fn enabled(s: Settings) bool {
+         return s.dir.len > 0 and s.gib > 0;
+@@ -90,12 +93,18 @@ pub const Settings = struct {
+         s.quota = try num(f64, flag("--spill-quota") orelse env("TF_DS_SPILL_QUOTA"), s.quota);
+         s.staging_mib = try num(u32, flag("--spill-staging-mib") orelse env("TF_DS_SPILL_STAGING_MIB"), s.staging_mib);
+         s.turns = try num(u32, env("TF_SPILL_TURNS"), s.turns);
++        s.image_cache = imageCache(env("TF_DS_IMAGE_CACHE"));
+         s.flush_ms = try num(u32, env("TF_SPILL_FLUSH_MS"), s.flush_ms);
+         if (!std.math.isFinite(s.gib) or !std.math.isFinite(s.quota) or s.quota < 0 or s.quota > 1) return error.BadSpillSetting;
+         if (s.staging_mib < min_staging_mib) return error.BadSpillSetting;
+         return s;
+     }
+ 
++    /// TF_DS_IMAGE_CACHE's value: on unless "0" (the server's and the fingerprint's reading).
++    pub fn imageCache(v: ?[]const u8) bool {
++        return pc.imageCacheOn(v); // (the server's reading too: exactly "0" is off)
++    }
++
+     fn num(comptime T: type, text: ?[]const u8, default: T) !T {
+         const t = std.mem.trim(u8, text orelse return default, " ");
+         if (t.len == 0) return default;
+@@ -195,12 +204,83 @@ pub fn valuesCounts(n: u8, values: *const [rank_wire.max_stats]u64) pc.TierCount
+     return c;
+ }
+ 
++// -- pictures (recipe 0006's content keys, recorded with their full digests) -----------------------------------------
++
++comptime {
++    // the prompt cache's media are the store's, byte for byte (Want.media and Kept.media go to the store as they are)
++    std.debug.assert(@sizeOf(pc.Media) == @sizeOf(format.Media) and @alignOf(pc.Media) == @alignOf(format.Media));
++    std.debug.assert(@offsetOf(pc.Media, "start") == @offsetOf(format.Media, "start"));
++    std.debug.assert(@offsetOf(pc.Media, "len") == @offsetOf(format.Media, "len"));
++    std.debug.assert(@offsetOf(pc.Media, "digest") == @offsetOf(format.Media, "digest"));
++    std.debug.assert(pc.picture_ids == format.picture_ids);
++}
++
++/// The store's view of the prompt cache's media (the same bytes: checked above).
++pub fn asFormat(m: []const pc.Media) []const format.Media {
++    return @ptrCast(m);
++}
++
++/// Pictures a keep carries at most (rank_wire.max_keep_media: a keep with the most forks and pictures fits a frame); a
++/// point with more is not written.
++pub const max_note_media = rank_wire.max_keep_media;
++
++/// A point's pictures as the store records them: the prompt's media that start before the cut (a prefix of them),
++/// and the model id their raw positions hold (the placeholder, the same for every picture).
++pub const Pictures = struct { media: []const format.Media = &.{}, placeholder: u32 = 0 };
++
++/// The pictures of the point `keyed[0..at]` of a prompt whose pictures are `media` (all of them, in order) and whose
++/// model ids are `raw`: null when the ids do not agree with the media (a picture `media` does not name, ids not made
++/// from its digest, a raw id that is not the placeholder: the point is then not written), or past max_note_media.
++/// A point no picture reaches is a text point (`media` empty).
++pub fn pointPictures(keyed: []const u32, raw: []const u32, media: []const pc.Media, at: u32) ?Pictures {
++    if (keyed.len < at or !pc.mediaKeys(keyed, at, media)) return null;
++    var n: usize = 0;
++    while (n < media.len and media[n].start < at) n += 1;
++    if (n == 0) return .{};
++    if (n > max_note_media or raw.len < at) return null;
++    const placeholder = raw[media[0].start];
++    if (placeholder >= pc.picture_ids) return null;
++    var i: usize = 0;
++    for (media[0..n]) |m| {
++        if (!std.mem.eql(u32, keyed[i..m.start], raw[i..m.start])) return null;
++        const stop = @min(@as(usize, m.start) + m.len, at);
++        for (raw[m.start..stop]) |x| if (x != placeholder) return null;
++        i = stop;
++    }
++    if (!std.mem.eql(u32, keyed[i..at], raw[i..at])) return null;
++    return .{ .media = asFormat(media[0..n]), .placeholder = placeholder };
++}
++
++/// A follower's ids for the point rank 0 noted: from its own runtime sequence `seq` (Lanes.seqs: the model's ids,
++/// picture positions negative), each picture position's keyed id made from the noted digest (format.pictureId) and
++/// its raw id the noted placeholder. False when the negative positions are not exactly the noted pictures' before
++/// `at` (this rank's prompt is not rank 0's).
++pub fn followerIds(seq: []const i32, at: u32, media: []const format.Media, placeholder: u32, keyed: []u32, raw: ?[]u32) bool {
++    if (seq.len < at or keyed.len != at) return false;
++    if (raw) |r| if (r.len != at) return false;
++    var mi: usize = 0;
++    for (seq[0..at], 0..) |q, i| {
++        while (mi < media.len and i >= @as(u64, media[mi].start) + media[mi].len) mi += 1;
++        const in = mi < media.len and i >= media[mi].start;
++        if (in) {
++            if (q >= 0) return false;
++            keyed[i] = format.pictureId(&media[mi].digest, @intCast(i - media[mi].start));
++            if (raw) |r| r[i] = placeholder;
++        } else {
++            if (q < 0) return false;
++            keyed[i] = @intCast(q);
++            if (raw) |r| r[i] = @intCast(q);
++        }
++    }
++    return true;
++}
++
+ // -- one rank's side: its store, packing, staging events, writes and restores ----------------------------------------
+ 
+ /// What a keep stores on a rank.
+ pub const KeepArgs = struct {
+     keyed: []const u32, // [0, at)
+-    key: Digest, // format.pointKey(keyed[0..at], block tokens, no media): the caller's, hashed once
++    key: Digest, // format.pointKey(keyed[0..at], block tokens, media): the caller's, hashed once
+     at: u32,
+     base: usize, // the kept state's extent
+     snap: u64, // its Snap.id
+@@ -209,6 +289,9 @@ pub const KeepArgs = struct {
+     origin: ?format.Origin = null,
+     shared: bool = false,
+     group: u64 = 0,
++    /// With pictures before `at`: the prompt's model ids [0, at) and the pictures (a point's media, in order).
++    raw: ?[]const u32 = null,
++    media: []const format.Media = &.{},
+ };
+ 
+ pub const Kept = enum { queued, stored, refused };
+@@ -387,7 +470,7 @@ pub fn Side(comptime Dev: type) type {
+             self.writes.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
+             self.copies.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
+             const sections = [_]spill.store.SectionSpec{.{ .name = section_name, .len = self.layout.small_bytes }};
+-            const r = self.store.keep(.{ .keyed = k.keyed[0..at], .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = &sections, .source = .{ .id = k.snap, .generation = pin.stamp } });
++            const r = self.store.keep(.{ .keyed = k.keyed[0..at], .raw = if (k.raw) |x| x[0..at] else null, .media = k.media, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = &sections, .source = .{ .id = k.snap, .generation = pin.stamp } });
+             switch (r) {
+                 .stored => return .stored,
+                 .queued => |q| {
+@@ -763,10 +846,29 @@ pub fn Side(comptime Dev: type) type {
+ // -- the keep notice: rank 0's write at keep as rank_wire carries it ------------------------------------------------
+ 
+ /// rank_wire's keep for a kept state rank 0 writes (`forks` holds the lineage's forks: at most max_keep_forks).
+-pub fn keepMsg(slot: u32, kept: u64, base: u64, at: u32, key: Digest, group: u64, shared: bool, lin: format.Lineage, origin: ?format.Origin, forks: []rank_wire.Fork) !rank_wire.Keep {
++/// `pics`: the point's pictures (pointPictures; empty for a text point), carried as they are (rank_wire.Media is
++/// format.Media field for field: checked below).
++pub fn keepMsg(slot: u32, kept: u64, base: u64, at: u32, key: Digest, group: u64, shared: bool, lin: format.Lineage, origin: ?format.Origin, forks: []rank_wire.Fork, pics: Pictures) !rank_wire.Keep {
+     if (lin.forks.len > forks.len or lin.forks.len > rank_wire.max_keep_forks) return error.TooManyForks;
++    if (pics.media.len > rank_wire.max_keep_media) return error.TooManyPictures;
+     for (lin.forks, forks[0..lin.forks.len]) |f, *o| o.* = .{ .name = f.name, .at = f.at };
+-    return .{ .slot = slot, .kept = kept, .base = base, .at = at, .point = key, .group = group, .shared = shared, .root = lin.root, .part = lin.part, .origin = if (origin) |o| .{ .key = o.key, .at = o.at } else null, .forks = forks[0..lin.forks.len] };
++    return .{ .slot = slot, .kept = kept, .base = base, .at = at, .point = key, .group = group, .shared = shared, .root = lin.root, .part = lin.part, .origin = if (origin) |o| .{ .key = o.key, .at = o.at } else null, .forks = forks[0..lin.forks.len], .placeholder = if (pics.media.len > 0) pics.placeholder else null, .media = wireMedia(pics.media) };
++}
++
++comptime {
++    // a keep's pictures are the store's, byte for byte (keepMsg and Follower.keep cast between the two)
++    std.debug.assert(@sizeOf(rank_wire.Media) == @sizeOf(format.Media) and @alignOf(rank_wire.Media) == @alignOf(format.Media));
++    std.debug.assert(@offsetOf(rank_wire.Media, "start") == @offsetOf(format.Media, "start"));
++    std.debug.assert(@offsetOf(rank_wire.Media, "len") == @offsetOf(format.Media, "len"));
++    std.debug.assert(@offsetOf(rank_wire.Media, "digest") == @offsetOf(format.Media, "digest"));
++}
++
++pub fn wireMedia(m: []const format.Media) []const rank_wire.Media {
++    return @ptrCast(m);
++}
++
++pub fn keepMedia(m: []const rank_wire.Media) []const format.Media {
++    return @ptrCast(m);
+ }
+ 
+ /// A keep's lineage as core/spill takes it (`forks` holds its forks).
+@@ -838,6 +940,9 @@ pub fn Leader(comptime Dev: type) type {
+         lead: ?*rank_wire.Leader,
+         own_lead: bool = true, // false: the pair's one Leader (Lanes.rw), shared with the KV parts and freed by them
+         min_tokens: u32,
++        image_cache: bool, // Settings.image_cache: pictures' points kept and found
++        pictures_kept: u64 = 0, // points written with pictures before their cut
++        pictures_refused: u64 = 0, // keeps and lookups with pictures turned away (their ids and media disagree, or image cache off)
+         max_restores: u32, // restores in flight at most (Settings.restores, the store's reads; <= rank_wire.max_restores)
+         flush_ms: u32,
+         jobs: std.AutoHashMapUnmanaged(u64, *Job) = .empty,
+@@ -885,7 +990,7 @@ pub fn Leader(comptime Dev: type) type {
+             const self = try gpa.create(Self);
+             errdefer gpa.destroy(self);
+             const wf: []rank_wire.Fork = if (wire != null) try gpa.alloc(rank_wire.Fork, rank_wire.max_keep_forks) else &.{};
+-            self.* = .{ .gpa = gpa, .side = side, .fam = fam, .wire = wire, .lead = lead, .min_tokens = s.min_tokens, .max_restores = @intCast(@max(1, @min(s.restores, rank_wire.max_restores))), .flush_ms = s.flush_ms, .boot = boot, .wire_forks = wf };
++            self.* = .{ .gpa = gpa, .side = side, .fam = fam, .wire = wire, .lead = lead, .min_tokens = s.min_tokens, .image_cache = s.image_cache, .max_restores = @intCast(@max(1, @min(s.restores, rank_wire.max_restores))), .flush_ms = s.flush_ms, .boot = boot, .wire_forks = wf };
+             return self;
+         }
+ 
+@@ -1089,7 +1194,14 @@ pub fn Leader(comptime Dev: type) type {
+         fn lookupFn(ptr: *anyopaque, want: *const pc.Want) ?pc.Point {
+             const self = of(ptr);
+             if (self.broken != null) return null;
+-            const hit = self.side.store.lookup(.{ .keyed = want.key, .longer_than = want.beyond, .max_at = want.max_at, .grid = want.grid }) orelse {
++            // pictures: every one accounted for by its full identity (the store then matches spans and digests before
++            // each point's cut), or no point at all; a missing or mismatched identity is a miss
++            if (want.images or want.media.len > 0) if (!self.image_cache or !pc.mediaKeys(want.key, want.key.len, want.media)) {
++                self.pictures_refused += 1;
++                self.misses += 1;
++                return null;
++            };
++            const hit = self.side.store.lookup(.{ .keyed = want.key, .media = asFormat(want.media), .longer_than = want.beyond, .max_at = want.max_at, .grid = want.grid }) orelse {
+                 self.misses += 1;
+                 return null;
+             };
+@@ -1100,10 +1212,23 @@ pub fn Leader(comptime Dev: type) type {
+ 
+         fn keepFn(ptr: *anyopaque, kept: *const pc.Kept) ?u64 {
+             const self = of(ptr);
+-            if (self.broken != null or kept.images) return null; // (pictures need full payload digests: not written)
++            if (self.broken != null) return null;
+             const bt = self.side.bt;
+             const at = kept.at;
+             if (at == 0 or at % bt != 0 or at < self.min_tokens or kept.key.len < at) return null;
++            // pictures: recorded with their spans and full digests (those before the cut), the keyed ids checked to
++            // derive from them and the prompt's model ids kept beside them; any disagreement keeps nothing on disk
++            var pics: Pictures = .{};
++            if (kept.images or kept.media.len > 0) {
++                if (!self.image_cache) {
++                    self.pictures_refused += 1;
++                    return null;
++                }
++                pics = pointPictures(kept.key, kept.raw, kept.media, at) orelse {
++                    self.pictures_refused += 1;
++                    return null;
++                };
++            }
+             const info = self.fam.info(self.fam.ptr, kept.saved);
+             if (info.at != at) return null;
+             var forks: std.ArrayList(format.Fork) = .empty;
+@@ -1116,9 +1241,11 @@ pub fn Leader(comptime Dev: type) type {
+             if (self.side.layout.owner_layout == .owner_sharded) lin = lin.inPart(info.part orelse return null);
+             const origin: ?format.Origin = if (kept.parent) |p| (if (self.points.get(p)) |r| .{ .key = r.key, .at = kept.fork } else null) else null;
+             const keyed = kept.key[0..at];
+-            const key = format.pointKey(keyed, bt, &.{});
+-            const r = self.side.keepPoint(.{ .keyed = keyed, .key = key, .at = at, .base = info.base, .snap = info.id, .buf = info.buf, .lineage = lin, .origin = origin, .shared = kept.shared, .group = kept.group });
++            const key = format.pointKey(keyed, bt, pics.media);
++            const raw: ?[]const u32 = if (pics.media.len > 0) kept.raw[0..at] else null;
++            const r = self.side.keepPoint(.{ .keyed = keyed, .key = key, .at = at, .base = info.base, .snap = info.id, .buf = info.buf, .lineage = lin, .origin = origin, .shared = kept.shared, .group = kept.group, .raw = raw, .media = pics.media });
+             if (r == .refused) return null;
++            if (pics.media.len > 0) self.pictures_kept += 1;
+             const id = pointId(key);
+             const gop = self.points.getOrPut(self.gpa, id) catch return null;
+             if (!gop.found_existing) gop.value_ptr.room = 0;
+@@ -1130,7 +1257,7 @@ pub fn Leader(comptime Dev: type) type {
+             // now (its store.keep dedups when it holds it), so a point rank 0 holds is repaired on the pair
+             if (self.wire != null) {
+                 self.noted.put(self.gpa, info.id, .{ .key = key }) catch {};
+-                const m = keepMsg(info.slot, info.id, info.base, at, key, kept.group, kept.shared, lin, origin, self.wire_forks) catch return id;
++                const m = keepMsg(info.slot, info.id, info.base, at, key, kept.group, kept.shared, lin, origin, self.wire_forks, pics) catch return id;
+                 _ = self.post(0, .{ .keep = m }) catch {};
+             }
+             return id;
+@@ -1206,6 +1333,8 @@ pub fn Leader(comptime Dev: type) type {
+             var c = self.side.cached;
+             c.presence_refused = self.presence_refused;
+             c.compatible_misses = self.misses;
++            c.pictures_kept = self.pictures_kept;
++            c.pictures_refused = self.pictures_refused;
+             out[0] = c;
+             const n = @min(self.peers_n, out.len - 1);
+             @memcpy(out[1..][0..n], self.peers[0..n]); // (as their last stats replies carried them)
+@@ -1492,14 +1621,20 @@ pub fn Follower(comptime Dev: type) type {
+         asked: std.AutoHashMapUnmanaged(u64, Digest) = .empty, // has answered, not yet reserved (an abort's forget)
+         forks: []format.Fork,
+         keyed: std.ArrayList(u32) = .empty,
++        raw: std.ArrayList(u32) = .empty, // a picture point's model ids (the noted placeholder at its pictures)
++        image_cache: bool,
+         skipped: u64 = 0, // keep notes this rank could not write (ids or state not as rank 0's)
++        pictures_kept: u64 = 0, // this rank's points written with pictures before their cut (its stats reply's)
++        pictures_refused: u64 = 0, // keeps with pictures this rank turned away (image cache off, ids or media disagree)
+         flush_ns: u64, // rank 0's done: the drain's bound (TF_SPILL_FLUSH_MS)
+ 
+         /// `fam`: the kept states restores install into, or null until `attach` (lanes.followWith).
+         pub fn create(gpa: Allocator, io: std.Io, rank: u16, fx: fingerprint.Exchange, fam: ?FollowerFamily, opening: Opening(Dev)) !*Self {
+             const self = try gpa.create(Self);
+             errdefer gpa.destroy(self);
+-            self.* = .{ .gpa = gpa, .io = io, .rank = rank, .wf = rank_wire.Follower.init(rank, fx), .fam = fam orelse undefined, .fam_live = fam != null, .opening = opening, .forks = try gpa.alloc(format.Fork, 4096), .flush_ns = @as(u64, opening.settings.flush_ms) * std.time.ns_per_ms };
++            const forks = try gpa.alloc(format.Fork, 4096);
++            errdefer gpa.free(forks);
++            self.* = .{ .gpa = gpa, .io = io, .rank = rank, .wf = rank_wire.Follower.init(rank, fx), .fam = fam orelse undefined, .fam_live = fam != null, .opening = opening, .forks = forks, .image_cache = opening.settings.image_cache, .flush_ns = @as(u64, opening.settings.flush_ms) * std.time.ns_per_ms };
+             return self;
+         }
+ 
+@@ -1535,6 +1670,7 @@ pub fn Follower(comptime Dev: type) type {
+             self.asked.deinit(self.gpa);
+             if (self.side) |s| s.destroy() else if (self.opening) |*o| o.gens.deinit(self.gpa);
+             self.keyed.deinit(self.gpa);
++            self.raw.deinit(self.gpa);
+             self.gpa.free(self.forks);
+             self.gpa.destroy(self);
+         }
+@@ -1567,16 +1703,19 @@ pub fn Follower(comptime Dev: type) type {
+             const ids = self.fam.ids(self.fam.ptr, m.slot);
+             const buf = self.fam.buf(self.fam.ptr, m.kept) orelse return self.skip();
+             if (ids.len < m.at) return self.skip();
+-            if (m.media.len > 0) return self.skip(); // (pictures' points: port/spill-pictures writes them)
++            const media = keepMedia(m.media);
++            if (media.len > 0 and !self.image_cache) return self.skipPictures(); // (the fingerprints agreed: not on a pair)
++            const placeholder = m.placeholder orelse 0;
++            if (placeholder >= format.picture_ids) return self.skipPictures(); // (rank_wire does not know the model's ids)
+             self.keyed.resize(self.gpa, m.at) catch return self.skip();
+-            for (ids[0..m.at], self.keyed.items) |q, *o| {
+-                if (q < 0) return self.skip();
+-                o.* = @intCast(q);
+-            }
++            self.raw.resize(self.gpa, if (media.len > 0) m.at else 0) catch return self.skip();
++            // this rank's sequence (pictures' positions negative) with the kept pictures' keyed ids and placeholder
++            if (!followerIds(ids, m.at, media, placeholder, self.keyed.items, if (media.len > 0) self.raw.items else null)) return if (media.len > 0) self.skipPictures() else self.skip();
+             // the point is rank 0's: this rank's ids must name the same one, or a restore could never agree on it
+-            if (!std.mem.eql(u8, &format.pointKey(self.keyed.items, s.bt, &.{}), &m.point)) return self.skip();
++            if (!std.mem.eql(u8, &format.pointKey(self.keyed.items, s.bt, media), &m.point)) return self.skip();
+             const lin = keepLineage(m, self.forks) catch return self.skip();
+-            _ = s.keepPoint(.{ .keyed = self.keyed.items, .key = m.point, .at = m.at, .base = @intCast(m.base), .snap = m.kept, .buf = buf, .lineage = lin, .origin = keepOrigin(m), .shared = m.shared, .group = m.group });
++            const r = s.keepPoint(.{ .keyed = self.keyed.items, .key = m.point, .at = m.at, .base = @intCast(m.base), .snap = m.kept, .buf = buf, .lineage = lin, .origin = keepOrigin(m), .shared = m.shared, .group = m.group, .raw = if (media.len > 0) self.raw.items else null, .media = media });
++            if (r != .refused and media.len > 0) self.pictures_kept += 1; // (as rank 0 counts its own: Leader.keepFn)
+         }
+ 
+         pub fn share(self: *Self, _: Head, m: rank_wire.Share) !void {
+@@ -1598,6 +1737,12 @@ pub fn Follower(comptime Dev: type) type {
+             self.skipped += 1;
+         }
+ 
++        /// A keep with pictures this rank turned away: skipped, and counted as rank 0 counts its refusals.
++        fn skipPictures(self: *Self) void {
++            self.skipped += 1;
++            self.pictures_refused += 1;
++        }
++
+         /// At every frame and while idle: copies handed on, restores copied as far as rank 0 allowed, writes staged.
+         pub fn service(self: *Self, budget_ns: u64) void {
+             self.settle(false) catch {}; // (an open's failure ends this rank at rank 0's next ask)
+@@ -1850,6 +1995,9 @@ pub fn Follower(comptime Dev: type) type {
+                 s.refresh();
+                 c = s.cached;
+             }
++            // this rank's own picture keeps and refusals (rank 0's Leader counts its own the same way: countsFn)
++            c.pictures_kept = self.pictures_kept;
++            c.pictures_refused = self.pictures_refused;
+             const v = countsValues(c);
+             return switch (m.set) {
+                 .tier => .{ .set = .tier, .n = v.n, .values = v.values },
+diff --git a/zig/src/families/dsv41/spill_tier_test.zig b/zig/src/families/dsv41/spill_tier_test.zig
+index 264220c987b0833c5dd23c911c758ef09fcdaf6f..0515f9a0f1afb6ed4c7a90910393ad3a3080ea43 100644
+--- a/zig/src/families/dsv41/spill_tier_test.zig
++++ b/zig/src/families/dsv41/spill_tier_test.zig
+@@ -600,7 +600,7 @@ test "a keep crosses rank_wire with its lineage and origin intact; a lineage pas
+     const forks = [_]format.Fork{ .{ .name = @splat(4), .at = 32 }, .{ .name = @splat(5), .at = 48 } };
+     const lin: format.Lineage = .{ .root = @splat(1), .part = 2, .forks = &forks };
+     var wf: [4]rank_wire.Fork = undefined;
+-    const m = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, .{ .key = @splat(8), .at = 32 }, &wf);
++    const m = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, .{ .key = @splat(8), .at = 32 }, &wf, .{});
+     var buf: [rank_wire.max_frame]u8 = undefined;
+     const bytes = try rank_wire.encode(&buf, .{ .op = .keep, .from = 0, .epoch = 1, .txn = 1, .seq = 2 }, .{ .keep = m });
+     var back: [4]rank_wire.Fork = undefined;
+@@ -614,8 +614,8 @@ test "a keep crosses rank_wire with its lineage and origin intact; a lineage pas
+     var one: [1]format.Fork = undefined;
+     try testing.expectError(error.TooManyForks, tier.keepLineage(k, &one));
+     var wf1: [1]rank_wire.Fork = undefined;
+-    try testing.expectError(error.TooManyForks, tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, null, &wf1));
+-    const none = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, false, .{ .root = @splat(1) }, null, &wf);
++    try testing.expectError(error.TooManyForks, tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, true, lin, null, &wf1, .{}));
++    const none = try tier.keepMsg(3, 77, 4096, 64, @splat(9), 5, false, .{ .root = @splat(1) }, null, &wf, .{});
+     try testing.expect(none.part == null and none.origin == null and none.forks.len == 0);
+ }
+ 
+@@ -656,7 +656,7 @@ test "follower settings: flags over the environment, off without a directory or
+ /// Test frames beside the protocol's: [kind u8][payload].
+ const T = struct {
+     const snap: u8 = 20; // id u64, slot u32, base u64, at u32: the follower keeps a state (its own bytes there)
+-    const ids: u8 = 21; // slot u32, then u32 ids: the slot's prompt as this rank holds it
++    const ids: u8 = 21; // slot u32, then u32 ids (i32 bits): the slot's sequence as this rank holds it
+     const query: u8 = 24; // key [32]: the follower answers [present u8][restores open u8][committed u32][aborted u32][skipped u32]
+     const verify: u8 = 25; // src u64, dst u64, at u32, src snap u64, dst snap u64: the follower answers [ok u8]
+     const corrupt: u8 = 23;
+@@ -764,7 +764,7 @@ const Peer = struct {
+                     const n = (body.len - 4) / 4;
+                     gpa.free(fam.ids[slot]);
+                     fam.ids[slot] = try gpa.alloc(i32, n);
+-                    for (fam.ids[slot]) |*x| x.* = @intCast(try r.int(u32));
++                    for (fam.ids[slot]) |*x| x.* = @bitCast(try r.int(u32)); // (pictures' positions negative)
+                 },
+                 T.query => {
+                     var key: format.Digest = undefined;
+@@ -1460,6 +1460,356 @@ test "two ranks: a slow follower never stalls rank 0's polls; validate is asked
+     ld_alive = false;
+     try pr.finish();
+ }
++// -- pictures (recipe 0006's content keys, recorded with their full digests) ------------------------------------------
++
++const placeholder: u32 = 129264; // the model's image token
++
++/// A picture of a test prompt: its span and the payload its digest is made from.
++const Pic = struct { start: u32, len: u32, payload: []const u8 };
++
++/// A prompt with pictures as the server keys it: text ids from `seed`; each picture's keyed ids made from its
++/// payload's SHA-256 (pc.pictureId), its raw ids the placeholder and its sequence positions negative (Lanes.seqs).
++const PicPrompt = struct {
++    keyed: []u32,
++    raw: []u32,
++    seq: []i32,
++    media: []pc.Media,
++
++    fn init(n: usize, seed: u32, pics: []const Pic) !PicPrompt {
++        const p: PicPrompt = .{ .keyed = try gpa.alloc(u32, n), .raw = try gpa.alloc(u32, n), .seq = try gpa.alloc(i32, n), .media = try gpa.alloc(pc.Media, pics.len) };
++        testIds(p.keyed, seed);
++        @memcpy(p.raw, p.keyed);
++        for (pics, p.media) |x, *m| {
++            m.* = .{ .start = x.start, .len = x.len, .digest = undefined };
++            std.crypto.hash.sha2.Sha256.hash(x.payload, &m.digest, .{});
++            for (0..x.len) |j| {
++                if (x.start + j >= n) break;
++                p.keyed[x.start + j] = pc.pictureId(&m.digest, @intCast(j));
++                p.raw[x.start + j] = placeholder;
++            }
++        }
++        for (p.seq, p.raw) |*q, id| q.* = if (id == placeholder) -1 else @intCast(id);
++        return p;
++    }
++
++    fn deinit(p: PicPrompt) void {
++        gpa.free(p.keyed);
++        gpa.free(p.raw);
++        gpa.free(p.seq);
++        gpa.free(p.media);
++    }
++
++    fn want(p: PicPrompt) pc.Want {
++        return .{ .key = p.keyed, .beyond = 0, .max_at = @intCast(p.keyed.len), .grid = bt, .images = true, .media = p.media };
++    }
++
++    /// The point a keep at `at` writes: its key over the pictures before the cut.
++    fn key(p: PicPrompt, at: u32) format.Digest {
++        var n: usize = 0;
++        while (n < p.media.len and p.media[n].start < at) n += 1;
++        return format.pointKey(p.keyed[0..at], bt, tier.asFormat(p.media[0..n]));
++    }
++};
++
++fn keepPics(t: pc.Tier, sn: *Snap, p: PicPrompt, lineage: []const pc.Fork) ?u64 {
++    return t.vtable.keep(t.ptr, &.{ .saved = sn, .key = p.keyed[0..sn.at], .at = @intCast(sn.at), .bytes = 0, .group = 9, .images = true, .media = p.media, .raw = p.raw, .lineage = lineage });
++}
++
++test "pictures: the server's cache ids are the store's scheme" {
++    var prng = std.Random.DefaultPrng.init(6);
++    for (0..2000) |_| {
++        var d: format.Digest = undefined;
++        prng.random().bytes(&d);
++        const j = prng.random().int(u32);
++        try testing.expectEqual(format.pictureId(&d, j), pc.pictureId(&d, j));
++        try testing.expect(pc.pictureId(&d, j) >= pc.picture_ids);
++    }
++}
++
++test "pictures: identical pictures across a restart hit and restore byte for byte; changed or unnamed pictures miss" {
++    const r = try Rank.init(0, "pics", 0);
++    defer r.deinit();
++    var fam: Fam0 = .{ .sim = r.sim };
++    defer fam.deinit();
++    // three pictures in a 6-block prompt, the point at 4 blocks: one wholly before the cut, one straddling it, one after
++    const pics = [_]Pic{ .{ .start = 5, .len = 9, .payload = "red apple" }, .{ .start = 4 * bt - 6, .len = 12, .payload = "blue sky" }, .{ .start = 5 * bt, .len = 7, .payload = "green" } };
++    const p = try PicPrompt.init(6 * bt, 31, &pics);
++    defer p.deinit();
++    const sn = try keptSnap(r.sim, 1, 0, 4 * bt);
++    defer gpa.destroy(sn);
++    {
++        const ld = try L.create(gpa, try r.side(0, agreement()), fam.family(), null, null, r.settings, @splat(3));
++        defer ld.destroy();
++        const t = ld.tier();
++        const id = keepPics(t, sn, p, &.{.{ .name = 5, .at = 0 }}) orelse return error.NotKept;
++        try testing.expectEqual(tier.pointId(p.key(4 * bt)), id);
++        try testing.expectEqual(@as(u64, 1), ld.pictures_kept);
++        try pumpUntil(ld, 1);
++        try testing.expect(t.vtable.lookup(t.ptr, &p.want()) != null);
++    }
++    // the process restarts: a new tier over the same store directory recovers the point with its pictures
++    const ld = try L.create(gpa, try r.side(0, agreement()), fam.family(), null, null, r.settings, @splat(4));
++    defer ld.destroy();
++    const t = ld.tier();
++    try testing.expectEqual(@as(u64, 1), ld.side.store.counts().recovered_points);
++    const hit = t.vtable.lookup(t.ptr, &p.want()) orelse return error.NotFound;
++    try testing.expectEqual(@as(u32, 4 * bt), hit.at);
++    r.sim.delay = 1;
++    const done = pollUntilDone(t, try t.vtable.begin(t.ptr, &hit));
++    try testing.expect(done == .ready);
++    const got: *Snap = @ptrCast(@alignCast(done.ready.saved));
++    try testing.expect(r.sim.sameRows(0, got.base, 4 * bt));
++    try testing.expectEqualSlices(u8, r.sim.bytes(sn.buf, r.sim.layout.small_bytes), r.sim.bytes(got.buf, r.sim.layout.small_bytes));
++    r.sim.freeSnap(got.buf);
++    try stagingDrains(ld.side.store);
++
++    // the prompt's next turn (more text, another picture far past the cut) finds the same point
++    const more = [_]Pic{ pics[0], pics[1], pics[2], .{ .start = 7 * bt, .len = 5, .payload = "later" } };
++    const p2 = try PicPrompt.init(8 * bt, 31, &more);
++    defer p2.deinit();
++    try testing.expectEqual(hit.id, (t.vtable.lookup(t.ptr, &p2.want()) orelse return error.NotFound).id);
++    // another picture in the same positions (its own ids), or the same ids under another payload's full digest
++    // (only bytes past the 8 that seed the ids differ): no hit
++    const changed = [_]Pic{ .{ .start = 5, .len = 9, .payload = "red apples" }, pics[1], pics[2] };
++    const p3 = try PicPrompt.init(6 * bt, 31, &changed);
++    defer p3.deinit();
++    try testing.expect(t.vtable.lookup(t.ptr, &p3.want()) == null);
++    var forged = p.want();
++    const fm = try gpa.dupe(pc.Media, p.media);
++    defer gpa.free(fm);
++    fm[1].digest[31] ^= 1;
++    forged.media = fm;
++    try testing.expect(t.vtable.lookup(t.ptr, &forged) == null);
++    // the straddling picture's span another length (its positions past the cut changed): no hit
++    fm[1] = p.media[1];
++    fm[1].len -= 1;
++    try testing.expect(t.vtable.lookup(t.ptr, &forged) == null);
++    // missing identities force a miss: no media at all, or one picture not named
++    var bare = p.want();
++    bare.media = &.{};
++    try testing.expect(t.vtable.lookup(t.ptr, &bare) == null);
++    var partial = p.want();
++    partial.media = p.media[1..];
++    try testing.expect(t.vtable.lookup(t.ptr, &partial) == null);
++    try testing.expect(ld.pictures_refused >= 2);
++}
++
++test "pictures: a keep whose ids disagree with its pictures writes nothing; text before every picture is a text point; image cache off" {
++    const r = try Rank.init(0, "picbad", 0);
++    defer r.deinit();
++    var fam: Fam0 = .{ .sim = r.sim };
++    defer fam.deinit();
++    const ld = try L.create(gpa, try r.side(0, agreement()), fam.family(), null, null, r.settings, @splat(3));
++    defer ld.destroy();
++    const t = ld.tier();
++    const pics = [_]Pic{.{ .start = 2 * bt + 3, .len = 6, .payload = "cat" }};
++    const p = try PicPrompt.init(4 * bt, 41, &pics);
++    defer p.deinit();
++    const sn = try keptSnap(r.sim, 1, 0, 3 * bt);
++    defer gpa.destroy(sn);
++    // no identities: nothing kept (the keyed ids hold a picture the tier cannot name)
++    try testing.expect(t.vtable.keep(t.ptr, &.{ .saved = sn, .key = p.keyed[0..sn.at], .at = 3 * bt, .bytes = 0, .images = true, .raw = p.raw }) == null);
++    // raw ids that are not the placeholder at the picture, or are missing
++    const raw = try gpa.dupe(u32, p.raw);
++    defer gpa.free(raw);
++    raw[2 * bt + 4] = 7;
++    try testing.expect(t.vtable.keep(t.ptr, &.{ .saved = sn, .key = p.keyed[0..sn.at], .at = 3 * bt, .bytes = 0, .images = true, .media = p.media, .raw = raw }) == null);
++    try testing.expect(t.vtable.keep(t.ptr, &.{ .saved = sn, .key = p.keyed[0..sn.at], .at = 3 * bt, .bytes = 0, .images = true, .media = p.media }) == null);
++    // keyed ids that do not derive from the named digest
++    const keyed = try gpa.dupe(u32, p.keyed);
++    defer gpa.free(keyed);
++    keyed[2 * bt + 5] ^= 1;
++    try testing.expect(t.vtable.keep(t.ptr, &.{ .saved = sn, .key = keyed[0..sn.at], .at = 3 * bt, .bytes = 0, .images = true, .media = p.media, .raw = p.raw }) == null);
++    try testing.expectEqual(@as(u64, 4), ld.pictures_refused);
++    {
++        // rank 0's counts carry them (TierCounts, appended: the stats wire and /metrics)
++        var out: [1]pc.TierCounts = undefined;
++        try testing.expectEqual(@as(usize, 1), t.vtable.counts(t.ptr, &out));
++        try testing.expectEqual(@as(u64, 4), out[0].pictures_refused);
++        try testing.expectEqual(ld.pictures_kept, out[0].pictures_kept);
++        // and survive the wire's encoding, an older peer's shorter reply zero-filling them
++        const v = tier.countsValues(out[0]);
++        try testing.expectEqual(@as(u64, 4), tier.valuesCounts(v.n, &v.values).pictures_refused);
++        try testing.expectEqual(@as(u64, 0), tier.valuesCounts(v.n - 2, &v.values).pictures_refused);
++    }
++    try testing.expectEqual(@as(u64, 0), ld.side.store.counts().queued);
++    // with image cache off nothing is kept for a prompt with pictures, nor found
++    ld.image_cache = false;
++    try testing.expect(keepPics(t, sn, p, &.{.{ .name = 1, .at = 0 }}) == null);
++    ld.image_cache = true;
++    // a cut no picture reaches: a text point (no media, no raw ids), found by the text prompt with no pictures too
++    const sn2 = try keptSnap(r.sim, 2, 4 * bt, 2 * bt);
++    defer gpa.destroy(sn2);
++    _ = keepPics(t, sn2, p, &.{.{ .name = 2, .at = 0 }}) orelse return error.NotKept;
++    try testing.expectEqual(@as(u64, 0), ld.pictures_kept);
++    try pumpUntil(ld, 1);
++    try testing.expect(ld.side.store.presence(format.pointKey(p.keyed[0 .. 2 * bt], bt, &.{})));
++    try testing.expect(t.vtable.lookup(t.ptr, &want(p.keyed[0 .. 2 * bt + 3])) != null);
++    try testing.expect(t.vtable.lookup(t.ptr, &p.want()) != null); // (the picture starts past its cut)
++    ld.image_cache = false;
++    try testing.expect(t.vtable.lookup(t.ptr, &p.want()) == null); // pictures stay out of the tier
++    ld.image_cache = true;
++    // a picture point, then the same cut with image cache off is refused and the point not found
++    const sn3 = try keptSnap(r.sim, 3, 8 * bt, 3 * bt);
++    defer gpa.destroy(sn3);
++    _ = keepPics(t, sn3, p, &.{.{ .name = 3, .at = 0 }}) orelse return error.NotKept;
++    try pumpUntil(ld, 2);
++    try testing.expectEqual(@as(u32, 3 * bt), (t.vtable.lookup(t.ptr, &p.want()) orelse return error.NotFound).at);
++    ld.image_cache = false;
++    try testing.expect(t.vtable.lookup(t.ptr, &p.want()) == null);
++    ld.image_cache = true;
++    try stagingDrains(ld.side.store);
++    // the follower's switch: TF_DS_IMAGE_CACHE=0 there too
++    try testing.expect(!tier.Settings.imageCache("0"));
++    try testing.expect(tier.Settings.imageCache(null) and tier.Settings.imageCache("1"));
++    try testing.expect(tier.Settings.imageCache(" 0")); // (exactly "0", as the server and round 2's fingerprint read it)
++}
++
++test "pictures: a keep carries them (text keeps unchanged), bounded; a follower rebuilds its ids from its sequence" {
++    var wf: [4]rank_wire.Fork = undefined;
++    const lin: format.Lineage = .{ .root = @splat(1) };
++    const text = try tier.keepMsg(1, 7, 0, 64, @splat(9), 5, false, lin, null, &wf, .{});
++    try testing.expectEqual(@as(?u32, null), text.placeholder);
++    try testing.expectEqual(@as(usize, 0), text.media.len);
++    const media = [_]format.Media{ .{ .start = 3, .len = 4, .digest = @splat(2) }, .{ .start = 60, .len = 10, .digest = @splat(3) } };
++    const m = try tier.keepMsg(1, 7, 0, 64, @splat(9), 5, false, lin, null, &wf, .{ .media = &media, .placeholder = placeholder });
++    try testing.expectEqual(@as(?u32, placeholder), m.placeholder);
++    // across rank_wire: the follower gets the store's media back field for field
++    const buf = try gpa.alloc(u8, rank_wire.max_frame);
++    defer gpa.free(buf);
++    const head: rank_wire.Head = .{ .op = .keep, .from = 0, .epoch = 1, .txn = 0, .seq = 3 };
++    const text_len = (try rank_wire.encode(buf, head, .{ .keep = text })).len;
++    const bytes = try rank_wire.encode(buf, head, .{ .keep = m });
++    try testing.expect(bytes.len > text_len);
++    var forks: [4]rank_wire.Fork = undefined;
++    var mb: [4]rank_wire.Media = undefined;
++    const f = try rank_wire.decodeInto(bytes, .{ .forks = &forks, .media = &mb });
++    const got = tier.keepMedia(f.msg.keep.media);
++    try testing.expectEqual(@as(usize, 2), got.len);
++    try testing.expect(got[1].eql(media[1]));
++    try testing.expectEqual(@as(?u32, placeholder), f.msg.keep.placeholder);
++    var one: [1]rank_wire.Media = undefined;
++    try testing.expectError(error.BadCount, rank_wire.decodeInto(bytes, .{ .forks = &forks, .media = &one })); // no room
++    // bounded: overlapping, at-the-cut and empty spans refused before they reach the wire
++    const bads = [_][2]format.Media{
++        .{ media[0], .{ .start = 5, .len = 2, .digest = @splat(3) } }, // overlapping
++        .{ media[0], .{ .start = 64, .len = 2, .digest = @splat(3) } }, // at the cut
++        .{ media[0], .{ .start = 10, .len = 0, .digest = @splat(3) } }, // empty
++    };
++    for (bads) |bad| {
++        const k = try tier.keepMsg(1, 7, 0, 64, @splat(9), 5, false, lin, null, &wf, .{ .media = &bad, .placeholder = placeholder });
++        try testing.expectError(error.BadValue, rank_wire.encode(buf, head, .{ .keep = k }));
++    }
++    const many = try gpa.alloc(format.Media, rank_wire.max_keep_media + 1);
++    defer gpa.free(many);
++    for (many, 0..) |*x, i| x.* = .{ .start = @intCast(i * 2), .len = 1, .digest = @splat(4) };
++    try testing.expectError(error.TooManyPictures, tier.keepMsg(1, 7, 0, 4096, @splat(9), 5, false, lin, null, &wf, .{ .media = many, .placeholder = placeholder }));
++
++    // the follower's rebuild: its sequence (pictures negative) + the noted pictures give rank 0's keyed and raw ids
++    const pics = [_]Pic{ .{ .start = 2, .len = 5, .payload = "a" }, .{ .start = 12, .len = 8, .payload = "b" } };
++    const p = try PicPrompt.init(24, 51, &pics);
++    defer p.deinit();
++    const pm = tier.pointPictures(p.keyed, p.raw, p.media, 16) orelse return error.NoPictures;
++    try testing.expectEqual(@as(usize, 2), pm.media.len);
++    try testing.expectEqual(placeholder, pm.placeholder);
++    var keyed: [16]u32 = undefined;
++    var raw: [16]u32 = undefined;
++    try testing.expect(tier.followerIds(p.seq, 16, pm.media, pm.placeholder, &keyed, &raw));
++    try testing.expectEqualSlices(u32, p.keyed[0..16], &keyed);
++    try testing.expectEqualSlices(u32, p.raw[0..16], &raw);
++    // a sequence whose picture sits elsewhere, or a text position made dead: not rank 0's prompt
++    var seq = try gpa.dupe(i32, p.seq);
++    defer gpa.free(seq);
++    seq[1] = -1;
++    try testing.expect(!tier.followerIds(seq, 16, pm.media, pm.placeholder, &keyed, &raw));
++    @memcpy(seq, p.seq);
++    seq[13] = 5;
++    try testing.expect(!tier.followerIds(seq, 16, pm.media, pm.placeholder, &keyed, &raw));
++    // pointPictures: a cut before every picture is text; ids or raw ids off are refused
++    try testing.expectEqual(@as(usize, 0), (tier.pointPictures(p.keyed, p.raw, p.media, 2) orelse return error.NoPictures).media.len);
++    var r2 = try gpa.dupe(u32, p.raw);
++    defer gpa.free(r2);
++    r2[0] +%= 1;
++    try testing.expect(tier.pointPictures(p.keyed, r2, p.media, 16) == null);
++    try testing.expect(tier.pointPictures(p.keyed, p.raw[0..10], p.media, 16) == null);
++}
++
++/// A kept picture state on both ranks: the follower's own bytes at the same base, its sequence (pictures negative) in
++/// slot 0, then rank 0's keep.
++fn keepBothPics(w: *Rank0Wire, t: pc.Tier, sim: *Sim, id: u64, base: usize, at: usize, p: PicPrompt, follower_seq: []const i32) !*Snap {
++    const sn = try keptSnap(sim, id, base, at);
++    try w.send(T.snap, &.{ &le(u64, id), &le(u32, 0), &le(u64, base), &le(u32, @intCast(at)) });
++    var raw: std.ArrayList(u8) = .empty;
++    defer raw.deinit(gpa);
++    try raw.appendSlice(gpa, &le(u32, 0));
++    for (follower_seq) |x| try raw.appendSlice(gpa, &le(u32, @bitCast(x)));
++    try w.send(T.ids, &.{raw.items});
++    _ = keepPics(t, sn, p, &.{.{ .name = id, .at = 0 }}) orelse return error.NotKept;
++    return sn;
++}
++
++test "two ranks: a picture point written on both (the follower's ids from its sequence and the note), restored on both" {
++    const pr = try Pair.start("ppics", 0, 87);
++    defer pr.deinit();
++    const r0 = pr.r0;
++    const w = &pr.w;
++    var fam: Fam0 = .{ .sim = r0.sim };
++    defer fam.deinit();
++    const ld = try pr.leader(&fam, 8);
++    var ld_alive = true;
++    defer if (ld_alive) ld.destroy();
++    const t = ld.tier();
++    // two pictures before the cut, one straddling it
++    const pics = [_]Pic{ .{ .start = 1, .len = 3, .payload = "one" }, .{ .start = bt + 2, .len = 5, .payload = "two" }, .{ .start = 3 * bt - 4, .len = 9, .payload = "three" } };
++    const p = try PicPrompt.init(5 * bt, 61, &pics);
++    defer p.deinit();
++    const sn = try keepBothPics(w, t, r0.sim, 1, 0, 3 * bt, p, p.seq);
++    defer gpa.destroy(sn);
++    try pumpUntil(ld, 1);
++    const key = p.key(3 * bt);
++    try w.waitPresent(key, true);
++    const hit = t.vtable.lookup(t.ptr, &p.want()) orelse return error.NotFound;
++    const done = pollUntilDone(t, try t.vtable.begin(t.ptr, &hit));
++    try testing.expect(done == .ready);
++    const got: *Snap = @ptrCast(@alignCast(done.ready.saved));
++    defer r0.sim.freeSnap(got.buf);
++    try testing.expect(r0.sim.sameRows(0, got.base, 3 * bt));
++    try testing.expect(try w.yes(T.verify, &.{ &le(u64, 0), &le(u64, got.base), &le(u32, 3 * bt), &le(u64, 1), &le(u64, got.id) }));
++    try stagingDrains(ld.side.store);
++    // each rank counts its own picture keep (rank 1's rides its stats reply)
++    var counts: [pc.max_ranks]pc.TierCounts = undefined;
++    ld.stats_at = 0;
++    t.vtable.pump.?(t.ptr, std.time.ns_per_ms);
++    try testing.expectEqual(@as(usize, 2), t.vtable.counts(t.ptr, &counts));
++    try testing.expectEqual(@as(u64, 1), counts[0].pictures_kept);
++    try testing.expectEqual(@as(u64, 1), counts[1].pictures_kept);
++    try testing.expectEqual(@as(u64, 0), counts[1].pictures_refused);
++
++    // a follower whose sequence has a picture elsewhere never writes the point: presence refused, forgotten
++    const p2 = try PicPrompt.init(5 * bt, 62, &pics);
++    defer p2.deinit();
++    const seq = try gpa.dupe(i32, p2.seq);
++    defer gpa.free(seq);
++    seq[0] = -1;
++    const sn2 = try keepBothPics(w, t, r0.sim, 2, 4 * bt, 3 * bt, p2, seq);
++    defer gpa.destroy(sn2);
++    try pumpUntil(ld, 2);
++    const q = try w.query(p2.key(3 * bt));
++    try testing.expectEqual(@as(u8, 0), q[0]);
++    try testing.expect(std.mem.readInt(u32, q[10..14], .little) >= 1); // skipped
++    ld.stats_at = 0;
++    t.vtable.pump.?(t.ptr, std.time.ns_per_ms);
++    try testing.expectEqual(@as(usize, 2), t.vtable.counts(t.ptr, &counts));
++    try testing.expectEqual(@as(u64, 2), counts[0].pictures_kept); // (rank 0 wrote its copy)
++    try testing.expectEqual(@as(u64, 1), counts[1].pictures_kept); // rank 1 turned its copy away, counted there
++    try testing.expectEqual(@as(u64, 1), counts[1].pictures_refused);
++    const hit2 = t.vtable.lookup(t.ptr, &p2.want()) orelse return error.NotFound;
++    try testing.expectError(error.SpillNotOnEveryRank, t.vtable.begin(t.ptr, &hit2));
++    try testing.expect(t.vtable.lookup(t.ptr, &p2.want()) == null);
++    ld.destroy();
++    ld_alive = false;
++    try pr.finish();
++}
+ 
+ test "two ranks: a follower still incomplete past status_wait gives the restore up as timeout, never validate; the point restores again" {
+     const pr = try Pair.start("pwait", 0, 83);
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 91dadbb81618d9008e96c73a331cfbca6ce973b1..dfd151b6271a8f775b28238daab6beef7aec4e57 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -177,6 +177,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         .prompt = rendered.ids,
+         .images = rendered.images,
+         .cache_key = rendered.key,
++        .cache_media = rendered.media,
+         .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
+         .sampling = sampling,
+         .eos = if (stops_opt.ignore_eos) &.{} else srv.eos,
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index ac33ab1e8039996c5dc1fa56d006d73239494a6b..976cc3a3d23b2cf9c524dde617d60909843474fd 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -10,8 +10,9 @@ const api = @import("engine_api");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ 
+-/// `key`: with images, the prompt cache's ids for the prompt (see `cacheKey`); empty without.
+-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, key: []const u32 = &.{} };
++/// `key`: with images, the prompt cache's ids for the prompt (see `spans`); empty without. `media`: with `key`, each
++/// image's span and full payload digest (the durable tier's identity of it; the key's ids derive from the digest).
++pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, key: []const u32 = &.{}, media: []const api.prompt_cache.Media = &.{} };
+ 
+ pub const isTitle = messages_mod.isTitleRequest;
+ 
+@@ -61,21 +62,16 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+     if (input.images.len > 0) {
+         var r = try spans(srv, cx, prompt, input.images, history_len);
+         // TF_DS_IMAGE_CACHE=0: pictures keep nothing and resume nothing, as before (no key: the cache refuses such a request)
+-        if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) {
++        if (!api.prompt_cache.imageCacheOn(if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| std.mem.span(v) else null)) {
+             r.key = &.{};
++            r.media = &.{};
+             r.history_len = 0;
+-        };
++        }
+         return r;
+     }
+     return .{ .ids = prompt, .history_len = history_len };
+ }
+ 
+-/// The prompt cache's id for position `j` of a picture whose payload hashes to `seed`: above every vocabulary id, so it
+-/// never equals a text token, and the same for the same picture at any place in any prompt.
+-fn pictureId(seed: u64, j: u32) u32 {
+-    return 0x8000_0000 | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);
+-}
+-
+ /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
+ /// the payload the engine reads), the images in prompt order. `history_raw`: the history's length in `ids` (0: none), returned
+ /// as its length in the expanded prompt. The prompt cache keys a kept state by tokens, and every picture's positions hold
+@@ -86,6 +82,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8, hi
+     var out: std.ArrayList(u32) = .empty;
+     var key: std.ArrayList(u32) = .empty;
+     var placed: std.ArrayList(api.Image) = .empty;
++    var media: std.ArrayList(api.prompt_cache.Media) = .empty;
+     var history_len: usize = 0;
+     for (ids, 0..) |id, i| {
+         if (history_raw > 0 and i == history_raw) history_len = out.items.len;
+@@ -105,11 +102,12 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8, hi
+         try out.appendNTimes(cx.a, vision.token, prep.tokens);
+         var digest: [32]u8 = undefined;
+         std.crypto.hash.sha2.Sha256.hash(prep.payload, &digest, .{});
+-        const seed = std.mem.readInt(u64, digest[0..8], .little);
+-        for (0..prep.tokens) |j| try key.append(cx.a, pictureId(seed, @intCast(j)));
++        try media.append(cx.a, .{ .start = @intCast(out.items.len - prep.tokens), .len = prep.tokens, .digest = digest });
++        // (the cache ids recipe 0006 made: the digest's first 8 bytes seed them, prompt_cache.pictureId)
++        for (0..prep.tokens) |j| try key.append(cx.a, api.prompt_cache.pictureId(&digest, @intCast(j)));
+     }
+     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
+-    return .{ .ids = out.items, .images = placed.items, .key = key.items, .history_len = history_len };
++    return .{ .ids = out.items, .images = placed.items, .key = key.items, .media = media.items, .history_len = history_len };
+ }
+ 
+ /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
