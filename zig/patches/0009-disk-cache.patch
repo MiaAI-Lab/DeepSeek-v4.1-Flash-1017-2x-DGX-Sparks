@@ -1289,7 +1289,7 @@ index e883286..581f84d 100644
      refAll(tri);
      refAll(tri_basic);
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index 2c76760..91645a3 100644
+index 2c76760..9080368 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -20,6 +20,7 @@ const round = @import("round.zig");
@@ -1598,7 +1598,7 @@ index 2c76760..91645a3 100644
          errdefer sn.buf.free();
          try self.snaps.append(self.gpa, sn);
          self.next_snap += 1;
-@@ -876,6 +1062,219 @@ pub const Lanes = struct {
+@@ -876,6 +1062,221 @@ pub const Lanes = struct {
          self.gpa.destroy(sn);
      }
  
@@ -1703,6 +1703,8 @@ index 2c76760..91645a3 100644
 +    pub fn snapReadFn(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!*anyopaque {
 +        const self = of(ptr);
 +        const d = if (self.disk) |*x| x else return error.NoDiskCache;
++        // A learned state may be read before the lane thread runs its first prefill.
++        try self.m.ctx.makeCurrent();
 +        self.dir = dir;
 +        if (at == 0 or at % model.chunk_rows != 0) return error.NotAChunkEnd;
 +        if (memAvailable()) |avail| if (avail < d.mem_floor + self.m.snapBytes()) return error.LowMemory;
@@ -1818,7 +1820,7 @@ index 2c76760..91645a3 100644
      fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
          const self = of(ptr);
          const kv = self.streams.fetchRemove(s) orelse return;
-@@ -921,6 +1320,23 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -921,6 +1322,23 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
          while (ki.next()) |b| b.free();
          kept.deinit(gpa);
      }
@@ -1842,7 +1844,7 @@ index 2c76760..91645a3 100644
      while (true) {
          // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
          // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
-@@ -935,12 +1351,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -935,12 +1353,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
              7 => .snap_drop,
              8 => .fill_images,
              9 => .done,
@@ -1860,7 +1862,7 @@ index 2c76760..91645a3 100644
              m.joinAhead();
              m.fill_seq = &.{};
          }
-@@ -1048,11 +1468,212 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+@@ -1048,11 +1470,212 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                      b.free();
                  }
              },
@@ -2073,7 +2075,7 @@ index 2c76760..91645a3 100644
  test "draft chances are the prefix survivals chooseK sums" {
      var out: [3]f64 = undefined;
      survivals(&.{ 0.0, 0.0, 2.0 }, &out);
-@@ -1158,3 +1779,31 @@ test "a prefix two conversations share: the second one resuming it in place woul
+@@ -1158,3 +1781,31 @@ test "a prefix two conversations share: the second one resuming it in place woul
      try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
      try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
  }
