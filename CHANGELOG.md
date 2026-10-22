@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `zig/patches/0011-step-ahead.patch` and `STEP_AHEAD` (off by default): when a reply ends and nothing else runs or waits,
+  rank 0 reads the reply ahead while the client runs its tools, a background prompt pass of prompt + reply up to its last
+  2,048-row chunk end before the window, and keeps the state there. An agent's next request (prompt + reply + tool results)
+  then resumes past its own previous reply instead of reading it again. Up to the kept point the pass is that request's own
+  cold pass (the same grid and tokens), so replies keep their bits. On one Hermes Agent deployment's traffic (248 chained
+  requests of 30-175K tokens, thinking on) a step re-read 3,277 tokens on average, 2,178 of them its own previous reply.
+  Measured on a pair with a scripted 8-step agent loop at 62-72K tokens (greedy, thinking high, replies up to 2,500 tokens,
+  3 s of tool time a step): the replies are identical with the switch on and off (8 of 8 steps), the steps after the first
+  re-read 2,667 -> 1,789 tokens and their time to first token went 1.99 -> 1.34 s (-33%; the steps whose pass was used:
+  2.1-2.3 -> 1.0-1.1 s). A pass took 1.4-2.1 s of otherwise idle GPU time. The image with the switch off gives the previous
+  image's reply ids (greedy, seeded temperature 1, thinking, a tool call, a 10K-token prompt); `tools/validate.py` passes
+  (video aside: this engine refuses video input) and `tools/toolcheck.py` too. A client that sends the reply back
+  differently from the generated tokens resumes where it did before: no loss, no gain. By **Coinupbtc**.
+
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,

@@ -141,6 +141,11 @@ REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
 # rounds for the streams already live (and to their cancels): TF_DS_PREFILL_INTERLEAVE_MS, read by rank 0 only. 0: the pass runs to
 # its end first, as before. 250 is what PR #5 and this recipe measured. Each such stop costs the long prompt about the time given.
 PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
+# zig/patches/0011 (by Coinupbtc): when a reply ends and nothing else runs or waits, rank 0 reads the reply ahead while the client
+# runs its tools: a background prompt pass of prompt + reply up to its last 2,048-row chunk end before the window, kept there. An
+# agent's next request (prompt + reply + tool results) then resumes past its own previous reply instead of reading it again. The
+# pass is that request's own cold pass up to there, so replies keep their bits. TF_DS_STEP_AHEAD, read by rank 0 only. 0: off.
+STEP_AHEAD="${STEP_AHEAD:-0}"
 
 # ---------------------------------------------------------------- files
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
