@@ -93,6 +93,13 @@ prebuilt_image() {
   if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
 }
 CONTAINER_NAME="${CONTAINER_NAME:-dsv41-1017-exl3-tf}"   # the same name on both Sparks
+# docker --cpuset-cpus for the containers (empty: every cpu, as before). GB10's Cortex-A725 efficiency cores are 0-4,10-14
+# on both Sparks (check with lscpu -e); CPUSET="0-4,10-14" moves the engine's busy-wait threads off the X925 cores, which
+# keeps an idle rank (rank 1 most) cooler at about -1% decode (TensorFold RUNBOOK, GB10 CPU pinning). HEAD_ / WORKER_
+# override it per node
+CPUSET="${CPUSET:-}"
+HEAD_CPUSET="${HEAD_CPUSET:-$CPUSET}"
+WORKER_CPUSET="${WORKER_CPUSET:-$CPUSET}"
 
 # ---------------------------------------------------------------- serving
 SERVED_NAME="${SERVED_NAME:-DeepSeek-V4.1-Flash-1017}"

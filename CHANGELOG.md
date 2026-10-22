@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `CPUSET` (empty: every CPU) and `HEAD_CPUSET` / `WORKER_CPUSET`: pass `docker --cpuset-cpus` to both rank containers. On a GB10 pair the engine's waiting threads (the RDMA proxy before `zig/patches/0010`, the idle loops) otherwise sit on the X925 big cores; `CPUSET=0-4,10-14` is the Cortex-A725 efficiency cluster on both Sparks (`lscpu -e`), where an idle rank runs cooler at about -1% decode (TensorFold RUNBOOK, GB10 CPU pinning) with no change to the engine's bits.
+
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,
