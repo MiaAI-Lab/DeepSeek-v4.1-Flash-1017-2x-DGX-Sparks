@@ -155,6 +155,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   [pull request #15](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/15) (commit [`b2bf975`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/b2bf975)): the loop that advances admitted prompts a chunk a turn, `Engine.fillStream`,
   the fake chunked backend and the late-request host tests. It was re-written here against this tree's spill tier, parked requests, KV parts and
   pair-broken handling, with the follower's `fill_resume` frame, by Mia's AI Lab.
+- **`zig/patches/0038-step-ahead.patch`** (a finished reply read ahead while the client runs its tools, `STEP_AHEAD`) was authored by
+  **[Coinupbtc](https://github.com/Coinupbtc)** in [pull request #41](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/41)
+  (commit [`7714eae`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/41/commits/7714eaec5f54c2c6f05b5c2cb0f48931d06195ea)), rebased onto this series by
+  **[Braincramps](https://github.com/Braincramps)** in [pull request #66](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/66)
+  (commit [`1418489`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/66/commits/1418489d7a9b8cc9190c06839fc0afeea7c3c894)); carried here after `0037` with the wait for a pass in progress and its test added by Mia's AI Lab.
 - **`zig/patches/0004-call-gate.patch`** (`tool_choice` enforcement) was written by Mia's AI Lab (Apache-2.0). Its new file,
   `zig/src/core/lanes/call_gate.zig`, is Mia's AI Lab's Zig call gate for the Flash Next CUDA engine (commits `49350ed6` and
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's

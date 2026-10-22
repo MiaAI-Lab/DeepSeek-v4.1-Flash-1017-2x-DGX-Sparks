@@ -174,6 +174,11 @@ PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
 # as before; prompts with pictures are read whole either way. TF_DS_PREFILL_YIELD, read by rank 0; both ranks must run an
 # image that has the patch (rank 0 sends rank 1 a frame the earlier image does not know). Not measured on a pair yet.
 PREFILL_YIELD="${PREFILL_YIELD:-0}"
+# zig/patches/0038 (by Coinupbtc): when a reply ends and nothing else runs or waits, rank 0 reads the reply ahead while the client
+# runs its tools: a background prompt pass of prompt + reply up to its last 2,048-row chunk end before the window, kept there. An
+# agent's next request (prompt + reply + tool results) then resumes past its own previous reply instead of reading it again. The
+# pass is that request's own cold pass up to there, so replies keep their bits. TF_DS_STEP_AHEAD, read by rank 0 only. 0: off.
+STEP_AHEAD="${STEP_AHEAD:-0}"
 
 # ---------------------------------------------------------------- files
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"

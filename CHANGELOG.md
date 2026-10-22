@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `zig/patches/0038-step-ahead.patch` (`STEP_AHEAD=1`; off by default): when a reply ends and nothing else runs or waits,
+  rank 0 reads it ahead while the client runs its tools. An agent's next request is its last prompt, the reply and the tool
+  results, but the prompt cache keeps states only at a prompt pass's chunk ends, so that request resumed at its previous
+  prompt's last kept chunk end and read its own previous reply again (on one Hermes Agent deployment: 2,178 of the 3,277
+  tokens a step re-read were its own previous reply). The background pass reads prompt + reply, cut at the last chunk
+  end that leaves the window, and keeps a state there; it is the next request's own cold pass up to that point, so replies
+  keep their bits. A queued pass yields to any arrival; with prompt steps (`0037`) a request that continues a pass that is
+  mid-way waits for its state, and one that does not cancels it. The author's agent-loop measurement: time to first token
+  of a step 1.99 s to 1.34 s (8 steps, 62-72K tokens). By **Coinupbtc ([Coinupbtc](https://github.com/Coinupbtc))**
+  ([pull request #41](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/41)), rebased by **Braincramps ([Braincramps](https://github.com/Braincramps))**
+  ([pull request #66](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/66)) and carried onto the prompt steps here; host tests, also run with prompts read a chunk a turn.
+  Its two open questions from the review of #41 (a run with `SPILL_GIB` and `KV_SHARD=1`, and whether a pass may park on a
+  disk restore) are not answered by a run: it is off by default, and **not run on a pair here**.
 - `zig/patches/0037-prompt-steps.patch` (`PREFILL_YIELD=1`; off by default): a prompt can be read a chunk at a time. Until
   now a prompt's whole pass ran inside its admission, so a request that arrived while a long prompt was being read waited
   for all of it (a 250K-token cold prompt: two minutes; the live streams already got decode rounds between its chunks,
