@@ -9,7 +9,8 @@
   is built by `scripts/prepare.sh` from `gateway/Dockerfile` (multi-stage Rust 1.97 to Debian slim, unprivileged, no GPU,
   no Python, no OpenCV); `GATEWAY_MEMORY`, `GATEWAY_CPUS`, `GATEWAY_STRICT`, `GATEWAY_BLOCK_PRIVATE_URLS`,
   `GATEWAY_API_SAMPLING`, `GATEWAY_IMAGE_TOKEN`, `GATEWAY_LOG`, `GATEWAY_MAX_IMAGES` and `GATEWAY_MAX_IMAGE_MB` are the
-  gateway's settings. `API_GATEWAY=0` keeps the previous output byte for byte (`scripts/test_api_gateway_settings.py`).
+  gateway's settings. `API_GATEWAY=0` keeps the previous output except the derived engine image tag, which changes when
+  0011 enters `zig/patches/`; `scripts/test_api_gateway_settings.py` compares every other byte.
   See the README section "DeepSeek API parity (gateway)" and `docs/api-gateway.md`; the comparator (`ds41-paridad`) is
   verified when E6 lands.
 - `zig/patches/0009-disk-cache.patch` (off by default; `DISK_CACHE=1`): kept conversation states go to disk, each rank its

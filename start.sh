@@ -93,7 +93,7 @@ check_workers
 
 # rank 0's command (its serve flags need no link): built first, so the flags can be checked before anything is stopped
 # API_GATEWAY=1: the engine moves to loopback and the gateway takes HOST:PORT. With API_GATEWAY=0 this is the command of
-# today, byte for byte.
+# today; only the image tag changes when patch 0011 enters zig/patches/.
 SERVE_HOST=$HOST; SERVE_PORT=$PORT
 if [[ "$API_GATEWAY" == 1 ]]; then SERVE_HOST=127.0.0.1; SERVE_PORT=$ENGINE_PORT; fi
 SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$SERVE_HOST" --port "$SERVE_PORT" --name "$SERVED_NAME"

@@ -423,7 +423,8 @@ and encodes the prompt, calls `POST /inference/v1/generate` on the engine, and t
 API's body or SSE. Requests that the conversion cannot represent faithfully, and fields only the Zig server knows, go to
 the engine unchanged with `x-ds41-gateway: fallback` and one log line with the reason; `GATEWAY_STRICT=1` returns the
 API's 400 instead. The engine's other routes (`/v1/models`, `/tokenize`, `/metrics`, `/health`, ...) are proxied as they
-are. The gateway is off by default: with `API_GATEWAY=0` (the default) the recipe behaves exactly as before.
+are. The gateway is off by default: with `API_GATEWAY=0` (the default) the recipe behaves as before; the only output
+difference is the derived engine image tag, which changes when 0011 enters `zig/patches/`.
 
 **Turn it on.** Put `API_GATEWAY=1` in `scripts/local.sh` and run `./start.sh` (or `./start.sh restart`). The engine
 then listens on `127.0.0.1:ENGINE_PORT` (default 8887) with `TENSORFOLD_TOKEN_ROUTE=1`, and the gateway listens on
