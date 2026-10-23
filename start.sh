@@ -279,8 +279,20 @@ running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>
 gateway_remove_after_failure() {
   [[ "$API_GATEWAY" == 1 ]] || return 0
   docker inspect ds41-gateway >/dev/null 2>&1 || return 0
-  docker rm -f ds41-gateway >/dev/null 2>&1 || true
-  log "Removed ds41-gateway after the failure"
+  if docker rm -f ds41-gateway >/dev/null 2>&1; then
+    log "Removed ds41-gateway after the failure"
+  else
+    warn "could not remove ds41-gateway after the failure"
+  fi
+}
+# Save and print the gateway's last log lines before removing it, so a failed start keeps its reason.
+gateway_dump_logs() {
+  [[ "$API_GATEWAY" == 1 ]] || return 0
+  docker inspect ds41-gateway >/dev/null 2>&1 || return 0
+  local saved
+  saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || true
+  docker logs --tail 15 ds41-gateway 2>&1 | sed 's/^/  │ /'
+  [[ -z "$saved" ]] || log "Gateway's log: $saved"
 }
 # ds41-gateway's command: the API's flags, the engine on loopback, the served tokenizer and the container's limits.
 GATEWAY_LISTEN="$HOST:$PORT"; [[ "$HOST" != *:* ]] || GATEWAY_LISTEN="[$HOST]:$PORT"
@@ -348,9 +360,14 @@ log "Rank 0 here: ${SERVE[*]}"
 step 4 "Loading: ~98 GiB of weights on each Spark, then Engram and the caches (a few minutes)"
 docker logs -f "$CONTAINER_NAME" 2>&1 | sed -u "s/^/  ${D}│${R} /" &
 LOGS_PID=$!
-trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
+# The EXIT trap stops the log follower. It also removes a gateway started by this run when the start was interrupted
+# (INT/TERM) before it finished, so a later start does not inherit a half-started one.
+GATEWAY_STARTED=0
+STARTUP_DONE=0
+trap 'kill $LOGS_PID 2>/dev/null || true; [[ "$GATEWAY_STARTED" == 1 && "$STARTUP_DONE" != 1 ]] && docker rm -f ds41-gateway >/dev/null 2>&1 || true' EXIT
 fail() {
   kill $LOGS_PID 2>/dev/null || true
+  gateway_dump_logs
   gateway_remove_after_failure
   printf '%s── rank 1 (%s): last log lines ──%s\n' "$D" "$(worker_host 1)" "$R"; worker 1 docker logs --tail 15 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
   die "$1"
@@ -374,6 +391,7 @@ if [[ "$API_GATEWAY" == 1 ]]; then
     gateway_remove_after_failure
     die "could not start ds41-gateway"
   fi
+  GATEWAY_STARTED=1
   gstart=$SECONDS
   until curl -sf --max-time 5 "$URL/health" >/dev/null 2>&1; do
     if ! running_gateway; then
@@ -426,6 +444,7 @@ if awk -v g="$MEMGUARD_GIB" 'BEGIN {exit !(g > 0)}'; then
 fi
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
+STARTUP_DONE=1
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   $( [[ "$API_GATEWAY" == 1 ]] && echo "(gateway: DeepSeek API parity on; engine on 127.0.0.1:$ENGINE_PORT)" || echo "(model: $SERVED_NAME)" )

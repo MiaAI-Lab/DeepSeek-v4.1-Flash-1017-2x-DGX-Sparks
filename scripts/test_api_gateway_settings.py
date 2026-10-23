@@ -121,6 +121,16 @@ class ApiGatewaySettingsTest(unittest.TestCase):
             [str(ROOT / "start.sh")], cwd=ROOT, env=env, text=True, capture_output=True, timeout=60
         )
 
+    def _gateway_tokens(self, out):
+        """Decode the [dry-run] gateway docker line back into argv (bash %q escapes the image token)."""
+        line = next(l for l in out.splitlines() if l.strip().startswith("docker run -d --name ds41-gateway"))
+        split = subprocess.run(
+            ["bash", "-c", 'eval "a=($(cat))"; printf "%s\\0" "${a[@]}"'],
+            input=line.strip(), text=True, capture_output=True, env={"PATH": f"{self.bin}:/usr/bin:/bin"}, timeout=10,
+        )
+        self.assertEqual(split.returncode, 0, split.stderr)
+        return [token for token in split.stdout.split("\0") if token]
+
     def test_api_gateway_0_matches_the_recorded_output(self):
         result = self.run_start()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -161,7 +171,8 @@ class ApiGatewaySettingsTest(unittest.TestCase):
             "--tokenizer /served/tokenizer.json --served-name DeepSeek-V4.1-Flash-1017 --image-token",
             out,
         )
-        self.assertIn("deepseek_image", out)
+        gateway_tokens = self._gateway_tokens(out)
+        self.assertEqual(gateway_tokens[gateway_tokens.index("--image-token") + 1], "<\uff5cdeepseek_image\uff5c>")
         self.assertIn(
             "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --log debug --default-thinking "
             "--strict --block-private-urls=false --api-sampling=false --require-key",
@@ -211,6 +222,15 @@ class ApiGatewaySettingsTest(unittest.TestCase):
                 accepted.add("--" + (long_name.group(1) if long_name else field.replace("_", "-")))
             for flag in flags:
                 self.assertIn(flag, accepted)
+
+    def test_api_gateway_banner_is_the_contract_phrase(self):
+        """DRY_RUN stops before the banner, so pin its exact phrase in the source (the contract's wording)."""
+        source = (ROOT / "start.sh").read_text()
+        self.assertIn(
+            "(gateway: DeepSeek API parity on; engine on 127.0.0.1:$ENGINE_PORT)",
+            source,
+        )
+        self.assertIn('|| echo "(model: $SERVED_NAME)"', source)
 
     def test_token_route_without_the_gateway_only_sets_the_engine_variable(self):
         result = self.run_start(TOKEN_ROUTE=1)
