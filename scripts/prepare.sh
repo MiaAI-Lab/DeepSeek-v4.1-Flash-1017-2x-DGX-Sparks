@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prepare two Sparks to serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw with TensorFold's native engine. The
+# Prepare two Sparks to serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw with TensorFold's native engine. The
 # checkpoint, the kit and the served folder land on this Spark; the worker reads them over NFS:
 #   1. preflight: docker and the GPU on both Sparks, key-based ssh, the link between them
 #   2. the engine image on this Spark (zig/Dockerfile: BertholomusAI's TensorFold fork at TF_REF plus zig/patches, and

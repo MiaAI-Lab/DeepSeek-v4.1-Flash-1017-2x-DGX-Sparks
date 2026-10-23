@@ -12,7 +12,7 @@ class CheckpointPinTest(unittest.TestCase):
     def test_default_revision_resolves_with_checkpoint_files(self):
         config = (Path(__file__).resolve().parent / "config.sh").read_text()
         revision = re.search(r"_rev=([0-9a-f]{40})", config).group(1)
-        url = "https://huggingface.co/api/models/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw/revision/" + revision
+        url = "https://huggingface.co/api/models/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw/revision/" + revision
         with urllib.request.urlopen(url, timeout=30) as response:
             metadata = json.loads(response.read(16 * 1024 * 1024))
         self.assertEqual(metadata["sha"], revision)

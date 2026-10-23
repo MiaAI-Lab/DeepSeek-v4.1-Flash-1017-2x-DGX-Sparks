@@ -39,13 +39,15 @@ MASTER_ADDR="${MASTER_ADDR:-}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-}"     # NCCL's bootstrap socket's netdev on both nodes (default: the link's)
 
 # ---------------------------------------------------------------- the checkpoint, the engine, the kernel kit
-# The weights: Mia's AI Lab's EAQ v1 EXL3 quantization of DeepSeek-V4.1-Flash-1017 at 2.9 bits a weight (39 shards, 196 GiB;
-# the vision tower and the DSpark draft blocks are in it). Its Engram n-gram tables are not: they are read unquantized from
+# The weights: Mia's AI Lab's EAQ v1.1 EXL3 quantization of DeepSeek-V4.1-Flash-1017 at 2.9 bits a weight (39 shards,
+# 210,735,685,708 tensor bytes / ~196 GiB; the vision tower and the DSpark draft blocks are in it; 27 linears are BF16,
+# so the engine must have the mixed-pack loader). Its Engram n-gram tables are not: they are read unquantized from
 # the base model's shards 47 and 48 (ENGRAM_ID, ~203 GB), which this Spark downloads beside it.
-MODEL_ID="${MODEL_ID:-Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw}"
-_rev=""; [[ "$MODEL_ID" == Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw ]] && _rev=45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b
+MODEL_ID="${MODEL_ID:-Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw}"
+_rev=""; [[ "$MODEL_ID" == Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw ]] && _rev=aee640e2afba93be683bb5b9b420115fe7fbac20
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-# Keys' matching Mia EAQ 2.9 bpw overlay (not a standalone checkpoint).
+# Keys' matching Mia EAQ 2.9 bpw overlay (not a standalone checkpoint). It matches EAQ v1, not v1.1: ABLIT=1 with the
+# v1.1 default is refused below; set MODEL_ID and MODEL_REVISION to the v1 checkpoint for the overlay.
 export ABLIT="${ABLIT:-0}"
 ABLIT_ID=drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 ABLIT_REVISION="${ABLIT_REVISION:-0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw (an EXL3 quantization of DeepSeek-V4.1-Flash-1017) on two DGX
+# Serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw (an EXL3 quantization of DeepSeek-V4.1-Flash-1017) on two DGX
 # Sparks with TensorFold's native engine, end to end: runs scripts/prepare.sh when the image, the checkpoint, the weight
 # files, the kit or the worker's NFS volume are not ready yet (the first run, or after the patches change), starts rank 1
 # on the worker and rank 0 here, which serves the API on port 8888, waits until the OpenAI API answers, then runs a smoke

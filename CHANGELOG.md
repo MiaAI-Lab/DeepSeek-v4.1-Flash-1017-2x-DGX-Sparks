@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Default checkpoint moved to `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2` (39 shards,
+  ~196 GiB). v1.1 keeps the EAQ v1 widths but stores 27 indexer/compressor linears as BF16, so the engine must have the
+  mixed-pack loader. `ABLIT=1` still requires the EAQ v1 checkpoint and is refused with the v1.1 default.
+  `scripts/test_checkpoint_pin.py` checks the new pin.
+
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,
