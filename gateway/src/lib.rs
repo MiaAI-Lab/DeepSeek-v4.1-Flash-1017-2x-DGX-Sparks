@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use deepseek_recipe::request::{ConversionError, ConversionOptions, ModelVersion, ProtocolRequest};
 use deepseek_recipe_core::conversation::Conversation;
 use deepseek_recipe_core::messages::InputMessage;
+use deepseek_recipe_core::multimodal::ImageSource;
 use deepseek_recipe_core::special_tokens::{SpecialToken, SpecialTokens, SpecialTokensMap};
 use deepseek_recipe_encoding::v4::dsv41::DeepseekV41Encoding;
 use deepseek_recipe_encoding::{PromptEncoding, PromptTokenizer, RenderedPrompt, TokenizerEncoder};
@@ -21,7 +22,10 @@ use tokenizers::Tokenizer;
 pub mod api;
 pub mod engine;
 pub mod health;
+pub mod images;
+pub mod paridad;
 pub mod parity;
+pub mod proxy;
 
 /// The error shape of the public API.  `status` is the HTTP status, and `body` is the
 /// JSON body (`{"error": {"message", ...}}`) that the API returns.
@@ -29,6 +33,9 @@ pub mod parity;
 pub struct ApiError {
     pub status: u16,
     pub body: Value,
+    /// Set when a conversion error should be proxied to the engine instead of
+    /// returned as the API's 400.
+    pub fallback_reason: Option<String>,
 }
 
 impl ApiError {
@@ -45,7 +52,16 @@ impl ApiError {
                     "code": kind,
                 }
             }),
+            fallback_reason: None,
         }
+    }
+
+    /// A conversion error that the caller may proxy to the engine.
+    pub fn fallback(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let mut error = Self::bad_request(message.clone());
+        error.fallback_reason = Some(message);
+        error
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -102,6 +118,7 @@ pub struct EncodedPrompt {
     pub history_len: u32,
     pub shared_prefixes: Vec<u32>,
     pub image_count: usize,
+    pub image_sources: Vec<ImageSource>,
 }
 
 /// Settings needed to build a [`Gateway`].
@@ -182,9 +199,16 @@ impl Gateway {
         &self,
         request: R,
     ) -> Result<deepseek_recipe::request::ConversationRequest, ApiError> {
-        request
-            .convert(self.options.clone())
-            .map_err(ApiError::from)
+        self.try_convert(request).map_err(ApiError::from)
+    }
+
+    /// Convert while preserving the typed conversion error, so the caller can
+    /// decide between the API's 400 and a fallback to the engine.
+    pub fn try_convert<R: ProtocolRequest>(
+        &self,
+        request: R,
+    ) -> Result<deepseek_recipe::request::ConversationRequest, ConversionError> {
+        request.convert(self.options.clone())
     }
 
     /// Render the conversation, then encode it while recording where every explicit
@@ -224,6 +248,7 @@ impl Gateway {
             history_len,
             shared_prefixes,
             image_count: rendered.image_sources.len(),
+            image_sources: rendered.image_sources,
         })
     }
 

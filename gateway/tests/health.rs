@@ -18,7 +18,9 @@ use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 
 fn tokenizer_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json")
+    std::env::var_os("DS41_TOKENIZER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json"))
 }
 
 fn gateway() -> Gateway {
@@ -28,7 +30,7 @@ fn gateway() -> Gateway {
         GatewaySettings {
             served_name: "DeepSeek-V4.1-Flash-1017".to_string(),
             default_thinking: true,
-            image_token: "<｜end_of_query｜>".to_string(),
+            image_token: "<｜deepseek_image｜>".to_string(),
             aliases: Vec::new(),
         },
     )
@@ -182,6 +184,112 @@ async fn render_reports_a_fallback_reason_without_touching_the_engine() {
 }
 
 #[tokio::test]
+async fn render_strict_returns_the_api_400_for_a_fallback_field() {
+    let url = spawn_gateway(
+        "http://127.0.0.1:1",
+        gateway(),
+        GatewayConfig {
+            strict: true,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "draft": true
+        }))
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 400);
+    let value: Value = response.json().await.expect("body");
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert_eq!(value["error"]["message"], "vLLM field draft");
+}
+
+#[tokio::test]
+async fn render_keeps_a_known_response_format_on_the_api_path() {
+    let url = spawn_gateway("http://127.0.0.1:1", gateway(), GatewayConfig::default()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Return json"}],
+            "response_format": {"type": "json_object"}
+        }))
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("body");
+    assert!(value["fallback_reason"].is_null());
+    assert!(value["prompt"].as_str().unwrap().contains("json"));
+}
+
+#[tokio::test]
+async fn render_keeps_regex_on_the_api_path() {
+    // deepseek-recipe 0.2.0 converts `ResponseFormat::Regex` (it only does not
+    // render it into the prompt), so the gateway must not fall back for it.
+    let url = spawn_gateway("http://127.0.0.1:1", gateway(), GatewayConfig::default()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Return a number"}],
+            "response_format": {"type": "regex", "regex": "[0-9]+"}
+        }))
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("body");
+    assert!(value["fallback_reason"].is_null());
+    assert!(value["prompt"].is_string());
+}
+
+#[tokio::test]
+async fn render_falls_back_only_for_an_unknown_response_format() {
+    let url = spawn_gateway("http://127.0.0.1:1", gateway(), GatewayConfig::default()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "response_format": {"type": "xml"}
+        }))
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("body");
+    assert_eq!(value["fallback_reason"], "vLLM field response_format xml");
+    assert!(value["prompt"].is_null());
+}
+
+#[tokio::test]
+async fn render_maps_an_effort_only_kwarg_without_disabling_thinking() {
+    let url = spawn_gateway("http://127.0.0.1:1", gateway(), GatewayConfig::default()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "chat_template_kwargs": {"reasoning_effort": "low"}
+        }))
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("body");
+    assert!(value["fallback_reason"].is_null());
+    assert_eq!(value["thinking"], true);
+    assert_eq!(value["effort"], "low");
+}
+
+#[tokio::test]
 async fn render_injects_the_operator_default_effort() {
     let url = spawn_gateway(
         "http://127.0.0.1:1",
@@ -205,6 +313,25 @@ async fn render_injects_the_operator_default_effort() {
     let value: Value = response.json().await.expect("body");
     assert_eq!(value["effort"], "low");
     assert_eq!(value["thinking"], true);
+}
+
+#[tokio::test]
+async fn render_falls_back_when_response_format_has_no_type() {
+    let url = spawn_gateway("http://127.0.0.1:1", gateway(), GatewayConfig::default()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "response_format": {}
+        }))
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("body");
+    assert_eq!(value["fallback_reason"], "vLLM field response_format");
+    assert!(value["prompt"].is_null());
 }
 
 #[tokio::test]
@@ -269,4 +396,79 @@ async fn render_rejects_a_non_object_body_with_the_api_error() {
     assert_eq!(response.status(), 400);
     let body: Value = response.json().await.expect("body");
     assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn render_falls_back_on_a_conversion_error_and_strict_returns_the_api_400() {
+    let body = json!({
+        "model": "unknown-model",
+        "messages": [{"role": "user", "content": "Hola"}]
+    });
+    let url = spawn_gateway("http://127.0.0.1:1", gateway(), GatewayConfig::default()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&body)
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("body");
+    assert!(value["fallback_reason"].is_string());
+    for field in [
+        "prompt",
+        "prompt_token_ids",
+        "image_count",
+        "thinking",
+        "effort",
+        "sampling",
+        "max_tokens",
+        "history_len",
+        "shared_prefixes",
+    ] {
+        assert!(
+            value[field].is_null(),
+            "{field} is not null: {}",
+            value[field]
+        );
+    }
+
+    let url = spawn_gateway(
+        "http://127.0.0.1:1",
+        gateway(),
+        GatewayConfig {
+            strict: true,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&body)
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.headers()["x-ds41-gateway"], "api");
+    let value: Value = response.json().await.expect("body");
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert!(value["error"]["message"].is_string());
+}
+
+#[tokio::test]
+async fn responses_video_url_is_a_fallback_reason() {
+    let url = spawn_gateway("http://127.0.0.1:1", gateway(), GatewayConfig::default()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/ds41/render/responses"))
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "input": "Hola",
+            "video_url": "https://example.com/a.mp4"
+        }))
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.expect("body");
+    assert_eq!(value["fallback_reason"], "vLLM field video_url");
+    assert!(value["prompt"].is_null());
 }

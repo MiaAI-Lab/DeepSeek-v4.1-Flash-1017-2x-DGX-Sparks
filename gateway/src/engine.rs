@@ -10,6 +10,7 @@ use std::time::Duration;
 use deepseek_recipe::stream::{
     InferenceChunk, InferenceFinishReason, InferenceTokenLogprob, PromptUsage,
 };
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -110,6 +111,28 @@ impl EngineClient {
         &self.base
     }
 
+    /// A cheap `/v1/models` request used by `--require-key` to let the engine decide
+    /// whether the client's credentials are acceptable.
+    pub async fn models(&self, headers: &HeaderMap) -> Result<(u16, Value), ApiError> {
+        let mut builder = self.client.get(format!("{}/v1/models", self.base));
+        for name in ["authorization", "x-api-key"] {
+            if let Some(value) = headers.get(name) {
+                builder = builder.header(name, value);
+            }
+        }
+        let response = builder.send().await.map_err(|error| {
+            ApiError::bad_gateway(format!("the model server is unreachable: {error}"))
+        })?;
+        let status = response.status().as_u16();
+        let body = response.json().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
+    /// The shared HTTP client, used by the transparent proxy.
+    pub fn http(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     /// Fetch the engine's `/health`; returns its status and JSON body, or a transport
     /// error message.
     pub async fn health(&self) -> Result<(u16, Value), String> {
@@ -130,17 +153,18 @@ impl EngineClient {
         &self,
         request: &GenerateRequest,
         eos: u32,
+        headers: &HeaderMap,
     ) -> Result<EngineStream, ApiError> {
         let url = format!("{}/inference/v1/generate", self.base);
-        let response = self
-            .client
-            .post(&url)
-            .json(request)
-            .send()
-            .await
-            .map_err(|error| {
-                ApiError::bad_gateway(format!("the model server is unreachable: {error}"))
-            })?;
+        let mut builder = self.client.post(&url).json(request);
+        for name in ["authorization", "x-api-key"] {
+            if let Some(value) = headers.get(name) {
+                builder = builder.header(name, value);
+            }
+        }
+        let response = builder.send().await.map_err(|error| {
+            ApiError::bad_gateway(format!("the model server is unreachable: {error}"))
+        })?;
         let status = response.status();
         if !status.is_success() {
             let body: Value = response.json().await.unwrap_or(Value::Null);
@@ -155,6 +179,19 @@ impl EngineClient {
             logprobs_top_n: request.logprobs_top_n,
             eos,
         })
+    }
+}
+
+/// Read the status of an engine error event.  The engine sends a number or a
+/// string; known string codes that mean a bad request become 400.
+fn error_status(code: Option<&Value>) -> u16 {
+    match code {
+        Some(Value::Number(number)) => number.as_u64().unwrap_or(500).min(599) as u16,
+        Some(Value::String(code)) => code.parse().unwrap_or(match code.as_str() {
+            "context_length_exceeded" | "invalid_request_error" => 400,
+            _ => 500,
+        }),
+        _ => 500,
     }
 }
 
@@ -226,8 +263,7 @@ impl EngineStream {
                         ));
                     }
                     if let Some(error) = value.get("error") {
-                        let status =
-                            error.get("code").and_then(Value::as_u64).unwrap_or(500) as u16;
+                        let status = error_status(error.get("code"));
                         return Err(upstream_error(status, &value));
                     }
                     let mapped = self.map_event(&value)?;
@@ -312,6 +348,7 @@ impl EngineStream {
                     logprobs.pop();
                 }
             }
+            let mut finish_raw = Vec::new();
             if !token_ids.is_empty() {
                 events.push(EngineEvent {
                     chunk: InferenceChunk::Tokens {
@@ -320,16 +357,10 @@ impl EngineStream {
                     },
                     raw_ids,
                 });
-            } else if !raw_ids.is_empty() {
-                // The only token was the terminal EOS: keep the raw ids for the token
-                // hash but do not push an empty token chunk.
-                events.push(EngineEvent {
-                    chunk: InferenceChunk::Tokens {
-                        token_ids: Vec::new(),
-                        logprobs: None,
-                    },
-                    raw_ids,
-                });
+            } else {
+                // The only token was the terminal EOS: keep its raw ids on the finish
+                // event for the token hash, without emitting an empty token chunk.
+                finish_raw = raw_ids;
             }
             if let Some(finish) = finish {
                 let finish_reason = match finish {
@@ -343,7 +374,7 @@ impl EngineStream {
                 };
                 events.push(EngineEvent {
                     chunk: InferenceChunk::Finish { finish_reason },
-                    raw_ids: Vec::new(),
+                    raw_ids: finish_raw,
                 });
             }
         }

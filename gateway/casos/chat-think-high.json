@@ -1,0 +1,31 @@
+{
+ "id": "chat-think-high",
+ "protocol": "chat",
+ "tags": [
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola @script=think"
+   }
+  ],
+  "thinking": {
+   "type": "enabled"
+  },
+  "reasoning_effort": "high"
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": {
+   "invariants": true,
+   "same_ids": true,
+   "finish_reason": "stop"
+  }
+ },
+ "greedy": true,
+ "nota": "el guion del fake_serve deja <|im_end|> en el content; el gateway no lo recorta"
+}

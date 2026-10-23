@@ -7,7 +7,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
 use ds41_gateway::engine::{EngineClient, GenerateRequest, SamplingParams, StreamOptions};
@@ -92,7 +92,10 @@ async fn maps_rounds_usage_and_trims_the_terminal_eos() {
     ];
     let base = spawn(mock(events, true, Arc::clone(&seen)).await).await;
     let client = EngineClient::new(base).expect("client");
-    let mut stream = client.start(&request(), 1).await.expect("start");
+    let mut stream = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect("start");
 
     let mut chunks = Vec::new();
     let mut raw = Vec::new();
@@ -140,7 +143,10 @@ async fn maps_length_without_trimming() {
     ];
     let base = spawn(mock(events, true, seen).await).await;
     let client = EngineClient::new(base).expect("client");
-    let mut stream = client.start(&request(), 1).await.expect("start");
+    let mut stream = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect("start");
     let mut token_ids = Vec::new();
     let mut finish = None;
     while let Some(event) = stream.next_event().await.expect("event") {
@@ -169,7 +175,10 @@ async fn an_error_event_becomes_an_api_error() {
     ];
     let base = spawn(mock(events, true, seen).await).await;
     let client = EngineClient::new(base).expect("client");
-    let mut stream = client.start(&request(), 1).await.expect("start");
+    let mut stream = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect("start");
     let error = stream.next_event().await.expect_err("error");
     assert_eq!(error.status, 400);
     assert_eq!(error.body["error"]["message"], "bad logprobs");
@@ -184,7 +193,10 @@ async fn a_cut_stream_without_finish_is_a_bad_gateway() {
     ];
     let base = spawn(mock(events, false, seen).await).await;
     let client = EngineClient::new(base).expect("client");
-    let mut stream = client.start(&request(), 1).await.expect("start");
+    let mut stream = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect("start");
     let _ = stream.next_event().await.expect("ready");
     let _ = stream.next_event().await.expect("tokens");
     let error = stream.next_event().await.expect_err("cut stream");
@@ -203,7 +215,10 @@ async fn http_500_becomes_a_bad_gateway() {
     let router = Router::new().route("/inference/v1/generate", post(fail));
     let base = spawn(router).await;
     let client = EngineClient::new(base).expect("client");
-    let error = client.start(&request(), 1).await.expect_err("http error");
+    let error = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect_err("http error");
     assert_eq!(error.status, 502);
     assert_eq!(error.body["error"]["message"], "engine exploded");
 }
@@ -247,7 +262,10 @@ async fn dropping_the_stream_closes_the_engine_connection() {
     let router = Router::new().route("/inference/v1/generate", post(handler));
     let base = spawn(router).await;
     let client = EngineClient::new(base).expect("client");
-    let mut stream = client.start(&request(), 1).await.expect("start");
+    let mut stream = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect("start");
     let _ = stream.next_event().await.expect("ready");
     drop(stream);
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -277,7 +295,10 @@ async fn tolerant_logprob_token_spellings_are_accepted_and_trimmed() {
     let mut request = request();
     request.sampling_params.logprobs = Some(2);
     request.logprobs_top_n = Some(1);
-    let mut stream = client.start(&request, 1).await.expect("start");
+    let mut stream = client
+        .start(&request, 1, &HeaderMap::new())
+        .await
+        .expect("start");
     let mut logprobs = None;
     while let Some(event) = stream.next_event().await.expect("event") {
         if let deepseek_recipe::stream::InferenceChunk::Tokens {
@@ -296,7 +317,10 @@ async fn tolerant_logprob_token_spellings_are_accepted_and_trimmed() {
 #[tokio::test]
 async fn unreachable_engine_is_a_bad_gateway() {
     let client = EngineClient::new("http://127.0.0.1:1").expect("client");
-    let error = client.start(&request(), 1).await.expect_err("unreachable");
+    let error = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect_err("unreachable");
     assert_eq!(error.status, 502);
     assert!(
         error.body["error"]["message"]
@@ -304,4 +328,52 @@ async fn unreachable_engine_is_a_bad_gateway() {
             .unwrap()
             .contains("unreachable")
     );
+}
+
+#[tokio::test]
+async fn an_eos_only_final_event_does_not_emit_an_empty_token_chunk() {
+    let seen = Arc::new(tokio::sync::Mutex::new(None));
+    let events = vec![
+        json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10}}),
+        json!({"choices": [{"index": 0, "finish_reason": "stop", "token_ids": [1], "logprobs": null}]}),
+        json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}}),
+    ];
+    let base = spawn(mock(events, true, seen).await).await;
+    let client = EngineClient::new(base).expect("client");
+    let mut stream = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect("start");
+    let mut raw = Vec::new();
+    let mut chunks = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event") {
+        raw.extend(event.raw_ids);
+        chunks.push(event.chunk);
+    }
+    assert_eq!(raw, vec![1]);
+    assert!(chunks.iter().all(|chunk| !matches!(
+        chunk,
+        deepseek_recipe::stream::InferenceChunk::Tokens { token_ids, .. } if token_ids.is_empty()
+    )));
+    assert!(chunks.iter().any(|chunk| matches!(
+        chunk,
+        deepseek_recipe::stream::InferenceChunk::Finish {
+            finish_reason: deepseek_recipe::stream::InferenceFinishReason::Stop
+        }
+    )));
+}
+
+#[tokio::test]
+async fn a_context_length_error_code_string_is_a_bad_request() {
+    let seen = Arc::new(tokio::sync::Mutex::new(None));
+    let events = vec![json!({"error": {"message": "too long", "code": "context_length_exceeded"}})];
+    let base = spawn(mock(events, true, seen).await).await;
+    let client = EngineClient::new(base).expect("client");
+    let mut stream = client
+        .start(&request(), 1, &HeaderMap::new())
+        .await
+        .expect("start");
+    let error = stream.next_event().await.expect_err("error");
+    assert_eq!(error.status, 400);
+    assert_eq!(error.body["error"]["message"], "too long");
 }

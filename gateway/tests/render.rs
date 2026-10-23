@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 
 fn tokenizer_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json")
+    std::env::var_os("DS41_TOKENIZER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json"))
 }
 
 fn gateway() -> Gateway {

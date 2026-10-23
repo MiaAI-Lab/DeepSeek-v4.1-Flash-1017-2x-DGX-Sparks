@@ -1,0 +1,20 @@
+{
+ "id": "responses-reasoning-medium",
+ "protocol": "responses",
+ "tags": [
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "input": "Hola",
+  "reasoning": {
+   "effort": "medium"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

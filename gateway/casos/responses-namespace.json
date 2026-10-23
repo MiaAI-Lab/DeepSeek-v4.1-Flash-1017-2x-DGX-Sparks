@@ -1,0 +1,37 @@
+{
+ "id": "responses-namespace",
+ "protocol": "responses",
+ "tags": [
+  "tools"
+ ],
+ "body": {
+  "input": "Consulta",
+  "tools": [
+   {
+    "type": "function",
+    "name": "ns_get_weather",
+    "description": "Weather",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  ],
+  "reasoning": {
+   "effort": "none"
+  }
+ },
+ "expect": {
+  "render": {
+   "class": "herramientas",
+   "note": "el gateway y el template del Zig difieren en las líneas antes de ## Tools"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

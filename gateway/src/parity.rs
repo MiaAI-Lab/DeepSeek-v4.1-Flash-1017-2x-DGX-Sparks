@@ -3,6 +3,8 @@
 //! Both endpoints must produce exactly the same prompt, token IDs, sampling parameters
 //! and cache marks, so the preparation lives here and neither endpoint can drift.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +16,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::engine::{GenerateRequest, SamplingParams, StreamOptions};
+use crate::images::{self, ImageSettings, ResolvedImages};
 use crate::{ApiError, EncodedPrompt, Gateway};
 
 /// The public protocol of a request.
@@ -65,6 +68,10 @@ pub struct GatewayConfig {
     pub log_level: String,
     /// The public model name.
     pub served_name: String,
+    /// Whether the engine reports logprobs support, when known.
+    pub engine_logprobs: Option<bool>,
+    /// Test-only host-to-address overrides for image fetches.
+    pub dns_overrides: HashMap<String, IpAddr>,
 }
 
 impl Default for GatewayConfig {
@@ -80,6 +87,8 @@ impl Default for GatewayConfig {
             max_image_mb: 64,
             log_level: "info".to_string(),
             served_name: "DeepSeek-V4.1-Flash-1017".to_string(),
+            engine_logprobs: None,
+            dns_overrides: HashMap::new(),
         }
     }
 }
@@ -100,6 +109,7 @@ pub struct Prepared {
     pub sampling: Value,
     pub fallback_reason: Option<String>,
     pub logprobs_top_n: Option<u8>,
+    pub images: ResolvedImages,
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -125,7 +135,7 @@ pub fn response_id(prefix: &str) -> String {
 }
 
 /// Prepare a request body for the engine.  `R` is the protocol request type.
-pub fn prepare<R: ProtocolRequest + DeserializeOwned>(
+pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
     gateway: &Gateway,
     config: &GatewayConfig,
     protocol: Protocol,
@@ -136,17 +146,37 @@ pub fn prepare<R: ProtocolRequest + DeserializeOwned>(
             "the request body must be a JSON object",
         ));
     };
-    let mut fallback_reason = fallback_fields(&object, protocol);
+    let mut fallback_reason = fallback_fields(&object, protocol, config.engine_logprobs);
     if protocol == Protocol::Chat {
         fallback_reason = fallback_reason.or_else(|| shim_chat(&mut object));
+    }
+    if fallback_reason.is_some() && config.strict {
+        return Err(ApiError::bad_request(fallback_reason.clone().unwrap()));
+    }
+    if object.get("model").is_none_or(Value::is_null) {
+        object.insert("model".to_string(), json!(config.served_name));
     }
     inject_default_effort(&mut object, protocol, config.default_effort.as_deref());
     let request: R = serde_json::from_value(Value::Object(object.clone()))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let converted = gateway.convert(request)?;
-    let model = converted_model(&converted, &object);
+    let converted = match gateway.try_convert(request) {
+        Ok(converted) => converted,
+        Err(error) if config.strict => return Err(ApiError::from(error)),
+        Err(error) => return Err(ApiError::fallback(error.to_string())),
+    };
+    let model = converted_model(&object, &config.served_name);
     let encoded = gateway.prepare_conversation(&converted.conversation)?;
-    let prompt_tokens = encoded.ids.len() as u32;
+    let images = images::resolve(
+        &encoded.image_sources,
+        &ImageSettings {
+            max_images: config.max_images,
+            max_total_bytes: config.max_image_mb.saturating_mul(1024 * 1024),
+            block_private_urls: config.block_private_urls,
+            dns_overrides: config.dns_overrides.clone(),
+        },
+    )
+    .await?;
+    let prompt_tokens = encoded.ids.len() as u32 + images.adjustment as u32;
     let (max_tokens, context_error) =
         match converted.resolve_max_tokens(prompt_tokens, config.max_model_len) {
             Ok(max_tokens) => (Some(max_tokens), None),
@@ -202,16 +232,17 @@ pub fn prepare<R: ProtocolRequest + DeserializeOwned>(
         sampling,
         fallback_reason,
         logprobs_top_n,
+        images,
         converted,
     })
 }
 
 /// The public model name the client asked for, or the served one if absent.
-fn converted_model(_converted: &ConversationRequest, object: &Map<String, Value>) -> String {
+fn converted_model(object: &Map<String, Value>, served_name: &str) -> String {
     object
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("DeepSeek-V4.1-Flash-1017")
+        .unwrap_or(served_name)
         .to_string()
 }
 
@@ -248,7 +279,11 @@ fn shim_chat(object: &mut Map<String, Value>) -> Option<String> {
     let has_effort = object
         .get("reasoning_effort")
         .is_some_and(|value| !value.is_null());
-    if !has_thinking && !has_effort {
+    let has_switch = ["thinking", "enable_thinking"]
+        .iter()
+        .any(|key| ctk.contains_key(*key));
+    if !has_thinking && has_switch {
+        // The two switches are ORed as vLLM does; the effort is mapped separately.
         let on = ["thinking", "enable_thinking"]
             .iter()
             .any(|key| ctk.get(*key).and_then(Value::as_bool).unwrap_or(false))
@@ -258,6 +293,8 @@ fn shim_chat(object: &mut Map<String, Value>) -> Option<String> {
             json!({"type": if on { "enabled" } else { "disabled" }}),
         );
     }
+    // An effort alone does not decide thinking: the request or --default-thinking
+    // does, so no `thinking` field is inserted here.
     if let Some(effort) = effort
         && !has_effort
     {
@@ -267,11 +304,15 @@ fn shim_chat(object: &mut Map<String, Value>) -> Option<String> {
 }
 
 /// Detect the fallback fields of a raw body, including Chat's `chat_template_kwargs`.
-pub fn detect_fallback(body: &Value, protocol: Protocol) -> Option<String> {
+pub fn detect_fallback(
+    body: &Value,
+    protocol: Protocol,
+    engine_logprobs: Option<bool>,
+) -> Option<String> {
     let Value::Object(object) = body else {
         return None;
     };
-    let mut reason = fallback_fields(object, protocol);
+    let mut reason = fallback_fields(object, protocol, engine_logprobs);
     if protocol == Protocol::Chat {
         let mut object = object.clone();
         reason = reason.or_else(|| shim_chat(&mut object));
@@ -282,8 +323,18 @@ pub fn detect_fallback(body: &Value, protocol: Protocol) -> Option<String> {
 /// Fields the Zig engine owns that the API path would drop, so the request must go to
 /// the engine untouched (the proxy itself is T022; the render endpoint already reports
 /// the reason).
-fn fallback_fields(object: &Map<String, Value>, protocol: Protocol) -> Option<String> {
+fn fallback_fields(
+    object: &Map<String, Value>,
+    protocol: Protocol,
+    engine_logprobs: Option<bool>,
+) -> Option<String> {
     let present = |key: &str| object.get(key).is_some_and(|value| !value.is_null());
+    if engine_logprobs == Some(false)
+        && (object.get("logprobs").and_then(Value::as_bool) == Some(true)
+            || present("top_logprobs"))
+    {
+        return Some("vLLM logprobs while /health says logprobs: false".to_string());
+    }
     for key in [
         "prompt",
         "draft",
@@ -307,7 +358,7 @@ fn fallback_fields(object: &Map<String, Value>, protocol: Protocol) -> Option<St
         return Some("vLLM field return_token_ids".to_string());
     }
     if protocol == Protocol::Responses {
-        for key in ["previous_response_id", "store", "conversation"] {
+        for key in ["previous_response_id", "store", "conversation", "video_url"] {
             if present(key) {
                 return Some(format!("vLLM field {key}"));
             }
@@ -323,13 +374,15 @@ fn fallback_fields(object: &Map<String, Value>, protocol: Protocol) -> Option<St
             return Some("vLLM field audio".to_string());
         }
     }
-    if let Some(format) = object
+    if let Some(response_format) = object
         .get("response_format")
-        .and_then(|format| format.get("type"))
-        .and_then(Value::as_str)
-        && !matches!(format, "text" | "json_object" | "json_schema" | "regex")
+        .filter(|value| !value.is_null())
     {
-        return Some(format!("vLLM field response_format {format}"));
+        match response_format.get("type").and_then(Value::as_str) {
+            Some("text" | "json_object" | "json_schema" | "regex") => {}
+            Some(format) => return Some(format!("vLLM field response_format {format}")),
+            None => return Some("vLLM field response_format".to_string()),
+        }
     }
     None
 }
@@ -412,7 +465,7 @@ pub fn generate_request(prepared: &Prepared) -> GenerateRequest {
         stream_options: StreamOptions {
             include_usage: true,
         },
-        content_parts: None,
+        content_parts: prepared.images.parts.clone(),
         history_len: prepared.encoded.history_len,
         shared_prefixes: prepared.encoded.shared_prefixes.clone(),
         thinking: prepared.converted.conversation.thinking_mode,

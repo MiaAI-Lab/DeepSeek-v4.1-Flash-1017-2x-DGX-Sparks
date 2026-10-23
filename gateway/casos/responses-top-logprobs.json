@@ -1,0 +1,17 @@
+{
+ "id": "responses-top-logprobs",
+ "protocol": "responses",
+ "tags": [
+  "logprobs"
+ ],
+ "body": {
+  "input": "Di algo",
+  "top_logprobs": 5
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

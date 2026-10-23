@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
 use deepseek_recipe::request::ProtocolRequest;
@@ -24,7 +24,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 fn tokenizer_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json")
+    std::env::var_os("DS41_TOKENIZER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json"))
 }
 
 fn gateway() -> Gateway {
@@ -34,7 +36,7 @@ fn gateway() -> Gateway {
         GatewaySettings {
             served_name: "DeepSeek-V4.1-Flash-1017".to_string(),
             default_thinking: true,
-            image_token: "<｜end_of_query｜>".to_string(),
+            image_token: "<｜deepseek_image｜>".to_string(),
             aliases: Vec::new(),
         },
     )
@@ -66,6 +68,7 @@ fn text_ids(gateway: &Gateway, text: &str) -> Vec<u32> {
 
 struct MockState {
     body: Mutex<Option<Value>>,
+    headers: Mutex<Option<HeaderMap>>,
     closed: AtomicBool,
     events: Vec<Value>,
     delay: Duration,
@@ -75,14 +78,16 @@ struct MockState {
 async fn spawn_mock(events: Vec<Value>, delay: Duration, done: bool) -> (String, Arc<MockState>) {
     let state = Arc::new(MockState {
         body: Mutex::new(None),
+        headers: Mutex::new(None),
         closed: AtomicBool::new(false),
         events,
         delay,
         done,
     });
-    let handler = |State(state): State<Arc<MockState>>, body: Bytes| async move {
+    let handler = |State(state): State<Arc<MockState>>, headers: HeaderMap, body: Bytes| async move {
         let value: Value = serde_json::from_slice(&body).expect("json request");
         *state.body.lock().unwrap() = Some(value);
+        *state.headers.lock().unwrap() = Some(headers);
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         let task_state = Arc::clone(&state);
         let watcher = tx.clone();
@@ -171,10 +176,9 @@ async fn post_json(url: &str, body: Value) -> reqwest::Response {
 
 fn token_sha(ids: &[u32]) -> String {
     let joined = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    Sha256::digest(joined.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = Sha256::digest(joined.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex[..12].to_string()
 }
 
 /// Parse the gateway's SSE body into (event name, data) pairs.
@@ -251,6 +255,20 @@ async fn chat_non_stream_uses_the_api_shape_and_token_hashes() {
     assert_eq!(response.headers()["x-ds41-gateway"], "api");
     assert_eq!(response.headers()["x-ds41-token-sha"], token_sha(&ids));
     assert_eq!(response.headers()["x-ds41-token-sha-raw"], token_sha(&ids));
+    assert_eq!(
+        response.headers()["x-ds41-token-sha"]
+            .to_str()
+            .unwrap()
+            .len(),
+        12
+    );
+    assert_eq!(
+        response.headers()["x-ds41-token-sha-raw"]
+            .to_str()
+            .unwrap()
+            .len(),
+        12
+    );
     let body: Value = response.json().await.expect("body");
     let id = body["id"].as_str().expect("id");
     assert!(id.starts_with("chatcmpl-"));
@@ -828,4 +846,147 @@ async fn chat_template_kwargs_thinking_is_mapped_before_conversion() {
     assert_eq!(sent["thinking"], true);
     let body: Value = response.json().await.expect("body");
     assert!(body["choices"][0]["message"]["reasoning_content"].is_string());
+}
+
+#[tokio::test]
+async fn api_requests_forward_both_auth_headers_to_the_engine() {
+    let gw = gateway();
+    let ids = text_ids(&gw, "Hola");
+    let (engine, mock) = spawn_mock(
+        vec![
+            usage(4, 0),
+            tokens(&ids, Some("stop")),
+            final_usage(4, 0, ids.len() as u64),
+        ],
+        Duration::ZERO,
+        true,
+    )
+    .await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", "Bearer sk-test")
+        .header("x-api-key", "key-test")
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "thinking": {"type": "disabled"}
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+    let headers = mock
+        .headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("engine headers");
+    assert_eq!(headers["authorization"], "Bearer sk-test");
+    assert_eq!(headers["x-api-key"], "key-test");
+}
+
+#[tokio::test]
+async fn an_engine_rejection_before_the_first_token_is_a_normal_http_error() {
+    let (engine, _) = spawn_mock(
+        vec![json!({"error": {"message": "bad request", "code": 400}}), json!({"choices": [], "usage": {"prompt_tokens": 1, "prompt_tokens_details": {"cached_tokens": 0}}})],
+        Duration::ZERO,
+        true,
+    )
+    .await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+    let response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "thinking": {"type": "disabled"},
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.headers()["x-ds41-gateway"], "api");
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let body: Value = response.json().await.expect("body");
+    assert_eq!(body["error"]["message"], "bad request");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn a_missing_model_uses_the_configured_served_name() {
+    let tokenizer = Tokenizer::from_file(tokenizer_path()).expect("load tokenizer");
+    let gw = Gateway::new(
+        Arc::new(tokenizer),
+        GatewaySettings {
+            served_name: "Custom-Model-42".to_string(),
+            default_thinking: true,
+            image_token: "<｜end_of_query｜>".to_string(),
+            aliases: Vec::new(),
+        },
+    )
+    .expect("build gateway");
+    let ids = text_ids(&gw, "Hola");
+    let (engine, mock) = spawn_mock(
+        vec![
+            usage(4, 0),
+            tokens(&ids, Some("stop")),
+            final_usage(4, 0, ids.len() as u64),
+        ],
+        Duration::ZERO,
+        true,
+    )
+    .await;
+    let url = spawn_gateway_config(
+        &engine,
+        gw,
+        GatewayConfig {
+            served_name: "Custom-Model-42".to_string(),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        json!({
+            "messages": [{"role": "user", "content": "Hola"}],
+            "thinking": {"type": "disabled"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("body");
+    assert_eq!(body["model"], "Custom-Model-42");
+    let sent = mock.body.lock().unwrap().clone().expect("engine body");
+    assert_eq!(sent["model"], "Custom-Model-42");
+}
+
+#[tokio::test]
+async fn chat_template_kwargs_disable_thinking_even_with_a_top_level_effort() {
+    let gw = gateway();
+    let ids = text_ids(&gw, "Hola");
+    let (engine, mock) = spawn_mock(
+        vec![
+            usage(4, 0),
+            tokens(&ids, Some("stop")),
+            final_usage(4, 0, ids.len() as u64),
+        ],
+        Duration::ZERO,
+        true,
+    )
+    .await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+    let response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "reasoning_effort": "medium",
+            "chat_template_kwargs": {"enable_thinking": false}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let sent = mock.body.lock().unwrap().clone().expect("engine body");
+    assert_eq!(sent["thinking"], false);
 }

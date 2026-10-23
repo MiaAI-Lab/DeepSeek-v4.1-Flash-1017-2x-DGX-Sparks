@@ -11,7 +11,8 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 RUN cargo fetch --locked
 COPY src ./src
 COPY tests ./tests
-# ds41-paridad is the comparator; it is named here even while a gateway checkout without it is being integrated.
+# ds41-paridad (the comparator) runs the battery from the image, so the case files travel with it.
+COPY casos ./casos
 RUN cargo build --release --locked --bin ds41-gateway --bin ds41-paridad
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
@@ -22,6 +23,7 @@ RUN groupadd --system --gid 10001 ds41 \
  && useradd --system --uid 10001 --gid ds41 --no-create-home --shell /usr/sbin/nologin ds41
 COPY --from=builder /src/target/release/ds41-gateway /usr/local/bin/ds41-gateway
 COPY --from=builder /src/target/release/ds41-paridad /usr/local/bin/ds41-paridad
+COPY --from=builder /src/casos /casos
 ARG GATEWAY_HASH=unknown
 LABEL tf.gateway=${GATEWAY_HASH}
 USER ds41

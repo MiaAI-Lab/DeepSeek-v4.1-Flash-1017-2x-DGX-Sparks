@@ -1,0 +1,60 @@
+{
+ "id": "chat-tool-result-sin-id",
+ "protocol": "chat",
+ "tags": [
+  "tools"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Consulta"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_00_cccccccccccccccccccc",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\":\"París\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "18"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather by city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "render": "fallback",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true,
+ "nota": "el gateway E4 exige tool_call_id; el proxy es E5"
+}

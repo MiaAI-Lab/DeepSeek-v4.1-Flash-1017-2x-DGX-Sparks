@@ -1,0 +1,25 @@
+{
+ "id": "chat-basico",
+ "protocol": "chat",
+ "tags": [
+  "basico"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola @script=plain"
+   }
+  ]
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": {
+   "invariants": true,
+   "same_ids": true,
+   "finish_reason": "stop"
+  }
+ },
+ "greedy": true
+}

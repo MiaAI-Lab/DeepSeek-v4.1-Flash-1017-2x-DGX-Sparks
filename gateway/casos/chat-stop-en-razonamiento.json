@@ -1,0 +1,28 @@
+{
+ "id": "chat-stop-en-razonamiento",
+ "protocol": "chat",
+ "tags": [
+  "stops",
+  "thinking"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Piensa"
+   }
+  ],
+  "stop": [
+   "\n\n"
+  ],
+  "thinking": {
+   "type": "enabled"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

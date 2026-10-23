@@ -1,0 +1,24 @@
+{
+ "id": "chat-modelo-desconocido",
+ "protocol": "chat",
+ "tags": [
+  "errores",
+  "fallback"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "model": "modelo-inexistente"
+ },
+ "expect": {
+  "render": "fallback",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true,
+ "nota": "el gateway E4 convierte y falla con 400; el proxy es E5"
+}

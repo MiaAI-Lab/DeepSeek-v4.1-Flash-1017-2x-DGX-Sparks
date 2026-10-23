@@ -1,0 +1,25 @@
+{
+ "id": "chat-regex",
+ "protocol": "chat",
+ "tags": [
+  "formato"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Di sí o no"
+   }
+  ],
+  "response_format": {
+   "type": "regex",
+   "regex": "^(sí|no)$"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

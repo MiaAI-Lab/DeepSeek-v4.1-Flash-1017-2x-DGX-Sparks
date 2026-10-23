@@ -1,6 +1,8 @@
 //! `ds41-gateway`: the DeepSeek API front end for TensorFold's token-in/token-out route.
 
+use std::collections::HashMap;
 use std::error::Error;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,7 +67,12 @@ struct Cli {
     /// Log level.
     #[arg(long)]
     log: Option<String>,
+    /// Image DNS override for tests (`HOST=IP`, repeatable).
+    #[arg(long = "dns-override", value_name = "HOST=IP")]
+    dns_overrides: Vec<String>,
 }
+
+const DEFAULT_IMAGE_TOKEN: &str = "<｜deepseek_image｜>";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -97,7 +104,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let image_token = cli
         .image_token
         .or_else(|| env("GATEWAY_IMAGE_TOKEN"))
-        .unwrap_or_else(|| "<｜end_of_query｜>".to_string());
+        .unwrap_or_else(|| DEFAULT_IMAGE_TOKEN.to_string());
     let default_thinking = cli
         .default_thinking
         .or_else(|| env_bool("THINKING"))
@@ -125,6 +132,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .log
         .or_else(|| env("GATEWAY_LOG"))
         .unwrap_or_else(|| "info".to_string());
+    let dns_overrides = parse_dns_overrides(&cli.dns_overrides)?;
 
     let gateway = Gateway::from_file(
         &cli.tokenizer,
@@ -140,6 +148,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(limit) => limit,
         None => auto_max_model_len(&engine_client).await.unwrap_or(65_536),
     };
+    let engine_logprobs = auto_engine_logprobs(&engine_client).await;
     let config = GatewayConfig {
         max_model_len,
         api_sampling,
@@ -151,6 +160,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         max_image_mb,
         log_level,
         served_name: served_name.clone(),
+        engine_logprobs,
+        dns_overrides,
     };
     let state = AppState {
         gateway: Arc::new(gateway),
@@ -164,6 +175,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     axum::serve(listener, health::router(state)).await?;
     Ok(())
+}
+
+fn parse_dns_overrides(values: &[String]) -> Result<HashMap<String, IpAddr>, String> {
+    let mut overrides = HashMap::new();
+    for value in values {
+        let (host, address) = value
+            .split_once('=')
+            .ok_or_else(|| format!("--dns-override {value:?}: want HOST=IP"))?;
+        let address = address
+            .parse()
+            .map_err(|_| format!("--dns-override {value:?}: invalid IP address"))?;
+        overrides.insert(host.to_string(), address);
+    }
+    Ok(overrides)
+}
+
+/// Ask the engine whether it reports logprobs support; unknown means "allow".
+async fn auto_engine_logprobs(engine: &EngineClient) -> Option<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("{}/health", engine.base()))
+        .send()
+        .await
+        .ok()?;
+    if response.status() != reqwest::StatusCode::OK {
+        return None;
+    }
+    let body: Value = response.json().await.ok()?;
+    body.get("logprobs")
+        .or_else(|| body.get("engine").and_then(|engine| engine.get("logprobs")))
+        .and_then(Value::as_bool)
 }
 
 /// Ask the engine for its context limit; a short timeout keeps startup under two seconds.
@@ -193,4 +238,15 @@ async fn auto_max_model_len(engine: &EngineClient) -> Option<u32> {
         .or_else(|| value.get("max_model_len"))
         .and_then(Value::as_u64)
         .map(|value| value as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_IMAGE_TOKEN;
+
+    #[test]
+    fn the_default_image_token_is_the_served_spelling() {
+        assert_eq!(DEFAULT_IMAGE_TOKEN, "<｜deepseek_image｜>");
+        assert_ne!(DEFAULT_IMAGE_TOKEN, "<｜end_of_query｜>");
+    }
 }

@@ -1,0 +1,39 @@
+{
+ "id": "messages-system-bloques",
+ "protocol": "messages",
+ "tags": [
+  "sistema"
+ ],
+ "body": {
+  "system": [
+   {
+    "type": "text",
+    "text": "Eres útil."
+   },
+   {
+    "type": "text",
+    "text": "Responde breve."
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Hola"
+     }
+    ]
+   }
+  ],
+  "thinking": {
+   "type": "disabled"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

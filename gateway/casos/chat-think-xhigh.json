@@ -1,0 +1,29 @@
+{
+ "id": "chat-think-xhigh",
+ "protocol": "chat",
+ "tags": [
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "thinking": {
+   "type": "enabled"
+  },
+  "reasoning_effort": "xhigh"
+ },
+ "expect": {
+  "render": {
+   "class": "esfuerzo",
+   "note": "la plantilla del Zig solo nombra low/high/max; el API renderiza 75"
+  },
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

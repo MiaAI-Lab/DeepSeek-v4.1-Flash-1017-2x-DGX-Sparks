@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -50,21 +50,66 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/responses", post(responses))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
 
-async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
-    handle::<crate::parity::Chat>(state, Protocol::Chat, body).await
+async fn chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    handle::<crate::parity::Chat>(state, Protocol::Chat, headers, uri, body).await
 }
 
-async fn messages(State(state): State<AppState>, body: Bytes) -> Response {
-    handle::<crate::parity::Messages>(state, Protocol::Messages, body).await
+async fn messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    handle::<crate::parity::Messages>(state, Protocol::Messages, headers, uri, body).await
 }
 
-async fn responses(State(state): State<AppState>, body: Bytes) -> Response {
-    handle::<crate::parity::Responses>(state, Protocol::Responses, body).await
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    handle::<crate::parity::Responses>(state, Protocol::Responses, headers, uri, body).await
+}
+
+/// `POST /v1/messages/count_tokens`: the converted prompt's input tokens.
+async fn count_tokens(State(state): State<AppState>, body: Bytes) -> Response {
+    let value = match parse_body(&body) {
+        Ok(value) => value,
+        Err(error) => return anthropic_error(&error),
+    };
+    match prepare::<crate::parity::Messages>(
+        &state.gateway,
+        &state.config,
+        Protocol::Messages,
+        value,
+    )
+    .await
+    {
+        Ok(prepared) => {
+            let mut response = (
+                StatusCode::OK,
+                Json(json!({"input_tokens": prepared.prompt_tokens})),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert("x-ds41-gateway", HeaderValue::from_static("api"));
+            response
+        }
+        Err(error) => anthropic_error(&error),
+    }
 }
 
 /// Per-request token accounting for the two token-hash headers and the log line.
@@ -90,13 +135,19 @@ fn parse_body(body: &Bytes) -> Result<Value, ApiError> {
 }
 
 /// Serve one protocol request.
-async fn handle<R>(state: AppState, protocol: Protocol, body: Bytes) -> Response
+async fn handle<R>(
+    state: AppState,
+    protocol: Protocol,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response
 where
     R: ProtocolRequest + DeserializeOwned,
     ChunkOf<R>: Serialize + Send,
 {
     let started = Instant::now();
-    match serve::<R>(&state, protocol, &body, started).await {
+    match serve::<R>(&state, protocol, &headers, &uri, &body, started).await {
         Ok(response) => response,
         Err(error) => error_response(&error),
     }
@@ -105,6 +156,8 @@ where
 async fn serve<R>(
     state: &AppState,
     protocol: Protocol,
+    headers: &HeaderMap,
+    uri: &Uri,
     body: &Bytes,
     started: Instant,
 ) -> Result<Response, ApiError>
@@ -112,14 +165,49 @@ where
     R: ProtocolRequest + DeserializeOwned,
     ChunkOf<R>: Serialize + Send,
 {
+    if state.config.require_key && !has_key(headers) {
+        let (status, body) = state.engine.models(headers).await?;
+        if status != 200 {
+            return Err(ApiError {
+                status,
+                body,
+                fallback_reason: None,
+            });
+        }
+    }
     let value = parse_body(body)?;
-    let prepared = prepare::<R>(&state.gateway, &state.config, protocol, value)?;
+    if let Some(reason) =
+        crate::parity::detect_fallback(&value, protocol, state.config.engine_logprobs)
+    {
+        if state.config.strict {
+            return Err(ApiError::bad_request(reason));
+        }
+        return Ok(fallback_response(state, protocol, headers, uri, body, &reason, started).await);
+    }
+    let prepared = match prepare::<R>(&state.gateway, &state.config, protocol, value).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(reason) = error.fallback_reason.clone() {
+                return Ok(fallback_response(
+                    state, protocol, headers, uri, body, &reason, started,
+                )
+                .await);
+            }
+            return Err(error);
+        }
+    };
+    if let Some(reason) = prepared.fallback_reason.clone() {
+        return Ok(fallback_response(state, protocol, headers, uri, body, &reason, started).await);
+    }
     if let Some(error) = prepared.context_error.clone() {
         log_line(&prepared, &Trace::default(), None, started.elapsed());
         return Err(error);
     }
     let request = generate_request(&prepared);
-    let mut stream = state.engine.start(&request, state.gateway.eos).await?;
+    let mut stream = state
+        .engine
+        .start(&request, state.gateway.eos, headers)
+        .await?;
     let first = match stream.next_event().await? {
         Some(event) => event,
         None => {
@@ -346,7 +434,7 @@ where
     R: ProtocolRequest,
     ChunkOf<R>: Serialize + Send,
 {
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Event, Infallible>>(16);
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Event, ApiError>>(16);
     let trace_task = Arc::clone(&trace);
     let error_task = Arc::clone(&error_slot);
     let id = prepared.id.clone();
@@ -355,6 +443,7 @@ where
     let max_tokens = prepared.max_tokens.unwrap_or(0);
     tokio::spawn(async move {
         let mut protocol_stream = Box::pin(protocol_stream);
+        let mut sent = false;
         loop {
             tokio::select! {
                 _ = frame_tx.closed() => break,
@@ -364,9 +453,15 @@ where
                         if frame_tx.send(Ok(event)).await.is_err() {
                             break;
                         }
+                        sent = true;
                     }
                     Some(Err(error)) => {
-                        let _ = frame_tx.send(Ok(error_event(protocol, &ApiError::bad_gateway(error.to_string())))).await;
+                        let error = ApiError::bad_gateway(error.to_string());
+                        let _ = if sent {
+                            frame_tx.send(Ok(error_event(protocol, &error))).await
+                        } else {
+                            frame_tx.send(Err(error)).await
+                        };
                         break;
                     }
                     None => break,
@@ -375,7 +470,11 @@ where
         }
         let error = error_task.lock().expect("error mutex poisoned").take();
         if let Some(error) = error {
-            let _ = frame_tx.send(Ok(error_event(protocol, &error))).await;
+            let _ = if sent {
+                frame_tx.send(Ok(error_event(protocol, &error))).await
+            } else {
+                frame_tx.send(Err(error)).await
+            };
         } else if let Some(done) = R::Response::sse_done_data() {
             let _ = frame_tx.send(Ok(Event::default().data(done))).await;
         }
@@ -388,28 +487,38 @@ where
             trace.cached,
             max_tokens,
             trace.finish.as_deref().unwrap_or("cut"),
-            started.elapsed().as_millis(),
+            started.elapsed().as_millis()
         );
     });
 
+    let sse = |rx: mpsc::Receiver<Result<Event, ApiError>>| {
+        ReceiverStream::new(rx).map(move |item| match item {
+            Ok(event) => Ok::<Event, Infallible>(event),
+            Err(error) => Ok(error_event(protocol, &error)),
+        })
+    };
+
     // Wait for the first frame, but do not hold a long prefill: after two seconds the
-    // headers go out and the stream continues.
+    // headers go out and the stream continues.  A rejection before the first frame is
+    // still a normal HTTP error, not an error inside a 200 SSE stream.
     let first = tokio::time::timeout(Duration::from_secs(2), frame_rx.recv()).await;
     let mut response = match first {
-        Ok(Some(frame)) => {
-            let stream = tokio_stream::once(frame).chain(ReceiverStream::new(frame_rx));
+        Ok(Some(Ok(frame))) => {
+            let stream = tokio_stream::once(Ok::<Event, Infallible>(frame)).chain(sse(frame_rx));
             Sse::new(stream)
                 .keep_alive(KeepAlive::default())
                 .into_response()
         }
+        Ok(Some(Err(error))) => {
+            return Err(error);
+        }
         Ok(None) => {
             if let Some(error) = error_slot.lock().expect("error mutex poisoned").take() {
-                log_line(prepared, &trace.lock().unwrap(), None, started.elapsed());
                 return Err(error);
             }
-            Sse::new(ReceiverStream::new(frame_rx)).into_response()
+            Sse::new(sse(frame_rx)).into_response()
         }
-        Err(_) => Sse::new(ReceiverStream::new(frame_rx)).into_response(),
+        Err(_) => Sse::new(sse(frame_rx)).into_response(),
     };
     response
         .headers_mut()
@@ -470,7 +579,8 @@ fn patch_usage(value: &mut Value, protocol: Protocol, cached: usize, prompt: usi
 fn token_sha(ids: &[u32]) -> String {
     let joined = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     let digest = Sha256::digest(joined.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex[..12].to_string()
 }
 
 fn unix_now() -> u64 {
@@ -489,6 +599,72 @@ fn error_response(error: &ApiError) -> Response {
     response
 }
 
+/// The Anthropic error shape used by `count_tokens`.
+fn anthropic_error(error: &ApiError) -> Response {
+    let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let message = error
+        .body
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("invalid request")
+        .to_string();
+    let kind = if status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "api_error"
+    };
+    let mut response = (
+        status,
+        Json(json!({
+            "type": "error",
+            "error": {"type": kind, "message": message}
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-ds41-gateway", HeaderValue::from_static("api"));
+    response
+}
+
+/// Whether the request carries either accepted credential header.
+fn has_key(headers: &HeaderMap) -> bool {
+    ["authorization", "x-api-key"]
+        .iter()
+        .any(|name| headers.get(*name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Send a request that must go to the engine untouched and mark the response.
+async fn fallback_response(
+    state: &AppState,
+    protocol: Protocol,
+    headers: &HeaderMap,
+    uri: &Uri,
+    body: &Bytes,
+    reason: &str,
+    started: Instant,
+) -> Response {
+    eprintln!(
+        "- {} camino=fallback motivo={reason} ms={}",
+        protocol.path(),
+        started.elapsed().as_millis()
+    );
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| protocol.path().to_string());
+    crate::proxy::forward(
+        state,
+        Method::POST,
+        &path_and_query,
+        headers.clone(),
+        body.clone(),
+        Some(("x-ds41-gateway", "fallback")),
+    )
+    .await
+}
+
 /// One stderr line per request: no request content and no URLs with credentials.
 fn log_line(prepared: &Prepared, trace: &Trace, finish: Option<&str>, elapsed: Duration) {
     eprintln!(
@@ -500,6 +676,14 @@ fn log_line(prepared: &Prepared, trace: &Trace, finish: Option<&str>, elapsed: D
         prepared.max_tokens.unwrap_or(0),
         finish.unwrap_or("cut"),
         elapsed.as_millis()
+    );
+}
+
+/// Log a render that falls back before conversion, without request content.
+fn log_render_fallback(protocol: Protocol, reason: &str) {
+    eprintln!(
+        "- {} camino=fallback render motivo={reason}",
+        protocol.path()
     );
 }
 
@@ -520,24 +704,40 @@ fn render_fallback(reason: &str) -> Value {
 }
 
 /// Render endpoint helper shared with T021.
-pub fn render_handler(
+pub async fn render_handler(
     state: &AppState,
     protocol: Protocol,
     body: &Bytes,
 ) -> Result<Value, ApiError> {
     let value = parse_body(body)?;
-    if let Some(reason) = crate::parity::detect_fallback(&value, protocol) {
+    if let Some(reason) =
+        crate::parity::detect_fallback(&value, protocol, state.config.engine_logprobs)
+    {
+        log_render_fallback(protocol, &reason);
+        if state.config.strict {
+            return Err(ApiError::bad_request(reason));
+        }
         return Ok(render_fallback(&reason));
     }
-    let prepared = match protocol {
+    let prepared = match match protocol {
         Protocol::Chat => {
-            prepare::<crate::parity::Chat>(&state.gateway, &state.config, protocol, value)?
+            prepare::<crate::parity::Chat>(&state.gateway, &state.config, protocol, value).await
         }
         Protocol::Messages => {
-            prepare::<crate::parity::Messages>(&state.gateway, &state.config, protocol, value)?
+            prepare::<crate::parity::Messages>(&state.gateway, &state.config, protocol, value).await
         }
         Protocol::Responses => {
-            prepare::<crate::parity::Responses>(&state.gateway, &state.config, protocol, value)?
+            prepare::<crate::parity::Responses>(&state.gateway, &state.config, protocol, value)
+                .await
+        }
+    } {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(reason) = error.fallback_reason.clone() {
+                log_render_fallback(protocol, &reason);
+                return Ok(render_fallback(&reason));
+            }
+            return Err(error);
         }
     };
     let info = render_info(&prepared);

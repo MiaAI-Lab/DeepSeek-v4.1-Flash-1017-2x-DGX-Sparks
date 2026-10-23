@@ -1,0 +1,35 @@
+{
+ "id": "messages-imagen",
+ "protocol": "messages",
+ "tags": [
+  "imagenes"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Mira"
+     },
+     {
+      "type": "image",
+      "source": {
+       "type": "base64",
+       "media_type": "image/png",
+       "data": "ds41-b64://green16"
+      }
+     }
+    ]
+   }
+  ]
+ },
+ "expect": {
+  "render": "n/a",
+  "cache": "n/a",
+  "e2e": "n/a"
+ },
+ "greedy": true,
+ "nota": "fake_serve no tiene visión"
+}

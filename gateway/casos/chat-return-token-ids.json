@@ -1,0 +1,22 @@
+{
+ "id": "chat-return-token-ids",
+ "protocol": "chat",
+ "tags": [
+  "fallback"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "return_token_ids": true
+ },
+ "expect": {
+  "render": "fallback",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

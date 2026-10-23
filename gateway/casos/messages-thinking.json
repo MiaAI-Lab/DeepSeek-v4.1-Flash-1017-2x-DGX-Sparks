@@ -1,0 +1,34 @@
+{
+ "id": "messages-thinking",
+ "protocol": "messages",
+ "tags": [
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola @script=think"
+   }
+  ],
+  "thinking": {
+   "type": "enabled",
+   "budget_tokens": 2048
+  },
+  "output_config": {
+   "effort": "medium"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": {
+   "invariants": true,
+   "same_ids": true,
+   "finish_reason": "end_turn"
+  }
+ },
+ "greedy": true,
+ "nota": "el guion del fake_serve deja <|im_end|> en el texto; el invariante estricto lo marca"
+}

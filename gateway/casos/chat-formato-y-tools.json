@@ -1,0 +1,48 @@
+{
+ "id": "chat-formato-y-tools",
+ "protocol": "chat",
+ "tags": [
+  "formato",
+  "tools"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Consulta y responde JSON"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather by city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "response_format": {
+   "type": "json_object"
+  }
+ },
+ "expect": {
+  "render": {
+   "class": "herramientas",
+   "note": "tools con líneas en blanco distintas; el Zig no renderiza response_format"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

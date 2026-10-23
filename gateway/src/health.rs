@@ -1,7 +1,7 @@
 //! `/health`, `/ds41/render/*`, and the gateway's router assembly.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -17,7 +17,10 @@ pub fn router(state: AppState) -> Router {
     let extra = Router::new()
         .route("/health", get(health))
         .route("/ds41/render/{protocol}", post(render))
+        .route("/inference", any(inference_not_found))
         .route("/inference/{*path}", any(inference_not_found))
+        .fallback(any(crate::proxy::proxy_handler))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
     api.merge(extra)
 }
@@ -66,7 +69,7 @@ async fn render(
             return (StatusCode::NOT_FOUND, Json(json!({"detail": "Not Found"}))).into_response();
         }
     };
-    match api::render_handler(&state, protocol, &body) {
+    match api::render_handler(&state, protocol, &body).await {
         Ok(value) => {
             let mut response = (StatusCode::OK, Json(value)).into_response();
             response

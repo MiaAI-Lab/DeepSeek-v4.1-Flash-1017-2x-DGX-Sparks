@@ -1,0 +1,32 @@
+{
+ "id": "messages-contexto-excedido",
+ "protocol": "messages",
+ "tags": [
+  "errores"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "max_tokens": 70000,
+  "thinking": {
+   "type": "disabled"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": {
+   "invariants": true,
+   "same_ids": false,
+   "error": {
+    "status": 400,
+    "message_contains": "maximum context length"
+   }
+  }
+ },
+ "greedy": true
+}

@@ -1,0 +1,30 @@
+{
+ "id": "responses-input-text",
+ "protocol": "responses",
+ "tags": [
+  "basico"
+ ],
+ "body": {
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Hola"
+     }
+    ]
+   }
+  ],
+  "reasoning": {
+   "effort": "none"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

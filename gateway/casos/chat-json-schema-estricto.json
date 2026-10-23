@@ -1,0 +1,43 @@
+{
+ "id": "chat-json-schema-estricto",
+ "protocol": "chat",
+ "tags": [
+  "formato"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Devuelve el objeto"
+   }
+  ],
+  "response_format": {
+   "type": "json_schema",
+   "json_schema": {
+    "name": "respuesta",
+    "strict": true,
+    "schema": {
+     "type": "object",
+     "properties": {
+      "answer": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "answer"
+     ],
+     "additionalProperties": false
+    }
+   }
+  }
+ },
+ "expect": {
+  "render": {
+   "class": "formato",
+   "note": "el Zig /tokenize no renderiza response_format"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}
