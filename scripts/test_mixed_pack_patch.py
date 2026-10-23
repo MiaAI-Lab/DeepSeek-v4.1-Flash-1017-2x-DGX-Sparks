@@ -3,7 +3,8 @@
 
 The serving patch (zig/patches/0009-mixed-pack.patch) is against TF_REF; the rank-cache planner patch
 (zig/patches-inputs/0001-mixed-pack-rank-cache.patch) is against INPUTS_REF. Both are read from scripts/config.sh,
-so a re-pin moves the check with it.
+so a re-pin moves the check with it. 0011/0002 widen the EAQ v1.1 indexer's BF16 `weights_proj` to the f32 entry the
+loaders plan for it, in the engine's checkpoint reader and in the rank-cache writer.
 
 The application check needs a TensorFold clone with the pinned commits: set TF_SRC, or keep one at /tmp/tf-fork.
 Without one the content checks still run and the application check is skipped (the recipe's Dockerfile applies the
@@ -18,7 +19,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVING = ROOT / "zig" / "patches" / "0009-mixed-pack.patch"
+SERVING_BF16 = ROOT / "zig" / "patches" / "0011-widen-bf16.patch"
 INPUTS = ROOT / "zig" / "patches-inputs" / "0001-mixed-pack-rank-cache.patch"
+INPUTS_BF16 = ROOT / "zig" / "patches-inputs" / "0002-widen-bf16.patch"
 
 
 def pinned(name):
@@ -76,11 +79,21 @@ def main():
         "e.blas.linearBf16",
         "groupedRotated",
     ])
+    check_content(SERVING_BF16, [
+        "widenBFloat",
+        "from == .bf16 and k.dtype.? == .f32",
+        "a bf16 tensor read as f32 widens exactly",
+    ])
     check_content(INPUTS, [
         "wantsShards",
         "plain = true",
         "plainKey",
         "t.shape[1]",
+    ])
+    check_content(INPUTS_BF16, [
+        "widenBFloat",
+        "from == .bf16 and k.dtype.? == .f32",
+        "a bf16 tensor read as f32 widens exactly",
     ])
 
     src = source()
@@ -93,7 +106,9 @@ def main():
             print(f"skip the application check: {src} has no {sha[:12]} (set TF_SRC)")
             return 0
     apply_check(src, tf_ref, SERVING)
+    apply_check(src, tf_ref, SERVING_BF16)
     apply_check(src, inputs_ref, INPUTS)
+    apply_check(src, inputs_ref, INPUTS_BF16)
     return 0
 
 

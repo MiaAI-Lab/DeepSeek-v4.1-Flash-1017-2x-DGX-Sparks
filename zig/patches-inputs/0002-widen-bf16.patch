@@ -1,0 +1,56 @@
+diff --git a/zig/src/families/dsv41/checkpoint.zig b/zig/src/families/dsv41/checkpoint.zig
+index d236aa4..f7770d2 100644
+--- a/zig/src/families/dsv41/checkpoint.zig
++++ b/zig/src/families/dsv41/checkpoint.zig
+@@ -179,6 +179,7 @@ pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u
+         const from = try dtypeOf(t.dtype);
+         if (k.dtype == null or k.dtype.? == from) return @memcpy(out, t.bytes);
+         if (from == .f16 and k.dtype.? == .f32) return widenHalf(t.bytes, out);
++        if (from == .bf16 and k.dtype.? == .f32) return widenBFloat(t.bytes, out);
+         return error.UnsupportedConversion;
+     }
+     const es = (try dtypeOf(t.dtype)).size();
+@@ -210,6 +211,43 @@ fn widenHalf(src: []const u8, out: []u8) void {
+     }
+ }
+ 
++/// bf16 -> f32, exact (the loader's .to(torch.float32) of a bf16 tensor: the same bits in the high half, zeros below).
++fn widenBFloat(src: []const u8, out: []u8) void {
++    const n = src.len / 2;
++    for (0..n) |i| {
++        const b = std.mem.readInt(u16, src[2 * i ..][0..2], .little);
++        std.mem.writeInt(u32, out[4 * i ..][0..4], @as(u32, b) << 16, .little);
++    }
++}
++
++test "a bf16 tensor read as f32 widens exactly, as the loader's .to(torch.float32) does" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    // BF16 [2, 2] (1.0, -2.0, 0.5, 3.0): the high half of each f32's bits, the low half zero
++    const vals = [4]u16{ 0x3F80, 0xC000, 0x3F00, 0x4040 };
++    var body: [8]u8 = undefined;
++    for (vals, 0..) |v, i| std.mem.writeInt(u16, body[2 * i ..][0..2], v, .little);
++    const json = "{\"w.weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}";
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    try file.appendSlice(a, &body);
++    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var sh = try Shards.open(a, io, dir);
++    defer sh.close(io);
++    var out: [16]u8 = undefined;
++    try read(&sh, "w.weight|torch.float32", &out);
++    for (vals, 0..) |v, i| try std.testing.expectEqual(@as(u32, v) << 16, std.mem.readInt(u32, out[4 * i ..][0..4], .little));
++    try std.testing.expectError(error.BadSize, read(&sh, "w.weight|torch.float32", out[0..8]));
++}
++
+ test "loader keys parse as Python prints them" {
+     const p = try Key.parse("layers.3.ffn.experts.17.w2|None|(1152, 2304)|tr");
+     try std.testing.expect(p.exl3 and p.cols == null and p.rows.?[0] == 1152 and p.rows.?[1] == 2304);

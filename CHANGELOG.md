@@ -17,6 +17,12 @@
   `mixed pack: 27 float linears`. An EXL3-only pack (EAQ v1) plans no plain entries and runs exactly as before, so the
   same image serves both. The patch is checked against `TF_REF`/`INPUTS_REF` by `scripts/test_mixed_pack_patch.py`.
 
+- BF16 sources widen to the f32 entries the loaders plan: `zig/patches-inputs/0002-widen-bf16.patch` in the rank-cache
+  writer, and `zig/patches/0011-widen-bf16.patch` in the engine's checkpoint reader. EAQ v1.1 (as v1) stores the eight
+  `attn.indexer.weights_proj.weight` tensors as BF16 while both plans ask for f32, so the first rank-cache write stopped
+  with `error: UnsupportedConversion`; the widen is exact (BF16's bits in the high half, zeros below), the loader's
+  `.to(torch.float32)`. `scripts/test_mixed_pack_patch.py` checks both patches.
+
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,
