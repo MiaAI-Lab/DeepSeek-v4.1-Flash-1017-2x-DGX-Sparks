@@ -194,12 +194,16 @@ pub fn classify(
     right_prompt: &str,
     image_count: usize,
 ) -> (&'static str, &'static str) {
-    // `largo` is only the exact-prefix case of the two full sides; a shared
+    let classified = classify_window(tags, left_prompt, right_prompt, image_count);
+    // The contract's label and marker classes take priority over `largo`.  The
+    // latter is only the exact-prefix fallback of the two full sides; a shared
     // window prefix is not enough (the window may simply be cut).
-    if left_prompt.starts_with(right_prompt) || right_prompt.starts_with(left_prompt) {
+    if classified.0 == "otro"
+        && (left_prompt.starts_with(right_prompt) || right_prompt.starts_with(left_prompt))
+    {
         return ("largo", "model/chat_template.jinja");
     }
-    classify_window(tags, left_prompt, right_prompt, image_count)
+    classified
 }
 
 #[cfg(test)]
@@ -290,6 +294,13 @@ mod tests {
             "a window that happens to be a prefix must not claim largo"
         );
         assert_eq!(classify(&tags(&[]), "abc", "abcd", 0).0, "largo");
+    }
+
+    #[test]
+    fn a_prefix_case_outranks_the_length_shortcut() {
+        let (class, archivo) = classify(&tags(&["prefix"]), "abc", "abcd", 0);
+        assert_eq!(class, "prefijo");
+        assert_eq!(archivo, "server/messages.zig");
     }
 
     #[test]
