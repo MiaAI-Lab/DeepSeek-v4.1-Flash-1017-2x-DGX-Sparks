@@ -109,13 +109,17 @@ async fn alive(url: &str, path: &str) -> bool {
 }
 
 /// The API-side text around the first divergent token, not the start of the
-/// whole prompt.  Six ids before and six after `at`, decoded together.
+/// whole prompt.  Six ids before and six after `at`, decoded together and
+/// capped at 60 characters without splitting a UTF-8 sequence.
 fn api_text_window(tokenizer: &tokenizers::Tokenizer, ids: &[u32], at: usize) -> String {
     let start = at.saturating_sub(6);
     let end = (at + 6).min(ids.len());
     tokenizer
         .decode(&ids[start..end], false)
         .unwrap_or_default()
+        .chars()
+        .take(60)
+        .collect()
 }
 
 fn protocol_of(caso: &Caso) -> Protocol {
@@ -335,11 +339,7 @@ pub async fn run_render(
                                     }
                                     Some(at) => {
                                         let start = at.saturating_sub(6);
-                                        let api_end = (at + 6).min(ids.len());
-                                        let api_window = gateway
-                                            .tokenizer
-                                            .decode(&ids[start..api_end], false)
-                                            .unwrap_or_default();
+                                        let api_window = api_text_window(&gateway.tokenizer, ids, at);
                                         let zig_end = (at + 6).min(zig_side.token_strs.len());
                                         let zig_window = zig_side
                                             .token_strs
@@ -698,5 +698,19 @@ mod tests {
         let window = api_text_window(&tokenizer, &ids, ids.len().saturating_sub(1));
         assert!(window.contains("FINAL"), "window: {window:?}");
         assert!(!window.starts_with("hola hola"), "window: {window:?}");
+    }
+
+    #[test]
+    fn the_api_text_window_is_capped_at_sixty_unicode_characters() {
+        let vocab = [("é漢".repeat(40), 0)].into_iter().collect();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("build the synthetic tokenizer");
+        let tokenizer = tokenizers::Tokenizer::new(model);
+        let ids = vec![0; 12];
+        let window = api_text_window(&tokenizer, &ids, 6);
+        assert_eq!(window.chars().count(), 60, "window: {window:?}");
     }
 }
