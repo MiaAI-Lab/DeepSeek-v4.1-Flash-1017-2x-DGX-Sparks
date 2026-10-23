@@ -95,7 +95,7 @@ the load, 4.9 at 159K tokens, 4.2 at 261K), and a larger `CONTEXT` only allows l
 such a head, or free more of its memory first. A 100K-token prompt also ran without errors at the full
 1,048,576-token window (3.14 GiB free at the lowest) and at 524,288 tokens.
 
-**Engine patches** (`zig/patches/`; `zig/patches/README.md` lists them). The indexer split runs by default in chunks ending at token 131,072 or later; idle RDMA back-off is also enabled. The recorded token-hash checks cover 31 prompts through 100,000 tokens, cached resumes and four concurrent streams. Each switch is a `TF_DS_*` or `TF_RDMA_*` variable, which
+**Engine patches** (`zig/patches/`; `zig/patches/README.md` lists them). The indexer split runs by default in chunks ending at token 131,072 or later; idle RDMA back-off is also enabled. EAQ v1.1's mixed-pack loader (`0009` + `zig/patches-inputs/0001`) and its BF16 -> f32 widen (`0011` + `zig/patches-inputs/0002`) are automatic. The recorded token-hash checks cover 31 prompts through 100,000 tokens, cached resumes and four concurrent streams. Each switch is a `TF_DS_*` or `TF_RDMA_*` variable, which
 `start.sh` gives to both ranks, and each was tested on its own:
 
 | Switch | Result |
@@ -384,7 +384,7 @@ scripts/prepare.sh           image, downloads, kit, token map, weight files, the
 scripts/memguard.sh          the memory watchdog start.sh runs on both Sparks (kills a rank's container below MEMGUARD_GIB)
 scripts/zig_flags.py         start.sh's check of rank 0's serve flags against the image's `capabilities --json`
 scripts/publish-image.sh     pushes the built image to ghcr.io (only on purpose)
-zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine (three)
+zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine (see `zig/patches/README.md`)
 model/chat_template.jinja    the chat template rank 0 serves
 tools/validate.py            an end-to-end check of a running server
 tools/bench.py               prefill, decode, multi-stream and needle measurements as JSON, with `--compare A.json B.json`

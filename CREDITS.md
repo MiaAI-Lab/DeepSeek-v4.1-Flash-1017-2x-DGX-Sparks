@@ -25,6 +25,9 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 - **`zig/patches/0009-mixed-pack.patch`** and **`zig/patches-inputs/0001-mixed-pack-rank-cache.patch`** (the EAQ v1.1 mixed
   pack): the rank-cache planner plans a BF16 `.weight` linear where an EXL3 pack has trellis/suh/svh, and the engine runs
   it as a plain BF16 linear through the vision tower's cuBLAS `linearBf16`; written for this recipe, Apache-2.0.
+- **`zig/patches/0011-widen-bf16.patch`** and **`zig/patches-inputs/0002-widen-bf16.patch`**: widen a BF16 checkpoint
+  tensor to the f32 entry the loaders plan for it (EAQ's eight `attn.indexer.weights_proj.weight` are BF16); written for
+  this recipe, Apache-2.0.
 - **[TensorFold](https://github.com/ashhart/TensorFold)** by Ash Hart ([ashhart](https://github.com/ashhart)) and the
   TensorFold contributors (Apache-2.0): the native Zig engine, its OpenAI-compatible server, its lane core, CUDA runtime,
   Triton AOT loader and EXL3 module.

@@ -10,7 +10,7 @@ serves the API and drives the rounds, rank 1 (`tf-dsv41-lanes`) follows. Credits
 
 | Part | Source |
 | --- | --- |
-| `tensorfold-native`, `tf-dsv41-lanes` | BertholomusAI's `bertholomus/TensorFold`, branch `deepseek-v41-zig`, commit `629c524` (`TF_REF`), plus `zig/patches/*.patch` (three), built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
+| `tensorfold-native`, `tf-dsv41-lanes` | BertholomusAI's `bertholomus/TensorFold`, branch `deepseek-v41-zig`, commit `629c524` (`TF_REF`), plus `zig/patches/*.patch` (applied in filename order; [`../zig/patches/README.md`](../zig/patches/README.md)), built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
 | `tf-dsv41-rank-cache`, `make_token_map.py`, `make_rope.py`, `make_bias_vl.py` | the same fork's branch `deepseek-v41-zig-tp4`, commit `5940208` (`INPUTS_REF`); only these four files are kept |
 | the kernel kit (`TF_DS_KIT`, `TENSORFOLD_CUDA_KERNELS=<kit>/aot`) | not in the image: `kit/` of BertholomusAI's `deepseek-v4.1-tensorfold-tp2-2xgb10` at `abe07c7` (`KIT_REF`), fetched by `scripts/prepare.sh` into the Hugging Face cache and read by both ranks over NFS |
 
