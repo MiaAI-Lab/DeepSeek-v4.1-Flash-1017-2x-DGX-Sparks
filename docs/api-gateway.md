@@ -39,8 +39,15 @@ The API path is used, on purpose, for fields the Zig server handles differently:
 
 `image_url` data URLs and http(s) URLs, `input_image` and Messages image blocks are decoded to dimensions only (never to
 pixels) and counted with DeepSeek's `ImageTokenSpec::v41`. The destination filter (`GATEWAY_BLOCK_PRIVATE_URLS=1`)
-rejects loopback, RFC 1918, ULA, link-local, multicast, reserved and unspecified destinations, including every
-redirect and resolved address. The API's limits apply: `GATEWAY_MAX_IMAGES` (600), `GATEWAY_MAX_IMAGE_MB` (64) and
+rejects, for IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`,
+`192.0.0.0/24`, `192.0.2.0/24`, `192.31.196.0/24`, `192.52.193.0/24`, `192.88.99.0/24`, `192.168.0.0/16`,
+`192.175.48.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4` and the
+broadcast address; for IPv6: `::/128`, `::1/128`, `::ffff:0:0/96`, `64:ff9b::/96`, `64:ff9b:1::/48`, `100::/64`,
+`2001::/23`, `2001:db8::/32`, `2002::/16`, `3fff::/20`, `fc00::/7`, `fe80::/10`, `fec0::/10` and `ff00::/8`.
+IPv4-mapped and 6to4 addresses are checked through their embedded IPv4 address. These are the loopback, private,
+carrier-grade NAT, link-local, multicast, broadcast, reserved, documentation, benchmarking, discard, translation and
+tunnelling ranges, and every redirect and resolved address is checked, so an image URL cannot make the gateway fetch a
+private or non-routable destination. The API's limits apply: `GATEWAY_MAX_IMAGES` (600), `GATEWAY_MAX_IMAGE_MB` (64) and
 8192-character URLs; PNG, JPEG, WebP and GIF are accepted.
 The served tokenizer's image-token spelling is given by `GATEWAY_IMAGE_TOKEN`; the default is
 `<｜deepseek_image｜>`.
@@ -77,18 +84,22 @@ user, read-only, with `--memory` and `--cpus` from `GATEWAY_MEMORY` / `GATEWAY_C
 
 ## Parity battery without a GPU
 
-The comparator (`ds41-paridad`) and the CPU harness live in `gateway/` when task E6 is integrated. The intended CPU run
-is: a fake token-in engine (`fake_serve`, `TF_FAKE_TOKENIZER=tok/`, `TENSORFOLD_TOKEN_ROUTE=1`, `TF_FAKE_CONTEXT=65536`),
-then `ds41-gateway`, then
+The comparator (`ds41-paridad`) builds from `gateway/` and needs no model weights. The CPU harness is a fake token-in
+engine: the TensorFold checkout's `fake_serve` (`zig/tests/server/build.sh`, then
+`zig-out/server/fake_serve serve zig/tests/server/fixtures`) with `TF_FAKE_TOKENIZER=tok/`,
+`TENSORFOLD_TOKEN_ROUTE=1` and `TF_FAKE_CONTEXT=65536`. Start it on `ENGINE_PORT`, start `ds41-gateway` against it, then
 
 ```sh
 ds41-paridad casos --casos gateway/casos
 ds41-paridad render --casos gateway/casos --zig http://127.0.0.1:ENGINE_PORT \
   --gateway http://127.0.0.1:PORT --tokenizer tok/tokenizer.json --salida informes/cpu
-ds41-paridad e2e --gateway http://127.0.0.1:PORT
+ds41-paridad e2e --casos gateway/casos --gateway http://127.0.0.1:PORT \
+  --zig http://127.0.0.1:ENGINE_PORT --tokenizer tok/tokenizer.json --salida informes/cpu
 ```
 
-`render` compares the API path with the native route (first differing index, ids, classes and responsible file); `e2e`
-checks the API's message, usage, stream, Messages, Responses and context-error invariants against the gateway. The CPU
-report is saved as `informes/cpu/informe.{json,html}` and needs no GPU or model weights. A checkout without
-`src/bin/ds41-paridad.rs` still builds `ds41-gateway`; the comparator is verified when E6 lands.
+`casos` validates the case files; `render` compares the API path with the native `/tokenize` route and reports the first
+differing index, the ids, the class and the responsible file; `e2e` checks the message, usage, stream, Messages,
+Responses and context-error invariants and the token hashes. Each run writes `informes/cpu/informe.json` and
+`informes/cpu/informe.html`; open the HTML for the outcome table. The exit code is 0 when everything passes, 1 for
+divergences and 2 for a setup error. On the Spark pair the same three commands run against
+`--gateway http://127.0.0.1:8888 --zig http://127.0.0.1:8887` from the gateway container (no fake engine).

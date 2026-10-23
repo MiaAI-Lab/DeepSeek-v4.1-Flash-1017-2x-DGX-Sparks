@@ -9,13 +9,16 @@ engine on loopback. It is off by default and has no GPU, Python or OpenCV in its
 Rust 1.97.1 is pinned in `rust-toolchain.toml`. On a host with a C toolchain:
 
 ```sh
-cargo build --release --locked --bin ds41-gateway
+cargo build --release --locked --bin ds41-gateway --bin ds41-paridad
 ```
+
+The tests that need a tokenizer read `DS41_TOKENIZER` (a `tokenizer.json` path); without it they fall back to
+`../tok/tokenizer.json` next to this folder, so `cargo test --locked` needs either the variable or a `tok/` checkout.
 
 `scripts/prepare.sh` builds the container image from `Dockerfile` (multi-stage `rust:1.97-bookworm` to
 `debian:bookworm-slim`, unprivileged user, `ca-certificates`, both binaries) with the tag `GATEWAY_IMAGE`, which carries
-a hash of this folder. The Dockerfile also names `ds41-paridad`; a checkout without `src/bin/ds41-paridad.rs` builds the
-gateway alone and the comparator is verified when task E6 is integrated.
+a hash of this folder. The Dockerfile builds `ds41-gateway` and `ds41-paridad` and copies `casos/`, so the parity battery
+runs from the image too.
 
 ## Run with the recipe (GPU)
 
@@ -26,11 +29,12 @@ saves its log. `API_GATEWAY=0` is the recipe as before.
 
 ## Run without a GPU
 
-The gateway only needs an engine that speaks `POST /inference/v1/generate`. For a CPU check, start a fake engine and
-then the gateway (the fake harness lives in `tests/`; `fake_serve` is added with the comparator when E6 is integrated):
+The gateway only needs an engine that speaks `POST /inference/v1/generate`. For a CPU check, start a fake token-in
+engine and then the gateway; the fake engine is the TensorFold checkout's `fake_serve` (`zig/tests/server/build.sh`,
+then `zig-out/server/fake_serve serve zig/tests/server/fixtures`):
 
 ```sh
-TF_FAKE_TOKENIZER=tok/ TENSORFOLD_TOKEN_ROUTE=1 TF_FAKE_CONTEXT=65536 ./target/release/fake_serve --port 8887 &
+TF_FAKE_TOKENIZER=tok/ TENSORFOLD_TOKEN_ROUTE=1 TF_FAKE_CONTEXT=65536 zig-out/server/fake_serve serve zig/tests/server/fixtures &
 ./target/release/ds41-gateway --listen 127.0.0.1:8888 --engine http://127.0.0.1:8887 \
   --tokenizer tok/tokenizer.json --served-name DeepSeek-V4.1-Flash-1017
 curl -s http://127.0.0.1:8888/health
@@ -63,18 +67,38 @@ The defaults are in `scripts/config.sh`; the flags are in `src/main.rs`. The imp
 With `API_KEY=1` the recipe mounts the key at `/run/secrets/key` and passes `--require-key`; the gateway forwards
 `Authorization` / `x-api-key` to the engine and lets it decide.
 
+## Images
+
+`image_url`, `input_image` and Messages image blocks are fetched by the gateway and counted with DeepSeek's
+`ImageTokenSpec::v41`; only their dimensions are decoded, never their pixels. With `GATEWAY_BLOCK_PRIVATE_URLS=1` (the
+default) the destination filter rejects, for IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`,
+`169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.31.196.0/24`, `192.52.193.0/24`,
+`192.88.99.0/24`, `192.168.0.0/16`, `192.175.48.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`,
+`224.0.0.0/4`, `240.0.0.0/4` and the broadcast address; for IPv6: `::/128`, `::1/128`, `::ffff:0:0/96`,
+`64:ff9b::/96`, `64:ff9b:1::/48`, `100::/64`, `2001::/23`, `2001:db8::/32`, `2002::/16`, `3fff::/20`, `fc00::/7`,
+`fe80::/10`, `fec0::/10` and `ff00::/8`. IPv4-mapped and 6to4 addresses are checked through their embedded IPv4
+address. These are the loopback, private, carrier-grade NAT, link-local, multicast, broadcast, reserved, documentation,
+benchmarking, discard, translation and tunnelling ranges; every redirect and resolved address is checked, so an image URL
+cannot make the gateway fetch a private or non-routable destination. `GATEWAY_MAX_IMAGES` (600), `GATEWAY_MAX_IMAGE_MB`
+(64) and 8192-character URLs still apply.
+
 ## Parity battery
 
-When `src/bin/ds41-paridad.rs` is present (task E6), the comparator runs against the gateway and the engine:
+`ds41-paridad` compares the gateway's API rendering with TensorFold's token route and checks the API's shape against a
+scripted engine. It needs no model weights:
 
 ```sh
 ds41-paridad casos --casos casos
 ds41-paridad render --casos casos --zig http://127.0.0.1:ENGINE_PORT \
   --gateway http://127.0.0.1:PORT --tokenizer tok/tokenizer.json --salida informes/cpu
-ds41-paridad e2e --gateway http://127.0.0.1:PORT
+ds41-paridad e2e --casos casos --gateway http://127.0.0.1:PORT \
+  --zig http://127.0.0.1:ENGINE_PORT --tokenizer tok/tokenizer.json --salida informes/cpu
 ```
 
-`casos` validates the case files; `render` compares the API path with the native route and reports the first differing
-index, ids and the responsible class/file; `e2e` checks the message, usage, stream, Messages, Responses and context-error
-invariants. The CPU run uses `fake_serve` and no model weights; the report is `informes/cpu/informe.{json,html}`. The
+`casos` validates the case files (ids, fields, expectations); `render` compares the API path with the native
+`/tokenize` route and reports the first differing index, the ids, the class and the responsible file; `e2e` checks the
+message, usage, stream, Messages, Responses and context-error invariants and the token hashes. Each run writes
+`informes/cpu/informe.json` and `informes/cpu/informe.html`; open the HTML for the outcome table. The exit code is 0 when
+everything passes, 1 for divergences and 2 for a setup error. On the Spark pair, run the same three commands against
+`--gateway http://127.0.0.1:8888 --zig http://127.0.0.1:8887` from the gateway container instead of `fake_serve`. The
 contract is summarized in `../docs/api-gateway.md`.

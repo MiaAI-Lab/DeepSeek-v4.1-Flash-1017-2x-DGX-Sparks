@@ -11,8 +11,9 @@
   `GATEWAY_API_SAMPLING`, `GATEWAY_IMAGE_TOKEN`, `GATEWAY_LOG`, `GATEWAY_MAX_IMAGES` and `GATEWAY_MAX_IMAGE_MB` are the
   gateway's settings. `API_GATEWAY=0` keeps the previous output except the derived engine image tag, which changes when
   0011 enters `zig/patches/`; `scripts/test_api_gateway_settings.py` compares every other byte.
-  See the README section "DeepSeek API parity (gateway)" and `docs/api-gateway.md`; the comparator (`ds41-paridad`) is
-  verified when E6 lands.
+  See the README section "DeepSeek API parity (gateway)" and `docs/api-gateway.md`. The comparator (`ds41-paridad`) is
+  built into the image and runs `casos`, `render` and `e2e` with or without a GPU (the CPU run uses the TensorFold
+  checkout's `fake_serve`); it writes `informes/cpu/informe.{json,html}`.
 - `zig/patches/0009-disk-cache.patch` (off by default; `DISK_CACHE=1`): kept conversation states go to disk, each rank its
   half, before they lose their place in memory, and come back from it; a stop writes every kept state, so a restart
   resumes them. `start.sh` makes `DISK_CACHE_DIR` on both Sparks, mounts it in both containers and checks its free
@@ -157,7 +158,7 @@
   (`TF_DS_CACHE_PLACEMENT=1`, **on**: a resumed turn no longer misses the cache because another conversation's kept rows were in
   the way), a second Engram AIO ring (`TF_DS_ENGRAM_LANES=2`, off: 1.5-2.6% slower) and a prefill indexer row split
   (`TF_DS_IDX_SPLIT=1`, off: no measurable gain). `tools/exact.py` records and compares replies.
-- `zig/patches/0004-call-gate.patch`: the engine enforces `tool_choice` `"required"` and a named function (taken from the spark1/spark2
+- `zig/patches/0004-call-gate.patch`: the engine enforces `tool_choice` `"required"` and a named function (taken from a two-Spark
   deployment's copy; built into the running image `exl3-tp2-7c9bf5d36350`: required, named, streaming and thinking-on requests
   return valid tool calls, auto/none/absent are unchanged).
 - `RANK1_PROFILE` (rank 1 `--profile`); both GPUs must share one clock ceiling; each Spark can run from a local copy of the

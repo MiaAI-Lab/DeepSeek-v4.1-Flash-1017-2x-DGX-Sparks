@@ -466,10 +466,10 @@ Python and no OpenCV. The gateway's target after a battery is at most 300 MiB re
 token route off; the engine image is the same. To return to an engine without patch 0011, remove
 `zig/patches/0011-token-route.patch` and run `./start.sh restart` (the image is rebuilt, as with any patch).
 
-**Parity check.** When the comparator binary is present (`gateway/src/bin/ds41-paridad.rs`, task E6), run
-`ds41-paridad casos --casos gateway/casos` and `ds41-paridad render` / `e2e` as described in `gateway/README.md`; the
-CPU battery uses `fake_serve` and needs no GPU. `docs/api-gateway.md` has the contract summary, the fallback and the
-known limits.
+**Parity check.** The comparator (`ds41-paridad`) is built into the gateway image. Run
+`ds41-paridad casos --casos gateway/casos`, `ds41-paridad render` and `ds41-paridad e2e` as described in
+`gateway/README.md`; the CPU battery uses the TensorFold checkout's `fake_serve` and needs no GPU, and each run writes
+`informes/cpu/informe.{json,html}`. `docs/api-gateway.md` has the contract summary, the fallback and the known limits.
 
 ## Repository layout
 
@@ -482,7 +482,7 @@ scripts/memguard.sh          the memory watchdog start.sh runs on both Sparks (k
 scripts/zig_flags.py         start.sh's check of rank 0's serve flags against the image's `capabilities --json`
 scripts/publish-image.sh     pushes the built image to ghcr.io (only on purpose)
 zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine
-gateway/                     ds41-gateway (the DeepSeek API front end) and its Dockerfile; the comparator when present
+gateway/                     ds41-gateway (the DeepSeek API front end), ds41-paridad (the comparator) and their Dockerfile
 model/chat_template.jinja    the chat template rank 0 serves
 tools/validate.py            an end-to-end check of a running server
 tools/bench.py               prefill, decode, multi-stream and needle measurements as JSON, with `--compare A.json B.json`
