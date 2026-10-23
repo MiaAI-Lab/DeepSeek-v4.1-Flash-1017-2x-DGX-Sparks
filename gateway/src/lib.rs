@@ -27,6 +27,23 @@ pub mod paridad;
 pub mod parity;
 pub mod proxy;
 
+/// Load the real tokenizer shared by unit and integration tests.  Tests can set
+/// `DS41_TOKENIZER`; otherwise use the tokenizer distributed next to the crate.
+#[doc(hidden)]
+pub fn test_tokenizer() -> Tokenizer {
+    let path = std::env::var_os("DS41_TOKENIZER")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json")
+        });
+    Tokenizer::from_file(&path).unwrap_or_else(|error| {
+        panic!(
+            "could not load the test tokenizer at {}: {error}; set DS41_TOKENIZER=/path/to/tokenizer.json or restore the default ../tok/tokenizer.json",
+            path.display()
+        )
+    })
+}
+
 /// The error shape of the public API.  `status` is the HTTP status, and `body` is the
 /// JSON body (`{"error": {"message", ...}}`) that the API returns.
 #[derive(Debug, Clone)]

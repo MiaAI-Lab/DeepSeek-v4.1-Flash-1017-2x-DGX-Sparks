@@ -339,7 +339,8 @@ pub async fn run_render(
                                     }
                                     Some(at) => {
                                         let start = at.saturating_sub(6);
-                                        let api_window = api_text_window(&gateway.tokenizer, ids, at);
+                                        let api_window =
+                                            api_text_window(&gateway.tokenizer, ids, at);
                                         let zig_end = (at + 6).min(zig_side.token_strs.len());
                                         let zig_window = zig_side
                                             .token_strs
@@ -684,11 +685,7 @@ mod tests {
 
     #[test]
     fn the_api_text_window_is_around_the_divergence_not_the_prompt_start() {
-        let tokenizer_path = std::env::var_os("DS41_TOKENIZER")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("../tok/tokenizer.json"));
-        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .expect("the tokenizer next to the gateway");
+        let tokenizer = crate::test_tokenizer();
         let prompt = format!("{}FINAL", "hola ".repeat(120));
         let ids = tokenizer
             .encode(prompt, false)
@@ -712,5 +709,32 @@ mod tests {
         let ids = vec![0; 12];
         let window = api_text_window(&tokenizer, &ids, 6);
         assert_eq!(window.chars().count(), 60, "window: {window:?}");
+    }
+
+    #[test]
+    fn a_missing_test_tokenizer_explains_ds41_tokenizer() {
+        let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".missing-test-tokenizer/tokenizer.json");
+        assert!(!missing.exists(), "the missing-path fixture must not exist");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg(
+                "paridad::tests::the_api_text_window_is_around_the_divergence_not_the_prompt_start",
+            )
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("DS41_TOKENIZER", &missing)
+            .output()
+            .expect("run the window test with a missing DS41_TOKENIZER");
+        assert!(
+            !output.status.success(),
+            "the window test ignored DS41_TOKENIZER"
+        );
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(logs.contains("set DS41_TOKENIZER"), "output: {logs}");
+        assert!(logs.contains("tokenizer.json"), "output: {logs}");
     }
 }

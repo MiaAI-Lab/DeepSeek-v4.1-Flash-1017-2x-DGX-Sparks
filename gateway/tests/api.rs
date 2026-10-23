@@ -1,6 +1,5 @@
 //! T020: the three API routes against a simulated engine and the real tokenizer.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,18 +18,11 @@ use ds41_gateway::parity::GatewayConfig;
 use ds41_gateway::{Gateway, GatewaySettings};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-fn tokenizer_path() -> PathBuf {
-    std::env::var_os("DS41_TOKENIZER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json"))
-}
-
 fn gateway() -> Gateway {
-    let tokenizer = Tokenizer::from_file(tokenizer_path()).expect("load tokenizer");
+    let tokenizer = ds41_gateway::test_tokenizer();
     Gateway::new(
         Arc::new(tokenizer),
         GatewaySettings {
@@ -915,7 +907,7 @@ async fn an_engine_rejection_before_the_first_token_is_a_normal_http_error() {
 
 #[tokio::test]
 async fn a_missing_model_uses_the_configured_served_name() {
-    let tokenizer = Tokenizer::from_file(tokenizer_path()).expect("load tokenizer");
+    let tokenizer = ds41_gateway::test_tokenizer();
     let gw = Gateway::new(
         Arc::new(tokenizer),
         GatewaySettings {

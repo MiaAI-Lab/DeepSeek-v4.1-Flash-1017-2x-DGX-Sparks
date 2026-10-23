@@ -1,6 +1,5 @@
 //! T021: `/health`, `/ds41/render/*` and the gateway router.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -15,16 +14,9 @@ use ds41_gateway::health;
 use ds41_gateway::parity::GatewayConfig;
 use ds41_gateway::{Gateway, GatewaySettings};
 use serde_json::{Value, json};
-use tokenizers::Tokenizer;
-
-fn tokenizer_path() -> PathBuf {
-    std::env::var_os("DS41_TOKENIZER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tok/tokenizer.json"))
-}
 
 fn gateway() -> Gateway {
-    let tokenizer = Tokenizer::from_file(tokenizer_path()).expect("load tokenizer");
+    let tokenizer = ds41_gateway::test_tokenizer();
     Gateway::new(
         Arc::new(tokenizer),
         GatewaySettings {
