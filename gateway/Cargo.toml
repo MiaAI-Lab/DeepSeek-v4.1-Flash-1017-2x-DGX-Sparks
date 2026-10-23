@@ -1,0 +1,26 @@
+[package]
+name = "ds41-gateway"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "DeepSeek API parity gateway in front of TensorFold's token-in/token-out route."
+
+[dependencies]
+deepseek-recipe = "=0.2.0"
+deepseek-recipe-core = "=0.2.0"
+deepseek-recipe-encoding = "=0.2.0"
+deepseek-recipe-image = { version = "=0.2.0", default-features = false, features = ["reqwest-fetch"] }
+tokenizers = "0.23"
+axum = "0.8"
+tokio = { version = "1.48", features = ["full"] }
+tokio-stream = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
