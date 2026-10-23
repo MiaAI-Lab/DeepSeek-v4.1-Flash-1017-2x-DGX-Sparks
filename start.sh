@@ -428,7 +428,7 @@ IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" "$R"
 cat <<EOF
-    API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)$( [[ "$API_GATEWAY" == 1 ]] && echo "; gateway: DeepSeek API parity on; engine on 127.0.0.1:$ENGINE_PORT" )
+    API      http://${IP:-<spark-address>}:$PORT/v1   $( [[ "$API_GATEWAY" == 1 ]] && echo "(gateway: DeepSeek API parity on; engine on 127.0.0.1:$ENGINE_PORT)" || echo "(model: $SERVED_NAME)" )
     Access   $( [[ "$API_KEY" == 1 ]] && echo "API key required: Authorization: Bearer \$(cat $API_KEY_FILE)" || echo "open: no key, anyone who reaches port $PORT can use it (API_KEY=1 requires one)")
     Window   $CONTEXT tokens · $PARALLEL at once · EXL3 2.9 bpw · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images on
     Logs     docker logs -f $CONTAINER_NAME   (rank 1: ssh $(worker_host 1) docker logs -f $CONTAINER_NAME)
