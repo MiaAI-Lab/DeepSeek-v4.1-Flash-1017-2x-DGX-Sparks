@@ -261,6 +261,9 @@ rm -f "$VIEW.new/chat_template.jinja"
 cp model/chat_template.jinja "$VIEW.new/chat_template.jinja"
 rm -rf "$VIEW" && mv "$VIEW.new" "$VIEW"
 [[ -s "$VIEW/config.json" ]] || die "the served folder $VIEW does not reach the checkpoint"
+if [[ "${API_GATEWAY:-0}" == 1 ]]; then
+  [[ -s "$VIEW/tokenizer.json" ]] || die "the served folder $VIEW has no tokenizer.json: the gateway loads it at /served/tokenizer.json"
+fi
 log "Served folder: $VIEW (the checkpoint linked, the recipe's chat template)"
 
 # ---------------------------------------------------------------- 6. the worker's NFS volume
