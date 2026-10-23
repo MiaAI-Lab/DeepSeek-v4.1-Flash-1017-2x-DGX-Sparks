@@ -253,7 +253,7 @@ index df613e42..0abab289 100644
 +        if (s.dtype != .bf16) return error.UnsupportedPlainLinear;
 +        const ptr = try L.upload(name, try L.entry(key));
 +        L.plain_count += 1;
-+        return .{ .plain = ptr, .k = @intCast(s.shape[1]), .n = @intCast(s.shape[0]) };
++        return .{ .words = 0, .suh = 0, .svh = 0, .k = @intCast(s.shape[1]), .n = @intCast(s.shape[0]), .k2 = 0, .plain = ptr };
 +    }
 +
 +    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips, or a mixed pack's plain BF16 `.weight` when the
