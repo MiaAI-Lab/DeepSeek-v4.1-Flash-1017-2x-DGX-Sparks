@@ -200,7 +200,7 @@ SNAP_C=$(model_in_container)
 TOOLS=/opt/tensorfold/tools/inputs
 if [[ ! -s "$KIT_DIR/kit/rope-plain-cos.f32" || ! -s "$KIT_DIR/kit/rope-compressed-sin.f32" ]]; then
   log "Making the kit's RoPE tables from the checkpoint's config (CPU, PyTorch of the image)"
-  in_hf --entrypoint python3 "$IMAGE" $TOOLS/make_rope.py "$SNAP_C/config.json" "$KIT_IN" >/dev/null ||
+  in_hf --entrypoint python3 "$IMAGE" $TOOLS/make_rope.py "$SNAP_C" "$KIT_IN" >/dev/null ||
     die "the RoPE tables do not match the kit's rope.json: the checkpoint's config differs from the one the kit was made for"
 fi
 if [[ ! -s "$KIT_DIR/kit/vision/gate_bias_vl.safetensors" ]]; then
