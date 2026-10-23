@@ -101,6 +101,20 @@ class ApiGatewaySettingsTest(unittest.TestCase):
             "WORKER": "dummy@127.0.0.1",
             "FABRIC_PEER": "127.0.0.1",
             "DRY_RUN": "1",
+            # The feature's settings, explicit: an exported API_GATEWAY=1 or GATEWAY_* must not change the regression.
+            "API_GATEWAY": "0",
+            "TOKEN_ROUTE": "0",
+            "TF_DS_API_EFFORTS": "",
+            "GATEWAY_IMAGE": "ds41-gateway:test",
+            "GATEWAY_MEMORY": "512m",
+            "GATEWAY_CPUS": "2",
+            "GATEWAY_STRICT": "0",
+            "GATEWAY_BLOCK_PRIVATE_URLS": "1",
+            "GATEWAY_API_SAMPLING": "1",
+            "GATEWAY_IMAGE_TOKEN": "<\uff5cdeepseek_image\uff5c>",
+            "GATEWAY_MAX_IMAGES": "600",
+            "GATEWAY_MAX_IMAGE_MB": "64",
+            "GATEWAY_LOG": "info",
         }
         env.update({key: str(value) for key, value in extra.items()})
         return subprocess.run(
