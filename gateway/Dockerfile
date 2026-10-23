@@ -4,7 +4,8 @@
 #
 # The builder is Rust 1.97 (rust-toolchain.toml pins 1.97.1); the runtime is Debian slim with ca-certificates for
 # image URLs over https. The image is the same on aarch64 and x86_64; cargo builds for the builder's architecture.
-FROM rust:1.97-bookworm AS builder
+# Both base images are pinned by their multi-arch manifest digests (Docker Hub, resolved 2026-10-23).
+FROM rust:1.97-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 RUN cargo fetch --locked
@@ -13,7 +14,7 @@ COPY tests ./tests
 # ds41-paridad is the comparator; it is named here even while a gateway checkout without it is being integrated.
 RUN cargo build --release --locked --bin ds41-gateway --bin ds41-paridad
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
