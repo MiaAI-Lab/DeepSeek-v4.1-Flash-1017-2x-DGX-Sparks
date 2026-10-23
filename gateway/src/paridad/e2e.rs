@@ -265,7 +265,9 @@ pub fn sse_data_violations(text: &str) -> Vec<String> {
 }
 
 /// Chat stream invariants: one id, role first, reasoning before content, exactly
-/// one finish at the last chunk, usage in the last chunk, and `[DONE]`.
+/// one finish at the last chunk, usage in the last chunk, and `[DONE]`.  JSON
+/// syntax violations are owned by [`sse_data_violations`] so both checks can be
+/// combined without reporting a malformed `data:` line twice.
 pub fn chat_stream_violations(text: &str, thinking: bool) -> Vec<String> {
     let mut violations = Vec::new();
     let events = parse_sse(text);
@@ -275,13 +277,8 @@ pub fn chat_stream_violations(text: &str, thinking: bool) -> Vec<String> {
     }
     let mut chunks = Vec::new();
     for data in datas.iter().filter(|data| **data != "[DONE]") {
-        match serde_json::from_str::<Value>(data) {
-            Ok(chunk) => chunks.push(chunk),
-            Err(error) => violations.push(format!(
-                "SSE data is not JSON ({}): {:?}",
-                error,
-                truncate(data, 80)
-            )),
+        if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+            chunks.push(chunk);
         }
     }
     if chunks.is_empty() {
@@ -786,11 +783,11 @@ pub async fn run_case(caso: &Caso, gateway: &str, zig: &str, served_name: &str) 
                         .violaciones
                         .push("stream carries an error event".to_string());
                 }
-                result
-                    .violaciones
-                    .extend(sse_data_violations(&stream_reply.text));
             }
         }
+        result
+            .violaciones
+            .extend(sse_data_violations(&stream_reply.text));
     }
 
     // The render endpoint gives the prompt ids; the native completion route gives
@@ -971,17 +968,25 @@ mod tests {
     }
 
     #[test]
-    fn a_non_json_sse_data_line_is_a_violation() {
+    fn a_non_json_sse_data_line_is_not_duplicated() {
         let text = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: not-json\n\ndata: [DONE]\n\n";
-        let violations = chat_stream_violations(text, false);
-        assert!(
-            violations.iter().any(|v| v.contains("not JSON")),
-            "violations: {violations:?}"
-        );
-        assert!(
-            sse_data_violations(text)
+        let data_violations = sse_data_violations(text);
+        assert_eq!(
+            data_violations
                 .iter()
-                .any(|v| v.contains("not JSON"))
+                .filter(|violation| violation.contains("not JSON"))
+                .count(),
+            1
+        );
+        let mut violations = chat_stream_violations(text, false);
+        violations.extend(data_violations);
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.contains("not JSON"))
+                .count(),
+            1,
+            "violations: {violations:?}"
         );
     }
 
