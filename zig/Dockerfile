@@ -1,6 +1,7 @@
 # The engine image (both ranks): TensorFold's native (Zig) engine with the DeepSeek-V4.1-Flash family of BertholomusAI's
 # fork, branch deepseek-v41-zig (TF_REPO at TF_REF), plus zig/patches/*.patch if there are any (git apply in the
-# checkout's root, filename order). It builds on NVIDIA's PyTorch container, which every Spark already holds: its CUDA
+# checkout's root, filename order). The inputs checkout below gets zig/patches-inputs/*.patch the same way (the
+# mixed-pack rank-cache planner). It builds on NVIDIA's PyTorch container, which every Spark already holds: its CUDA
 # toolchain compiles the sm_121 fatbins, its NCCL 2.30.7, cuBLAS and libibverbs are what the engine loads at run time,
 # its PyTorch makes the kit's RoPE tables, and its Python with Pillow decodes the picture formats other than PNG (the
 # engine starts a python3 child for them). No GPU is needed to build.
@@ -46,6 +47,9 @@ ARG INPUTS_REF
 RUN git init -q /tf-inputs && cd /tf-inputs && git remote add origin "${TF_REPO}" && \
     git fetch -q --depth 1 origin "${INPUTS_REF}" && git checkout -q --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "${INPUTS_REF}"
+COPY zig/patches-inputs /opt/tf-inputs-patches
+RUN cd /tf-inputs && \
+    for p in /opt/tf-inputs-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
 RUN cd /tf-inputs && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
       --prefix /opt/inputs -j"$(nproc)" install && \
     test -x /opt/inputs/bin/tf-dsv41-rank-cache && \

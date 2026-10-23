@@ -5,7 +5,17 @@
 - Default checkpoint moved to `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2` (39 shards,
   ~196 GiB). v1.1 keeps the EAQ v1 widths but stores 27 indexer/compressor linears as BF16, so the engine must have the
   mixed-pack loader. `ABLIT=1` still requires the EAQ v1 checkpoint and is refused with the v1.1 default.
-  `scripts/test_checkpoint_pin.py` checks the new pin.
+  `scripts/test_checkpoint_pin.py` checks the new pin. The recorded `tools/exact.py` token hashes are EAQ v1's; v1.1's
+  weights differ, so record a new baseline before comparing replies.
+
+- Mixed-pack loader: `zig/patches/0009-mixed-pack.patch` and `zig/patches-inputs/0001-mixed-pack-rank-cache.patch`.
+  The rank-cache planner reads the checkpoint's headers and, for a whole replicated linear stored as a BF16 `.weight`
+  instead of trellis/suh/svh, plans one plain entry. The serving engine loads that entry as a plain BF16 linear and runs
+  it through cuBLAS (`cublas.Blas.linearBf16`, torch's bf16 `nn.Linear`) in decode and prefill, with the exact
+  bf16 -> fp32 widen where the caller wants fp32. EAQ v1.1's 27 linears are 8 `attn.wq_a`, 8 `attn.indexer.wq_b`,
+  4 `attn.compressor.wkv`, 3 `attn.compressor.wgate` and 4 `attn.indexer.wk`; the load prints
+  `mixed pack: 27 float linears`. An EXL3-only pack (EAQ v1) plans no plain entries and runs exactly as before, so the
+  same image serves both. The patch is checked against `TF_REF`/`INPUTS_REF` by `scripts/test_mixed_pack_patch.py`.
 
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.

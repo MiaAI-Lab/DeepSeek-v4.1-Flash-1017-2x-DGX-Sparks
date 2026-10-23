@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Check the mixed-pack patches: their content and that they apply to the pinned TensorFold commits.
+
+The serving patch (zig/patches/0009-mixed-pack.patch) is against TF_REF; the rank-cache planner patch
+(zig/patches-inputs/0001-mixed-pack-rank-cache.patch) is against INPUTS_REF. Both are read from scripts/config.sh,
+so a re-pin moves the check with it.
+
+The application check needs a TensorFold clone with the pinned commits: set TF_SRC, or keep one at /tmp/tf-fork.
+Without one the content checks still run and the application check is skipped (the recipe's Dockerfile applies the
+patches when it builds the image).
+"""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SERVING = ROOT / "zig" / "patches" / "0009-mixed-pack.patch"
+INPUTS = ROOT / "zig" / "patches-inputs" / "0001-mixed-pack-rank-cache.patch"
+
+
+def pinned(name):
+    text = (ROOT / "scripts" / "config.sh").read_text()
+    m = re.search(rf'^{name}="\$\{{{name}:-([0-9a-f]{{40}})\}}"', text, re.M)
+    if not m:
+        sys.exit(f"config.sh: no {name} pin")
+    return m.group(1)
+
+
+def check_content(path, needles):
+    text = path.read_text()
+    if not text.strip():
+        sys.exit(f"{path.relative_to(ROOT)}: empty")
+    for needle in needles:
+        if needle not in text:
+            sys.exit(f"{path.relative_to(ROOT)}: missing {needle!r}")
+    print(f"ok  {path.relative_to(ROOT)}: {len(text.splitlines())} lines, {len(needles)} markers")
+
+
+def source():
+    env = os.environ.get("TF_SRC")
+    if env:
+        return Path(env)
+    fallback = Path("/tmp/tf-fork")
+    return fallback if fallback.exists() else None
+
+
+def run(args):
+    p = subprocess.run(args, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"{' '.join(args)}: {p.stderr.strip() or p.stdout.strip()}")
+
+
+def apply_check(src, sha, patch):
+    with tempfile.TemporaryDirectory() as td:
+        wt = Path(td) / "wt"
+        run(["git", "-C", str(src), "worktree", "add", "-q", "--detach", str(wt), sha])
+        try:
+            run(["git", "-C", str(wt), "apply", "--check", str(patch)])
+        finally:
+            subprocess.run(["git", "-C", str(src), "worktree", "remove", "--force", str(wt)],
+                           capture_output=True, text=True)
+    print(f"ok  {patch.relative_to(ROOT)} applies to {sha[:12]}")
+
+
+def main():
+    tf_ref = pinned("TF_REF")
+    inputs_ref = pinned("INPUTS_REF")
+
+    check_content(SERVING, [
+        "mixed pack: {d} float linears",
+        "plain: u64 = 0",
+        "plain_tmp",
+        "e.blas.linearBf16",
+        "groupedRotated",
+    ])
+    check_content(INPUTS, [
+        "wantsShards",
+        "plain = true",
+        "plainKey",
+        "t.shape[1]",
+    ])
+
+    src = source()
+    if src is None:
+        print("skip the application check: no TensorFold clone (set TF_SRC)")
+        return 0
+    for sha in (tf_ref, inputs_ref):
+        if subprocess.run(["git", "-C", str(src), "cat-file", "-e", f"{sha}^{{commit}}"],
+                          capture_output=True).returncode != 0:
+            print(f"skip the application check: {src} has no {sha[:12]} (set TF_SRC)")
+            return 0
+    apply_check(src, tf_ref, SERVING)
+    apply_check(src, inputs_ref, INPUTS)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

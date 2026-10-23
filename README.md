@@ -17,8 +17,8 @@ against the unquantized model).
 
 - Checkpoint: `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw` (39 shards, routed experts at 3 bits a
   weight, 2 bits in layers 18-22, attention at 5, shared experts at 4-5, head at 6, DSpark blocks at 4; 27
-  indexer/compressor linears are BF16, so the engine needs its mixed-pack loader; the vision tower and the DSpark blocks
-  are in it; the revision is pinned in `scripts/config.sh`), plus Engram's two tables, unquantized, from
+  indexer/compressor linears are BF16 and load as plain BF16 linears through patch `0009`'s mixed-pack loader; the vision
+  tower and the DSpark blocks are in it; the revision is pinned in `scripts/config.sh`), plus Engram's two tables, unquantized, from
   `deepseek-ai/DeepSeek-V4.1-Flash-1017` @ `1bae0e10` (shards 47 and 48, ~203 GB; the quantization leaves them out)
 - API model id: `DeepSeek-V4.1-Flash-1017`, port 8888
 - Engine: TensorFold native (Zig 0.17.0), BertholomusAI's `dsv41` family at TP=2, one rank on each Spark
@@ -308,7 +308,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MODEL_ID`, `MODEL_REVISION` | `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2` | the checkpoint. The Hugging Face cache is keyed by the repo's name and revision: a copy under another name or revision is not found under the default, and `scripts/prepare.sh` would download 196 GiB. It stops when the disk cannot hold that. To keep serving a copy you have, set both to what `~/.cache/huggingface/hub` holds. v1.1 needs an engine with the mixed-pack loader; the recipe's pinned image must print `mixed pack: 27 float linears` when it loads this checkpoint |
+| `MODEL_ID`, `MODEL_REVISION` | `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2` | the checkpoint. The Hugging Face cache is keyed by the repo's name and revision: a copy under another name or revision is not found under the default, and `scripts/prepare.sh` would download 196 GiB. It stops when the disk cannot hold that. To keep serving a copy you have, set both to what `~/.cache/huggingface/hub` holds. v1.1's 27 BF16 linears load through the image's mixed-pack loader (`zig/patches/0009` + `zig/patches-inputs/0001`); the load prints `mixed pack: 27 float linears`. An EXL3-only pack (EAQ v1) has no plain entries and takes the old path |
 | `ABLIT` | 0 | `0`: stock Mia EAQ 2.9 bpw; `1`: apply the matching gated Keys overlay; requires your HF token and repository access (see Abliterated mode) |
 | `ABLIT_REVISION` | `0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0` | pinned Keys overlay and application script; full commit hash |
 | `HF_TOKEN` | unset | Hugging Face read token for downloads; alternatively authenticate with `hf auth login` on the head |
