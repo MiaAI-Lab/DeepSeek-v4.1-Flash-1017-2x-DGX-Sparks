@@ -94,6 +94,36 @@ prebuilt_image() {
 }
 CONTAINER_NAME="${CONTAINER_NAME:-dsv41-1017-exl3-tf}"   # the same name on both Sparks
 
+# ---------------------------------------------------------------- the API gateway (feature 004, off by default)
+# API_GATEWAY=1 puts ds41-gateway in front of the engine: the engine listens on 127.0.0.1:ENGINE_PORT and serves the
+# token-in/token-out route (TENSORFOLD_TOKEN_ROUTE=1); the gateway listens on HOST:PORT and answers the DeepSeek API.
+# With API_GATEWAY=0 nothing changes: the engine is the API on HOST:PORT and the route stays off unless TOKEN_ROUTE=1.
+API_GATEWAY="${API_GATEWAY:-0}"
+ENGINE_PORT="${ENGINE_PORT:-8887}"      # the engine's loopback port when API_GATEWAY=1; may not be PORT
+TOKEN_ROUTE="${TOKEN_ROUTE:-0}"         # 1 without the gateway: serve the token route where the engine is (experiments)
+# The gateway image: built by scripts/prepare.sh from gateway/ (no GPU, no Python); the tag carries a hash of that folder
+# (target/ and .git/ excluded), so a changed gateway rebuilds. GATEWAY_IMAGE may name a prebuilt image instead.
+gateway_hash() {
+  local dir="$_cfg_root/gateway"
+  [[ -d "$dir" ]] || { echo nogateway; return 0; }
+  ( cd "$dir" || exit 1
+    find . -type f ! -path './target/*' ! -path './.git/*' -print0 |
+      LC_ALL=C sort -z | xargs -0 -r sha256sum
+  ) | sha256sum | cut -c1-12
+}
+GATEWAY_IMAGE="${GATEWAY_IMAGE:-ds41-gateway:$(gateway_hash)}"
+GATEWAY_MEMORY="${GATEWAY_MEMORY:-512m}"  # docker --memory for the gateway container
+GATEWAY_CPUS="${GATEWAY_CPUS:-2}"         # docker --cpus for the gateway container
+GATEWAY_STRICT="${GATEWAY_STRICT:-0}"     # 1: the API's 400 instead of falling back to the engine
+GATEWAY_BLOCK_PRIVATE_URLS="${GATEWAY_BLOCK_PRIVATE_URLS:-1}"  # 1: reject private image destinations
+GATEWAY_API_SAMPLING="${GATEWAY_API_SAMPLING:-1}"              # 1: the API's sampling policy
+GATEWAY_IMAGE_TOKEN="${GATEWAY_IMAGE_TOKEN-<｜end_of_query｜>}"  # the served tokenizer's image-token spelling
+GATEWAY_MAX_IMAGES="${GATEWAY_MAX_IMAGES:-600}"       # the API's per-request image limit
+GATEWAY_MAX_IMAGE_MB="${GATEWAY_MAX_IMAGE_MB:-64}"    # the API's total image megabytes per request
+GATEWAY_LOG="${GATEWAY_LOG:-info}"       # debug, info, warn or error; one line per request
+# TF_DS_API_EFFORTS=1 is the engine patch 0011's switch: the API's effort table instead of the lane's. Empty: the engine's.
+TF_DS_API_EFFORTS="${TF_DS_API_EFFORTS:-}"
+
 # ---------------------------------------------------------------- serving
 SERVED_NAME="${SERVED_NAME:-DeepSeek-V4.1-Flash-1017}"
 HOST="${HOST:-0.0.0.0}"

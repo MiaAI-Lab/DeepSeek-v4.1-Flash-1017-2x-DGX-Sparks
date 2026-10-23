@@ -14,6 +14,7 @@
 #   CONTEXT=262144 ./start.sh restart
 #   ABLIT=1 ./start.sh restart   # Mia EAQ 2.9 bpw + Keys overlay; requires your HF token and gated repo access
 #   API_KEY=1 ./start.sh restart  # require an API key (generated in $STATE_DIR/api-key, mode 600; see scripts/config.sh)
+#   API_GATEWAY=1 ./start.sh       # engine on 127.0.0.1:8887, ds41-gateway on HOST:PORT (the DeepSeek API)
 #   FOREGROUND=1 ./start.sh       # stay attached to rank 0's log and exit with its code (for systemd Restart=on-failure)
 #   DRY_RUN=1 ./start.sh        # print the link found and both ranks' docker commands, change nothing and start nothing
 # Extra arguments go to rank 0's `tensorfold-native serve` after the defaults, so they win.
@@ -25,6 +26,9 @@
 #   files    ABLIT (0 | 1), ABLIT_REVISION, MODEL_ID, MODEL_REVISION, ENGRAM_ID, ENGRAM_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER, NFS_VOLUME,
 #            WORKER_ENGRAM_DIR, WORKER_CACHE_DIR, STATE_DIR, LOG_DIR, LOG_KEEP
 #   engine   TF_REPO, TF_REF, INPUTS_REF, KIT_REPO, KIT_REF, ZIG_VERSION, BASE_IMAGE, IMAGE, CONTAINER_NAME
+#   gateway  API_GATEWAY (0 | 1), ENGINE_PORT, TOKEN_ROUTE (0 | 1), GATEWAY_IMAGE, GATEWAY_MEMORY, GATEWAY_CPUS,
+#            GATEWAY_STRICT, GATEWAY_BLOCK_PRIVATE_URLS, GATEWAY_API_SAMPLING, GATEWAY_IMAGE_TOKEN,
+#            GATEWAY_MAX_IMAGES, GATEWAY_MAX_IMAGE_MB, GATEWAY_LOG, TF_DS_API_EFFORTS
 #   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1
 #   memory   MIN_AVAIL_GIB (refuse to start below it), MIN_AVAIL_WAIT_S (re-read for this long first), MEMGUARD_GIB (kill a rank's container below it), HEAD_NFS_SERVER,
 #            HEAD_NFS_VOLUME (rank 0 reads the checkpoint over NFS through a docker volume)
@@ -71,11 +75,28 @@ for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_K
 [[ "$RDMA_IDLE_S" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$RDMA_IDLE_S" 'BEGIN { exit !(value <= 3600) }' || die "RDMA_IDLE_S is 0 to 3600 seconds (0 turns the nap off), not $RDMA_IDLE_S"
 [[ "$RDMA_NAP_US" =~ ^[1-9][0-9]*$ ]] && awk -v value="$RDMA_NAP_US" 'BEGIN { exit !(value <= 1000000) }' || die "RDMA_NAP_US is 1 to 1000000 microseconds, not $RDMA_NAP_US"
 [[ "${RANK1_PROFILE:-}" =~ ^[012]?$ ]] || die "RANK1_PROFILE is empty, 0, 1 or 2, not '${RANK1_PROFILE:-}'"
+for v in API_GATEWAY TOKEN_ROUTE GATEWAY_STRICT GATEWAY_BLOCK_PRIVATE_URLS GATEWAY_API_SAMPLING; do
+  [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"
+done
+[[ -z "${TF_DS_API_EFFORTS:-}" || "$TF_DS_API_EFFORTS" =~ ^[01]$ ]] || die "TF_DS_API_EFFORTS is empty, 0 or 1, not $TF_DS_API_EFFORTS"
+[[ "$ENGINE_PORT" =~ ^[1-9][0-9]*$ ]] && (( ENGINE_PORT <= 65535 )) || die "ENGINE_PORT is 1 to 65535, not $ENGINE_PORT"
+[[ "$API_GATEWAY" != 1 || "$ENGINE_PORT" != "$PORT" ]] || die "ENGINE_PORT and PORT are both $PORT: the engine and the gateway need different ports"
+[[ "$GATEWAY_MEMORY" =~ ^[0-9]+([.][0-9]+)?[mMgG]$ ]] || die "GATEWAY_MEMORY is a size with an m or g suffix (512m, 1g), not $GATEWAY_MEMORY"
+[[ "$GATEWAY_CPUS" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v c="$GATEWAY_CPUS" 'BEGIN { exit !(c > 0) }' || die "GATEWAY_CPUS is a positive number, not $GATEWAY_CPUS"
+[[ "$GATEWAY_LOG" =~ ^(debug|info|warn|error)$ ]] || die "GATEWAY_LOG is debug, info, warn or error, not $GATEWAY_LOG"
+[[ -n "$GATEWAY_IMAGE_TOKEN" ]] || die "GATEWAY_IMAGE_TOKEN is empty: give the served tokenizer's image-token spelling"
+for v in GATEWAY_MAX_IMAGES GATEWAY_MAX_IMAGE_MB; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
+[[ -n "$GATEWAY_IMAGE" ]] || die "GATEWAY_IMAGE is empty"
+[[ "$API_GATEWAY" != 1 ]] || TOKEN_ROUTE=1
 nccl_extra_collect
 check_workers
 
 # rank 0's command (its serve flags need no link): built first, so the flags can be checked before anything is stopped
-SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$HOST" --port "$PORT" --name "$SERVED_NAME"
+# API_GATEWAY=1: the engine moves to loopback and the gateway takes HOST:PORT. With API_GATEWAY=0 this is the command of
+# today, byte for byte.
+SERVE_HOST=$HOST; SERVE_PORT=$PORT
+if [[ "$API_GATEWAY" == 1 ]]; then SERVE_HOST=127.0.0.1; SERVE_PORT=$ENGINE_PORT; fi
+SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$SERVE_HOST" --port "$SERVE_PORT" --name "$SERVED_NAME"
        --context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
 if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking); fi
 [[ -z "$REASONING_EFFORT" ]] || SERVE+=(--reasoning-effort "$REASONING_EFFORT")
@@ -171,6 +192,9 @@ if (( ! DRY )); then
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   worker 1 "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"
   if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"; fi
+  if [[ "$API_GATEWAY" == 1 ]] && ss -ltn "sport = :$ENGINE_PORT" 2>/dev/null | grep -q LISTEN; then
+    die "ENGINE_PORT $ENGINE_PORT is already in use: $(ss -ltnp "sport = :$ENGINE_PORT" 2>/dev/null | tail -n +2)"
+  fi
   # memory: a rank that takes all of a Spark's memory freezes the machine, so refuse to start on one that cannot hold it
   if (( MIN_AVAIL_GIB > 0 )); then
     await_memory || true
@@ -192,15 +216,23 @@ fi
 # SIGTERM run ./stop.sh. Note the supervisor restarts a start that was killed by memguard too; give it a RestartSec.
 # (From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's start.sh, for the one worker here.)
 foreground() {
-  local watch w code
+  local watch w code gw_warned=0
   trap './stop.sh; exit 130' INT TERM
   ( exec 8>&-                                        # not holding start.sh's lock once start.sh has exited
     while sleep 30; do
-      running_here || exit 0
+      if ! running_here; then
+        [[ "$API_GATEWAY" != 1 ]] || docker rm -f ds41-gateway >/dev/null 2>&1 || true
+        exit 0
+      fi
+      if [[ "$API_GATEWAY" == 1 ]] && ! running_gateway; then
+        (( gw_warned )) || warn "ds41-gateway exited: the engine's native API stays on 127.0.0.1:$ENGINE_PORT"
+        gw_warned=1
+      fi
       worker 1 true 2>/dev/null || continue         # a worker out of reach for a moment says nothing about its rank
       running_worker 1 && continue
       warn "rank 1 on $(worker_host 1) exited: stopping rank 0"
       docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
+      [[ "$API_GATEWAY" != 1 ]] || docker rm -f ds41-gateway >/dev/null 2>&1 || true
       exit 1
     done ) &
   watch=$!
@@ -210,10 +242,13 @@ foreground() {
   code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
   [[ "$w" != 1 || "$code" != 0 ]] || code=1         # the worker's rank failed, even if rank 0 then shut down cleanly
   worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
+  [[ "$API_GATEWAY" != 1 ]] || docker rm -f ds41-gateway >/dev/null 2>&1 || true
   exit "$code"
 }
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDMA_IDLE_S=$RDMA_IDLE_S" "TF_RDMA_NAP_US=$RDMA_NAP_US" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
+[[ "$TOKEN_ROUTE" != 1 ]] || ENGINE_ENV+=("TENSORFOLD_TOKEN_ROUTE=1")
+[[ -z "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=$TF_DS_API_EFFORTS")
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
@@ -236,9 +271,24 @@ if [[ "$DISK_CACHE" == 1 ]]; then
     log "Disk cache: $DISK_CACHE_DIR on both Sparks (up to $DISK_CACHE_GIB GiB each, $DISK_CACHE_MIN_FREE_GIB GiB kept free; stop waits ${STOP_TIMEOUT}s)"
   fi
 fi
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|DISK_CACHE[A-Z0-9_]*)=' || true)
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|API_EFFORTS|DISK_CACHE[A-Z0-9_]*)=' || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
+running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>/dev/null)" == true ]]; }
+# ds41-gateway's command: the API's flags, the engine on loopback, the served tokenizer and the container's limits.
+GATEWAY_ARGS=(ds41-gateway --listen "$HOST:$PORT" --engine "http://127.0.0.1:$ENGINE_PORT" --tokenizer /served/tokenizer.json
+              --served-name "$SERVED_NAME" --image-token "$GATEWAY_IMAGE_TOKEN" --max-model-len "$CONTEXT"
+              --max-images "$GATEWAY_MAX_IMAGES" --max-image-mb "$GATEWAY_MAX_IMAGE_MB" --log "$GATEWAY_LOG")
+if [[ "$THINKING" == 1 ]]; then GATEWAY_ARGS+=(--default-thinking); else GATEWAY_ARGS+=(--default-thinking=false); fi
+[[ -z "$REASONING_EFFORT" ]] || GATEWAY_ARGS+=(--default-effort "$REASONING_EFFORT")
+[[ "$GATEWAY_STRICT" != 1 ]] || GATEWAY_ARGS+=(--strict)
+if [[ "$GATEWAY_BLOCK_PRIVATE_URLS" == 1 ]]; then GATEWAY_ARGS+=(--block-private-urls); else GATEWAY_ARGS+=(--block-private-urls=false); fi
+if [[ "$GATEWAY_API_SAMPLING" == 1 ]]; then GATEWAY_ARGS+=(--api-sampling); else GATEWAY_ARGS+=(--api-sampling=false); fi
+[[ "$API_KEY" != 1 ]] || GATEWAY_ARGS+=(--require-key)
+GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
+             --restart on-failure:3 --read-only --tmpfs /tmp -v "$DATA_DIR/model:/served:ro")
+if [[ "$API_KEY" == 1 ]]; then GATEWAY_RUN+=(-v "$API_KEY_FILE:/run/secrets/key:ro" -e API_KEY_FILE=/run/secrets/key); fi
+GATEWAY_RUN+=("$GATEWAY_IMAGE")
 DATA=/hf/$DATA_SUB
 KIT=/hf/$KIT_SUB/kit
 # rank 1 takes the round's settings as flags only (tf-dsv41-lanes reads no TF_DS_GRAPHS & co.): without them it runs
@@ -277,7 +327,11 @@ if [[ "$API_KEY" == 1 ]]; then here+=(-v "$API_KEY_FILE:$API_KEY_IN_CONTAINER:ro
 for x in "${ENV0[@]}" "${ENGINE_ENV[@]}"; do here+=(-e "$x"); done
 rank_nccl_args 0
 here+=("${NCCL_ARGS[@]}" "$IMAGE" "${SERVE[@]}")
-if (( DRY )); then printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"; exit 0; fi
+if (( DRY )); then
+  printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"
+  if [[ "$API_GATEWAY" == 1 ]]; then printf '[dry-run] gateway:\n  %s\n' "$(printf '%q ' "${GATEWAY_RUN[@]}" "${GATEWAY_ARGS[@]}")"; fi
+  exit 0
+fi
 log "Rank 0 here: ${SERVE[*]}"
 "${here[@]}" >/dev/null
 [[ "${FOREGROUND:-0}" != 1 ]] || foreground
@@ -292,8 +346,9 @@ fail() {
   printf '%s── rank 1 (%s): last log lines ──%s\n' "$D" "$(worker_host 1)" "$R"; worker 1 docker logs --tail 15 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
   die "$1"
 }
+WAIT_URL=$URL; [[ "$API_GATEWAY" != 1 ]] || WAIT_URL="http://127.0.0.1:$ENGINE_PORT"
 start=$SECONDS
-until curl -sf --max-time 5 "${AUTH[@]}" "$URL/v1/models" >/dev/null 2>&1; do
+until curl -sf --max-time 5 "${AUTH[@]}" "$WAIT_URL/v1/models" >/dev/null 2>&1; do
   running_here || fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
   running_worker 1 || fail "rank 1 on $(worker_host 1) exited before the server was ready"
   (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running"
@@ -301,6 +356,28 @@ until curl -sf --max-time 5 "${AUTH[@]}" "$URL/v1/models" >/dev/null 2>&1; do
 done
 kill $LOGS_PID 2>/dev/null || true
 log "Server answered after $((SECONDS - start))s"
+
+# ---------------------------------------------------------------- 4b. gateway
+if [[ "$API_GATEWAY" == 1 ]]; then
+  docker rm -f ds41-gateway >/dev/null 2>&1 || true
+  log "Gateway: $GATEWAY_IMAGE on $HOST:$PORT (engine http://127.0.0.1:$ENGINE_PORT)"
+  "${GATEWAY_RUN[@]}" "${GATEWAY_ARGS[@]}" >/dev/null || die "could not start ds41-gateway"
+  gstart=$SECONDS
+  until curl -sf --max-time 5 "$URL/health" >/dev/null 2>&1; do
+    if ! running_gateway; then
+      saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || true
+      docker logs --tail 15 ds41-gateway 2>&1 | sed 's/^/  │ /'
+      die "ds41-gateway exited before /health answered${saved:+; its log: $saved}"
+    fi
+    if (( SECONDS - gstart >= 60 )); then
+      saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || true
+      docker logs --tail 15 ds41-gateway 2>&1 | sed 's/^/  │ /'
+      die "ds41-gateway did not answer /health within 60s${saved:+; its log: $saved}"
+    fi
+    sleep 1
+  done
+  log "Gateway answered /health after $((SECONDS - gstart))s"
+fi
 
 # ---------------------------------------------------------------- 5. smoke test
 step 5 "Smoke test: one chat completion through both ranks"
@@ -310,6 +387,15 @@ if smoke=$(curl -s --max-time 300 "${AUTH[@]}" "$URL/v1/chat/completions" -H 'Co
   log "OK: $smoke"
 else
   fail "the smoke test request failed (no reply text, or one character repeated); the ranks are still running"
+fi
+if [[ "$API_GATEWAY" == 1 ]]; then
+  if smoke=$(curl -s --max-time 300 "${AUTH[@]}" "http://127.0.0.1:$ENGINE_PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+               -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
+             python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
+    log "OK (engine): $smoke"
+  else
+    fail "the engine's own smoke test on 127.0.0.1:$ENGINE_PORT failed; the ranks and the gateway are still running"
+  fi
 fi
 # Headroom: how far MemAvailable sits above memguard's floor once the weights, graphs and caches are loaded (issue #4). Nothing in
 # the engine holds MemAvailable above that floor while it runs: a long prompt's workspace comes out of this headroom, and memguard
@@ -328,7 +414,7 @@ IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" "$R"
 cat <<EOF
-    API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)
+    API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)$( [[ "$API_GATEWAY" == 1 ]] && echo "; gateway: DeepSeek API parity on; engine on 127.0.0.1:$ENGINE_PORT" )
     Access   $( [[ "$API_KEY" == 1 ]] && echo "API key required: Authorization: Bearer \$(cat $API_KEY_FILE)" || echo "open: no key, anyone who reaches port $PORT can use it (API_KEY=1 requires one)")
     Window   $CONTEXT tokens · $PARALLEL at once · EXL3 2.9 bpw · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images on
     Logs     docker logs -f $CONTAINER_NAME   (rank 1: ssh $(worker_host 1) docker logs -f $CONTAINER_NAME)

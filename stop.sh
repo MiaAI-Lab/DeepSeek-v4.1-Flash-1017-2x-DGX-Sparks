@@ -7,12 +7,27 @@
 # each rank stay.
 # From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's stop.sh (Mia's AI Lab).
 # Usage: ./stop.sh      Env: CONTAINER_NAME, PORT, WORKER (see scripts/config.sh), STOP_TIMEOUT,
-#                       LOG_DIR, LOG_KEEP
+#                       LOG_DIR, LOG_KEEP, API_GATEWAY (see scripts/config.sh)
 #   DRY_RUN=1 ./stop.sh   says what it would stop, and on which Spark, and stops nothing
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
 source ./scripts/nodes.sh
+
+# The gateway first: it is the API clients hold, and its log says why it stopped. With API_GATEWAY=0 and no gateway
+# container this block prints nothing, as before.
+gateway=0; docker ps -a --format '{{.Names}}' | grep -qx ds41-gateway && gateway=1
+if (( gateway )); then
+  if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    log "DRY_RUN=1: would stop and remove ds41-gateway first (up to ${STOP_TIMEOUT:-30}s); nothing is stopped"
+    printf '[dry-run] gateway here:\n  docker stop -t %s ds41-gateway; (its log saved to %s); docker rm -f ds41-gateway\n' "${STOP_TIMEOUT:-30}" "$LOG_DIR"
+  else
+    docker stop -t "${STOP_TIMEOUT:-30}" ds41-gateway >/dev/null 2>&1 || true
+    saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || warn "could not save the gateway's log to $LOG_DIR"
+    docker rm -f ds41-gateway >/dev/null
+    log "Stopped and removed the gateway${saved:+; its log: $saved}"
+  fi
+fi
 
 # Where the containers are: here (rank 0) and on the workers (rank i on worker i)
 here=0; docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME" && here=1
