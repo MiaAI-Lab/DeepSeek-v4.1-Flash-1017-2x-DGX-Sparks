@@ -280,7 +280,8 @@ The stock performance and correctness results above do not validate the ablitera
 `scripts/prepare.sh` (run by `start.sh` when something is missing; safe to re-run) on the head:
 
 1. checks docker, the GPU, ssh and the link;
-2. builds the image from `zig/Dockerfile` (the pinned engine plus the inputs' tools) and copies it to the worker;
+2. builds the image from `zig/Dockerfile` (the pinned engine plus the inputs' tools) and copies it to the worker; with
+   `API_GATEWAY=1` it also builds the gateway image from `gateway/Dockerfile` here;
 3. downloads the checkpoint and Engram's two shards (with their index and config) at their pinned revisions, and checks the
    shards' sizes (`VERIFY_SHA=1` also their sha256, as the model card lists them: the 1017 tables are new, the older
    release's must not be used);
@@ -363,7 +364,7 @@ answering and has to be power-cycled (this happened once, with the engine's rese
   and reboot; other containers; sparkDash and similar on the worker or another machine), keep `MIN_AVAIL_GIB` as it is, and do not
   raise `MEMGUARD_GIB` (a higher floor kills sooner). The defaults are the loose end of what has been run here (2.5 GiB floor, 4 s hold, 1 GiB
   hard floor; the long-prompt runs in Status used 2.5): a lower floor or a longer hold trades the kill for the risk of freezing the Spark. `ENGINE=jl` does check at run time: it refuses admissions under a 4 GiB hard floor, falls
-  back to 2K prompt segments and runs a missing graph eagerly instead of capturing it ([docs/jl-engine.md](docs/jl-engine.md)); its boot check also sizes the pool to what the
+  back to 2K prompt segments and runs a missing graph eagerly instead of capturing it ([docs/zig-engine.md](docs/zig-engine.md)); its boot check also sizes the pool to what the
   head can spare.
 - the KV cache is small (compressed FP4 with block scales; about 0.5 GiB at 262,144 tokens and ~1.8 GiB at the full window,
   by two memory readings); it is sized from `CONTEXT` when the model loads and shared by the streams. Most of the
@@ -414,6 +415,61 @@ kept state, so a restart resumes them too.
   tok/s (67.3 without the patch), structured 140.8 (140.3), 4 streams 183.2 together (184): within 0.5%. Nothing of the
   cache runs in a decode round.
 
+## DeepSeek API parity (gateway)
+
+`gateway/` is `ds41-gateway`, a Rust front end for DeepSeek's API in front of TensorFold's token-in/token-out route.
+It converts Chat Completions, Messages and Responses requests with DeepSeek's `deepseek-recipe` 0.2.0 library, renders
+and encodes the prompt, calls `POST /inference/v1/generate` on the engine, and turns the token stream back into the
+API's body or SSE. Requests that the conversion cannot represent faithfully, and fields only the Zig server knows, go to
+the engine unchanged with `x-ds41-gateway: fallback` and one log line with the reason; `GATEWAY_STRICT=1` returns the
+API's 400 instead. The engine's other routes (`/v1/models`, `/tokenize`, `/metrics`, `/health`, ...) are proxied as they
+are. The gateway is off by default: with `API_GATEWAY=0` (the default) the recipe behaves exactly as before.
+
+**Turn it on.** Put `API_GATEWAY=1` in `scripts/local.sh` and run `./start.sh` (or `./start.sh restart`). The engine
+then listens on `127.0.0.1:ENGINE_PORT` (default 8887) with `TENSORFOLD_TOKEN_ROUTE=1`, and the gateway listens on
+`HOST:PORT` (default `0.0.0.0:8888`). `scripts/prepare.sh` builds the gateway image from `gateway/Dockerfile` when the
+image for that folder's hash is missing; it is a separate, CPU-only image. `start.sh` waits for the engine, starts the
+gateway, waits for `/health`, runs the smoke test through the gateway and a second one against the engine's own API, and
+`stop.sh` removes the gateway first, saving its log. With `API_GATEWAY=1` and `API_KEY=1`, the key is mounted read-only
+at `/run/secrets/key` and the gateway requires it before rendering.
+
+**What changes for a client.** The model names are the served name, `DeepSeek-V4.1-Flash` and `deepseek-flash`.
+Thinking, `reasoning_effort`, `max_tokens` / `max_completion_tokens`, the API's sampling policy and stop sequences are
+handled on the API side; the engine's own `top_k` and `min_p` still apply. `logprobs`, grammar/structured output,
+`thinking_budget`, `previous_response_id` and a few other Zig-only fields use the fallback until the engine serves them.
+Images are fetched and counted by the gateway, with private destinations rejected by default. The gateway's `/health`
+reports the engine's health and is 200 only while the engine is 200.
+
+**Ports and resources.** The gateway is the only listener on `HOST:PORT`; the engine is on loopback. The container is
+capped at `GATEWAY_MEMORY` (512m) and `GATEWAY_CPUS` (2), runs read-only with a `tmpfs` at `/tmp`, and has no GPU, no
+Python and no OpenCV. The gateway's target after a battery is at most 300 MiB resident; the cap is the enforced limit.
+
+**Settings** (defaults and notes in `scripts/config.sh`):
+
+| Setting | Default | |
+| --- | --- | --- |
+| `API_GATEWAY` | 0 | `1`: gateway on `HOST:PORT`, engine on `127.0.0.1:ENGINE_PORT`, token route on |
+| `ENGINE_PORT` | 8887 | the engine's loopback port; may not equal `PORT` |
+| `TOKEN_ROUTE` | 0 | `1` without the gateway: serve the token route where the engine is (experiments); `API_GATEWAY=1` implies it |
+| `GATEWAY_IMAGE` | `ds41-gateway:<hash of gateway/>` | the gateway image `prepare.sh` builds; set it to use a prebuilt one |
+| `GATEWAY_MEMORY`, `GATEWAY_CPUS` | 512m, 2 | the container's `--memory` and `--cpus` |
+| `GATEWAY_STRICT` | 0 | `1`: the API's 400 instead of the fallback |
+| `GATEWAY_BLOCK_PRIVATE_URLS` | 1 | `1`: reject loopback, private, link-local and reserved image destinations |
+| `GATEWAY_API_SAMPLING` | 1 | `1`: use the API's sampling policy; `0`: the client's temperature/top_p/seed |
+| `GATEWAY_IMAGE_TOKEN` | `<｜end_of_query｜>` | the served tokenizer's image-token spelling |
+| `GATEWAY_MAX_IMAGES`, `GATEWAY_MAX_IMAGE_MB` | 600, 64 | the API's per-request image limits |
+| `GATEWAY_LOG` | info | debug, info, warn or error; one line per request (id, route, api/fallback, reason, ms) |
+| `TF_DS_API_EFFORTS` | unset | `1`: patch 0011's API effort table (minimal 50, low 50, medium 75, high 75, xhigh 75, max 100) on the engine |
+
+**Back out.** `API_GATEWAY=0 ./start.sh restart` brings the engine back to `HOST:PORT`, stops the gateway and leaves the
+token route off; the engine image is the same. To return to an engine without patch 0011, remove
+`zig/patches/0011-token-route.patch` and run `./start.sh restart` (the image is rebuilt, as with any patch).
+
+**Parity check.** When the comparator binary is present (`gateway/src/bin/ds41-paridad.rs`, task E6), run
+`ds41-paridad casos --casos gateway/casos` and `ds41-paridad render` / `e2e` as described in `gateway/README.md`; the
+CPU battery uses `fake_serve` and needs no GPU. `docs/api-gateway.md` has the contract summary, the fallback and the
+known limits.
+
 ## Repository layout
 
 ```
@@ -424,7 +480,8 @@ scripts/prepare.sh           image, downloads, kit, token map, weight files, the
 scripts/memguard.sh          the memory watchdog start.sh runs on both Sparks (kills a rank's container below MEMGUARD_GIB)
 scripts/zig_flags.py         start.sh's check of rank 0's serve flags against the image's `capabilities --json`
 scripts/publish-image.sh     pushes the built image to ghcr.io (only on purpose)
-zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine (three)
+zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine
+gateway/                     ds41-gateway (the DeepSeek API front end) and its Dockerfile; the comparator when present
 model/chat_template.jinja    the chat template rank 0 serves
 tools/validate.py            an end-to-end check of a running server
 tools/bench.py               prefill, decode, multi-stream and needle measurements as JSON, with `--compare A.json B.json`
@@ -433,6 +490,7 @@ tools/smoke.py               a quick correctness check: health, stop strings, st
 tools/prompt_reuse.py        a conversation resumes from its kept prompt state (from the GLM-5.3-Flash recipe)
 tools/toolcheck.py, needle.py, end_of_turn.py, anthropiccheck.py   single checks, from the GLM-5.3-Flash recipe
 docs/zig-engine.md           how the pieces fit, and what is not verified
+docs/api-gateway.md          the gateway's contract, fallback and known limits; the CPU parity battery
 docs/hermes-agent.md         Hermes Agent as a client (by Steve Darlow)
 ```
 
@@ -472,6 +530,14 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   Commits in that branch by [sayyidfareed](https://github.com/sayyidfareed) (RDMA GID and MTU),
   [Lucas Peters](https://github.com/lucas-peters) (indexer alignment; the kit's `_topk_sel` variant), lepetitprince716-prog
   (expert-run loading) and LeetJoe (image placeholder escaping).
+- **[DeepSeek](https://github.com/deepseek-ai)**: the `deepseek-recipe` Rust library (MIT) that converts the API's
+  requests and renders the prompt, used as it is; its tokenizer copy under `static/tokenizers/v41` is used only in tests.
+- **[Sufyan (@sfxnz)](https://github.com/sfxnz)**: the reference vLLM gateway
+  [`DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark`](https://github.com/sfxnz/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark)
+  (MIT): the design of the gateway over the token-in route, its fallback, its invariants and the parity cases taken from
+  its `tests/api_eval.py` and `tools/api_eval_fixtures.py`.
+- **[vLLM](https://github.com/vllm-project/vllm)** (Apache-2.0): the `/inference/v1/generate` token-in/token-out contract
+  the gateway speaks to the engine.
 - **[Coinupbtc](https://github.com/Coinupbtc)** (@Coinupbtc) authored `zig/patches/0005-prefill-interleave.patch`, in
   [pull request #5](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/5) (commit [`27e02c6`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/5/commits/27e02c605eae0997ed9161baaf583dd3ad431bb3)): decode rounds and cancels for the other live streams between the chunks of a long prompt pass.
 - **Mia's AI Lab**: this recipe's scripts, adapted from

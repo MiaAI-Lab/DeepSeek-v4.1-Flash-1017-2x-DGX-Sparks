@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `gateway/` (`ds41-gateway`, Rust): the DeepSeek API front end over TensorFold's token-in/token-out route, with
+  `zig/patches/0011-token-route.patch` (`TENSORFOLD_TOKEN_ROUTE=1`) and the API's effort table behind
+  `TF_DS_API_EFFORTS=1`. Off by default; `API_GATEWAY=1` moves the engine to `127.0.0.1:ENGINE_PORT`, starts the gateway
+  on `HOST:PORT`, waits for `/health`, runs a second smoke test against the engine and stops the gateway first. The image
+  is built by `scripts/prepare.sh` from `gateway/Dockerfile` (multi-stage Rust 1.97 to Debian slim, unprivileged, no GPU,
+  no Python, no OpenCV); `GATEWAY_MEMORY`, `GATEWAY_CPUS`, `GATEWAY_STRICT`, `GATEWAY_BLOCK_PRIVATE_URLS`,
+  `GATEWAY_API_SAMPLING`, `GATEWAY_IMAGE_TOKEN`, `GATEWAY_LOG`, `GATEWAY_MAX_IMAGES` and `GATEWAY_MAX_IMAGE_MB` are the
+  gateway's settings. `API_GATEWAY=0` keeps the previous output byte for byte (`scripts/test_api_gateway_settings.py`).
+  See the README section "DeepSeek API parity (gateway)" and `docs/api-gateway.md`; the comparator (`ds41-paridad`) is
+  verified when E6 lands.
 - `zig/patches/0009-disk-cache.patch` (off by default; `DISK_CACHE=1`): kept conversation states go to disk, each rank its
   half, before they lose their place in memory, and come back from it; a stop writes every kept state, so a restart
   resumes them. `start.sh` makes `DISK_CACHE_DIR` on both Sparks, mounts it in both containers and checks its free
