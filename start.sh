@@ -275,6 +275,13 @@ while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | 
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>/dev/null)" == true ]]; }
+# A gateway started for this run is removed before a failure exits, so a later start does not inherit a broken one.
+gateway_remove_after_failure() {
+  [[ "$API_GATEWAY" == 1 ]] || return 0
+  docker inspect ds41-gateway >/dev/null 2>&1 || return 0
+  docker rm -f ds41-gateway >/dev/null 2>&1 || true
+  log "Removed ds41-gateway after the failure"
+}
 # ds41-gateway's command: the API's flags, the engine on loopback, the served tokenizer and the container's limits.
 GATEWAY_LISTEN="$HOST:$PORT"; [[ "$HOST" != *:* ]] || GATEWAY_LISTEN="[$HOST]:$PORT"
 GATEWAY_ARGS=(--listen "$GATEWAY_LISTEN" --engine "http://127.0.0.1:$ENGINE_PORT" --tokenizer /served/tokenizer.json
@@ -344,6 +351,7 @@ LOGS_PID=$!
 trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
 fail() {
   kill $LOGS_PID 2>/dev/null || true
+  gateway_remove_after_failure
   printf '%s── rank 1 (%s): last log lines ──%s\n' "$D" "$(worker_host 1)" "$R"; worker 1 docker logs --tail 15 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
   die "$1"
 }
@@ -362,17 +370,22 @@ log "Server answered after $((SECONDS - start))s"
 if [[ "$API_GATEWAY" == 1 ]]; then
   docker rm -f ds41-gateway >/dev/null 2>&1 || true
   log "Gateway: $GATEWAY_IMAGE on $HOST:$PORT (engine http://127.0.0.1:$ENGINE_PORT)"
-  "${GATEWAY_RUN[@]}" "${GATEWAY_ARGS[@]}" >/dev/null || die "could not start ds41-gateway"
+  if ! "${GATEWAY_RUN[@]}" "${GATEWAY_ARGS[@]}" >/dev/null; then
+    gateway_remove_after_failure
+    die "could not start ds41-gateway"
+  fi
   gstart=$SECONDS
   until curl -sf --max-time 5 "$URL/health" >/dev/null 2>&1; do
     if ! running_gateway; then
       saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || true
       docker logs --tail 15 ds41-gateway 2>&1 | sed 's/^/  │ /'
+      gateway_remove_after_failure
       die "ds41-gateway exited before /health answered${saved:+; its log: $saved}"
     fi
     if (( SECONDS - gstart >= 60 )); then
       saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || true
       docker logs --tail 15 ds41-gateway 2>&1 | sed 's/^/  │ /'
+      gateway_remove_after_failure
       die "ds41-gateway did not answer /health within 60s${saved:+; its log: $saved}"
     fi
     sleep 1
