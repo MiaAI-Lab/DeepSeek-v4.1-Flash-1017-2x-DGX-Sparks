@@ -11,6 +11,7 @@ The container has no Docker, no ssh and no RoCE devices, so the test supplies sm
 cat; ssh runs its command locally, and the fake sysfs answers one RoCE device. The output is deterministic. Run:
     python3 -I scripts/test_api_gateway_settings.py
 """
+import json
 import os
 import re
 from pathlib import Path
@@ -142,7 +143,7 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         self.assertIn("-v /tmp/ds41-home/.local/state/dsv41-tensorfold/api-key:/run/secrets/key:ro", out)
         self.assertIn("-e API_KEY_FILE=/run/secrets/key", out)
         self.assertIn(
-            "ds41-gateway --listen 0.0.0.0:8888 --engine http://127.0.0.1:8887 "
+            "--listen 0.0.0.0:8888 --engine http://127.0.0.1:8887 "
             "--tokenizer /served/tokenizer.json --served-name DeepSeek-V4.1-Flash-1017 --image-token",
             out,
         )
@@ -154,6 +155,48 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         )
         self.assertNotIn("-e API_KEY=0", out)
         self.assertNotIn("--host 0.0.0.0 --port 8888", out)
+
+    def test_gateway_argv_has_no_duplicate_binary_and_flags_are_accepted(self):
+        """Docker runs ENTRYPOINT + the arguments after the image; argv[1] must be --listen, not the binary again."""
+        result = self.run_start(API_GATEWAY=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        at = lines.index("[dry-run] gateway:")
+        line = lines[at + 1].strip()
+        split = subprocess.run(
+            ["bash", "-c", 'eval "a=($(cat))"; printf "%s\\0" "${a[@]}"'],
+            input=line, text=True, capture_output=True, env={"PATH": f"{self.bin}:/usr/bin:/bin"}, timeout=10,
+        )
+        self.assertEqual(split.returncode, 0, split.stderr)
+        tokens = [token for token in split.stdout.split("\0") if token]
+        image = next(i for i, token in enumerate(tokens) if token.startswith("ds41-gateway:"))
+        args = tokens[image + 1:]
+        dockerfile = (ROOT / "gateway" / "Dockerfile").read_text()
+        entrypoint = json.loads(re.search(r"^ENTRYPOINT\s+(\[.*\])\s*$", dockerfile, re.M).group(1))
+        argv = entrypoint + args
+        self.assertEqual(argv[0], "ds41-gateway")
+        self.assertEqual(argv[1], "--listen", f"argv={argv[:4]}")
+        self.assertNotIn("ds41-gateway", args)
+
+        flags = [token.split("=", 1)[0] for token in args if token.startswith("--")]
+        binary = Path(os.environ.get("DS41_GATEWAY_BIN", ROOT / "gateway" / "target" / "release" / "ds41-gateway"))
+        if binary.is_file():
+            checked = subprocess.run([str(binary), *args, "--help"], text=True, capture_output=True, timeout=30)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            help_text = checked.stdout + checked.stderr
+            for flag in flags:
+                self.assertIn(flag, help_text)
+        else:
+            source = (ROOT / "gateway" / "src" / "main.rs").read_text()
+            accepted = set()
+            for match in re.finditer(r"#\[arg\(([^)]*)\)\]\s*\n\s*(\w+)\s*:", source):
+                attrs, field = match.groups()
+                if "long" not in attrs:
+                    continue
+                long_name = re.search(r'long\s*=\s*"([^"]+)"', attrs)
+                accepted.add("--" + (long_name.group(1) if long_name else field.replace("_", "-")))
+            for flag in flags:
+                self.assertIn(flag, accepted)
 
     def test_token_route_without_the_gateway_only_sets_the_engine_variable(self):
         result = self.run_start(TOKEN_ROUTE=1)

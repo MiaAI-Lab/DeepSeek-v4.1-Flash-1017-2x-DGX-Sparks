@@ -277,7 +277,7 @@ RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --gpus all --ipc=host --netw
 running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>/dev/null)" == true ]]; }
 # ds41-gateway's command: the API's flags, the engine on loopback, the served tokenizer and the container's limits.
 GATEWAY_LISTEN="$HOST:$PORT"; [[ "$HOST" != *:* ]] || GATEWAY_LISTEN="[$HOST]:$PORT"
-GATEWAY_ARGS=(ds41-gateway --listen "$GATEWAY_LISTEN" --engine "http://127.0.0.1:$ENGINE_PORT" --tokenizer /served/tokenizer.json
+GATEWAY_ARGS=(--listen "$GATEWAY_LISTEN" --engine "http://127.0.0.1:$ENGINE_PORT" --tokenizer /served/tokenizer.json
               --served-name "$SERVED_NAME" --image-token "$GATEWAY_IMAGE_TOKEN" --max-model-len "$CONTEXT"
               --max-images "$GATEWAY_MAX_IMAGES" --max-image-mb "$GATEWAY_MAX_IMAGE_MB" --log "$GATEWAY_LOG")
 if [[ "$THINKING" == 1 ]]; then GATEWAY_ARGS+=(--default-thinking); else GATEWAY_ARGS+=(--default-thinking=false); fi
