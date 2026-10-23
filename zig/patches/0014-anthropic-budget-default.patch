@@ -1,0 +1,15 @@
+--- a/zig/src/server/anthropic_translate.zig	2026-10-21 22:45:22
++++ b/zig/src/server/anthropic_translate.zig	2026-10-21 22:45:23
+@@ -286,8 +286,10 @@
+     if (std.mem.eql(u8, t, "enabled")) {
+         const budget = positiveInt(thinking.get("budget_tokens"));
+         const limit = if (body.get("max_tokens")) |m| m.int64() orelse std.math.maxInt(i64) else 0;
+-        if (budget == null or (!count and budget.? >= limit)) return cx.refuse("thinking.budget_tokens must be positive and less than max_tokens");
+-        try chat.put(a, "thinking_budget", thinking.get("budget_tokens").?);
++        if (budget) |b| {
++            if (!count and b >= limit) return cx.refuse("thinking.budget_tokens must be positive and less than max_tokens");
++            try chat.put(a, "thinking_budget", thinking.get("budget_tokens").?);
++        }
+     }
+     return .{ .object = chat };
+ }
