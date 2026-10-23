@@ -456,7 +456,7 @@ Python and no OpenCV. The gateway's target after a battery is at most 300 MiB re
 | `GATEWAY_STRICT` | 0 | `1`: the API's 400 instead of the fallback |
 | `GATEWAY_BLOCK_PRIVATE_URLS` | 1 | `1`: reject loopback, private, link-local and reserved image destinations |
 | `GATEWAY_API_SAMPLING` | 1 | `1`: use the API's sampling policy; `0`: the client's temperature/top_p/seed |
-| `GATEWAY_IMAGE_TOKEN` | `<｜end_of_query｜>` | the served tokenizer's image-token spelling |
+| `GATEWAY_IMAGE_TOKEN` | `<｜deepseek_image｜>` | the served tokenizer's image-token spelling |
 | `GATEWAY_MAX_IMAGES`, `GATEWAY_MAX_IMAGE_MB` | 600, 64 | the API's per-request image limits |
 | `GATEWAY_LOG` | info | debug, info, warn or error; one line per request (id, route, api/fallback, reason, ms) |
 | `TF_DS_API_EFFORTS` | unset | `1`: patch 0011's API effort table (minimal 50, low 50, medium 75, high 75, xhigh 75, max 100) on the engine |

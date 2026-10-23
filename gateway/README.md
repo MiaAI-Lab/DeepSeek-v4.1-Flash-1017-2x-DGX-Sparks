@@ -52,7 +52,7 @@ The defaults are in `scripts/config.sh`; the flags are in `src/main.rs`. The imp
 | `SERVED_NAME` | `--served-name` | `DeepSeek-V4.1-Flash-1017` |
 | `THINKING`, `REASONING_EFFORT` | `--default-thinking`, `--default-effort` | 1, empty |
 | `CONTEXT` | `--max-model-len` | auto from the engine, 65536 if it does not answer |
-| `GATEWAY_IMAGE_TOKEN` | `--image-token` | `<｜end_of_query｜>` |
+| `GATEWAY_IMAGE_TOKEN` | `--image-token` | `<｜deepseek_image｜>` |
 | `GATEWAY_STRICT` | `--strict` | 0 |
 | `GATEWAY_BLOCK_PRIVATE_URLS` | `--block-private-urls` | 1 |
 | `GATEWAY_API_SAMPLING` | `--api-sampling` | 1 |

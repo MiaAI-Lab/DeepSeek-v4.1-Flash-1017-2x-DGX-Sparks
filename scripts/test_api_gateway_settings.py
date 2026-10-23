@@ -147,7 +147,7 @@ class ApiGatewaySettingsTest(unittest.TestCase):
             "--tokenizer /served/tokenizer.json --served-name DeepSeek-V4.1-Flash-1017 --image-token",
             out,
         )
-        self.assertIn("end_of_query", out)
+        self.assertIn("deepseek_image", out)
         self.assertIn(
             "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --log debug --default-thinking "
             "--strict --block-private-urls=false --api-sampling=false --require-key",

@@ -42,6 +42,8 @@ pixels) and counted with DeepSeek's `ImageTokenSpec::v41`. The destination filte
 rejects loopback, RFC 1918, ULA, link-local, multicast, reserved and unspecified destinations, including every
 redirect and resolved address. The API's limits apply: `GATEWAY_MAX_IMAGES` (600), `GATEWAY_MAX_IMAGE_MB` (64) and
 8192-character URLs; PNG, JPEG, WebP and GIF are accepted.
+The served tokenizer's image-token spelling is `GATEWAY_IMAGE_TOKEN`, default
+`<｜deepseek_image｜>`.
 
 ## Known limits
 
