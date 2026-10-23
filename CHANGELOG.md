@@ -23,6 +23,14 @@
   with `error: UnsupportedConversion`; the widen is exact (BF16's bits in the high half, zeros below), the loader's
   `.to(torch.float32)`. `scripts/test_mixed_pack_patch.py` checks both patches.
 
+- A mixed pack's plain (cuBLAS) linear runs over a fixed number of rows: `zig/patches/0012-plain-rows.patch` and
+  `TF_DS_PLAIN_ROWS` (default 16, never beyond a round's rows; `0` turns the padding off). cuBLAS picks its kernel and
+  split-K from the GEMM's shape and its rounding follows the pick, so a decode round whose row count changes with the
+  streams or the draft block could change a token's bits. On the pair, without it, drafts-on and drafts-off replies
+  matched 4 of 8 `tools/validate.py` prompts, and its 8-concurrent check matched 4 of 8 with drafts off (6 of 8 with
+  drafts on); with it those checks are to be re-run. The EXL3 linears are untouched: their kernels compute each row in a
+  fixed order, which is why EAQ v1 kept the same bits across round shapes.
+
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,

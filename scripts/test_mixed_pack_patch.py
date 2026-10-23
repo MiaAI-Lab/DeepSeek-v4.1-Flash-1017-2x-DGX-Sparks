@@ -4,7 +4,8 @@
 The serving patch (zig/patches/0009-mixed-pack.patch) is against TF_REF; the rank-cache planner patch
 (zig/patches-inputs/0001-mixed-pack-rank-cache.patch) is against INPUTS_REF. Both are read from scripts/config.sh,
 so a re-pin moves the check with it. 0011/0002 widen the EAQ v1.1 indexer's BF16 `weights_proj` to the f32 entry the
-loaders plan for it, in the engine's checkpoint reader and in the rank-cache writer.
+loaders plan for it, in the engine's checkpoint reader and in the rank-cache writer; 0012 pads a mixed pack's plain
+linear to a fixed row count (`TF_DS_PLAIN_ROWS`), so cuBLAS's shape does not decide a token's bits.
 
 The application check needs a TensorFold clone with the pinned commits: set TF_SRC, or keep one at /tmp/tf-fork.
 Without one the content checks still run and the application check is skipped (the recipe's Dockerfile applies the
@@ -22,6 +23,7 @@ SERVING = ROOT / "zig" / "patches" / "0009-mixed-pack.patch"
 SERVING_BF16 = ROOT / "zig" / "patches" / "0011-widen-bf16.patch"
 INPUTS = ROOT / "zig" / "patches-inputs" / "0001-mixed-pack-rank-cache.patch"
 INPUTS_BF16 = ROOT / "zig" / "patches-inputs" / "0002-widen-bf16.patch"
+SERVING_ROWS = ROOT / "zig" / "patches" / "0012-plain-rows.patch"
 
 
 def pinned(name):
@@ -68,6 +70,20 @@ def apply_check(src, sha, patch):
     print(f"ok  {patch.relative_to(ROOT)} applies to {sha[:12]}")
 
 
+def apply_chain(src, sha, patches):
+    """The Dockerfile's order: git apply each patch in filename order, so a later one may build on an earlier one."""
+    with tempfile.TemporaryDirectory() as td:
+        wt = Path(td) / "wt"
+        run(["git", "-C", str(src), "worktree", "add", "-q", "--detach", str(wt), sha])
+        try:
+            for patch in patches:
+                run(["git", "-C", str(wt), "apply", str(patch)])
+        finally:
+            subprocess.run(["git", "-C", str(src), "worktree", "remove", "--force", str(wt)],
+                           capture_output=True, text=True)
+    print(f"ok  all {len(patches)} zig/patches apply in filename order to {sha[:12]}")
+
+
 def main():
     tf_ref = pinned("TF_REF")
     inputs_ref = pinned("INPUTS_REF")
@@ -95,6 +111,12 @@ def main():
         "from == .bf16 and k.dtype.? == .f32",
         "a bf16 tensor read as f32 widens exactly",
     ])
+    check_content(SERVING_ROWS, [
+        "plainRows",
+        "TF_DS_PLAIN_ROWS",
+        "e.plain_rows <= m",
+        "e.round_rows",
+    ])
 
     src = source()
     if src is None:
@@ -109,6 +131,7 @@ def main():
     apply_check(src, tf_ref, SERVING_BF16)
     apply_check(src, inputs_ref, INPUTS)
     apply_check(src, inputs_ref, INPUTS_BF16)
+    apply_chain(src, tf_ref, sorted((ROOT / "zig" / "patches").glob("*.patch")))
     return 0
 
 
