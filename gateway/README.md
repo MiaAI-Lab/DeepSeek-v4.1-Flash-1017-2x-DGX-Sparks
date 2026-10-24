@@ -101,4 +101,4 @@ message, usage, stream, Messages, Responses and context-error invariants and the
 `informes/cpu/informe.json` and `informes/cpu/informe.html`; open the HTML for the outcome table. The exit code is 0 when
 everything passes, 1 for divergences and 2 for a setup error. On the Spark pair, run the same three commands against
 `--gateway http://127.0.0.1:8888 --zig http://127.0.0.1:8887` from the gateway container instead of `fake_serve`. The
-contract is summarized in `../docs/api-gateway.md`.
+contract is summarized in `docs/api-gateway.md` (the recipe ships the same page under its `docs/`).

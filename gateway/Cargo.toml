@@ -3,6 +3,7 @@ name = "ds41-gateway"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "Apache-2.0"
 description = "DeepSeek API parity gateway in front of TensorFold's token-in/token-out route."
 
 [[bin]]
