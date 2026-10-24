@@ -1,0 +1,39 @@
+{
+ "id": "chat-16-stops",
+ "protocol": "chat",
+ "tags": [
+  "stops"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Di algo"
+   }
+  ],
+  "stop": [
+   "0",
+   "1",
+   "2",
+   "3",
+   "4",
+   "5",
+   "6",
+   "7",
+   "8",
+   "9",
+   "10",
+   "11",
+   "12",
+   "13",
+   "14",
+   "15"
+  ]
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

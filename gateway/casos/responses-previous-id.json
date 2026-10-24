@@ -1,0 +1,17 @@
+{
+ "id": "responses-previous-id",
+ "protocol": "responses",
+ "tags": [
+  "fallback"
+ ],
+ "body": {
+  "input": "Hola",
+  "previous_response_id": "resp_123"
+ },
+ "expect": {
+  "render": "fallback",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

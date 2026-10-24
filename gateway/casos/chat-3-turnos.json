@@ -1,0 +1,29 @@
+{
+ "id": "chat-3-turnos",
+ "protocol": "chat",
+ "tags": [
+  "multi"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   },
+   {
+    "role": "assistant",
+    "content": "¿Qué tal?"
+   },
+   {
+    "role": "user",
+    "content": "Bien"
+   }
+  ]
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

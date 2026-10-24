@@ -1,0 +1,25 @@
+{
+ "id": "chat-system-vacio",
+ "protocol": "chat",
+ "tags": [
+  "sistema"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "system",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ]
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

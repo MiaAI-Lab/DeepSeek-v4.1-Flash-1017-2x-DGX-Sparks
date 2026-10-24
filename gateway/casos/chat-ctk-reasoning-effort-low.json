@@ -1,0 +1,26 @@
+{
+ "id": "chat-ctk-reasoning-effort-low",
+ "protocol": "chat",
+ "tags": [
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "chat_template_kwargs": {
+   "enable_thinking": true,
+   "reasoning_effort": "low"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

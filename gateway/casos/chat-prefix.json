@@ -1,0 +1,30 @@
+{
+ "id": "chat-prefix",
+ "protocol": "chat",
+ "tags": [
+  "multi",
+  "prefix"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Escribe un poema"
+   },
+   {
+    "role": "assistant",
+    "content": "Rosa",
+    "prefix": true
+   }
+  ]
+ },
+ "expect": {
+  "render": {
+   "class": "prefijo",
+   "note": "el Zig no tiene continuación de prefijo"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

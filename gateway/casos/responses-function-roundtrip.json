@@ -1,0 +1,59 @@
+{
+ "id": "responses-function-roundtrip",
+ "protocol": "responses",
+ "tags": [
+  "tools"
+ ],
+ "body": {
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Consulta"
+     }
+    ]
+   },
+   {
+    "type": "function_call",
+    "call_id": "call_00_dddddddddddddddddddd",
+    "name": "get_weather",
+    "arguments": "{\"city\":\"París\"}"
+   },
+   {
+    "type": "function_call_output",
+    "call_id": "call_00_dddddddddddddddddddd",
+    "output": "18"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Weather",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  ],
+  "reasoning": {
+   "effort": "none"
+  }
+ },
+ "expect": {
+  "render": {
+   "class": "herramientas",
+   "note": "el gateway y el template del Zig difieren en las líneas antes de ## Tools"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

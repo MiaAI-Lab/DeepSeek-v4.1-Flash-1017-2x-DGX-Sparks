@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- `gateway/` (`ds41-gateway`, Rust): the DeepSeek API front end over TensorFold's token-in/token-out route, with
+  `zig/patches/0011-token-route.patch` (`TENSORFOLD_TOKEN_ROUTE=1`) and the API's effort table behind
+  `TF_DS_API_EFFORTS=1`. Off by default; `API_GATEWAY=1` moves the engine to `127.0.0.1:ENGINE_PORT`, starts the gateway
+  on `HOST:PORT`, waits for `/health`, runs a second smoke test against the engine and stops the gateway first. The image
+  is built by `scripts/prepare.sh` from `gateway/Dockerfile` (multi-stage Rust 1.97 to Debian slim, unprivileged, no GPU,
+  no Python, no OpenCV); `GATEWAY_MEMORY`, `GATEWAY_CPUS`, `GATEWAY_STRICT`, `GATEWAY_BLOCK_PRIVATE_URLS`,
+  `GATEWAY_API_SAMPLING`, `GATEWAY_IMAGE_TOKEN`, `GATEWAY_LOG`, `GATEWAY_MAX_IMAGES` and `GATEWAY_MAX_IMAGE_MB` are the
+  gateway's settings. `API_GATEWAY=0` keeps the previous output except the derived engine image tag, which changes when
+  0011 enters `zig/patches/`; `scripts/test_api_gateway_settings.py` compares every other byte.
+  See the README section "DeepSeek API parity (gateway)" and `docs/api-gateway.md`. The comparator (`ds41-paridad`) is
+  built into the image and runs `casos`, `render` and `e2e` with or without a GPU (the CPU run uses the TensorFold
+  checkout's `fake_serve`); it writes `informes/cpu/informe.{json,html}`.
+- `zig/patches/0009-disk-cache.patch` (off by default; `DISK_CACHE=1`): kept conversation states go to disk, each rank its
+  half, before they lose their place in memory, and come back from it; a stop writes every kept state, so a restart
+  resumes them. `start.sh` makes `DISK_CACHE_DIR` on both Sparks, mounts it in both containers and checks its free
+  space; `STOP_TIMEOUT` follows `DISK_CACHE_FLUSH_S`. Replies identical with and without it (`tools/exact.py` 31/31);
+  a 52K turn resumed from disk in 1.1-2.8 s instead of ~32 s; reading a 198,656-token state back pauses the other streams
+  for ~0.35 s. `/health` shows the prompt cache's counts (`prompt_cache`). See the README section "Disk cache of kept
+  conversations".
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,
@@ -139,7 +158,7 @@
   (`TF_DS_CACHE_PLACEMENT=1`, **on**: a resumed turn no longer misses the cache because another conversation's kept rows were in
   the way), a second Engram AIO ring (`TF_DS_ENGRAM_LANES=2`, off: 1.5-2.6% slower) and a prefill indexer row split
   (`TF_DS_IDX_SPLIT=1`, off: no measurable gain). `tools/exact.py` records and compares replies.
-- `zig/patches/0004-call-gate.patch`: the engine enforces `tool_choice` `"required"` and a named function (taken from the spark1/spark2
+- `zig/patches/0004-call-gate.patch`: the engine enforces `tool_choice` `"required"` and a named function (taken from a two-Spark
   deployment's copy; built into the running image `exl3-tp2-7c9bf5d36350`: required, named, streaming and thinking-on requests
   return valid tool calls, auto/none/absent are unchanged).
 - `RANK1_PROFILE` (rank 1 `--profile`); both GPUs must share one clock ceiling; each Spark can run from a local copy of the

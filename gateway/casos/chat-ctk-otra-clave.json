@@ -1,0 +1,24 @@
+{
+ "id": "chat-ctk-otra-clave",
+ "protocol": "chat",
+ "tags": [
+  "fallback"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "chat_template_kwargs": {
+   "otra": "clave"
+  }
+ },
+ "expect": {
+  "render": "fallback",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

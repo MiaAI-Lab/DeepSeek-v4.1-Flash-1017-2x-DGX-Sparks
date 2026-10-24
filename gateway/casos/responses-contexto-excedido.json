@@ -1,0 +1,27 @@
+{
+ "id": "responses-contexto-excedido",
+ "protocol": "responses",
+ "tags": [
+  "errores"
+ ],
+ "body": {
+  "input": "Hola",
+  "max_output_tokens": 70000,
+  "reasoning": {
+   "effort": "none"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": {
+   "invariants": true,
+   "same_ids": false,
+   "error": {
+    "status": 400,
+    "message_contains": "maximum context length"
+   }
+  }
+ },
+ "greedy": true
+}

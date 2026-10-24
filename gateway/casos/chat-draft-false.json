@@ -1,0 +1,22 @@
+{
+ "id": "chat-draft-false",
+ "protocol": "chat",
+ "tags": [
+  "fallback"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "draft": false
+ },
+ "expect": {
+  "render": "fallback",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}
