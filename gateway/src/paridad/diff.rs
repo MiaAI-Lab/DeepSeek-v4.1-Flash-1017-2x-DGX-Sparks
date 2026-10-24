@@ -139,7 +139,7 @@ pub fn classify_window(
     if marker(&suffix, "## Response Format") || marker(&prefix, "## Response Format") {
         return ("formato", "model/chat_template.jinja, server/grammar.zig");
     }
-    if marker(&suffix, "Reasoning Effort:") || marker(&prefix, "Reasoning Effort:") {
+    if has_effort_marker(left_window) || has_effort_marker(right_window) {
         return (
             "esfuerzo",
             "families/dsv41/text.zig (tabla), model/chat_template.jinja",
@@ -166,6 +166,13 @@ pub fn classify_window(
         return ("sistema", "model/chat_template.jinja, server/messages.zig");
     }
     ("otro", "—")
+}
+
+/// Accept the API's decoded text and the raw token spellings used by `/tokenize`.
+fn has_effort_marker(text: &str) -> bool {
+    text.contains("Reasoning Effort:")
+        || text.contains("ReasoningĠEffort:")
+        || text.contains("Reasoning▁Effort:")
 }
 
 /// The Zig file(s) responsible for a class, straight from the contract table.
@@ -284,6 +291,25 @@ mod tests {
         assert_eq!(class, "esfuerzo");
         assert_eq!(archivo, responsible_file("esfuerzo"));
         assert!(archivo.contains("text.zig"));
+    }
+
+    #[test]
+    fn real_effort_windows_with_zig_token_markers_are_effort() {
+        let cases = [
+            ("chat-think-minimal", 50, 25),
+            ("chat-think-medium", 75, 62),
+            ("chat-think-xhigh", 75, 88),
+            ("messages-thinking", 75, 62),
+            ("responses-reasoning-medium", 75, 62),
+        ];
+        for (id, api, zig) in cases {
+            let left = format!("Reasoning Effort: {api} (range 1-");
+            let right = format!("ReasoningĠEffort:Ġ{zig}Ġ(rangeĠ1-");
+            let (class, archivo) =
+                classify_window(&tags(&["thinking", "effort"]), &left, &right, 0);
+            assert_eq!(class, "esfuerzo", "{id}");
+            assert_eq!(archivo, responsible_file("esfuerzo"), "{id}");
+        }
     }
 
     #[test]

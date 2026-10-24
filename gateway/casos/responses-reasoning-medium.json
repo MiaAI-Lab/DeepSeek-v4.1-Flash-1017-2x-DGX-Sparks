@@ -12,7 +12,10 @@
   }
  },
  "expect": {
-  "render": "identical",
+  "render": {
+    "class": "esfuerzo",
+    "note": "la plantilla del Zig asigna 62 a medium; la API 75"
+   },
   "cache": "equivalent",
   "e2e": "n/a"
  },

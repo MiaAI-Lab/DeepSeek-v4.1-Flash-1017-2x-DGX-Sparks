@@ -18,7 +18,10 @@
   "reasoning_effort": "minimal"
  },
  "expect": {
-  "render": "identical",
+  "render": {
+    "class": "esfuerzo",
+    "note": "la plantilla del Zig asigna 25 a minimal; la API 50"
+   },
   "cache": "equivalent",
   "e2e": "n/a"
  },
