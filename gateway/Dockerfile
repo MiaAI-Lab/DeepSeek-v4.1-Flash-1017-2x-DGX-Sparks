@@ -13,8 +13,6 @@ COPY src ./src
 COPY tests ./tests
 # ds41-paridad (the comparator) runs the battery from the image, so the case files travel with it.
 COPY casos ./casos
-# The tokenizer the gateway loads and the battery needs; the test suite reads this copy.
-COPY tok ./tok
 RUN cargo build --release --locked --bin ds41-gateway --bin ds41-paridad
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
@@ -26,11 +24,7 @@ RUN groupadd --system --gid 10001 ds41 \
 COPY --from=builder /src/target/release/ds41-gateway /usr/local/bin/ds41-gateway
 COPY --from=builder /src/target/release/ds41-paridad /usr/local/bin/ds41-paridad
 COPY --from=builder /src/casos /casos
-COPY --from=builder /src/tok/tokenizer.json /served/tokenizer.json
-COPY LICENSE NOTICE /usr/share/doc/dsgateway/
 ARG GATEWAY_HASH=unknown
 LABEL tf.gateway=${GATEWAY_HASH}
 USER ds41
-# The image carries the tokenizer at the default path, so the binary starts with no flags and no extra mount;
-# mounting a served tokenizer over /served/tokenizer.json replaces it.
 ENTRYPOINT ["ds41-gateway"]
