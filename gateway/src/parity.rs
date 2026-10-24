@@ -157,8 +157,21 @@ pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
         object.insert("model".to_string(), json!(config.served_name));
     }
     inject_default_effort(&mut object, protocol, config.default_effort.as_deref());
-    let request: R = serde_json::from_value(Value::Object(object.clone()))
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let request: R = serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
+        let message = error.to_string();
+        // The native chat route can infer a missing tool_call_id from the preceding
+        // tool calls; preserve that engine behavior unless strict mode is enabled.
+        // Only fall back when the missing id is genuinely the reason the request did
+        // not deserialize, not when an unrelated error merely mentions the field.
+        if protocol == Protocol::Chat
+            && !config.strict
+            && missing_tool_call_id_is_the_only_error::<R>(&object)
+        {
+            ApiError::fallback(message)
+        } else {
+            ApiError::bad_request(message)
+        }
+    })?;
     let converted = match gateway.try_convert(request) {
         Ok(converted) => converted,
         Err(error) if config.strict => return Err(ApiError::from(error)),
@@ -235,6 +248,42 @@ pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
         images,
         converted,
     })
+}
+
+/// Whether `R` fails to deserialize only because a `tool` message lacks its
+/// `tool_call_id`.  The native chat route infers the id from the preceding tool
+/// calls, so the gateway falls back to the engine for exactly that case; any other
+/// deserialization error stays the API's 400.
+fn missing_tool_call_id_is_the_only_error<R: DeserializeOwned>(
+    object: &Map<String, Value>,
+) -> bool {
+    let Some(messages) = object.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    if !messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            && message.get("tool_call_id").is_none()
+    }) {
+        return false;
+    }
+    let mut patched = object.clone();
+    let Some(messages) = patched.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    for message in messages {
+        let Some(message) = message.as_object_mut() else {
+            continue;
+        };
+        if message.get("role").and_then(Value::as_str) == Some("tool")
+            && message.get("tool_call_id").is_none()
+        {
+            message.insert(
+                "tool_call_id".to_string(),
+                Value::String("__missing__".to_string()),
+            );
+        }
+    }
+    serde_json::from_value::<R>(Value::Object(patched)).is_ok()
 }
 
 /// The public model name the client asked for, or the served one if absent.

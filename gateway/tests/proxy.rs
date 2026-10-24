@@ -125,6 +125,14 @@ async fn spawn_gateway(engine: &str, config: GatewayConfig) -> String {
     format!("http://{address}")
 }
 
+fn tool_result_without_id() -> Value {
+    let case: Value = serde_json::from_str(include_str!("../casos/chat-tool-result-sin-id.json"))
+        .expect("valid parity case");
+    let mut body = case["body"].clone();
+    body["model"] = json!("DeepSeek-V4.1-Flash-1017");
+    body
+}
+
 #[tokio::test]
 async fn a_five_megabyte_body_is_proxied_byte_for_byte() {
     let (engine, mock) = spawn_mock(false).await;
@@ -396,6 +404,94 @@ async fn a_conversion_error_falls_back_to_the_engine_unless_strict() {
         serde_json::from_slice::<Value>(&record.body).expect("json"),
         body
     );
+}
+
+#[tokio::test]
+async fn tool_result_without_id_falls_back_with_the_body_unchanged() {
+    let (engine, mock) = spawn_mock(false).await;
+    let url = spawn_gateway(&engine, GatewayConfig::default()).await;
+    let body = tool_result_without_id();
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{url}/ds41/render/chat"))
+        .json(&body)
+        .send()
+        .await
+        .expect("render");
+    assert_eq!(response.status(), 200);
+    let render: Value = response.json().await.expect("render body");
+    assert!(
+        render["fallback_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("missing field `tool_call_id`"))
+    );
+    assert!(mock.records.lock().unwrap().is_empty());
+
+    let response = client
+        .post(format!("{url}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-ds41-gateway"], "fallback");
+    let records = mock.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].path, "/v1/chat/completions");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&records[0].body).expect("json"),
+        body
+    );
+}
+
+#[tokio::test]
+async fn tool_result_without_id_is_an_api_400_in_strict_mode() {
+    let (engine, mock) = spawn_mock(false).await;
+    let url = spawn_gateway(
+        &engine,
+        GatewayConfig {
+            strict: true,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/chat/completions"))
+        .json(&tool_result_without_id())
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.headers()["x-ds41-gateway"], "api");
+    let body: Value = response.json().await.expect("body");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("missing field `tool_call_id`"))
+    );
+    assert!(mock.records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_unrelated_error_mentioning_tool_call_id_is_not_a_fallback() {
+    let (engine, mock) = spawn_mock(false).await;
+    let url = spawn_gateway(&engine, GatewayConfig::default()).await;
+    // `stream` must be a boolean; a string that happens to spell the missing-field
+    // message is a plain 400, not the tool_call_id fallback.
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "stream": "missing field `tool_call_id`"
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.headers()["x-ds41-gateway"], "api");
+    assert!(mock.records.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
