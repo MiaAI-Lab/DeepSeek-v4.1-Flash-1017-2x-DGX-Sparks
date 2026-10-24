@@ -252,6 +252,26 @@ fn parse_sse(text: &str) -> Vec<(Option<String>, String)> {
     events
 }
 
+/// Detect an actual error frame, not the valid `"error": null` field carried by
+/// a completed Responses object.
+fn has_error_event(events: &[(Option<String>, String)]) -> bool {
+    events.iter().any(|(name, data)| {
+        if name.as_deref() == Some("error") {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return false;
+        };
+        value.get("error").is_some_and(|error| !error.is_null())
+            || name.as_deref() == Some("response.failed")
+            || value.get("type").and_then(Value::as_str) == Some("response.failed")
+            || value
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .is_some_and(|error| !error.is_null())
+    })
+}
+
 /// Every SSE `data:` that is not `[DONE]` must be a JSON value; a malformed line
 /// is a violation, never silently dropped.
 pub fn sse_data_violations(text: &str) -> Vec<String> {
@@ -778,7 +798,7 @@ pub async fn run_case(caso: &Caso, gateway: &str, zig: &str, served_name: &str) 
                         .violaciones
                         .push("stream does not end with data: [DONE]".to_string());
                 }
-                if stream_reply.text.contains("\"error\"") {
+                if has_error_event(&events) {
                     result
                         .violaciones
                         .push("stream carries an error event".to_string());
@@ -965,6 +985,37 @@ mod tests {
         let violations = chat_stream_violations(text, false);
         assert!(violations.iter().any(|v| v.contains("[DONE]")));
         assert!(violations.iter().any(|v| v.contains("last chunk")));
+    }
+
+    #[test]
+    fn responses_error_null_is_not_an_error_event() {
+        let events = parse_sse(
+            "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"error\":null}}\n\ndata: [DONE]\n\n",
+        );
+        assert!(!has_error_event(&events));
+    }
+
+    #[test]
+    fn an_explicit_error_event_is_detected() {
+        let events =
+            parse_sse("event: error\ndata: {\"error\":{\"message\":\"boom\"}}\n\ndata: [DONE]\n\n");
+        assert!(has_error_event(&events));
+    }
+
+    #[test]
+    fn a_response_failed_event_with_a_nested_error_is_detected() {
+        let events = parse_sse(
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\ndata: [DONE]\n\n",
+        );
+        assert!(has_error_event(&events));
+    }
+
+    #[test]
+    fn a_response_failed_type_without_the_error_event_name_is_detected() {
+        let events = parse_sse(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\ndata: [DONE]\n\n",
+        );
+        assert!(has_error_event(&events));
     }
 
     #[test]
