@@ -1,0 +1,7 @@
+# gitleaks: false positives in test fixtures and prompts.
+# tools/needle.py and tools/bench.py use SECRET only as a prompt word list, not a credential;
+# gateway/tests/paridad_e2e.rs mocks the engine with a hex token_sha.
+af57cb05f104a363ab17ce29848790e6169c71f5:gateway/tests/paridad_e2e.rs:generic-api-key:52
+ef6a308b118ea61de052d9838416da93f1e79cd7:tools/needle.py:generic-api-key:17
+ef6a308b118ea61de052d9838416da93f1e79cd7:tools/bench.py:generic-api-key:43
+ed026ef92d1650120dada1294a112acb6c8f2f48:tools/needle.py:generic-api-key:16
