@@ -271,6 +271,7 @@ where
             protocol_stream,
             trace,
             error_slot,
+            engine_task,
             started,
             cached,
         )
@@ -362,6 +363,7 @@ fn inference_stream(
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, rx) = mpsc::channel::<Result<EngineEvent, ApiError>>(32);
+    let error_slot_task = Arc::clone(&error_slot);
     let handle = tokio::spawn(async move {
         for event in initial_events {
             let finished = matches!(event.chunk, InferenceChunk::Finish { .. });
@@ -370,9 +372,7 @@ fn inference_stream(
                 return;
             }
             if finished {
-                while let Ok(Some(event)) = stream.next_event().await {
-                    record_event(&trace, &event);
-                }
+                drain_final(&mut stream, &trace, &error_slot_task).await;
                 return;
             }
         }
@@ -390,9 +390,7 @@ fn inference_stream(
                             // The final usage snapshot follows the finish event.  Drain it
                             // for the cache-hit patch even though the processor already
                             // stopped consuming the stream.
-                            while let Ok(Some(event)) = stream.next_event().await {
-                                record_event(&trace, &event);
-                            }
+                            drain_final(&mut stream, &trace, &error_slot_task).await;
                             return;
                         }
                     }
@@ -415,6 +413,26 @@ fn inference_stream(
     (stream, handle)
 }
 
+/// Drain the engine events that follow a finish chunk, recording them for the trace.
+/// A late engine error is recorded into `error_slot` instead of being dropped, so the
+/// request does not close as successful.
+async fn drain_final(
+    stream: &mut EngineStream,
+    trace: &Arc<Mutex<Trace>>,
+    error_slot: &Arc<Mutex<Option<ApiError>>>,
+) {
+    loop {
+        match stream.next_event().await {
+            Ok(Some(event)) => record_event(trace, &event),
+            Ok(None) => return,
+            Err(error) => {
+                *error_slot.lock().expect("error mutex poisoned") = Some(error);
+                return;
+            }
+        }
+    }
+}
+
 /// Build the SSE response, waiting up to two seconds for the first protocol frame so an
 /// engine rejection is still a normal HTTP error.
 #[allow(clippy::too_many_arguments)]
@@ -427,6 +445,7 @@ async fn stream_response<R>(
     + 'static,
     trace: Arc<Mutex<Trace>>,
     error_slot: Arc<Mutex<Option<ApiError>>>,
+    engine_task: tokio::task::JoinHandle<()>,
     started: Instant,
     _cached: usize,
 ) -> Result<Response, ApiError>
@@ -444,6 +463,7 @@ where
     tokio::spawn(async move {
         let mut protocol_stream = Box::pin(protocol_stream);
         let mut sent = false;
+        let mut failed = false;
         loop {
             tokio::select! {
                 _ = frame_tx.closed() => break,
@@ -462,12 +482,16 @@ where
                         } else {
                             frame_tx.send(Err(error)).await
                         };
+                        failed = true;
                         break;
                     }
                     None => break,
                 }
             }
         }
+        // Wait for the engine task to finish draining after the finish chunk, so a
+        // late engine error is not masked by [DONE] or by a successful close.
+        let _ = engine_task.await;
         let error = error_task.lock().expect("error mutex poisoned").take();
         if let Some(error) = error {
             let _ = if sent {
@@ -475,7 +499,11 @@ where
             } else {
                 frame_tx.send(Err(error)).await
             };
-        } else if let Some(done) = R::Response::sse_done_data() {
+        } else if !failed {
+            // The gateway terminates all three SSE protocols with [DONE], but only
+            // when nothing already reported an error.
+            // deepseek-recipe only provides the marker explicitly for Chat.
+            let done = R::Response::sse_done_data().unwrap_or_else(|| "[DONE]".to_string());
             let _ = frame_tx.send(Ok(Event::default().data(done))).await;
         }
         let trace = trace_task.lock().expect("trace mutex poisoned");
@@ -752,4 +780,131 @@ pub async fn render_handler(
         prepared.fallback_reason.as_deref().unwrap_or("none"),
     );
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GatewaySettings;
+    use deepseek_recipe::stream::InferenceTokenLogprob;
+
+    fn test_gateway() -> Gateway {
+        Gateway::new(
+            Arc::new(crate::test_tokenizer()),
+            GatewaySettings {
+                served_name: "DeepSeek-V4.1-Flash-1017".to_string(),
+                default_thinking: true,
+                image_token: "<｜deepseek_image｜>".to_string(),
+                aliases: Vec::new(),
+            },
+        )
+        .expect("build gateway")
+    }
+
+    /// Drive `stream_response` with a processor error after output has already started,
+    /// returning the raw SSE body.
+    async fn sse_text_after_a_processor_error<R>(protocol: Protocol, body: Value) -> String
+    where
+        R: ProtocolRequest + DeserializeOwned,
+        ChunkOf<R>: Serialize + Send,
+    {
+        let gateway = test_gateway();
+        let config = GatewayConfig {
+            api_sampling: true,
+            ..GatewayConfig::default()
+        };
+        let prepared = prepare::<R>(&gateway, &config, protocol, body)
+            .await
+            .expect("prepare");
+        let generator = R::chunk_generator(
+            &prepared.converted,
+            prepared.id.clone(),
+            prepared.model.clone(),
+        );
+        let processor = StreamProcessor::new(generator, prepared.converted.parsing_options.clone())
+            .with_tokenizer(gateway.tokenizer.clone());
+        // A Ready chunk emits the start frame (so `sent` becomes true); the second
+        // Tokens chunk carries more log probabilities than token ids, which makes the
+        // processor yield a StreamError after output has already begun.
+        let inference = tokio_stream::iter(vec![
+            InferenceChunk::Ready {
+                system_fingerprint: None,
+                prompt_usage: PromptUsage {
+                    prompt_tokens: 1,
+                    prompt_cache_hit_tokens: 0,
+                },
+            },
+            InferenceChunk::Tokens {
+                token_ids: vec![0],
+                logprobs: Some(vec![
+                    InferenceTokenLogprob {
+                        logprob: 0.0,
+                        top_logprobs: Vec::new(),
+                    },
+                    InferenceTokenLogprob {
+                        logprob: 0.0,
+                        top_logprobs: Vec::new(),
+                    },
+                ]),
+            },
+        ]);
+        let protocol_stream = processor.into_protocol_stream(inference);
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let error_slot = Arc::new(Mutex::new(None::<ApiError>));
+        let engine_task = tokio::spawn(async {});
+        let response = stream_response::<R>(
+            protocol,
+            &prepared,
+            protocol_stream,
+            trace,
+            error_slot,
+            engine_task,
+            Instant::now(),
+            0,
+        )
+        .await
+        .expect("stream_response");
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .expect("sse body");
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[tokio::test]
+    async fn messages_stream_does_not_emit_done_after_a_processor_error() {
+        let text = sse_text_after_a_processor_error::<crate::parity::Messages>(
+            Protocol::Messages,
+            json!({
+                "model": "DeepSeek-V4.1-Flash-1017",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Hola"}],
+                "thinking": {"type": "disabled"}
+            }),
+        )
+        .await;
+        assert!(text.contains("error"), "no error frame in stream: {text}");
+        assert!(
+            !text.contains("[DONE]"),
+            "stream emitted [DONE] after the error: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_does_not_emit_done_after_a_processor_error() {
+        let text = sse_text_after_a_processor_error::<crate::parity::Responses>(
+            Protocol::Responses,
+            json!({
+                "model": "DeepSeek-V4.1-Flash-1017",
+                "input": "Hola",
+                "max_output_tokens": 64,
+                "reasoning": {"effort": "none"}
+            }),
+        )
+        .await;
+        assert!(text.contains("error"), "no error frame in stream: {text}");
+        assert!(
+            !text.contains("[DONE]"),
+            "stream emitted [DONE] after the error: {text}"
+        );
+    }
 }

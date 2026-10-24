@@ -420,6 +420,7 @@ async fn messages_non_stream_and_stream() {
             .iter()
             .any(|(name, _)| name.as_deref() == Some("message_stop"))
     );
+    assert_eq!(events.last().unwrap().1, "[DONE]");
 }
 
 #[tokio::test]
@@ -463,6 +464,10 @@ async fn responses_non_stream_and_stream() {
             .iter()
             .any(|(name, _)| name.as_deref() == Some("response.completed"))
     );
+    assert_eq!(events.last().unwrap().1, "[DONE]");
+    assert!(events.iter().all(|(name, data)| {
+        name.as_deref() != Some("error") && data.get("error").is_none_or(Value::is_null)
+    }));
 }
 
 #[tokio::test]
@@ -903,6 +908,65 @@ async fn an_engine_rejection_before_the_first_token_is_a_normal_http_error() {
     let body: Value = response.json().await.expect("body");
     assert_eq!(body["error"]["message"], "bad request");
     assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn an_engine_error_after_finish_surfaces_instead_of_closing_cleanly() {
+    let gw = gateway();
+    let ids = text_ids(&gw, "Hola");
+    let (engine, _) = spawn_mock(
+        vec![
+            usage(4, 0),
+            tokens(&ids, Some("stop")),
+            final_usage(4, 0, ids.len() as u64),
+            json!({"error": {"message": "boom", "code": 500}}),
+        ],
+        Duration::ZERO,
+        true,
+    )
+    .await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+
+    // Non-streaming: the late engine error must become a 502, not a 200.
+    let response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "thinking": {"type": "disabled"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 502);
+    let body: Value = response.json().await.expect("body");
+    assert_eq!(body["error"]["message"], "boom");
+
+    // Streaming: the stream must end with the error, not with [DONE].
+    let response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "thinking": {"type": "disabled"},
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.expect("sse");
+    let events = parse_sse(&text);
+    assert!(
+        events
+            .iter()
+            .any(|(_, data)| data.get("error").is_some_and(|error| !error.is_null())),
+        "no error event in {text}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(_, data)| data.as_str() == Some("[DONE]")),
+        "stream emitted [DONE] despite the engine error: {text}"
+    );
 }
 
 #[tokio::test]
