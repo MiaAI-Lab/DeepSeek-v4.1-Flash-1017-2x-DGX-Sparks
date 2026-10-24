@@ -309,7 +309,7 @@ if [[ "$GATEWAY_BLOCK_PRIVATE_URLS" == 1 ]]; then GATEWAY_ARGS+=(--block-private
 if [[ "$GATEWAY_API_SAMPLING" == 1 ]]; then GATEWAY_ARGS+=(--api-sampling); else GATEWAY_ARGS+=(--api-sampling=false); fi
 [[ "$API_KEY" != 1 ]] || GATEWAY_ARGS+=(--require-key)
 GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
-             --restart on-failure:3 --read-only --tmpfs /tmp -v "$DATA_DIR/model:/served:ro")
+             --restart on-failure:3 --read-only --tmpfs /tmp -v "$(readlink -f "$DATA_DIR/model/tokenizer.json"):/served/tokenizer.json:ro")
 if [[ "$API_KEY" == 1 ]]; then GATEWAY_RUN+=(-v "$API_KEY_FILE:/run/secrets/key:ro" -e API_KEY_FILE=/run/secrets/key); fi
 GATEWAY_RUN+=("$GATEWAY_IMAGE")
 DATA=/hf/$DATA_SUB
