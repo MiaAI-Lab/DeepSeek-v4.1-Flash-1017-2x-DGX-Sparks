@@ -39,15 +39,28 @@ MASTER_ADDR="${MASTER_ADDR:-}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-}"     # NCCL's bootstrap socket's netdev on both nodes (default: the link's)
 
 # ---------------------------------------------------------------- the checkpoint, the engine, the kernel kit
-# The weights: Mia's AI Lab's EAQ v1.1 EXL3 quantization of DeepSeek-V4.1-Flash-1017 at 2.9 bits a weight (39 shards,
-# 210,735,685,708 tensor bytes / ~196 GiB; the vision tower and the DSpark draft blocks are in it; 27 linears are BF16,
-# so the engine must have the mixed-pack loader). Its Engram n-gram tables are not: they are read unquantized from
+# The weights: Mia's AI Lab's EAQ EXL3 quantization of DeepSeek-V4.1-Flash-1017 at 2.9 bits a weight (39 shards,
+# ~196 GiB; the vision tower and the DSpark draft blocks are in it). EAQ v1 is the default: Mia's model card keeps it
+# the recommended pack. EAQ v1.1 is experimental (no perplexity or KL measurement against the unquantized model): set
+# EAQ_V1_1=1 for it. v1.1 keeps v1's widths but stores 27 indexer/compressor linears as BF16, so the engine must have
+# the mixed-pack loader; the image has it. Neither pack holds Engram's n-gram tables: they are read unquantized from
 # the base model's shards 47 and 48 (ENGRAM_ID, ~203 GB), which this Spark downloads beside it.
-MODEL_ID="${MODEL_ID:-Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw}"
-_rev=""; [[ "$MODEL_ID" == Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw ]] && _rev=aee640e2afba93be683bb5b9b420115fe7fbac20
+EAQ_V1_1="${EAQ_V1_1:-0}"   # 0: EAQ v1 (recommended); 1: EAQ v1.1 (experimental, BF16 mixed pack)
+_default_id=Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw
+_default_rev=45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b
+if [[ "$EAQ_V1_1" == 1 ]]; then
+  _default_id=Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw
+  _default_rev=aee640e2afba93be683bb5b9b420115fe7fbac20
+fi
+MODEL_ID="${MODEL_ID:-$_default_id}"
+_rev=""
+case "$MODEL_ID" in
+  Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw) _rev=45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b ;;
+  Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw) _rev=aee640e2afba93be683bb5b9b420115fe7fbac20 ;;
+esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-# Keys' matching Mia EAQ 2.9 bpw overlay (not a standalone checkpoint). It matches EAQ v1, not v1.1: ABLIT=1 with the
-# v1.1 default is refused below; set MODEL_ID and MODEL_REVISION to the v1 checkpoint for the overlay.
+# Keys' matching Mia EAQ 2.9 bpw overlay (not a standalone checkpoint). It matches EAQ v1, not v1.1: ABLIT=1 with
+# EAQ v1.1 is refused below; leave EAQ_V1_1=0 (the default) for the overlay.
 export ABLIT="${ABLIT:-0}"
 ABLIT_ID=drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 ABLIT_REVISION="${ABLIT_REVISION:-0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0}"
@@ -211,11 +224,12 @@ die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c
 
 [[ -z "${HF_TOKEN:-}" ]] || export HF_TOKEN
 ablit_notice() {
+  [[ "$EAQ_V1_1" =~ ^[01]$ ]] || die "EAQ_V1_1 is 0 or 1, not $EAQ_V1_1"
   [[ "$ABLIT" =~ ^[01]$ ]] || die "ABLIT is 0 or 1, not $ABLIT"
   [[ "$ABLIT" == 1 ]] || return 0
   case "$MODEL_ID" in
     Mia-AiLab/DeepSeek-V4.1-Flash-1017-EAQ-v1-2.9-bpw|Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw) ;;
-    *) die "ABLIT=1 requires the Mia EAQ v1 2.9 bpw checkpoint and its matching $ABLIT_SIDECAR overlay" ;;
+    *) die "ABLIT=1 requires the Mia EAQ v1 2.9 bpw checkpoint and its matching $ABLIT_SIDECAR overlay (EAQ_V1_1=0)" ;;
   esac
   [[ "$ABLIT_REVISION" =~ ^[0-9a-f]{40}$ ]] || die "ABLIT_REVISION must be a full Hugging Face commit hash"
   warn "ABLIT=1: $ABLIT_ID is gated. You must have access at https://huggingface.co/$ABLIT_ID (accept its terms while logged in) and use your Hugging Face read token: export HF_TOKEN=hf_... or hf auth login. The token's account must have access to this repository."

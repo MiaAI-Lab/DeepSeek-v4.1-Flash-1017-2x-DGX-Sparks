@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Prepare two Sparks to serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw with TensorFold's native engine. The
+# Prepare two Sparks to serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw (EAQ v1; EAQ_V1_1=1 for the
+# experimental v1.1 pack) with TensorFold's native engine. The
 # checkpoint, the kit and the served folder land on this Spark; the worker reads them over NFS:
 #   1. preflight: docker and the GPU on both Sparks, key-based ssh, the link between them
 #   2. the engine image on this Spark (zig/Dockerfile: BertholomusAI's TensorFold fork at TF_REF plus zig/patches, and
@@ -17,7 +18,8 @@
 # Pass --rebuild to rebuild the image from scratch; PULL=0 never pulls a published image. VERIFY_SHA=1 also checks Engram's shards against the sha256 the
 # checkpoint's model card lists (a few minutes of reading 203 GB).
 # ABLIT=1 applies Keys' matching Mia EAQ 2.9 bpw overlay in a separate folder. Requires your Hugging Face read token
-# (HF_TOKEN or hf auth login) AND access to https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated.
+# (HF_TOKEN or hf auth login) AND access to https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated;
+# EAQ_V1_1 must be 0 (the default).
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 source ./scripts/config.sh

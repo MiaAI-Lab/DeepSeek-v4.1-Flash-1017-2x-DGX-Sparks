@@ -6,8 +6,9 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # WORKER_ENGRAM_DIR='$HOME/.cache/dsv41-tensorfold/engram-1bae0e10'     # on the worker: Engram's tables (~203 GB)
 # WORKER_CACHE_DIR='$HOME/.cache/dsv41-tensorfold/rank-cache-c178a012'  # on the worker: rank 1's weight file (~106 GB)
 # MEMGUARD_GIB=2.5            # memguard's floor (GiB of MemAvailable), held MEMGUARD_HOLD_S=4 s before a kill; MEMGUARD_HARD_GIB=1 kills at once. README, Memory and safety
-# MODEL_ID=Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw   # the default checkpoint (this repo's name and revision)
-# MODEL_REVISION=aee640e2afba93be683bb5b9b420115fe7fbac20            # set both to what ~/.cache/huggingface/hub holds if you serve another copy
+# EAQ_V1_1=1                   # 1: the experimental EAQ v1.1 mixed pack (BF16 indexer/compressor linears); 0 (default): EAQ v1
+# MODEL_ID=Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw   # the default checkpoint (EAQ v1; this repo's name and revision)
+# MODEL_REVISION=45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b            # set both to what ~/.cache/huggingface/hub holds if you serve another copy
 # ABLIT=0                     # 1: matching Keys overlay on Mia EAQ 2.9 bpw; needs your HF token AND access below
 # HF_TOKEN=hf_...              # HF read token (or use hf auth login on the head); never commit your token
 # ABLIT=1 requires access: https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated

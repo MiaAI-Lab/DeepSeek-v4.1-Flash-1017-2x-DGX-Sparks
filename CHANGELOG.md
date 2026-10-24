@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-- Default checkpoint moved to `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2` (39 shards,
-  ~196 GiB). v1.1 keeps the EAQ v1 widths but stores 27 indexer/compressor linears as BF16, so the engine must have the
-  mixed-pack loader. `ABLIT=1` still requires the EAQ v1 checkpoint and is refused with the v1.1 default.
-  `scripts/test_checkpoint_pin.py` checks the new pin. The recorded `tools/exact.py` token hashes are EAQ v1's; v1.1's
-  weights differ, so record a new baseline before comparing replies.
+- The default checkpoint stays EAQ v1 (`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw` @ `45ee5d0f`, 39 shards,
+  ~196 GiB); the experimental EAQ v1.1 pack is opt-in with `EAQ_V1_1=1` (`...-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2`). v1.1
+  keeps EAQ v1's widths but stores 27 indexer/compressor linears as BF16, so the engine must have the mixed-pack loader.
+  `ABLIT=1` works with the v1 default and is refused when v1.1 is selected. `scripts/test_checkpoint_pin.py` checks both
+  pins. The recorded `tools/exact.py` token hashes are EAQ v1's; v1.1's weights differ, so record a new baseline before
+  comparing replies.
 
 - Mixed-pack loader: `zig/patches/0009-mixed-pack.patch` and `zig/patches-inputs/0001-mixed-pack-rank-cache.patch`.
   The rank-cache planner reads the checkpoint's headers and, for a whole replicated linear stored as a BF16 `.weight`
@@ -28,8 +29,9 @@
   split-K from the GEMM's shape and its rounding follows the pick, so a decode round whose row count changes with the
   streams or the draft block could change a token's bits. On the pair, without it, drafts-on and drafts-off replies
   matched 4 of 8 `tools/validate.py` prompts, and its 8-concurrent check matched 4 of 8 with drafts off (6 of 8 with
-  drafts on); with it those checks are to be re-run. The EXL3 linears are untouched: their kernels compute each row in a
-  fixed order, which is why EAQ v1 kept the same bits across round shapes.
+  drafts on); with it, the saved replies matched 8 of 8, the 8-at-once check matched 8 of 8 with drafts on and off, and
+  all 31 `tools/exact.py` cases were identical with drafts on vs off. The EXL3 linears are untouched: their kernels
+  compute each row in a fixed order, which is why EAQ v1 kept the same bits across round shapes.
 
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.

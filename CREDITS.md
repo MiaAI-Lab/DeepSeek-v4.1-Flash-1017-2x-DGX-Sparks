@@ -10,12 +10,14 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   [DeepSeek](https://huggingface.co/deepseek-ai): the model, its weights (MIT, Copyright (c) 2023 DeepSeek), its DSpark
   draft blocks and its reference inference code. Engram's two n-gram tables are read unquantized from DeepSeek's own
   shards 47 and 48 of this release; `scripts/prepare.sh` downloads them.
-- **[`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw)**
-  by Mia's AI Lab ([Mia-AiLab](https://huggingface.co/Mia-AiLab)) (MIT): the EAQ v1.1 EXL3 quantization this recipe serves
-  (experimental; its model card says EAQ v1 stays the recommended pack and measures no quality against the source model).
-  The weights are not part of this repository.
+- **[`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw)**
+  by Mia's AI Lab ([Mia-AiLab](https://huggingface.co/Mia-AiLab)) (MIT): the EAQ v1 EXL3 quantization this recipe serves
+  by default (experimental; its model card measures no quality against the source model). The experimental EAQ v1.1 pack
+  [`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw)
+  is opt-in with `EAQ_V1_1=1`; its model card says EAQ v1 stays the recommended pack. The weights are not part of this
+  repository.
 - **[`Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw)** by
-  Mia's AI Lab: the earlier EXL3 release whose per-tensor widths the checkpoint above equals (46,702 comparable tensors, by
+  Mia's AI Lab: the earlier EXL3 release whose per-tensor widths both EAQ packs equal (46,702 comparable tensors, by
   its model card), and the checkpoint the dsv41 family's two-node recipe was written against.
 - **[ExLlamaV3](https://github.com/turboderp-org/exllamav3)** by turboderp ([turboderp-org](https://github.com/turboderp-org)) (MIT): the
   EXL3 format and its quantizer.
