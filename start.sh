@@ -249,6 +249,9 @@ foreground() {
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDMA_IDLE_S=$RDMA_IDLE_S" "TF_RDMA_NAP_US=$RDMA_NAP_US" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 [[ "$TOKEN_ROUTE" != 1 ]] || ENGINE_ENV+=("TENSORFOLD_TOKEN_ROUTE=1")
 [[ -z "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=$TF_DS_API_EFFORTS")
+# API_GATEWAY=1: the effort names must render the API table (minimal 50, low 50, medium 75, high 75,
+# xhigh 75, max 100); the engine's own table (25/50/62/75/88/100) is the native one. 0011 carries both.
+[[ "$API_GATEWAY" != 1 || -n "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=1")
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
