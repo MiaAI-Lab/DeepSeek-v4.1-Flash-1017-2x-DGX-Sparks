@@ -124,9 +124,19 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   and KV sharding with prompt borrowing and the ring exchange (`0118`, [PR #152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152)), ported by
   him to TensorFold's native engine and the dsv41 family (Apache-2.0). Spill v2's block store (the 2,048-token block layout,
   lineage, the write-at-keep ring, release and fsync order, read-ahead) is **[BadAd84](https://github.com/BadAd84)**'s block-tier
-  design from that recipe (#118), credited in the patches' headers. The recipe side (`scripts/port.sh`, `scripts/port_test.sh`,
+  design from that recipe (#118), credited in the patches' headers. BadAd84 also authored code in
+  [PR #124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124): the CPU checks
+  `tools/spill_blocks_check.py` and `tools/spill_blocks_mutants.sh` (commit
+  [`269dc92`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124/commits/269dc92f6b288a801ef3919826ec3a0a738e8c12)),
+  which `0013` ports as `core/spill/store_test.zig`, and twelve fix commits to `0110` there, from `269dc92` to
+  [`f32226b`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124/commits/f32226b3cc5f443117d6d2411b1f2433c52f33a6)
+  (the read-ahead's preallocated buffers), which the port of `0110` carries. The recipe side (`scripts/port.sh`, `scripts/port_test.sh`,
   `scripts/port-patches.sh`, the spill folder checks and ownership in `start.sh` / `stop.sh`, `docs/PORT-RECIPE.md`) was written
   for this recipe by wojo, after the GLM recipe's spill settings (`SPILL_GIB`, `SPILL_DIR`, the `/spill` mount; Mia's AI Lab and wojo).
+- **`zig/patches/0023-server-prepare-memory.patch`** (rank 0's memory when several long prompts are prepared at once,
+  `TENSORFOLD_PREPARE_FLOOR_GIB`), a fix to the base engine rather than a part of the port, was authored by **Robert
+  Wojciechowski ([wojo](https://github.com/wojo))** for this recipe, in the same commit as the port; it is also his
+  [pull request #40](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/40) of this repository.
 - The Zig mirror list with bounded retries in `zig/Dockerfile` and the worker checks in the serving image in `scripts/prepare.sh` come
   from wojo's two-Spark deployment of this recipe.
 - **Written for this recipe** (Apache-2.0, see [`NOTICE`](NOTICE)): `tools/exact.py`, `scripts/memguard.sh` (the memory watchdog), the memory
