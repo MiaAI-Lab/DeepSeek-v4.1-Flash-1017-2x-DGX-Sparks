@@ -5147,7 +5147,7 @@ index 5d157512..27414ecb 100644
 -        break :blk out;
 -    };
 -    return &table;
-+    const use_api = if (std.c.getenv("TF_DS_API_EFFORTS")) |v| std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "1") else false;
++    const use_api = if (std.c.getenv("TF_DS_API_EFFORTS")) |v| std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " \t\r\n"), "1") else false;
 +    if (use_api and @hasDecl(F, "api_efforts")) return &F.api_efforts;
 +    return &F.efforts;
  }
@@ -5400,7 +5400,7 @@ index 27414ecb..ad31b0aa 100644
 @@ -440,8 +440,19 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
  fn familyEfforts(comptime F: type) []const api.Effort {
      if (!@hasDecl(F, "efforts")) return &.{};
-     const use_api = if (std.c.getenv("TF_DS_API_EFFORTS")) |v| std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "1") else false;
+     const use_api = if (std.c.getenv("TF_DS_API_EFFORTS")) |v| std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " \t\r\n"), "1") else false;
 -    if (use_api and @hasDecl(F, "api_efforts")) return &F.api_efforts;
 -    return &F.efforts;
 +    // text.Effort and api.Effort are different types: convert each table at comptime, as the base did.
