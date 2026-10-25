@@ -5,3 +5,4 @@ af57cb05f104a363ab17ce29848790e6169c71f5:gateway/tests/paridad_e2e.rs:generic-ap
 ef6a308b118ea61de052d9838416da93f1e79cd7:tools/needle.py:generic-api-key:17
 ef6a308b118ea61de052d9838416da93f1e79cd7:tools/bench.py:generic-api-key:43
 ed026ef92d1650120dada1294a112acb6c8f2f48:tools/needle.py:generic-api-key:16
+2fd7809571e4d34f46a055dabf11caed9b145988:tools/test_checklib_credentials.py:generic-api-key:20
