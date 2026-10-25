@@ -174,8 +174,8 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         gateway_tokens = self._gateway_tokens(out)
         self.assertEqual(gateway_tokens[gateway_tokens.index("--image-token") + 1], "<\uff5cdeepseek_image\uff5c>")
         self.assertIn(
-            "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --log debug --default-thinking "
-            "--strict --block-private-urls=false --api-sampling=false --require-key",
+            "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --max-concurrent 3 --log debug "
+            "--default-thinking --strict --block-private-urls=false --api-sampling=false --require-key",
             out,
         )
         self.assertNotIn("-e API_KEY=0", out)

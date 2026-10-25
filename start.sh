@@ -327,8 +327,17 @@ if [[ "$THINKING" == 1 ]]; then GATEWAY_ARGS+=(--default-thinking); else GATEWAY
 if [[ "$GATEWAY_BLOCK_PRIVATE_URLS" == 1 ]]; then GATEWAY_ARGS+=(--block-private-urls); else GATEWAY_ARGS+=(--block-private-urls=false); fi
 if [[ "$GATEWAY_API_SAMPLING" == 1 ]]; then GATEWAY_ARGS+=(--api-sampling); else GATEWAY_ARGS+=(--api-sampling=false); fi
 [[ "$API_KEY" != 1 ]] || GATEWAY_ARGS+=(--require-key --api-key-file /run/secrets/key)
+# The served folder may hold relative links (checkpoint/tokenizer.json -> ../...); the gateway needs the resolved
+# file. Resolve it explicitly so a missing path is a message, not a silent exit under `set -e`.
+# A dry run prints the commands without touching the filesystem: prepare.sh may not have downloaded the model yet.
+GATEWAY_MODEL_DIR=$DATA_DIR/model
+if [[ "$DRY" != 1 ]]; then
+  GATEWAY_MODEL_DIR=$(readlink -f "$DATA_DIR/model" 2>/dev/null || true)
+  [[ -n "$GATEWAY_MODEL_DIR" ]] || GATEWAY_MODEL_DIR=$DATA_DIR/model
+  [[ -d "$GATEWAY_MODEL_DIR" ]] || die "the served folder $GATEWAY_MODEL_DIR does not exist: prepare.sh downloads the model there"
+fi
 GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
-             --restart on-failure:3 --read-only --tmpfs /tmp -v "$(readlink -f "$DATA_DIR/model"):/served:ro")
+             --restart on-failure:3 --read-only --tmpfs /tmp -v "$GATEWAY_MODEL_DIR:/served:ro")
 if [[ "$API_KEY" == 1 ]]; then GATEWAY_RUN+=(-v "$API_KEY_FILE:/run/secrets/key:ro" -e API_KEY_FILE=/run/secrets/key); fi
 GATEWAY_RUN+=("$GATEWAY_IMAGE")
 DATA=/hf/$DATA_SUB
