@@ -52,7 +52,7 @@
   with quotas and crash recovery (GLM `0088`/`0110`, PRs #78 and #124, on **[BadAd84](https://github.com/BadAd84)**'s
   block-tier design, #118), chat continuation (`0111`, #128), KV sharding with prompt borrowing and the ring exchange
   (`0118`, #152) and the parked-page startup budget (`0119`, #149), ported to the native engine as twelve
-  patches, `zig/patches/0011` to `0022`, one per feature with a header in the GLM recipe's style (each checked with
+  patches, `zig/patches/0030` to `0022`, one per feature with a header in the GLM recipe's style (each checked with
   `git apply --check` on a clean `TF_REF` after `0001`-`0010` and the ones before it; the new `scripts/port-patches.sh`
   exports later engine work on top). **KV sharding builds on `0008`'s pool:** one `POOL` setting; with
   `KV_SHARD=1` the same pool is cut into one part a Spark, each holding a whole window (empty `POOL`: the pool that
@@ -102,7 +102,7 @@
   drafts on); with it, the saved replies matched 8 of 8, the 8-at-once check matched 8 of 8 with drafts on and off, and
   all 31 `tools/exact.py` cases were identical with drafts on vs off. The EXL3 linears are untouched: their kernels
   compute each row in a fixed order, which is why EAQ v1 kept the same bits across round shapes. (#57)
-
+- `zig/patches/0030-step-ahead.patch` and `STEP_AHEAD` (off by default): when a reply ends and nothing else runs or waits,
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,
