@@ -473,7 +473,7 @@ API's body or SSE. Requests that the conversion cannot represent faithfully, and
 the engine unchanged with `x-ds41-gateway: fallback` and one log line with the reason; `GATEWAY_STRICT=1` returns the
 API's 400 instead. The engine's other routes (`/v1/models`, `/tokenize`, `/metrics`, `/health`, ...) are proxied as they
 are. The gateway is off by default: with `API_GATEWAY=0` (the default) the recipe behaves as before; the only output
-difference is the derived engine image tag, which changes when 0030 enters `zig/patches/`.
+difference is the derived engine image tag, which changes when 0031 enters `zig/patches/`.
 
 **Turn it on.** Put `API_GATEWAY=1` in `scripts/local.sh` and run `./start.sh` (or `./start.sh restart`). The engine
 then listens on `127.0.0.1:ENGINE_PORT` (default 8887) with `TENSORFOLD_TOKEN_ROUTE=1`, and the gateway listens on
@@ -521,11 +521,11 @@ Raising the concurrency needs a corresponding memory measurement/cap.
 | `GATEWAY_IMAGE_TOKEN` | `<｜deepseek_image｜>` | the served tokenizer's image-token spelling |
 | `GATEWAY_MAX_IMAGES`, `GATEWAY_MAX_IMAGE_MB` | 600, 64 | the API's per-request image limits |
 | `GATEWAY_LOG` | info | debug, info, warn or error; one line per request (id, route, api/fallback, reason, ms) |
-| `TF_DS_API_EFFORTS` | unset | `1`: patch 0030's API effort table (minimal 50, low 50, medium 75, high 75, xhigh 75, max 100) on the engine |
+| `TF_DS_API_EFFORTS` | unset | `1`: patch 0031's API effort table (minimal 50, low 50, medium 75, high 75, xhigh 75, max 100) on the engine |
 
 **Back out.** `API_GATEWAY=0 ./start.sh restart` brings the engine back to `HOST:PORT`, stops the gateway and leaves the
-token route off; the engine image is the same. To return to an engine without patch 0030, remove
-`zig/patches/0030-token-route.patch` and run `./start.sh restart` (the image is rebuilt, as with any patch).
+token route off; the engine image is the same. To return to an engine without patch 0031, remove
+`zig/patches/0031-token-route.patch` and run `./start.sh restart` (the image is rebuilt, as with any patch).
 
 **Parity check.** The comparator (`ds41-paridad`) is built into the gateway image. Run
 `ds41-paridad casos --casos gateway/casos`, `ds41-paridad render` and `ds41-paridad e2e` as described in

@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Feature 004 is additive on Mia main at `27741e1`: the optional DeepSeek API gateway and comparator in `gateway/`, the
-  `API_GATEWAY=1` wiring, and `zig/patches/0030-token-route.patch` (renumbered from 0011 after Mia's 0011-0029 series).
+  `API_GATEWAY=1` wiring, and `zig/patches/0031-token-route.patch` (renumbered from 0011 after Mia's 0011-0029 series).
   With `API_KEY=1`, gateway middleware loads `API_KEY_FILE` once, rejects a missing or empty key at startup, and requires
   the actual Bearer or `x-api-key` value on every route except public `/health`, before reading a body; comparisons are
   constant-time and failures are API-shaped 401 responses. `GATEWAY_MAX_CONCURRENT` (default 3) queues excess requests

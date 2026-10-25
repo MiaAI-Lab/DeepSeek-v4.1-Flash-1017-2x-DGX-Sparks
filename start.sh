@@ -103,7 +103,7 @@ port_check_extra "$@"
 
 # rank 0's command (its serve flags need no link): built first, so the flags can be checked before anything is stopped
 # API_GATEWAY=1: the engine moves to loopback and the gateway takes HOST:PORT. With API_GATEWAY=0 this is Mia's command;
-# only the derived image tag changes when patch 0030 enters zig/patches/.
+# only the derived image tag changes when patch 0031 enters zig/patches/.
 SERVE_HOST=$HOST; SERVE_PORT=$PORT
 if [[ "$API_GATEWAY" == 1 ]]; then SERVE_HOST=127.0.0.1; SERVE_PORT=$ENGINE_PORT; fi
 SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$SERVE_HOST" --port "$SERVE_PORT" --name "$SERVED_NAME"
@@ -284,7 +284,7 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 [[ "$TOKEN_ROUTE" != 1 ]] || ENGINE_ENV+=("TENSORFOLD_TOKEN_ROUTE=1")
 [[ -z "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=$TF_DS_API_EFFORTS")
 # API_GATEWAY=1: the effort names must render the API table (minimal 50, low 50, medium 75, high 75,
-# xhigh 75, max 100); the engine's own table (25/50/62/75/88/100) is the native one. 0030 carries both.
+# xhigh 75, max 100); the engine's own table (25/50/62/75/88/100) is the native one. 0031 carries both.
 [[ "$API_GATEWAY" != 1 || -n "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=1")
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")

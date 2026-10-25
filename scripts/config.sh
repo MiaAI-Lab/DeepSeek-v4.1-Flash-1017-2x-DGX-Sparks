@@ -144,7 +144,7 @@ GATEWAY_IMAGE_TOKEN="${GATEWAY_IMAGE_TOKEN-<｜deepseek_image｜>}"  # the serve
 GATEWAY_MAX_IMAGES="${GATEWAY_MAX_IMAGES:-600}"       # the API's per-request image limit
 GATEWAY_MAX_IMAGE_MB="${GATEWAY_MAX_IMAGE_MB:-64}"    # the API's total image megabytes per request
 GATEWAY_LOG="${GATEWAY_LOG:-info}"       # debug, info, warn or error; one line per request
-# TF_DS_API_EFFORTS=1 is engine patch 0030's switch: the API's effort table instead of the lane's. Empty: the engine's.
+# TF_DS_API_EFFORTS=1 is engine patch 0031's switch: the API's effort table instead of the lane's. Empty: the engine's.
 TF_DS_API_EFFORTS="${TF_DS_API_EFFORTS:-}"
 
 # ---------------------------------------------------------------- serving
