@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `start.sh` compares the two ranks' Engram folders before anything is stopped when the spill tier is on
+  (`port_engram_check`, `scripts/port.sh`). The engine's rank fingerprint covers the folder's regular files by name and
+  size (`zig/patches/0016`, `fingerprint.zig`'s `listing()`), and a Hugging Face snapshot holds symlinks into `blobs/`:
+  with the default empty `HEAD_ENGRAM_DIR` rank 0 listed nothing against the worker's four files, so the pair refused
+  to load with `FingerprintMismatch` in `engram` — after the running server had already been stopped (issue #61). The
+  check refuses before the stop, naming both listings and the fix (`HEAD_ENGRAM_DIR` on a local folder holding the same
+  files, hardlinked: no extra disk, and rank 0 then reads Engram locally); it stays silent while a folder is not there
+  yet, warns when the worker cannot be reached, and does nothing with the tier off (KV sharding alone marks `engram`
+  `shard-only`, `0018`). `scripts/port_test.sh` covers the listing, the refusal and its message, both silent paths and
+  the warning.
 - `ABLIT=1` on a read-only Hugging Face blob cache: `prepare.sh` gives the overlay's work folder its own writable copy of
   the checkpoint index (the shards stay hard links), so the graft no longer fails with `PermissionError` when it rewrites
   the index (issue #42, reported by unitea1992). By **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,

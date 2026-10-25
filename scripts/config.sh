@@ -206,6 +206,9 @@ HEAD_NFS_SERVER="${HEAD_NFS_SERVER:-}"
 # Engram's tables on this Spark's own disk (a folder with the base model's shards 47 and 48, as WORKER_ENGRAM_DIR is on the worker),
 # mounted into rank 0 at /engram. Without it rank 0 reads them from HF_CACHE: over NFS a random 4 KiB read took 942 us here
 # against 90 us from the worker's local copy, and a decode round or a prefill chunk makes many of them. Empty: HF_CACHE.
+# With the spill tier on, the engine's rank fingerprint compares this folder's regular files with the worker's (name and
+# size; symlinks are skipped), so leaving it empty makes rank 0 list nothing against WORKER_ENGRAM_DIR's files and the
+# pair refuses to load with FingerprintMismatch in engram (start.sh's port_engram_check; issue #61).
 HEAD_ENGRAM_DIR="${HEAD_ENGRAM_DIR:-}"
 HEAD_NFS_VOLUME="${HEAD_NFS_VOLUME:-dsv41-hf-head}"
 

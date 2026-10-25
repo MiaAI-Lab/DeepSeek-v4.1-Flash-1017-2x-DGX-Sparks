@@ -378,6 +378,14 @@ for those defaults: the start goes on **without** the feature, with a loud `SPIL
   measured at 2,101,248 positions, 1,062 MiB a rank against 1,783 MiB replicated, for 1-4% decode. Runs together with
   spill.
 
+**The ranks' Engram folders must list the same files.** With the tier on, the rank fingerprint covers the Engram
+folder's regular files by name and size (`zig/patches/0016`, `fingerprint.zig`'s `listing()`, which skips symlinks).
+With `HEAD_ENGRAM_DIR` empty rank 0 reads the HF snapshot, whose entries are symlinks into `blobs/`, so it lists nothing
+while `WORKER_ENGRAM_DIR` lists its four files: the pair then refuses to load with `FingerprintMismatch` in `engram`
+(issue #61). `start.sh` compares the two listings before anything is stopped and refuses with both of them and the fix;
+put the same files on the head's disk and point `HEAD_ENGRAM_DIR` at them (hardlinks cost no extra disk), which also
+gives rank 0 local Engram reads instead of the HF cache.
+
 | Switch | Default | |
 | --- | --- | --- |
 | `SPILL_GIB` | `0` (off) | the spill tier's cap a Spark, GiB (`64` validated). A Spark whose folder fails the checks refuses the start |

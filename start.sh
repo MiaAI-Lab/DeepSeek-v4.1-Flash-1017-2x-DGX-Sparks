@@ -84,6 +84,9 @@ port_validate
 # tf.recipe.port label are made and before a running pair is compared with them: a spill tier that is on by default
 # only and fails here is off for this start (a warning), an explicit SPILL_GIB that fails refuses. Nothing with SPILL_GIB=0.
 port_spill_check
+# with the spill tier on, both ranks must list the same Engram files (the engine's rank fingerprint compares them; rank
+# 0's HF snapshot is all symlinks, which the listing skips) — refused here, before anything is stopped (issue #61)
+port_engram_check
 port_map
 port_check_extra "$@"
 
