@@ -145,8 +145,9 @@ PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
 # DISPLAY_KV_CARD mapped into the GPU's address space), so their bytes leave the host's MemAvailable. MiB of it to use, whole steps
 # of 16, at most 2032; the tensors that fit go there, the rest stay on ordinary memory. 0 (default): off. It needs no display
 # connected to the card (the engine checks); both ranks take it. TF_DS_DISPLAY_KV_MIB and TF_DS_DISPLAY_KV_CARD. The containers get the one
-# card node, read-write without mknod (--device CARD:CARD:rw), and use three DRM ioctls on it (MODE_CREATE_DUMB, MODE_MAP_DUMB, GEM_CLOSE)
-# plus an mmap of the buffer: none needs DRM master or CAP_SYS_ADMIN (see README, Memory and safety). DISPLAY_KV_CARD must look like /dev/dri/card0.
+# card node, read-write without mknod (--device CARD:CARD:rw), drop the DRM master the open grants (DROP_MASTER), then use three DRM ioctls
+# on it (MODE_CREATE_DUMB, MODE_MAP_DUMB, GEM_CLOSE) plus an mmap of the buffer: none needs DRM master or CAP_SYS_ADMIN (see README,
+# Memory and safety). DISPLAY_KV_CARD must look like /dev/dri/card0.
 DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-0}"
 DISPLAY_KV_CARD="${DISPLAY_KV_CARD:-/dev/dri/card0}"
 

@@ -13,10 +13,10 @@ index 97e048c..71c88f0 100644
      cuMemcpyDtoH_v2: *const fn (Ptr, DevicePtr, usize) callconv(.c) R,
 diff --git a/zig/src/families/dsv41/display.zig b/zig/src/families/dsv41/display.zig
 new file mode 100644
-index 0000000..5564724
+index 00000000..7194c6eb
 --- /dev/null
 +++ b/zig/src/families/dsv41/display.zig
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,465 @@
 +//! Display-reserve KV (TF_DS_DISPLAY_KV_MIB): the headless GB10's UEFI framebuffer reservation (about 1.75 GiB a GPU) carries part of the
 +//! device KV pool, so those bytes leave the host's MemAvailable. Ported from MiaAI-Lab's TensorFold GLM engine (glm_cuda/cuda_display_kv.zig,
 +//! TensorFold by Ash Hart and contributors), DRM backend only: a DRM dumb buffer mapped above the ordinary half of one span, each half
@@ -177,7 +177,7 @@ index 0000000..5564724
 +    return span;
 +}
 +
-+/// The real OS and driver calls (DRM_IOCTL_MODE_CREATE_DUMB 0xC02064B2, MODE_MAP_DUMB 0xC01064B3, GEM_CLOSE 0x40086409;
++/// The real OS and driver calls (DRM_IOCTL_DROP_MASTER 0x641F, MODE_CREATE_DUMB 0xC02064B2, MODE_MAP_DUMB 0xC01064B3, GEM_CLOSE 0x40086409;
 +/// cuMemHostRegister flags 2 = DEVICEMAP, 6 = DEVICEMAP | IOMEMORY).
 +const System = struct {
 +    d: *const cuda.Driver,
@@ -186,6 +186,11 @@ index 0000000..5564724
 +        const fd = open(s.card, 2 | 0x80000); // O_RDWR | O_CLOEXEC
 +        if (fd < 0) return error.DisplayCardUnavailable;
 +        return fd;
++    }
++    /// Opening a primary node nobody holds makes this fd the card's DRM master; the dumb-buffer calls need none, so give it back. The
++    /// kernel lets the fd that was master drop it without CAP_SYS_ADMIN; when another client holds master the call fails, and nothing is lost.
++    fn dropMaster(_: *System, fd: c_int) void {
++        _ = ioctl(fd, 0x641F);
 +    }
 +    fn create(_: *System, fd: c_int, size: usize) !struct { handle: u32, size: usize } {
 +        var dumb: extern struct { height: u32, width: u32 = 4096, bpp: u32 = 32, flags: u32 = 0, handle: u32 = 0, pitch: u32 = 0, size: u64 = 0 } = .{ .height = @intCast(std.math.divCeil(usize, size, 4096 * 4) catch return error.DisplayCreateDumb) };
@@ -233,6 +238,7 @@ index 0000000..5564724
 +fn mapDrm(system: anytype, ordinary: usize, display_bytes: usize) !Span {
 +    const fd = try system.openCard();
 +    errdefer system.closeFd(fd);
++    system.dropMaster(fd);
 +    const dumb = try system.create(fd, display_bytes);
 +    errdefer system.closeGem(fd, dumb.handle);
 +    if (dumb.size < display_bytes) return error.DisplayShort;
@@ -340,6 +346,8 @@ index 0000000..5564724
 +    unregistered: usize = 0,
 +    short: bool = false,
 +    separate: bool = false,
++    dropped_after: usize = 0,
++    dropped_fd: c_int = -1,
 +    fn next(f: *Fake) !void {
 +        f.step += 1;
 +        if (f.step == f.fail) return error.Injected;
@@ -389,6 +397,10 @@ index 0000000..5564724
 +    fn closeFd(f: *Fake, _: c_int) void {
 +        f.closed += 1;
 +    }
++    fn dropMaster(f: *Fake, fd: c_int) void {
++        f.dropped_after = f.step;
++        f.dropped_fd = fd;
++    }
 +};
 +
 +test "DRM span unwinds every failed step and rejects a short or noncontiguous span" {
@@ -415,6 +427,15 @@ index 0000000..5564724
 +    try std.testing.expectEqual(@as(usize, 8), f.step);
 +}
 +
++test "the DRM master that opening the card grants is dropped before anything else is asked of the card" {
++    var f: Fake = .{};
++    _ = try mapDrm(&f, 4096, 16384);
++    try std.testing.expectEqual(@as(usize, 1), f.dropped_after); // right after openCard, before create
++    try std.testing.expectEqual(@as(c_int, 3), f.dropped_fd);
++    f = .{ .fail = 2 };
++    try std.testing.expectError(error.Injected, mapDrm(&f, 4096, 16384));
++    try std.testing.expectEqual(@as(usize, 1), f.dropped_after);
++}
 +
 +/// What `Caches.layout` hands out in a first pass: it records each tensor's size and gives no address.
 +pub const Sizer = struct {
