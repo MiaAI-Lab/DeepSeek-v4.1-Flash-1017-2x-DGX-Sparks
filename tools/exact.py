@@ -8,16 +8,19 @@
 record sends a fixed prompt set (greedy: temperature 0 + seed, thinking off, non-streaming) and stores per prompt:
 prompt/completion tokens, finish reason, tensorfold.token_sha (sha256 of the reply token ids; falls back to sha256 of the
 exact text and says so), text sha256, cached tokens. It also runs intra-run checks (repeat == first, resume suffix replayed,
-4 concurrent == the same 4 solo) and exits 1 if one fails or a request errored.
+8 concurrent == the same 8 solo) and exits 1 if one fails or a request errored.
 Prompt set 2 (meta.prompt_set; a set-1 record cannot be used with --like). Cases: len_1, len_100, len_2048, len_2049,
 len_4096, len_8000, len_20000, len_30000, len_50000, len_64000, len_100000 (cold: own salt per case; >=30000 sized from
 a fit of the 8000/20000 calibrations, check prompt_tokens), conv_A1 B1 C1 A2 B2 C2 A3 (C1 scenario: 3 conversations with distinct
 ~6K-token system prompts, interleaved A1 B1 C1 A2 B2 C2 A3, each turn appends the previous reply; cached_tokens is
 shown side by side in compare as information only), repeat_2048
 (identical prompt again, cached), resume_1..3 (one long prefix, 3 short suffixes, sequential) + resume_1_again,
-conc_1..4 (4 at once) + solo_1..4. Prompt sizes are calibrated against usage.prompt_tokens (not exact for the long ones:
+conc_1..8 (8 at once, the qualified eight-stream baseline; --streams 4 for the old four) + solo_1..8. Prompt sizes are calibrated against usage.prompt_tokens (not exact for the long ones:
 compare the recorded prompt_tokens). --like FILE reuses the salt and word counts of an earlier record so the prompts
 are byte-identical. Without --like the salt is random (so a cold run is cold even on a warm server).
+Compatibility: a record made before the eight-stream cases (meta.conc_streams absent: 4) still serves as --like: the
+shapes of conc_5..8 are then derived from its conc_1..4 shapes (deterministically, so two records --like the same file
+match), and compare treats conc_k/solo_k beyond a record's own conc_streams as absent by design, not as a mismatch.
 Stdlib only. API key: API_KEY, else the first line of API_KEY_FILE (as tools/client.py). Proxies are never used.
 """
 import argparse
@@ -52,7 +55,8 @@ CONV_Q = {"A": ["What is the first topic in the text above?", "Name two words th
           "B": ["Summarize the text above in five words.", "Which word comes last in the text?", "Reply with a number between one and nine."],
           "C": ["Give a title for the text above.", "List three nouns from the text.", "Say hello in a different way."]}
 RESUME_TARGET = 8000
-CONC_TARGETS = [600, 1200, 1800, 2400]
+CONC_TARGETS = [600, 1200, 1800, 2400, 3000, 3600, 4200, 4800]   # the first four are the original cases
+OLD_STREAMS = 4                                                     # records without meta.conc_streams
 SUFFIXES = ["Summarize the text above in one sentence.",
             "List the three most frequent words in the text above.",
             "Write one question a reader could ask about the text above."]
@@ -200,10 +204,18 @@ def record(a) -> int:
     health = get_json(a.url, "/health")
     log(f"record: label={a.label!r} url={a.url} salt={salt} like={a.like}")
     todo = [(n, t, 0 if t <= 2049 else max(2, t // 100)) for n, t in COLD_SIZES] + [("resume", RESUME_TARGET, 80)]
-    todo += [(f"conc_{i+1}", t, 20) for i, t in enumerate(CONC_TARGETS)] + [("convsys", CONV_SYS_TARGET, 60)]
+    streams = a.streams
+    todo += [(f"conc_{i+1}", t, 20) for i, t in enumerate(CONC_TARGETS[:streams])] + [("convsys", CONV_SYS_TARGET, 60)]
     cal = {}
     for name, tgt, tol in todo:
         if name in shape:
+            continue
+        if like and name.startswith("conc_") and int(name[5:]) > like["meta"].get("conc_streams", OLD_STREAMS):
+            # an older record: derive the extra streams' shapes from its own conc shapes (deterministic)
+            known = [(shape[f"conc_{i+1}"], CONC_TARGETS[i]) for i in range(OLD_STREAMS) if f"conc_{i+1}" in shape]
+            ratio = sum(w for w, _ in known) / sum(t for _, t in known)
+            shape[name] = max(1, int(tgt * ratio))
+            log(f"  shape {name}: {shape[name]} words (derived from the --like record's conc shapes)")
             continue
         if like:
             log(f"--like file has no shape for {name}")
@@ -242,15 +254,15 @@ def record(a) -> int:
         put(f"resume_{i+1}", RESUME_TARGET, run.text(f"{salt}-resume", n, s))
     put("resume_1_again", RESUME_TARGET, run.text(f"{salt}-resume", n, SUFFIXES[0]))
     conc = [(f"conc_{i+1}", run.text(f"{salt}-conc{i+1}", shape[f"conc_{i+1}"], "Summarize the text above in one sentence."))
-            for i in range(4)]
-    with concurrent.futures.ThreadPoolExecutor(4) as ex:
+            for i in range(streams)]
+    with concurrent.futures.ThreadPoolExecutor(streams) as ex:
         futs = {nm: ex.submit(run.ask, c) for nm, c in conc}
         for (nm, _), tgt in zip(conc, CONC_TARGETS):
             r = futs[nm].result()
             r.pop("_text", None)
             r["target_tokens"] = tgt
             cases[nm] = r
-            log(f"  {nm} (4 at once): " + (r["error"] if "error" in r else
+            log(f"  {nm} ({streams} at once): " + (r["error"] if "error" in r else
                 f"prompt={r['prompt_tokens']} out={r['completion_tokens']} sha={r['token_sha'][:12]} {r['seconds']}s"))
     for i, (nm, c) in enumerate(conc):
         put(f"solo_{i+1}", CONC_TARGETS[i], c)
@@ -282,7 +294,7 @@ def record(a) -> int:
         return "error" not in cases[x] and "error" not in cases[y] and cases[x]["token_sha"] == cases[y]["token_sha"]
     chk("repeat_2048 == len_2048", same("repeat_2048", "len_2048"))
     chk("resume_1_again == resume_1", same("resume_1_again", "resume_1"))
-    for i in range(1, 5):
+    for i in range(1, streams + 1):
         chk(f"solo_{i} == conc_{i}", same(f"solo_{i}", f"conc_{i}"))
     c = cases["repeat_2048"].get("cached_tokens")
     log(f"  info: repeat_2048 cached_tokens={c} (informational: a 2048-token prompt may keep no snapshot)")
@@ -296,7 +308,7 @@ def record(a) -> int:
     weak = sorted(n for n, c in cases.items() if "error" not in c and c.get("token_sha_source") != "server")
     if weak:
         log(f"WARNING: the server gave no tensorfold.token_sha for {len(weak)} case(s): this record is WEAK (text hash only); compare refuses it without --allow-weak")
-    meta = {"schema": SCHEMA, "prompt_set": PROMPT_SET, "weak": bool(weak), "label": a.label, "drafts_label": a.drafts, "drafts_observed": drafts_seen,
+    meta = {"schema": SCHEMA, "prompt_set": PROMPT_SET, "conc_streams": streams, "weak": bool(weak), "label": a.label, "drafts_label": a.drafts, "drafts_observed": drafts_seen,
             "url": a.url, "model": a.model, "salt": salt, "seed": a.seed, "max_tokens": a.max_tokens, "shape": shape,
             "like": a.like, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "health": {k: health.get(k) for k in ("status", "model", "max_batch_size", "error")}}
@@ -337,6 +349,12 @@ def compare(pa, pb, allow_weak=False) -> int:
     for n in names:
         a, b = A["cases"].get(n), B["cases"].get(n)
         if a is None or b is None:
+            lacking = ma if a is None else mb
+            k = n.split("_", 1)[1] if n.startswith(("conc_", "solo_")) else ""
+            if k.isdigit() and int(k) > lacking.get("conc_streams", OLD_STREAMS):
+                print(f"note     {n}: only in {'B' if a is None else 'A'} ({'A' if a is None else 'B'} recorded "
+                      f"{lacking.get('conc_streams', OLD_STREAMS)} concurrent streams)")
+                continue
             print(f"MISMATCH {n}: present only in {'B' if a is None else 'A'}")
             bad += 1
             continue
@@ -377,6 +395,8 @@ def main() -> int:
     r.add_argument("--max-tokens", type=int, default=192)
     r.add_argument("--timeout", type=float, default=900)
     r.add_argument("--no-calibrate", action="store_true")
+    r.add_argument("--streams", type=int, choices=(4, 8), default=8,
+                   help="concurrent cases: 8 (default, the eight-stream baseline) or 4 (the original set)")
     r.add_argument("--keep-text", action="store_true", help="store reply text too (debugging)")
     c = sub.add_parser("compare")
     c.add_argument("a")

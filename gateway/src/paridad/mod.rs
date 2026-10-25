@@ -77,6 +77,7 @@ fn config(served_name: &str) -> GatewayConfig {
         default_effort: None,
         strict: false,
         require_key: false,
+        api_keys: None,
         block_private_urls: false,
         max_images: 600,
         max_image_mb: 64,

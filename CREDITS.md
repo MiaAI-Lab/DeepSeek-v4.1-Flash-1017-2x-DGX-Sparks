@@ -12,15 +12,28 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   shards 47 and 48 of this release; `scripts/prepare.sh` downloads them.
 - **[`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw)**
   by Mia's AI Lab ([Mia-AiLab](https://huggingface.co/Mia-AiLab)) (MIT): the EAQ v1 EXL3 quantization this recipe serves
-  (experimental; its model card measures no quality against the source model). The weights are not part of this repository.
+  by default (experimental; its model card measures no quality against the source model). The experimental EAQ v1.1 pack
+  [`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw)
+  is opt-in with `EAQ_V1_1=1`; its model card says EAQ v1 stays the recommended pack. The weights are not part of this
+  repository.
 - **[`Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw)** by
-  Mia's AI Lab: the earlier EXL3 release whose per-tensor widths the checkpoint above equals (46,702 comparable tensors, by
+  Mia's AI Lab: the earlier EXL3 release whose per-tensor widths both EAQ packs equal (46,702 comparable tensors, by
   its model card), and the checkpoint the dsv41 family's two-node recipe was written against.
 - **[ExLlamaV3](https://github.com/turboderp-org/exllamav3)** by turboderp ([turboderp-org](https://github.com/turboderp-org)) (MIT): the
   EXL3 format and its quantizer.
 
 ## Engine
 
+- **EAQ v1.1 support** (`EAQ_V1_1=1`) was authored by **Mykhailo Tamarin** ([MykhailoTamarin](https://github.com/MykhailoTamarin))
+  in [pull request #57](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/57) (Apache-2.0):
+  **`zig/patches/0024-mixed-pack.patch`** and **`zig/patches-inputs/0001-mixed-pack-rank-cache.patch`** (the EAQ v1.1 mixed
+  pack: the rank-cache planner plans a BF16 `.weight` linear where an EXL3 pack has trellis/suh/svh, and the engine runs
+  it as a plain BF16 linear through the vision tower's cuBLAS `linearBf16`), **`zig/patches/0025-widen-bf16.patch`** and
+  **`zig/patches-inputs/0002-widen-bf16.patch`** (widen a BF16 checkpoint tensor to the f32 entry the loaders plan for
+  it; EAQ's eight `attn.indexer.weights_proj.weight` are BF16), **`zig/patches/0026-plain-rows.patch`** (a mixed pack's
+  plain linears over a fixed row count, `TF_DS_PLAIN_ROWS`), the `EAQ_V1_1` setting and its pins, the second checkout's
+  patches in `zig/Dockerfile`, and `scripts/test_mixed_pack_patch.py`. His patches `0009`, `0011` and `0012` were
+  renumbered `0024`-`0026` and rebased after the port's series by Mia's AI Lab.
 - **[TensorFold](https://github.com/ashhart/TensorFold)** by Ash Hart ([ashhart](https://github.com/ashhart)) and the
   TensorFold contributors (Apache-2.0): the native Zig engine, its OpenAI-compatible server, its lane core, CUDA runtime,
   Triton AOT loader and EXL3 module.
@@ -76,8 +89,8 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   only in the tests.
 - **[Sufyan (@sfxnz)](https://github.com/sfxnz)**: the reference vLLM gateway
   [`DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark`](https://github.com/sfxnz/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark)
-  (MIT): the design of the gateway over the token-in route, its fallback, its invariants and the parity cases taken from
-  `tests/api_eval.py` and `tools/api_eval_fixtures.py`.
+  (MIT): the design of the gateway over the token-in route, its fallback, its invariants and the parity cases derived from
+  `tests/api_eval.py` and `tools/api_eval_fixtures.py`. The attribution and MIT notice are in `gateway/NOTICE`.
 - **[vLLM](https://github.com/vllm-project/vllm)** (Apache-2.0): the `/inference/v1/generate` token-in/token-out contract
   between the gateway and the engine.
 - **eleata**: the gateway and the comparator in `gateway/` were written for this recipe (Apache-2.0).
@@ -123,11 +136,46 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   (commit [`27e02c6`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/5/commits/27e02c605eae0997ed9161baaf583dd3ad431bb3)) of this repository, for issue #3: between two chunks of a long prompt pass, the other live streams get decode rounds and
   their cancels are taken (`TF_DS_PREFILL_INTERLEAVE_MS`), with its host test and the bit-identity runs in the pull request. It is carried here as it
   was sent; **`zig/patches/0006-image-prompt-cache.patch`** (issue #2) was written for this recipe on top of it.
+- **`zig/patches/0027-tool-call-prose.patch`** (the text before a reply's tool calls is its content) was authored by
+  **[Coinupbtc](https://github.com/Coinupbtc)** in [pull request #44](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/44)
+  (commit `3ff606e`, sent as `0012`; carried as sent, renumbered after the port's series).
+- **`zig/patches/0028-plain-request-text.patch`** (a request's own text never becomes a control token, issue #21) was authored by
+  **[Coinupbtc](https://github.com/Coinupbtc)** in [pull request #43](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/43)
+  (commit `d330a6d`, sent as `0013`); renumbered after the port's series, its tokenizer hunk merged onto `0023`'s
+  `encodeText`, and the Anthropic `count_tokens` route's masking added, by Mia's AI Lab.
+- **`zig/patches/0029-anthropic-budget-default.patch`** (the Anthropic frontend accepts thinking without `budget_tokens`) was
+  authored by **Maciej Kowalik ([koniaik](https://github.com/koniaik))** in [pull request #53](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/53)
+  (commit `ba7b21e`, sent as `0014`); renumbered, and changed by Mia's AI Lab so that a `budget_tokens` that is sent but
+  invalid is still refused.
 - **`zig/patches/0004-call-gate.patch`** (`tool_choice` enforcement) was written by Mia's AI Lab (Apache-2.0). Its new file,
   `zig/src/core/lanes/call_gate.zig`, is Mia's AI Lab's Zig call gate for the Flash Next CUDA engine (commits `49350ed6` and
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's
   Python engine (`call_gate.py`, by the TensorFold contributors, Apache-2.0). The rest of the patch wires it into the
   DeepSeek-V4.1 lanes.
+- **The port of the GLM spill tier and KV sharding** (the engine patches `zig/patches/0011-...` to `0022-...` and their settings; KV sharding built on `0008`'s pool) carries work
+  authored by **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)** in the GLM-5.3-Flash recipe: the spill tier (`0088`,
+  [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78)), spill v2 blocks, quotas and
+  crash recovery (`0110`, [PR #124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124)),
+  chat continuation (`0111`, [PR #128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128)),
+  the parked-page startup budget (`0119`, [PR #149](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/149))
+  and KV sharding with prompt borrowing and the ring exchange (`0118`, [PR #152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152)), ported by
+  him to TensorFold's native engine and the dsv41 family (Apache-2.0). Spill v2's block store (the 2,048-token block layout,
+  lineage, the write-at-keep ring, release and fsync order, read-ahead) is **[BadAd84](https://github.com/BadAd84)**'s block-tier
+  design from that recipe (#118), credited in the patches' headers. BadAd84 also authored code in
+  [PR #124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124): the CPU checks
+  `tools/spill_blocks_check.py` and `tools/spill_blocks_mutants.sh` (commit
+  [`269dc92`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124/commits/269dc92f6b288a801ef3919826ec3a0a738e8c12)),
+  which `0013` ports as `core/spill/store_test.zig`, and twelve fix commits to `0110` there, from `269dc92` to
+  [`f32226b`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124/commits/f32226b3cc5f443117d6d2411b1f2433c52f33a6)
+  (the read-ahead's preallocated buffers), which the port of `0110` carries. The recipe side (`scripts/port.sh`, `scripts/port_test.sh`,
+  `scripts/port-patches.sh`, the spill folder checks and ownership in `start.sh` / `stop.sh`, `docs/PORT-RECIPE.md`) was written
+  for this recipe by wojo, after the GLM recipe's spill settings (`SPILL_GIB`, `SPILL_DIR`, the `/spill` mount; Mia's AI Lab and wojo).
+- **`zig/patches/0023-server-prepare-memory.patch`** (rank 0's memory when several long prompts are prepared at once,
+  `TENSORFOLD_PREPARE_FLOOR_GIB`), a fix to the base engine rather than a part of the port, was authored by **Robert
+  Wojciechowski ([wojo](https://github.com/wojo))** for this recipe, in the same commit as the port; it is also his
+  [pull request #40](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/40) of this repository.
+- The Zig mirror list with bounded retries in `zig/Dockerfile` and the worker checks in the serving image in `scripts/prepare.sh` come
+  from wojo's two-Spark deployment of this recipe.
 - **Written for this recipe** (Apache-2.0, see [`NOTICE`](NOTICE)): `tools/exact.py`, `scripts/memguard.sh` (the memory watchdog), the memory
   preflight (`MIN_AVAIL_GIB`), `HEAD_ENGRAM_DIR` and `HEAD_NFS_SERVER` / `HEAD_NFS_VOLUME` (rank 0's local Engram folder
   and docker NFS volume), and `tools/bench.py` and `tools/smoke.py`. They use the engine's flags, `/health` and

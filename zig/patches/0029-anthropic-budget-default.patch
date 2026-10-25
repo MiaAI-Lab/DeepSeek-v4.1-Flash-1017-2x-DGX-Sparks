@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Maciej Kowalik <33423060+koniaik@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 21:18:25 +0200
+Subject: [PATCH] server: the Anthropic frontend accepts thinking without
+ budget_tokens
+
+An OpenAI-format request without thinking_budget gets the server's
+--thinking-budget default; an Anthropic-format request with
+thinking {"type": "enabled"} and no budget_tokens was refused
+outright ("thinking.budget_tokens must be positive and less than
+max_tokens"). The translation now passes such a request through to
+the same default (budget_tokens absent or null). A budget_tokens that
+is there is checked and forwarded exactly as before: zero, negative,
+non-integer or not below max_tokens is still refused.
+
+(Maintainer's variant of koniaik's patch: an invalid budget_tokens is
+refused rather than dropped.)
+---
+ zig/src/server/anthropic_translate.zig | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/server/anthropic_translate.zig b/zig/src/server/anthropic_translate.zig
+index f70b6a1..e7f01b8 100644
+--- a/zig/src/server/anthropic_translate.zig
++++ b/zig/src/server/anthropic_translate.zig
+@@ -284,10 +284,14 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
+     try chat.put(a, "chat_template_kwargs", .{ .object = kwargs });
+     if (!enabled) try chat.put(a, "reasoning_effort", .{ .string = "none" });
+     if (std.mem.eql(u8, t, "enabled")) {
+-        const budget = positiveInt(thinking.get("budget_tokens"));
+-        const limit = if (body.get("max_tokens")) |m| m.int64() orelse std.math.maxInt(i64) else 0;
+-        if (budget == null or (!count and budget.? >= limit)) return cx.refuse("thinking.budget_tokens must be positive and less than max_tokens");
+-        try chat.put(a, "thinking_budget", thinking.get("budget_tokens").?);
++        // no budget_tokens (absent or null): the server's --thinking-budget default, as an OpenAI request without
++        // thinking_budget gets; one that is there is checked and passed on as before
++        if (thinking.get("budget_tokens")) |given| if (given != .null) {
++            const budget = positiveInt(given);
++            const limit = if (body.get("max_tokens")) |m| m.int64() orelse std.math.maxInt(i64) else 0;
++            if (budget == null or (!count and budget.? >= limit)) return cx.refuse("thinking.budget_tokens must be positive and less than max_tokens");
++            try chat.put(a, "thinking_budget", given);
++        };
+     }
+     return .{ .object = chat };
+ }
+-- 
+2.43.0

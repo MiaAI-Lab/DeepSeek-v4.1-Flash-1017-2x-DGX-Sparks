@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::{GenerateRequest, SamplingParams, StreamOptions};
 use crate::images::{self, ImageSettings, ResolvedImages};
+use crate::security::ApiKeys;
 use crate::{ApiError, EncodedPrompt, Gateway};
 
 /// The public protocol of a request.
@@ -56,8 +57,10 @@ pub struct GatewayConfig {
     pub default_effort: Option<String>,
     /// Return the API's 400 instead of falling back (the fallback itself arrives in T022).
     pub strict: bool,
-    /// Require `Authorization`/`x-api-key` before rendering (checked by the engine in T022).
+    /// Require a local, constant-time `Authorization`/`x-api-key` check before any body handling.
     pub require_key: bool,
+    /// Digests loaded once at startup; redacted by this config's `Debug` output.
+    pub api_keys: Option<ApiKeys>,
     /// Reject private destinations for image URLs.
     pub block_private_urls: bool,
     /// Maximum images per request.
@@ -82,6 +85,7 @@ impl Default for GatewayConfig {
             default_effort: None,
             strict: false,
             require_key: false,
+            api_keys: None,
             block_private_urls: true,
             max_images: 600,
             max_image_mb: 64,

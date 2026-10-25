@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Prepare two Sparks to serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw with TensorFold's native engine. The
+# Prepare two Sparks to serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw (EAQ v1; EAQ_V1_1=1 for the
+# experimental v1.1 pack) with TensorFold's native engine. The
 # checkpoint, the kit and the served folder land on this Spark; the worker reads them over NFS:
 #   1. preflight: docker and the GPU on both Sparks, key-based ssh, the link between them
 #   2. the engine image on this Spark (zig/Dockerfile: BertholomusAI's TensorFold fork at TF_REF plus zig/patches, and
@@ -17,7 +18,8 @@
 # Pass --rebuild to rebuild the image from scratch; PULL=0 never pulls a published image. VERIFY_SHA=1 also checks Engram's shards against the sha256 the
 # checkpoint's model card lists (a few minutes of reading 203 GB).
 # ABLIT=1 applies Keys' matching Mia EAQ 2.9 bpw overlay in a separate folder. Requires your Hugging Face read token
-# (HF_TOKEN or hf auth login) AND access to https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated.
+# (HF_TOKEN or hf auth login) AND access to https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated;
+# EAQ_V1_1 must be 0 (the default).
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 source ./scripts/config.sh
@@ -73,14 +75,15 @@ if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built" != "$hash" ]]; then
 fi
 if [[ $REBUILD -eq 1 || "$built" != "$hash" ]]; then
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || { log "Pulling $BASE_IMAGE"; docker pull "$BASE_IMAGE" >/dev/null; }
-  log "Building $IMAGE (TensorFold ${TF_REF:0:12} + inputs' tools ${INPUTS_REF:0:12}, $(compgen -G 'zig/patches/*.patch' | wc -l) patches, Zig $ZIG_VERSION; two Zig builds, ~6 min on a Spark)"
+  log "Building $IMAGE (TensorFold ${TF_REF:0:12} + inputs' tools ${INPUTS_REF:0:12}, $(compgen -G 'zig/patches/*.patch' | wc -l) engine + $(compgen -G 'zig/patches-inputs/*.patch' | wc -l) inputs patches, Zig $ZIG_VERSION; two Zig builds, ~6 min on a Spark)"
   ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
   trap 'rm -rf -- "$ctx"' EXIT
-  mkdir -p "$ctx/zig"; cp -r zig/patches "$ctx/zig/patches"; cp zig/Dockerfile "$ctx/Dockerfile"
+  mkdir -p "$ctx/zig"; cp -r zig/patches "$ctx/zig/patches"; cp -r zig/patches-inputs "$ctx/zig/patches-inputs"; cp zig/Dockerfile "$ctx/Dockerfile"
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
   docker build "${nocache[@]}" -t "$IMAGE" -f "$ctx/Dockerfile" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" --build-arg INPUTS_REF="$INPUTS_REF" \
-    --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" --build-arg PATCHES_HASH="$hash" "$ctx"
+    --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" --build-arg ZIG_MIRRORS="$ZIG_MIRRORS" \
+    --build-arg PATCHES_HASH="$hash" "$ctx"
   rm -rf -- "$ctx"; trap - EXIT
 else
   log "Image $IMAGE already built (hash $hash; --rebuild forces it)"
@@ -180,6 +183,10 @@ if [[ "$ABLIT" == 1 ]]; then
     mkdir -p "$DATA_DIR/stock.new"
     # Dereference HF's relative blob symlinks before upstream hardlinks unchanged shards into the destination.
     cp -alL "$SNAP/." "$DATA_DIR/stock.new/"
+    # The overlay rewrites the index in its destination, and copies of a hardlinked read-only blob (huggingface_hub
+    # stores blobs 0444) cannot be opened for writing: give the work folder its own writable copy of the index.
+    rm -f "$DATA_DIR/stock.new/model.safetensors.index.json" &&
+      cp -L --no-preserve=mode "$SNAP/model.safetensors.index.json" "$DATA_DIR/stock.new/" || die "could not copy the checkpoint index"
     in_hf --entrypoint python3 "$IMAGE" "/hf/$overlay_sub/apply_mia29_wo_b_graft.py" \
       --src "/hf/$DATA_SUB/stock.new" --dst "/hf/$DATA_SUB/checkpoint.new" \
       --wo-b "/hf/$overlay_sub/$ABLIT_SIDECAR" || die "applying the matching Mia overlay failed; rerun prepare.sh to retry"
@@ -261,9 +268,6 @@ rm -f "$VIEW.new/chat_template.jinja"
 cp model/chat_template.jinja "$VIEW.new/chat_template.jinja"
 rm -rf "$VIEW" && mv "$VIEW.new" "$VIEW"
 [[ -s "$VIEW/config.json" ]] || die "the served folder $VIEW does not reach the checkpoint"
-if [[ "${API_GATEWAY:-0}" == 1 ]]; then
-  [[ -s "$VIEW/tokenizer.json" ]] || die "the served folder $VIEW has no tokenizer.json: the gateway loads it at /served/tokenizer.json"
-fi
 log "Served folder: $VIEW (the checkpoint linked, the recipe's chat template)"
 
 # ---------------------------------------------------------------- 6. the worker's NFS volume
@@ -275,7 +279,7 @@ manifest() {  # the files a rank reads, with their sizes, as paths under HF_CACH
 want=$(manifest)
 ensure_nfs_volume 1
 worker_files_check 1
-have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$BASE_IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
+have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
 [[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
   die "$(worker_host 1) does not see every file over NFS ($NFS_VOLUME)"; }
 log "Worker ($(worker_host 1)) reads the checkpoint, the kit and rank 0's files over NFS"
@@ -291,7 +295,7 @@ else
   spare=150; worker 1 "find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank1of2-*.bin' 2>/dev/null | grep -q ." && spare=10
   (( free + have > need + spare * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR), its weight file ~106 GB (unless it is already there), and $spare GiB to spare"
   log "Worker: copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over NFS, once)"
-  worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$BASE_IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
+  worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
     die "copying Engram's tables to $(worker_host 1) failed"
 fi
 wwant=$(worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' --entrypoint bash '$IMAGE' -c 'tf-dsv41-rank-cache $SNAP_C /tmp/x 1 2 --index-only | sha256sum | cut -c1-20'")

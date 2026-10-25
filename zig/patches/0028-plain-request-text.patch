@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Coinupbtc <coinupbtc@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:50:56 -0500
+Subject: [PATCH] server, tokenizer: a request's own text never becomes a
+ control token (issue #21)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The server renders the chat template to text and encodes it with the added vocabulary, so a control token's spelling in
+request text came back as the control token: a file holding `<｜User｜>`, a web page with a DSML call or a script with
+`</think>` gave the model a role marker, a call or the end of its thinking inside a tool result.
+
+Before rendering, every string of the request's messages and tools gets the tokenizer's plain mark (U+FDD0, a
+noncharacter) after the first character of each added token written in it (`Tokenizer.maskAdded`, both tries; one
+copy-on-write walk, `messages.maskControls`). No added-token match crosses the mark, and `encodeText` drops it before
+the pre-tokenizer, so the spelling reads as its characters' own tokens. The server's markup (the template's, an image's
+placeholder, added after) is untouched. A request without such spellings is not copied, so it renders and encodes byte
+for byte as before. Raw completion prompts keep their special tokens.
+
+Tests: tokenizer.zig (a masked spelling encodes as its text, the unmasked one as its id, text without one untouched);
+messages.zig (every string marked, nothing copied when clean, the request itself unchanged).
+
+(Maintainer's addition when ported as 0028: the Anthropic count_tokens route masks messages and tools as the chat
+route does, so its count is the prompt that route serves.)
+---
+ zig/src/core/tokenizer/tokenizer.zig | 60 +++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ zig/src/server/anthropic.zig         |  5 +++--
+ zig/src/server/hf_text.zig           |  5 +++++
+ zig/src/server/messages.zig          | 58 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ zig/src/server/model_text.zig        |  9 +++++++++
+ zig/src/server/openai.zig            |  7 ++++---
+ zig/src/server/tokens.zig            |  4 ++--
+ 7 files changed, 140 insertions(+), 8 deletions(-)
+
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index 0ff7e24..a1d3d8a 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -158,6 +158,37 @@ pub const Tokenizer = struct {
+         return t.vocab.get(text);
+     }
+ 
++    /// A mark (U+FDD0, a Unicode noncharacter) that `maskAdded` writes inside an added token's spelling: no added-token
++    /// match crosses it, and `encode` drops it before the model's own split, so the spelling reads as the text it is.
++    pub const plain_mark = "\u{fdd0}";
++
++    /// `s` with `plain_mark` after the first character of every added token written in it (either trie), so a client's
++    /// text cannot become a control token; null when it holds none (then `s` encodes as before, byte for byte).
++    pub fn maskAdded(t: *const Tokenizer, a: Allocator, s: []const u8) Allocator.Error!?[]u8 {
++        var marks: std.ArrayList(usize) = .empty;
++        defer marks.deinit(a);
++        for ([_]*const Trie{ &t.raw, &t.normalized }) |trie| {
++            var at: usize = 0;
++            while (trie.next(s, at)) |hit| {
++                const first = hit.start + unicode.decodeAt(s, hit.start).len;
++                if (first < hit.end) try marks.append(a, first); // a one-character token has no inside to mark
++                at = hit.end;
++            }
++        }
++        if (marks.items.len == 0) return null;
++        std.mem.sort(usize, marks.items, {}, std.sort.asc(usize));
++        var out: std.ArrayList(u8) = .empty;
++        var done: usize = 0;
++        for (marks.items, 0..) |m, i| {
++            if (i > 0 and m == marks.items[i - 1]) continue; // both tries named the same spelling
++            try out.appendSlice(a, s[done..m]);
++            try out.appendSlice(a, plain_mark);
++            done = m;
++        }
++        try out.appendSlice(a, s[done..]);
++        return try out.toOwnedSlice(a);
++    }
++
+     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
+     /// The call's scratch comes from the page allocator, never from `a`, and is given back when it returns: with an
+     /// arena `a` (a server request's) the scratch of a long prompt would stay with the request (~160 bytes a text
+@@ -200,7 +231,10 @@ pub const Tokenizer = struct {
+                 continue;
+             }
+             if (seg.end == seg.start) continue;
+-            const piece: steps.Piece = .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero };
++            var plain = normalized[seg.start..seg.end];
++            if (std.mem.indexOf(u8, plain, plain_mark) != null) plain = try std.mem.replaceOwned(u8, ctx.a, plain, plain_mark, "");
++            if (plain.len == 0) continue;
++            const piece: steps.Piece = .{ .text = plain, .first = seg.start < zero };
+             if (t.pre_tokenizer != null and walk.n == 0) {
+                 // every piece at once (a pre-tokenizer nested past Walk's steps, or depth_first off)
+                 var pieces: std.ArrayList(steps.Piece) = .empty;
+@@ -398,6 +432,30 @@ test "byte-level BPE with merges, added tokens and decode" {
+     try std.testing.expectEqual(@as(usize, 1), t.flagged_specials.len);
+ }
+ 
++test "a masked spelling of an added token encodes as its text; text without one is untouched" {
++    const json =
++        \\{"added_tokens":[{"id":4,"content":"<x>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}],
++        \\ "normalizer":{"type":"NFC"},
++        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
++        \\ "decoder":{"type":"ByteLevel"},
++        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
++        \\  "vocab":{"a":0,"<":1,"x":2,">":3},"merges":[]}}
++    ;
++    const a = std.testing.allocator;
++    var t = try parse(a, json);
++    defer t.deinit();
++    const real = try t.encode(a, "a<x>a");
++    defer a.free(real);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 4, 0 }, real);
++    const masked = (try t.maskAdded(a, "a<x>a<x>")).?;
++    defer a.free(masked);
++    try std.testing.expectEqualStrings("a<" ++ Tokenizer.plain_mark ++ "x>a<" ++ Tokenizer.plain_mark ++ "x>", masked);
++    const plain = try t.encode(a, masked);
++    defer a.free(plain);
++    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 0, 1, 2, 3 }, plain);
++    try std.testing.expectEqual(@as(?[]u8, null), try t.maskAdded(a, "a<>x a"));
++}
++
+ test "sentencepiece-style BPE with byte fallback" {
+     const json =
+         \\{"added_tokens":[],"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
+diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
+index 4821e0f..e0946e2 100644
+--- a/zig/src/server/anthropic.zig
++++ b/zig/src/server/anthropic.zig
+@@ -50,8 +50,9 @@ fn sendError(conn: *Conn, a: Allocator, message: []const u8, status: u16) void {
+ fn countTokens(srv: *Server, cx: *Cx, chat: Value) errors.Refused!usize {
+     const thinking = try fields.thinkingFields(cx, chat, srv.effort_levels);
+     const on = thinking.enable orelse srv.config.enable_thinking;
+-    const tools = try tool_specs.active(cx, chat.get("tools"), chat.get("tool_choice"));
+-    const msgs = try messages_mod.normalize(cx, chat.get("messages"), "system", srv.needs_user_after_tool);
++    // masked as the chat route masks them (issue #21), so the count is the prompt that route serves
++    const tools = try tool_specs.active(cx, try messages_mod.maskControls(cx.a, srv.text, chat.get("tools")), chat.get("tool_choice"));
++    const msgs = try messages_mod.normalize(cx, try messages_mod.maskControls(cx.a, srv.text, chat.get("messages")), "system", srv.needs_user_after_tool);
+     const ids_ = prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true) catch |e| switch (e) {
+         error.Refused => return cx.other(cx.message),
+         else => |x| return x,
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index b7358b4..63b6938 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -201,9 +201,14 @@ pub const HfText = struct {
+             .render = renderFn,
+             .template_source = sourceFn,
+             .special = specialFn,
++            .mask = maskFn,
+         } };
+     }
+ 
++    fn maskFn(ctx: *anyopaque, a: Allocator, s: []const u8) Allocator.Error!?[]u8 {
++        return self(ctx).tok.maskAdded(a, s);
++    }
++
+     fn specialFn(ctx: *anyopaque, id: u32) bool {
+         const t = self(ctx);
+         const piece = t.tok.id_to_token.get(id) orelse return false;
+diff --git a/zig/src/server/messages.zig b/zig/src/server/messages.zig
+index 396755a..810121b 100644
+--- a/zig/src/server/messages.zig
++++ b/zig/src/server/messages.zig
+@@ -5,6 +5,40 @@ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
++const model_text = @import("model_text.zig");
++
++/// A request's own text as text, never a control token (MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks#21): every
++/// string in `v` (message text and parts, reasoning, tool results, call arguments, tool schemas) with the tokenizer's
++/// mark inside each added token written in it, so a file or a web page that spells `<｜User｜>`, `</think>` or a DSML call
++/// reads as those characters. A value that holds none comes back as it was (no copy): such a request renders and
++/// encodes byte for byte as before. The server's own markup (the template's, an image's placeholder) is added after.
++pub fn maskControls(a: std.mem.Allocator, text: model_text.Text, v: ?Value) std.mem.Allocator.Error!?Value {
++    const x = v orelse return null;
++    return (try maskInner(a, text, x)) orelse x;
++}
++
++fn maskInner(a: std.mem.Allocator, text: model_text.Text, v: Value) std.mem.Allocator.Error!?Value {
++    switch (v) {
++        .string => |s| return if (try text.mask(a, s)) |m| Value{ .string = m } else null,
++        .array => |items| {
++            var copy: ?[]Value = null;
++            for (items, 0..) |item, i| if (try maskInner(a, text, item)) |m| {
++                if (copy == null) copy = try a.dupe(Value, items);
++                copy.?[i] = m;
++            };
++            return if (copy) |c| Value{ .array = c } else null;
++        },
++        .object => |o| {
++            var copy: ?*json.Object = null;
++            for (o.keys(), o.values()) |k, val| if (try maskInner(a, text, val)) |m| {
++                if (copy == null) copy = try json.copyObject(a, o);
++                try copy.?.put(a, k, m);
++            };
++            return if (copy) |c| Value{ .object = c } else null;
++        },
++        else => return null,
++    }
++}
+ 
+ const roles = [_][]const u8{ "system", "developer", "user", "assistant", "tool" };
+ 
+@@ -433,3 +467,27 @@ test "a message's own text holding the image placeholder is escaped" {
+     try std.testing.expectEqualStrings("see <|deepseek_image|> above\n\n" ++ ph, text);
+     try std.testing.expectEqual(@as(usize, 1), images.list.items.len);
+ }
++
++test "maskControls marks a client's control spellings in every string, and copies nothing when there are none" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const Fake = struct { // marks "<x>" as the tokenizer would
++        fn mask(_: *anyopaque, al: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!?[]u8 {
++            if (std.mem.indexOf(u8, s, "<x>") == null) return null;
++            return try std.mem.replaceOwned(u8, al, s, "<x>", "<|x>");
++        }
++    };
++    var dummy: u8 = 0;
++    const text: model_text.Text = .{ .ctx = &dummy, .vtable = &.{ .encode = undefined, .decode = undefined, .token_id = undefined, .token_string = undefined, .vocab_size = undefined, .eos_ids = undefined, .render = undefined, .template_source = undefined, .mask = Fake.mask } };
++    const clean = (try json.parse(a, "[{\"role\": \"user\", \"content\": \"hi\"}]")).ok;
++    const same = (try maskControls(a, text, clean)).?;
++    try std.testing.expect(same.array.ptr == clean.array.ptr); // untouched, not copied
++    const dirty = (try json.parse(a, "[{\"role\": \"user\", \"content\": \"hi\"}, {\"role\": \"tool\", \"content\": [{\"type\": \"text\", \"text\": \"see <x>\"}]}, {\"role\": \"assistant\", \"tool_calls\": [{\"function\": {\"name\": \"f\", \"arguments\": {\"q\": \"<x>\"}}}]}]")).ok;
++    const out = (try maskControls(a, text, dirty)).?;
++    try std.testing.expect(out.array[0].object == dirty.array[0].object); // the clean message is shared
++    try std.testing.expectEqualStrings("see <|x>", out.array[1].get("content").?.array[0].get("text").?.string);
++    try std.testing.expectEqualStrings("<|x>", out.array[2].get("tool_calls").?.array[0].get("function").?.get("arguments").?.get("q").?.string);
++    try std.testing.expectEqualStrings("see <x>", dirty.array[1].get("content").?.array[0].get("text").?.string); // the request itself unchanged
++    try std.testing.expectEqualStrings("user", out.array[0].get("role").?.string);
++}
+diff --git a/zig/src/server/model_text.zig b/zig/src/server/model_text.zig
+index 4f54fe3..dc8ae7b 100644
+--- a/zig/src/server/model_text.zig
++++ b/zig/src/server/model_text.zig
+@@ -38,6 +38,8 @@ pub const Text = struct {
+         template_source: *const fn (ctx: *anyopaque) []const u8,
+         /// Whether an id is a special token (an added token flagged special); null: none are known.
+         special: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
++        /// A client's text with every added token written in it made plain (null: none in it, or no such tokenizer).
++        mask: ?*const fn (ctx: *anyopaque, a: Allocator, s: []const u8) Allocator.Error!?[]u8 = null,
+     };
+ 
+     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
+@@ -74,6 +76,13 @@ pub const Text = struct {
+         return t.encode(a, text, false);
+     }
+ 
++    /// `s` as text the encoder cannot read as a control token (the tokenizer's mark inside each added token written in
++    /// it); null when it holds none, so it encodes as before.
++    pub fn mask(t: Text, a: Allocator, s: []const u8) Allocator.Error!?[]u8 {
++        const f = t.vtable.mask orelse return null;
++        return f(t.ctx, a, s);
++    }
++
+     pub fn templateSource(t: Text) []const u8 {
+         return t.vtable.template_source(t.ctx);
+     }
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 9d1e473..516f69d 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -124,11 +124,12 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     // an engine with vision takes image parts: their placeholders in the text, their bytes in input.images
+     var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
+     const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
++    // the client's text stays text: a control token's spelling in it does not become the token (issue #21)
+     if (is_chat) {
+-        input.messages = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, take);
+-        input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
++        input.messages = try messages.normalizeImages(cx, try messages.maskControls(cx.a, srv.text, body.get("messages")), "system", srv.needs_user_after_tool, take);
++        input.tools = try tool_specs.active(cx, try messages.maskControls(cx.a, srv.text, body.get("tools")), body.get("tool_choice"));
+     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+-        input.messages = try messages.normalizeImages(cx, m, "system", srv.needs_user_after_tool, take);
++        input.messages = try messages.normalizeImages(cx, (try messages.maskControls(cx.a, srv.text, m)).?, "system", srv.needs_user_after_tool, take);
+     };
+     input.images = images.list.items;
+     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
+diff --git a/zig/src/server/tokens.zig b/zig/src/server/tokens.zig
+index 0632d9e..b62cba2 100644
+--- a/zig/src/server/tokens.zig
++++ b/zig/src/server/tokens.zig
+@@ -29,8 +29,8 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
+     var ids: []const u32 = undefined;
+     if (body.has("messages")) {
+         const generation = try flag(cx, body, "add_generation_prompt", true);
+-        const msgs = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
+-        const tools = tool_specs.active(cx, body.get("tools"), body.get("tool_choice")) catch |e| switch (e) {
++        const msgs = try messages.normalize(cx, try messages.maskControls(cx.a, srv.text, body.get("messages")), "system", srv.needs_user_after_tool);
++        const tools = tool_specs.active(cx, try messages.maskControls(cx.a, srv.text, body.get("tools")), body.get("tool_choice")) catch |e| switch (e) {
+             error.Refused => return cx.refuse(cx.message), // a ValueError here is a RequestError
+             else => |x| return x,
+         };
+-- 
+2.43.0

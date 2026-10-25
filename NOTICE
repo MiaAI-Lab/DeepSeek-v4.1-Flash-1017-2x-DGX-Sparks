@@ -17,7 +17,7 @@ The DeepSeek-V4.1-Flash family on TensorFold's native engine (BertholomusAI's fo
   629c524a0ea57512a5342abb498d1b7c25353343; and, for the inputs' tools only, branch deepseek-v41-zig-tp4, commit
   59402086381a42c74d53053443224eec2790b4c5)
   Written by BertholomusAI (Albert Lee, @bertholomus), on TensorFold. Apache License, Version 2.0.
-  zig/Dockerfile builds those commits and applies the files in zig/patches (five: 0001, 0002, 0004 and 0006 written for this project; 0005 by Coinupbtc, pull request #5 of this repository, Apache-2.0) to the first. Any change in
+  zig/Dockerfile builds those commits and applies the files in zig/patches (0001, 0002, 0004 and 0006 written for this project; 0005 by Coinupbtc, pull request #5 of this repository, Apache-2.0; the others as zig/patches/README.md lists them; 0011 to 0022 by Robert Wojciechowski (wojo, https://github.com/wojo; @rwojo, https://x.com/rwojo), his GLM-5.3-Flash recipe patches 0088/0110/0111/0118/0119 (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull requests #78, #124, #128, #152 and #149) ported by him to this engine, with spill v2's block layout after BadAd84's block-tier design (#118 there) and BadAd84's spill v2 CPU checks and fixes to 0110 (#124 there); 0023, a base-engine fix, by Robert Wojciechowski, also pull request #40 of this repository; 0024 to 0026 by Mykhailo Tamarin (MykhailoTamarin, https://github.com/MykhailoTamarin), the EAQ v1.1 mixed pack, pull request #57 of this repository; Apache-2.0) to the first, and the files in zig/patches-inputs (0001 and 0002, by Mykhailo Tamarin, the same pull request) to the second. Any change in
   zig/patches is this project's work under Apache-2.0; the code it modifies, and quotes as diff context, stays under its
   authors' license.
 
@@ -50,6 +50,12 @@ GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
   validate.py, bench.py and smoke.py, docs/hermes-agent.md and the .github templates are adapted from it, including
   code by webzone, Alexbob0, john, Eduardo Florencio and Steve Darlow (see CREDITS.md). scripts/memguard.sh, bench.py and
   smoke.py are written for this project.
+
+Sufyan's reference vLLM gateway and derived parity cases
+  https://github.com/sfxnz/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark
+  By Sufyan (@sfxnz, https://github.com/sfxnz). MIT License. The gateway's token-route/fallback design, invariants and
+  cases derived from tests/api_eval.py and tools/api_eval_fixtures.py keep this attribution. The full MIT notice is in
+  gateway/NOTICE and is included in the gateway image.
 
 NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
   The image's base, under NVIDIA's container license and its components' own licenses.

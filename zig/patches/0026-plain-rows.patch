@@ -1,0 +1,130 @@
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 62b939a..49967f9 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -68,6 +68,7 @@ pub const Options = struct {
+     engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
+     arena_bytes: usize = 0, // the device arena's first block (0: it grows from 256 MiB blocks as the buffers ask)
+     round_rows: usize = round.default_rows, // a round's rows at most (TF_DS_ROUND_ROWS; the four-node lane's 48)
++    plain_rows: usize = round.default_rows, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; 0: the round's own)
+     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
+     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
+     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+@@ -318,6 +319,7 @@ pub const Model = struct {
+         }
+         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+         m.eng.round_rows = o.round_rows;
++        m.eng.plain_rows = o.plain_rows;
+         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.request_cap);
+         errdefer if (m.kvs) |*x| x.k.unload(); // (registered before the load: nothing between them leaks it)
+         if (mode != .off) {
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index a0516fc..1c57752 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -13,6 +13,8 @@
+ //!                                               served ROUND_MS unless set: a four-node lane's rounds cost less)
+ //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
+ //!                                               streams (4; its 16): --parallel at most the streams
++//!   TF_DS_PLAIN_ROWS                            the rows a mixed pack's plain (cuBLAS) linear runs over, padded to this
++//!                                               count so a token's bits do not change with the round's shape (16; 0: off)
+ //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
+ //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
+ //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
+@@ -211,6 +213,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .drafts = o.drafts,
+         .arena_bytes = arena_gib << 30,
+         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
++        .plain_rows = if (getenv("TF_DS_PLAIN_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadPlainRows else round.default_rows,
+         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
+         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
+     };
+@@ -617,6 +620,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
+         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
+         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
++        error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
+         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
+         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index df44fa5..245f56f 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -125,6 +125,7 @@ pub const Engine = struct {
+     plain: Rope,
+     compressed: Rope,
+     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
++    plain_rows: usize = 0, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; model.zig sets it)
+     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
+     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
+     kv: ?*shard_ops.KvShard = null, // TF_DS_KV_SHARD: the parts, the decode mode, the fetch kernels (null: replicated)
+@@ -583,6 +584,15 @@ pub fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
+     return error.NoCounters;
+ }
+ 
++/// The rows a mixed pack's plain (cuBLAS) linear runs over: `m`, padded to the engine's plain-rows setting and never
++/// beyond a round's rows (the buffers are sized for those). cuBLAS picks its kernel and split-K from the GEMM's shape
++/// and its rounding follows the pick, so a fixed shape keeps a token's bits the same whether it is decoded alone,
++/// beside other streams, or under the draft block (TF_DS_PLAIN_ROWS=0 turns the padding off).
++fn plainRows(e: *const Engine, m: usize) usize {
++    if (e.plain_rows <= m) return m;
++    return @min(e.plain_rows, e.round_rows);
++}
++
+ /// Exl3Group(ls) on m (1..128) rows (linear.py): one rot_many launch rotating every layer's input rows xs[i] (bf16,
+ /// row stride ldxs[i]) into the group's buffer, then a glinear launch for each (bits, warps) set, outputs into outs[i]
+ /// (row stride ldos[i], dtype types[i]); programmatic dependent launches, split-K partials dropped from L2 (the served
+@@ -610,14 +620,15 @@ pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights
+         try exl3_linear.rotMany(e.lin, e.s, calls[0..n_calls], m, true);
+         try exl3_linear.glinear(e.lin, e.s, calls[0..n_calls], m, ch.gz, true, true);
+     }
++    const mp = plainRows(e, m);
+     for (plain[0..n_plain]) |i| {
+         const l = ls[i];
+         if (ldxs[i] != @as(usize, l.k) or ldos[i] != @as(usize, l.n)) return error.UnsupportedPlainLinear;
+         if (types[i] == .bf16) {
+-            try e.blas.linearBf16(xs[i], l.plain, outs[i], m, @as(usize, l.k), @as(usize, l.n));
++            try e.blas.linearBf16(xs[i], l.plain, outs[i], mp, @as(usize, l.k), @as(usize, l.n));
+         } else {
+-            try e.blas.linearBf16(xs[i], l.plain, ch.plain_tmp, m, @as(usize, l.k), @as(usize, l.n));
+-            try e.ops.toF32(e.s, ch.plain_tmp, outs[i], m * @as(usize, l.n));
++            try e.blas.linearBf16(xs[i], l.plain, ch.plain_tmp, mp, @as(usize, l.k), @as(usize, l.n));
++            try e.ops.toF32(e.s, ch.plain_tmp, outs[i], mp * @as(usize, l.n));
+         }
+     }
+ }
+@@ -643,13 +654,14 @@ pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl
+     }
+     for (exl3[0..n_exl3]) |*c| c.counters = try counterOf(ch, c.layer);
+     if (n_exl3 > 0) try exl3_linear.glinear(e.lin, e.s, exl3[0..n_exl3], m, ch.gz, true, true);
++    const mp = plainRows(e, m);
+     for (plain[0..n_plain]) |c| {
+         if (c.x == 0 or c.xh != 0 or c.ldx != @as(i64, c.layer.k) or c.ldy != @as(i64, c.layer.n)) return error.UnsupportedPlainLinear;
+         if (c.y_dtype == .bf16) {
+-            try e.blas.linearBf16(c.x, c.layer.plain, c.y, m, @as(usize, c.layer.k), @as(usize, c.layer.n));
++            try e.blas.linearBf16(c.x, c.layer.plain, c.y, mp, @as(usize, c.layer.k), @as(usize, c.layer.n));
+         } else {
+-            try e.blas.linearBf16(c.x, c.layer.plain, ch.plain_tmp, m, @as(usize, c.layer.k), @as(usize, c.layer.n));
+-            try e.ops.toF32(e.s, ch.plain_tmp, c.y, m * @as(usize, c.layer.n));
++            try e.blas.linearBf16(c.x, c.layer.plain, ch.plain_tmp, mp, @as(usize, c.layer.k), @as(usize, c.layer.n));
++            try e.ops.toF32(e.s, ch.plain_tmp, c.y, mp * @as(usize, c.layer.n));
+         }
+     }
+ }
+@@ -862,11 +874,12 @@ fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u6
+     // bf16 -> fp32 widen when the caller wants fp32 (torch's mm's out_dtype).
+     if (l.plain != 0) {
+         if (ldx != @as(usize, l.k) or os != @as(usize, l.n)) return error.UnsupportedPlainLinear;
++        const mp = plainRows(e, m);
+         if (out_type == .bf16) {
+-            try e.blas.linearBf16(x, l.plain, out, m, @as(usize, l.k), @as(usize, l.n));
++            try e.blas.linearBf16(x, l.plain, out, mp, @as(usize, l.k), @as(usize, l.n));
+         } else {
+-            try e.blas.linearBf16(x, l.plain, ch.plain_tmp, m, @as(usize, l.k), @as(usize, l.n));
+-            try e.ops.toF32(e.s, ch.plain_tmp, out, m * @as(usize, l.n));
++            try e.blas.linearBf16(x, l.plain, ch.plain_tmp, mp, @as(usize, l.k), @as(usize, l.n));
++            try e.ops.toF32(e.s, ch.plain_tmp, out, mp * @as(usize, l.n));
+         }
+         return;
+     }

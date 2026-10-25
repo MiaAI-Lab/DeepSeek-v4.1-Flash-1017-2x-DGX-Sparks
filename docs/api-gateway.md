@@ -2,7 +2,7 @@
 
 `gateway/` builds `ds41-gateway`, a Rust front end that gives TensorFold's token-in/token-out route the DeepSeek API's
 surface. It is off by default (`API_GATEWAY=0`); `API_GATEWAY=1` starts it on `HOST:PORT` and moves the engine to
-`127.0.0.1:ENGINE_PORT`. The engine image is unchanged apart from `zig/patches/0011-token-route.patch`.
+`127.0.0.1:ENGINE_PORT`. The engine image is unchanged apart from `zig/patches/0030-token-route.patch`.
 
 ## Routes
 
@@ -18,6 +18,25 @@ surface. It is off by default (`API_GATEWAY=0`); `API_GATEWAY=1` starts it on `H
 Responses from the API path carry `x-ds41-gateway: api`; fallback responses carry `x-ds41-gateway: fallback`. Non-streaming
 API responses also carry `x-ds41-token-sha` (the ids the gateway delivered) and `x-ds41-token-sha-raw` (the ids the engine
 emitted, including a trailing EOS), which the comparator uses against the native route's `tensorfold.token_sha`.
+
+## Authentication and admission
+
+With `API_KEY=1`, `start.sh` passes `--require-key --api-key-file /run/secrets/key` and sets `API_KEY_FILE` to that
+read-only mount. The gateway loads the key once at startup and refuses to start if it is missing, unreadable or empty;
+restart it after rotating the file. `--require-key` without a usable `API_KEY_FILE`/`--api-key-file` is likewise a startup
+error, not an authentication bypass.
+
+`/health` is public. Every other route, including the API, render, count-tokens, `/inference/*` and transparent engine
+proxy routes, requires `Authorization: Bearer <key>` or `x-api-key: <key>`. Middleware checks the actual key with a
+constant-time comparison before reading or parsing the body. A missing or wrong key therefore gets an API-shaped 401,
+not a 400 for malformed JSON and not a proxy response from the engine. The key is never logged. `API_KEY=0` leaves the
+API open, as the native recipe does by default.
+
+`GATEWAY_MAX_CONCURRENT` (default 3) admits that many requests and queues the rest instead of rejecting them at the cap.
+A permit covers the whole response body, including an SSE stream, and is released on completion or client cancellation.
+The default derives from a conservative 512 MiB budget: 235 MiB idle RSS plus 70 MiB for a 188,000-token request gives
+`floor((512-235)/70)=3`; four concurrent requests would need 515 MiB. The container default is nevertheless `1g`, since
+the old 512m cap stalled Hernan's startup. Raising the permit count requires a new memory measurement and a suitable cap.
 
 ## Fallback and strict mode
 
@@ -58,7 +77,8 @@ The served tokenizer's image-token spelling is given by `GATEWAY_IMAGE_TOKEN`; t
   thinking prompt faithfully.
 - Grammar-constrained decoding (`guided_json`, `guided_regex`, `guided_choice`, `grammar`, `structured_outputs`) falls
   back; `json_object`/`json_schema`/`regex` are written into the prompt without a grammar.
-- `logprobs` / `top_logprobs` fall back until the engine serves logprobs on the token route.
+- Patch 0030 serves `logprobs` / `top_logprobs` on the token route. They fall back only if the running engine's health
+  reports `logprobs: false` (for example, an engine without that patch).
 - The image token count is the API's own estimate; the engine's prompt length can differ by the tokenizer's special
   tokens. The comparator reports both.
 - `n > 1` is not converted; it falls back.
@@ -80,7 +100,9 @@ cargo build --release --locked --bin ds41-gateway
 ```
 
 The flags and their defaults are in `gateway/src/main.rs` and `gateway/README.md`. The container runs as an unprivileged
-user, read-only, with `--memory` and `--cpus` from `GATEWAY_MEMORY` / `GATEWAY_CPUS`, and no GPU.
+user, read-only, with `--memory` and `--cpus` from `GATEWAY_MEMORY` / `GATEWAY_CPUS`, and no GPU. The memory default is
+`1g` because 512m stalled Hernan's startup; the independent concurrency default still uses the conservative 512 MiB
+request budget described above.
 
 ## Parity battery without a GPU
 

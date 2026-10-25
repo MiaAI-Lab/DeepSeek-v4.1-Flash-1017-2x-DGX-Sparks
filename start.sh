@@ -3,18 +3,20 @@
 # Sparks with TensorFold's native engine, end to end: runs scripts/prepare.sh when the image, the checkpoint, the weight
 # files, the kit or the worker's NFS volume are not ready yet (the first run, or after the patches change), starts rank 1
 # on the worker and rank 0 here, which serves the API on port 8888, waits until the OpenAI API answers, then runs a smoke
-# test. The worker reads the checkpoint from this Spark over NFS. Stop it with ./stop.sh.
+# test. The worker reads the checkpoint from this Spark over NFS. Stop it with ./stop.sh. EAQ v1 is the default; the
+# experimental EAQ v1.1 pack is opt-in with EAQ_V1_1=1.
 # The shape of this script (setup, checks, launch, load, smoke test) is the GLM-5.3-Flash recipe's and the four-Spark
 # DeepSeek-V4.1 recipe's (MiaAI-Lab); the engine's flags are BertholomusAI's two-node launch.
 #
 # Usage: ./start.sh [restart] [extra tensorfold-native serve args]
 #   ./start.sh                  # scripts/config.sh's defaults (4 requests at once, a 1,048,576-token window, drafts,
 #                               # images); if the server already runs, says so and leaves it alone
+#   SPILL_GIB=64 KV_SHARD=1 ./start.sh restart   # the ported spill v2 and KV sharding on, as the pair was validated
 #   ./start.sh restart          # stop both ranks (./stop.sh), then start again (e.g. after changing settings)
 #   CONTEXT=262144 ./start.sh restart
+#   EAQ_V1_1=1 ./start.sh restart # the experimental EAQ v1.1 mixed pack instead of the EAQ v1 default
 #   ABLIT=1 ./start.sh restart   # Mia EAQ 2.9 bpw + Keys overlay; requires your HF token and gated repo access
 #   API_KEY=1 ./start.sh restart  # require an API key (generated in $STATE_DIR/api-key, mode 600; see scripts/config.sh)
-#   API_GATEWAY=1 ./start.sh       # engine on 127.0.0.1:8887, ds41-gateway on HOST:PORT (the DeepSeek API)
 #   FOREGROUND=1 ./start.sh       # stay attached to rank 0's log and exit with its code (for systemd Restart=on-failure)
 #   DRY_RUN=1 ./start.sh        # print the link found and both ranks' docker commands, change nothing and start nothing
 # Extra arguments go to rank 0's `tensorfold-native serve` after the defaults, so they win.
@@ -23,16 +25,23 @@
 #   serving  CONTEXT, POOL, PARALLEL, ROUND_ROWS, MAX_TOKENS, THINKING, REASONING_EFFORT, THINKING_BUDGET, TEMPERATURE, TOP_P, TOP_K, DRAFTS,
 #            SERVED_NAME, HOST, PORT, RDMA, RDMA_IDLE_S, RDMA_NAP_US, GRAPHS, SIDE, PREFETCH, ENGRAM_AIO, REPLAY_FLOOR
 #   nodes    WORKER, FABRIC_PEER, MASTER_ADDR, MASTER_PORT, SOCKET_IFNAME, NCCL_RAILS, NCCL_DEBUG
-#   files    ABLIT (0 | 1), ABLIT_REVISION, MODEL_ID, MODEL_REVISION, ENGRAM_ID, ENGRAM_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER, NFS_VOLUME,
-#            WORKER_ENGRAM_DIR, WORKER_CACHE_DIR, STATE_DIR, LOG_DIR, LOG_KEEP
+#   files    EAQ_V1_1 (0 | 1), ABLIT (0 | 1), ABLIT_REVISION, MODEL_ID, MODEL_REVISION, ENGRAM_ID, ENGRAM_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER, NFS_VOLUME,
+#            WORKER_ENGRAM_DIR, WORKER_CACHE_DIR, STATE_DIR, LOG_DIR, LOG_KEEP, LOG_MAX_SIZE, LOG_MAX_FILE
 #   engine   TF_REPO, TF_REF, INPUTS_REF, KIT_REPO, KIT_REF, ZIG_VERSION, BASE_IMAGE, IMAGE, CONTAINER_NAME
-#   gateway  API_GATEWAY (0 | 1), ENGINE_PORT, TOKEN_ROUTE (0 | 1), GATEWAY_IMAGE, GATEWAY_MEMORY, GATEWAY_CPUS,
-#            GATEWAY_STRICT, GATEWAY_BLOCK_PRIVATE_URLS, GATEWAY_API_SAMPLING, GATEWAY_IMAGE_TOKEN,
-#            GATEWAY_MAX_IMAGES, GATEWAY_MAX_IMAGE_MB, GATEWAY_LOG, TF_DS_API_EFFORTS
 #   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1
-#   memory   MIN_AVAIL_GIB (refuse to start below it), MIN_AVAIL_WAIT_S (re-read for this long first), MEMGUARD_GIB (kill a rank's container below it), HEAD_NFS_SERVER,
+#   memory   MIN_AVAIL_GIB (refuse to start below it; pages parked on the per-CPU free lists count, as the engine counts
+#            them, and a start waits up to MIN_AVAIL_WAIT_S for them to drain), MEMGUARD_GIB (kill a rank's container
+#            below it), HEAD_NFS_SERVER,
 #            HEAD_NFS_VOLUME (rank 0 reads the checkpoint over NFS through a docker volume)
-#   ranks    TENSORFOLD_* and TF_DS_* go to both ranks, except values mapped from recipe settings (use POOL, not TF_DS_POOL)
+#   port     SPILL_GIB (default 0: off), SPILL_DIR, WORKER_SPILL_DIR, SPILL_FLOOR_GIB, SPILL_QUOTA_GIB, SPILL_MIN_TOKENS,
+#            SPILL_STAGING_MIB, SPILL_TURNS, SPILL_FLUSH_MS, SPILL_WEIGHTS_SHA, KV_SHARD (default 0: off), KV_SHARD_DECODE,
+#            KV_SHARD_CARRY, KV_SHARD_TWINS, KV_SHARD_CHECK (with KV_SHARD=1 an empty POOL is the pool it needs): the
+#            ported spill v2 / KV sharding, OFF by default (scripts/port.sh, docs/PORT-RECIPE.md). Set explicitly, a
+#            setting that cannot run (a Spark's spill folder fails its checks) refuses; a fork's default that cannot
+#            starts without it and warns. Both ranks get the same values, the spill tier's identity
+#            (derived from the image and the pins), and each its own local spill directory at /spill. Spill settings
+#            are never extra arguments (refused: rank 1 would not get them)
+#   ranks    TENSORFOLD_*, TF_DS_* and TF_SPILL_* go to both ranks, except values mapped from recipe settings (use POOL, not TF_DS_POOL)
 #            every other exported NCCL_* variable too (values of A-Z a-z 0-9 _ . , : = / - only), RANK1_PROFILE=1|2: rank 1's --profile
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
@@ -50,28 +59,19 @@ ablit_notice
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
 (( CONTEXT <= 1048576 )) || die "CONTEXT is at most 1048576 (the model's window), not $CONTEXT"
-[[ "$DISK_CACHE" == 0 || "$DISK_CACHE" == 1 ]] || die "DISK_CACHE is 0 or 1 (got '$DISK_CACHE')"
-if [[ "$DISK_CACHE" == 1 ]]; then
-  [[ "$DISK_CACHE_DIR" == /* && "$DISK_CACHE_DIR" != *..* && "$DISK_CACHE_DIR" != / ]] || die "DISK_CACHE_DIR must be an absolute path (got '$DISK_CACHE_DIR')"
-  case "$DISK_CACHE_DIR" in *[[:space:]]*|*:*) die "DISK_CACHE_DIR may not hold spaces or ':' (docker -v reads them; got '$DISK_CACHE_DIR')" ;; esac
-  for v in DISK_CACHE_GIB DISK_CACHE_MIN_FREE_GIB DISK_CACHE_MEM_FLOOR_GIB DISK_CACHE_TTL_H; do
-    [[ "${!v}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v is a number (got '${!v}')"
-  done
-  for v in DISK_CACHE_MIN_TOKENS DISK_CACHE_FLUSH_S; do
-    [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v is a whole number (got '${!v}')"
-  done
-fi
 [[ -z "$POOL" ]] || { [[ "$POOL" =~ ^[1-9][0-9]*$ ]] && (( POOL >= CONTEXT )); } || die "POOL is empty (the pool is CONTEXT) or a count of positions of at least CONTEXT ($CONTEXT), not $POOL"
 (( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16 (the engine's streams), not $PARALLEL"
 [[ -z "$ROUND_ROWS" ]] || { [[ "$ROUND_ROWS" =~ ^[0-9]+$ ]] && (( ROUND_ROWS == 16 )); } || die "ROUND_ROWS must be empty or 16: the pinned kit has no wider row kernels (issue #23), not $ROUND_ROWS"
 [[ -z "$THINKING_BUDGET" || "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]] || die "THINKING_BUDGET is a positive count of reasoning tokens (or empty for no cap), not $THINKING_BUDGET"
 [[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || die "REASONING_EFFORT is low, medium, high or xhigh (or empty), not $REASONING_EFFORT"
 [[ "$MIN_AVAIL_GIB" =~ ^[0-9]+$ ]] || die "MIN_AVAIL_GIB is a whole number of GiB (0 turns it off), not $MIN_AVAIL_GIB"
-[[ "$MIN_AVAIL_WAIT_S" =~ ^[0-9]+$ ]] || die "MIN_AVAIL_WAIT_S is a whole number of seconds (0 reads the memory once), not $MIN_AVAIL_WAIT_S"
+[[ "$MIN_AVAIL_WAIT_S" =~ ^[0-9]+$ ]] && (( MIN_AVAIL_WAIT_S <= 3600 )) || die "MIN_AVAIL_WAIT_S is 0 to 3600 seconds, not $MIN_AVAIL_WAIT_S"
 [[ "$MEMGUARD_GIB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "MEMGUARD_GIB is a number of GiB (2.5 is fine; 0 turns it off), not $MEMGUARD_GIB"
 [[ "$MEMGUARD_HOLD_S" =~ ^[0-9]+(\.[0-9]+)?$ && "$MEMGUARD_HARD_GIB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "MEMGUARD_HOLD_S is a number of seconds and MEMGUARD_HARD_GIB a number of GiB, not $MEMGUARD_HOLD_S and $MEMGUARD_HARD_GIB"
 [[ "$PREFILL_INTERLEAVE_MS" =~ ^[0-9]+$ ]] && (( PREFILL_INTERLEAVE_MS <= 5000 )) || die "PREFILL_INTERLEAVE_MS is 0 to 5000 milliseconds, not $PREFILL_INTERLEAVE_MS"
-for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+[[ -z "$LOG_MAX_SIZE" || "$LOG_MAX_SIZE" =~ ^[1-9][0-9]*[kmg]$ ]] || die "LOG_MAX_SIZE is a size such as 100m (k, m or g), or empty for the docker daemon's own setting, not $LOG_MAX_SIZE"
+[[ "$LOG_MAX_FILE" =~ ^[1-9][0-9]*$ ]] || die "LOG_MAX_FILE is a number of files, 1 or more, not $LOG_MAX_FILE"
+for v in EAQ_V1_1 THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$RDMA_IDLE_S" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$RDMA_IDLE_S" 'BEGIN { exit !(value <= 3600) }' || die "RDMA_IDLE_S is 0 to 3600 seconds (0 turns the nap off), not $RDMA_IDLE_S"
 [[ "$RDMA_NAP_US" =~ ^[1-9][0-9]*$ ]] && awk -v value="$RDMA_NAP_US" 'BEGIN { exit !(value <= 1000000) }' || die "RDMA_NAP_US is 1 to 1000000 microseconds, not $RDMA_NAP_US"
 [[ "${RANK1_PROFILE:-}" =~ ^[012]?$ ]] || die "RANK1_PROFILE is empty, 0, 1 or 2, not '${RANK1_PROFILE:-}'"
@@ -83,6 +83,7 @@ done
 [[ "$API_GATEWAY" != 1 || "$ENGINE_PORT" != "$PORT" ]] || die "ENGINE_PORT and PORT are both $PORT: the engine and the gateway need different ports"
 [[ "$GATEWAY_MEMORY" =~ ^[0-9]+([.][0-9]+)?[mMgG]$ ]] || die "GATEWAY_MEMORY is a size with an m or g suffix (512m, 1g), not $GATEWAY_MEMORY"
 [[ "$GATEWAY_CPUS" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v c="$GATEWAY_CPUS" 'BEGIN { exit !(c > 0) }' || die "GATEWAY_CPUS is a positive number, not $GATEWAY_CPUS"
+[[ "$GATEWAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONCURRENT is a positive count, not $GATEWAY_MAX_CONCURRENT"
 [[ "$GATEWAY_LOG" =~ ^(debug|info|warn|error)$ ]] || die "GATEWAY_LOG is debug, info, warn or error, not $GATEWAY_LOG"
 [[ -n "$GATEWAY_IMAGE_TOKEN" ]] || die "GATEWAY_IMAGE_TOKEN is empty: give the served tokenizer's image-token spelling"
 for v in GATEWAY_MAX_IMAGES GATEWAY_MAX_IMAGE_MB; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
@@ -90,10 +91,19 @@ for v in GATEWAY_MAX_IMAGES GATEWAY_MAX_IMAGE_MB; do [[ "${!v}" =~ ^[1-9][0-9]*$
 [[ "$API_GATEWAY" != 1 ]] || TOKEN_ROUTE=1
 nccl_extra_collect
 check_workers
+need_workers
+port_validate
+# the spill tier's directory on each Spark (scripts/port.sh): local disk, yours, outside the export and the model folders,
+# above SPILL_FLOOR_GIB; created when missing (DRY_RUN: not). Checked here, before the flags, the variables and the
+# tf.recipe.port label are made and before a running pair is compared with them: a spill tier that is on by default
+# only and fails here is off for this start (a warning), an explicit SPILL_GIB that fails refuses. Nothing with SPILL_GIB=0.
+port_spill_check
+port_map
+port_check_extra "$@"
 
 # rank 0's command (its serve flags need no link): built first, so the flags can be checked before anything is stopped
-# API_GATEWAY=1: the engine moves to loopback and the gateway takes HOST:PORT. With API_GATEWAY=0 this is the command of
-# today; only the image tag changes when patch 0011 enters zig/patches/.
+# API_GATEWAY=1: the engine moves to loopback and the gateway takes HOST:PORT. With API_GATEWAY=0 this is Mia's command;
+# only the derived image tag changes when patch 0030 enters zig/patches/.
 SERVE_HOST=$HOST; SERVE_PORT=$PORT
 if [[ "$API_GATEWAY" == 1 ]]; then SERVE_HOST=127.0.0.1; SERVE_PORT=$ENGINE_PORT; fi
 SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$SERVE_HOST" --port "$SERVE_PORT" --name "$SERVED_NAME"
@@ -104,6 +114,7 @@ if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking)
 # drafts off on rank 0 as on rank 1 (a follower without the drafter refuses a drafted round)
 [[ "$DRAFTS" == 1 ]] || SERVE+=(--no-drafts)
 [[ "$API_KEY" != 1 ]] || SERVE+=(--api-key-file "$API_KEY_IN_CONTAINER")
+SERVE+=(${PORT_SERVE[@]+"${PORT_SERVE[@]}"})   # the ported features' flags (scripts/port.sh; none with all of them off)
 SERVE+=("$@")
 
 B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
@@ -112,7 +123,7 @@ source ./scripts/banner.sh
 echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · 2 x DGX Spark · %s at once · %s-token window · EXL3 2.9 bpw · port %s%s\n\n' "$D" "$MODEL_ID" "$PARALLEL" "$CONTEXT" "$PORT" "$R"
+printf '%s  %s · 2 x DGX Spark · %s at once · %s-token window%s · EXL3 2.9 bpw · port %s%s\n\n' "$D" "$MODEL_ID" "$PARALLEL" "$CONTEXT" "$(port_summary)" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
@@ -120,13 +131,16 @@ command -v docker >/dev/null || die "docker is not installed"
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 exec 8>"$STATE_DIR/start.lock"
 flock -n 8 || die "another ./start.sh is already running; wait for it to finish"
-need_workers
 (( DRY )) && log "DRY_RUN=1: printing the docker commands; nothing is stopped, started or prepared"
 
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 URL="http://$API_HOST:$PORT"
 running_here()   { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
 running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
+# a container of that name at all, running or exited (a rank that failed, or rank 0 ended by a broken pair's status 75)
+exists_here()    { docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
+exists_worker()  { worker "$1" docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
+running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>/dev/null)" == true ]]; }
 if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; then
   # Preparation may have run separately while the old server stayed up: inspect the live ranks too.
   live_head=$(docker inspect -f '{{index .Config.Labels "tf.recipe.ablit"}}' "$CONTAINER_NAME")
@@ -136,6 +150,14 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; th
   [[ -n "$live_worker" && "$live_worker" != '<no value>' ]] || live_worker=0
   [[ "$live_head" == "$(ablit_identity)" && "$live_worker" == "$(ablit_identity)" ]] || \
     die "the running ranks use a different ABLIT mode or overlay revision; run ./start.sh restart with ABLIT=$ABLIT"
+  # the ported features (scripts/port.sh): containers started before them carry no label, and run with all of them off
+  live_head=$(docker inspect -f '{{index .Config.Labels "tf.recipe.port"}}' "$CONTAINER_NAME")
+  live_worker=$(worker 1 "docker inspect -f '{{index .Config.Labels \"tf.recipe.port\"}}' '$CONTAINER_NAME'")
+  [[ -n "$live_head" && "$live_head" != '<no value>' ]] || live_head=off
+  [[ -n "$live_worker" && "$live_worker" != '<no value>' ]] || live_worker=off
+  [[ "$live_head" == "$live_worker" ]] || die "the two running ranks disagree on the ported features ($live_head here, $live_worker on $(worker_host 1)): run ./start.sh restart"
+  [[ "$live_head" == "$(port_identity)" ]] || \
+    die "the running ranks use other spill / KV-shard / pool settings ($live_head, asked: $(port_identity)); run ./start.sh restart"
   [[ "$(prepared_state 2>/dev/null)" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
     die "the requested configuration differs from the prepared server; run ./start.sh restart with the same settings (including ABLIT)"
   log "$CONTAINER_NAME is already running on both Sparks (port $PORT): nothing to do. ./start.sh restart restarts it, ./stop.sh stops it."
@@ -185,23 +207,35 @@ if docker image inspect "$IMAGE" >/dev/null 2>&1; then
   docker run --rm --network none --entrypoint tensorfold-native "$IMAGE" capabilities --json |
     python3 scripts/zig_flags.py "${SERVE[@]:3}" || die "rank 0's serve arguments are not ones $IMAGE serves (above); nothing was stopped"
 fi
+# (the spill tier's directories were checked before the flags were made: port_spill_check, above)
+# the spill tier's identity (scripts/port.sh): the image's patch hash and ref, the checkpoint's and Engram's revisions,
+# each rank's weight-file digest (cached beside the file). Nothing with SPILL_GIB=0.
+port_ident_map "$IMAGE"
+port_weights_check
+# A previous gateway (running or exited) is not reusable: preserve its log before replacing it.
+if (( ! DRY )) && docker inspect ds41-gateway >/dev/null 2>&1; then
+  gateway_saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || warn "could not save the previous gateway's log"
+  docker rm -f ds41-gateway >/dev/null 2>&1 || die "could not remove the previous ds41-gateway container"
+fi
 if (( ! DRY )); then
   # Preparation's marker cannot detect an export/root change since the last run.
   worker_files_check 1
-  if running_here || running_worker 1; then ./stop.sh; fi
+  # stop.sh for any container left, an exited one too: it saves each rank's log before it removes the container, so a
+  # restart (./start.sh restart, or a supervisor's start after rank 0 exited) keeps the failed run's last lines
+  if exists_here || exists_worker 1; then ./stop.sh; fi
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   worker 1 "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"
   if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"; fi
-  if [[ "$API_GATEWAY" == 1 ]] && ss -ltn "sport = :$ENGINE_PORT" 2>/dev/null | grep -q LISTEN; then
-    die "ENGINE_PORT $ENGINE_PORT is already in use: $(ss -ltnp "sport = :$ENGINE_PORT" 2>/dev/null | tail -n +2)"
-  fi
-  # memory: a rank that takes all of a Spark's memory freezes the machine, so refuse to start on one that cannot hold it
+  # memory: a rank that takes all of a Spark's memory freezes the machine, so refuse to start on one that cannot hold it.
+  # Counted as the engine's startup budget counts it (0119): MemAvailable plus the pages parked on the per-CPU free
+  # lists (scripts/memavail.sh). Right after an image build or copy those drain for a minute or two: wait up to
+  # MIN_AVAIL_WAIT_S for both Sparks before refusing.
   if (( MIN_AVAIL_GIB > 0 )); then
     await_memory || true
     here_gb=$HERE_GB
     if awk -v a="$here_gb" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a < m)}'; then
       shm=$(du -sm /dev/shm 2>/dev/null | cut -f1); shm=${shm:-0}
-      die "only $here_gb GiB memory available here, $MIN_AVAIL_GIB GiB needed (the weights plus the engine's reserve): free memory first${shm:+ (/dev/shm holds $shm MiB)}; MIN_AVAIL_GIB=0 skips this check, and a rank that takes all the memory freezes the Spark"
+      die "only $here_gb GiB memory available here (MemAvailable plus the pages parked on the per-CPU lists), $MIN_AVAIL_GIB GiB needed (the weights plus the engine's reserve): free memory first${shm:+ (/dev/shm holds $shm MiB)}; MIN_AVAIL_GIB=0 skips this check, and a rank that takes all the memory freezes the Spark"
     fi
     g=$WORKER_GB
     awk -v a="$g" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a < m)}' &&
@@ -250,34 +284,18 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 [[ "$TOKEN_ROUTE" != 1 ]] || ENGINE_ENV+=("TENSORFOLD_TOKEN_ROUTE=1")
 [[ -z "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=$TF_DS_API_EFFORTS")
 # API_GATEWAY=1: the effort names must render the API table (minimal 50, low 50, medium 75, high 75,
-# xhigh 75, max 100); the engine's own table (25/50/62/75/88/100) is the native one. 0011 carries both.
+# xhigh 75, max 100); the engine's own table (25/50/62/75/88/100) is the native one. 0030 carries both.
 [[ "$API_GATEWAY" != 1 || -n "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=1")
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
-DISK_MOUNT=""   # zig/patches/0009: the disk cache's directory, the same path in both containers
-if [[ "$DISK_CACHE" == 1 ]]; then
-  ENGINE_ENV+=("TF_DS_DISK_CACHE=1" "TF_DS_DISK_CACHE_DIR=$DISK_CACHE_DIR" "TF_DS_DISK_CACHE_GIB=$DISK_CACHE_GIB"
-               "TF_DS_DISK_CACHE_MIN_FREE_GIB=$DISK_CACHE_MIN_FREE_GIB" "TF_DS_DISK_CACHE_MIN_TOKENS=$DISK_CACHE_MIN_TOKENS"
-               "TF_DS_DISK_CACHE_MEM_FLOOR_GIB=$DISK_CACHE_MEM_FLOOR_GIB" "TF_DS_DISK_CACHE_TTL_H=$DISK_CACHE_TTL_H"
-               "TF_DS_DISK_CACHE_FLUSH_S=$DISK_CACHE_FLUSH_S")
-  DISK_MOUNT="-v $DISK_CACHE_DIR:$DISK_CACHE_DIR"
-  # each Spark: the directory (0700), writable, and the disk's free space against DISK_CACHE_MIN_FREE_GIB
-  disk_prep='d=$1; min=$2; [ -n "$d" ] || exit 2; case "$d" in /*) ;; *) exit 2 ;; esac
-    mkdir -p -m 700 "$d" || exit 3; [ -d "$d" ] && [ ! -L "$d" ] || exit 3
-    touch "$d/.w" 2>/dev/null && rm -f -- "$d/.w" || exit 4
-    free=$(df -Pk "$d" | awk "NR==2 {print \$4}"); [ "$free" -ge $(awk -v g="$min" "BEGIN {printf \"%d\", g * 1048576}") ] || exit 5'
-  if (( ! DRY )); then
-    bash -c "$disk_prep" _ "$DISK_CACHE_DIR" "$DISK_CACHE_MIN_FREE_GIB" || die "DISK_CACHE_DIR $DISK_CACHE_DIR on this Spark: not a writable directory with $DISK_CACHE_MIN_FREE_GIB GiB free (code $?)"
-    worker 1 "bash -c $(printf %q "$disk_prep") _ $(printf %q "$DISK_CACHE_DIR") $(printf %q "$DISK_CACHE_MIN_FREE_GIB")" ||
-      die "DISK_CACHE_DIR $DISK_CACHE_DIR on $(worker_host 1): not a writable directory with $DISK_CACHE_MIN_FREE_GIB GiB free"
-    log "Disk cache: $DISK_CACHE_DIR on both Sparks (up to $DISK_CACHE_GIB GiB each, $DISK_CACHE_MIN_FREE_GIB GiB kept free; stop waits ${STOP_TIMEOUT}s)"
-  fi
-fi
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|API_EFFORTS|DISK_CACHE[A-Z0-9_]*)=' || true)
+ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
+ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|API_EFFORTS)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
-RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
-running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>/dev/null)" == true ]]; }
+RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
+# each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response
+[[ -z "$LOG_MAX_SIZE" ]] || RUN_ARGS+=" --log-driver json-file --log-opt max-size=$LOG_MAX_SIZE --log-opt max-file=$LOG_MAX_FILE"
 # A gateway started for this run is removed before a failure exits, so a later start does not inherit a broken one.
 gateway_remove_after_failure() {
   [[ "$API_GATEWAY" == 1 ]] || return 0
@@ -301,22 +319,23 @@ gateway_dump_logs() {
 GATEWAY_LISTEN="$HOST:$PORT"; [[ "$HOST" != *:* ]] || GATEWAY_LISTEN="[$HOST]:$PORT"
 GATEWAY_ARGS=(--listen "$GATEWAY_LISTEN" --engine "http://127.0.0.1:$ENGINE_PORT" --tokenizer /served/tokenizer.json
               --served-name "$SERVED_NAME" --image-token "$GATEWAY_IMAGE_TOKEN" --max-model-len "$CONTEXT"
-              --max-images "$GATEWAY_MAX_IMAGES" --max-image-mb "$GATEWAY_MAX_IMAGE_MB" --log "$GATEWAY_LOG")
+              --max-images "$GATEWAY_MAX_IMAGES" --max-image-mb "$GATEWAY_MAX_IMAGE_MB"
+              --max-concurrent "$GATEWAY_MAX_CONCURRENT" --log "$GATEWAY_LOG")
 if [[ "$THINKING" == 1 ]]; then GATEWAY_ARGS+=(--default-thinking); else GATEWAY_ARGS+=(--default-thinking=false); fi
 [[ -z "$REASONING_EFFORT" ]] || GATEWAY_ARGS+=(--default-effort "$REASONING_EFFORT")
 [[ "$GATEWAY_STRICT" != 1 ]] || GATEWAY_ARGS+=(--strict)
 if [[ "$GATEWAY_BLOCK_PRIVATE_URLS" == 1 ]]; then GATEWAY_ARGS+=(--block-private-urls); else GATEWAY_ARGS+=(--block-private-urls=false); fi
 if [[ "$GATEWAY_API_SAMPLING" == 1 ]]; then GATEWAY_ARGS+=(--api-sampling); else GATEWAY_ARGS+=(--api-sampling=false); fi
-[[ "$API_KEY" != 1 ]] || GATEWAY_ARGS+=(--require-key)
+[[ "$API_KEY" != 1 ]] || GATEWAY_ARGS+=(--require-key --api-key-file /run/secrets/key)
 GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
-             --restart on-failure:3 --read-only --tmpfs /tmp -v "$(readlink -f "$DATA_DIR/model/tokenizer.json"):/served/tokenizer.json:ro")
+             --restart on-failure:3 --read-only --tmpfs /tmp -v "$(readlink -f "$DATA_DIR/model"):/served:ro")
 if [[ "$API_KEY" == 1 ]]; then GATEWAY_RUN+=(-v "$API_KEY_FILE:/run/secrets/key:ro" -e API_KEY_FILE=/run/secrets/key); fi
 GATEWAY_RUN+=("$GATEWAY_IMAGE")
 DATA=/hf/$DATA_SUB
 KIT=/hf/$KIT_SUB/kit
 # rank 1 takes the round's settings as flags only (tf-dsv41-lanes reads no TF_DS_GRAPHS & co.): without them it runs
 # every round ungraphed, with no side stream, prefetch or AIO, and rank 0 waits on it each round. Its pool is rank 0's
-# context, and its streams rank 0's (TF_DS_STREAMS): with other values the two ranks wait on each other.
+# context (or POOL, which scripts/port.sh derives for KV_SHARD=1 when it is empty), and its streams rank 0's (TF_DS_STREAMS): with other values the two ranks wait on each other.
 FOLLOW="--pool ${POOL:-$CONTEXT} --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 [[ -z "$ROUND_ROWS" ]] || FOLLOW+=" --round-rows $ROUND_ROWS"
 # RANK1_PROFILE=1|2: rank 1's own profile (--profile; 2 adds prefill_phases_ms), AGGREGATED over the run and printed to its
@@ -329,9 +348,12 @@ if [[ "$API_KEY" == 1 ]]; then
   else api_key_ensure; AUTH=(-H "@$(api_header_file)"); fi
 fi
 step 3 "Launch: container $CONTAINER_NAME, rank 1 on the worker, then rank 0 here"
+# spill files a crashed run left as root go back to their directory's owner (scripts/port.sh; nothing with SPILL_GIB=0)
+(( DRY )) || port_spill_fix_both
 cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache 1 2 ${LINK_HEAD_ADDR[1]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
 [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[1]}"   # this node's RoCE devices
-remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro $DISK_MOUNT $(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}") $(rank_nccl_env 1) $IMAGE $cmd"
+spill1=$(port_spill_args 1)   # rank 1's spill directory (scripts/port.sh; empty, and no extra space, with it off)
+remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill1:+$spill1 }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}" ${PORT_RANK_SHA[1]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[1]}"} ${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"}) $(rank_nccl_env 1) $IMAGE $cmd"
 if (( DRY )); then printf '[dry-run] rank 1 on %s:\n  %s\n' "$(worker_host 1)" "$remote"
 else
   log "Rank 1 on $(worker_host 1): $cmd"
@@ -341,18 +363,22 @@ ENV0=(TF_TP_WORLD=2 "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_POR
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container)" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json"
       "TF_DS_GRAPHS=$GRAPHS" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
 if (( DRY )); then HEAD_HF=${HEAD_NFS_SERVER:+$HEAD_NFS_VOLUME}; HEAD_HF=${HEAD_HF:-$HF_CACHE}; else HEAD_HF=$(head_hf_mount); fi
-here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro" $DISK_MOUNT)
+here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro")
+read -ra port0 <<<"$(port_spill_args 0)"; here+=(${port0[@]+"${port0[@]}"})   # rank 0's spill directory (scripts/port.sh)
 if [[ -n "$HEAD_ENGRAM_DIR" ]]; then
   here+=(-v "$HEAD_ENGRAM_DIR:/engram:ro")
 fi
 [[ "$RDMA" == 0 ]] || ENV0+=("TF_RDMA_DEVICES=${NODE_HCAS[0]}")
+[[ -z "${PORT_RANK_SHA[0]:-}" ]] || ENV0+=("TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[0]}")   # this rank's own weight file's
 if [[ "$API_KEY" == 1 ]]; then here+=(-v "$API_KEY_FILE:$API_KEY_IN_CONTAINER:ro"); fi
 for x in "${ENV0[@]}" "${ENGINE_ENV[@]}"; do here+=(-e "$x"); done
 rank_nccl_args 0
 here+=("${NCCL_ARGS[@]}" "$IMAGE" "${SERVE[@]}")
 if (( DRY )); then
   printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"
-  if [[ "$API_GATEWAY" == 1 ]]; then printf '[dry-run] gateway:\n  %s\n' "$(printf '%q ' "${GATEWAY_RUN[@]}" "${GATEWAY_ARGS[@]}")"; fi
+  if [[ "$API_GATEWAY" == 1 ]]; then
+    printf '[dry-run] gateway:\n  %s\n' "$(printf '%q ' "${GATEWAY_RUN[@]}" "${GATEWAY_ARGS[@]}")"
+  fi
   exit 0
 fi
 log "Rank 0 here: ${SERVE[*]}"
@@ -360,24 +386,20 @@ log "Rank 0 here: ${SERVE[*]}"
 [[ "${FOREGROUND:-0}" != 1 ]] || foreground
 
 # ---------------------------------------------------------------- 4. load
+API_URL=$URL
+if [[ "$API_GATEWAY" == 1 ]]; then URL="http://$API_HOST:$ENGINE_PORT"; fi
 step 4 "Loading: ~98 GiB of weights on each Spark, then Engram and the caches (a few minutes)"
 docker logs -f "$CONTAINER_NAME" 2>&1 | sed -u "s/^/  ${D}│${R} /" &
 LOGS_PID=$!
-# The EXIT trap stops the log follower. It also removes a gateway started by this run when the start was interrupted
-# (INT/TERM) before it finished, so a later start does not inherit a half-started one.
-GATEWAY_STARTED=0
-STARTUP_DONE=0
-trap 'kill $LOGS_PID 2>/dev/null || true; [[ "$GATEWAY_STARTED" == 1 && "$STARTUP_DONE" != 1 ]] && docker rm -f ds41-gateway >/dev/null 2>&1 || true' EXIT
+trap 'kill $LOGS_PID 2>/dev/null || true; gateway_remove_after_failure' EXIT
 fail() {
   kill $LOGS_PID 2>/dev/null || true
-  gateway_dump_logs
-  gateway_remove_after_failure
   printf '%s── rank 1 (%s): last log lines ──%s\n' "$D" "$(worker_host 1)" "$R"; worker 1 docker logs --tail 15 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
+  gateway_dump_logs
   die "$1"
 }
-WAIT_URL=$URL; [[ "$API_GATEWAY" != 1 ]] || WAIT_URL="http://127.0.0.1:$ENGINE_PORT"
 start=$SECONDS
-until curl -sf --max-time 5 "${AUTH[@]}" "$WAIT_URL/v1/models" >/dev/null 2>&1; do
+until curl -sf --max-time 5 "${AUTH[@]}" "$URL/v1/models" >/dev/null 2>&1; do
   running_here || fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
   running_worker 1 || fail "rank 1 on $(worker_host 1) exited before the server was ready"
   (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running"
@@ -386,51 +408,37 @@ done
 kill $LOGS_PID 2>/dev/null || true
 log "Server answered after $((SECONDS - start))s"
 
-# ---------------------------------------------------------------- 4b. gateway
 if [[ "$API_GATEWAY" == 1 ]]; then
+  log "Starting ds41-gateway on $HOST:$PORT (engine on 127.0.0.1:$ENGINE_PORT)"
   docker rm -f ds41-gateway >/dev/null 2>&1 || true
-  log "Gateway: $GATEWAY_IMAGE on $HOST:$PORT (engine http://127.0.0.1:$ENGINE_PORT)"
-  if ! "${GATEWAY_RUN[@]}" "${GATEWAY_ARGS[@]}" >/dev/null; then
-    gateway_remove_after_failure
-    die "could not start ds41-gateway"
-  fi
-  GATEWAY_STARTED=1
-  gstart=$SECONDS
-  until curl -sf --max-time 5 "$URL/health" >/dev/null 2>&1; do
-    if ! running_gateway; then
-      saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || true
-      docker logs --tail 15 ds41-gateway 2>&1 | sed 's/^/  │ /'
-      gateway_remove_after_failure
-      die "ds41-gateway exited before /health answered${saved:+; its log: $saved}"
-    fi
-    if (( SECONDS - gstart >= 60 )); then
-      saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || true
-      docker logs --tail 15 ds41-gateway 2>&1 | sed 's/^/  │ /'
-      gateway_remove_after_failure
-      die "ds41-gateway did not answer /health within 60s${saved:+; its log: $saved}"
-    fi
-    sleep 1
+  "${GATEWAY_RUN[@]}" "${GATEWAY_ARGS[@]}" >/dev/null || fail "could not start ds41-gateway"
+  for _ in $(seq 1 24); do
+    curl -sf --max-time 3 "$API_URL/health" >/dev/null 2>&1 && break
+    if ! running_gateway; then gateway_dump_logs; gateway_remove_after_failure; fail "ds41-gateway exited during startup"; fi
+    sleep 2
   done
-  log "Gateway answered /health after $((SECONDS - gstart))s"
+  curl -sf --max-time 5 "$API_URL/health" >/dev/null 2>&1 || { gateway_dump_logs; fail "ds41-gateway did not become healthy"; }
+  log "Gateway answered on $API_URL"
 fi
 
 # ---------------------------------------------------------------- 5. smoke test
 step 5 "Smoke test: one chat completion through both ranks"
+if [[ "$API_GATEWAY" == 1 ]]; then
+  if smoke=$(curl -s --max-time 300 "${AUTH[@]}" "$API_URL/v1/chat/completions" -H 'Content-Type: application/json' \
+               -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
+             python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
+    log "OK through the gateway: $smoke"
+  else
+    fail "the gateway smoke test failed (no reply text, or one character repeated); the ranks and gateway are still running"
+  fi
+fi
+# The engine's own API too: a gateway conversion bug must not be able to hide an engine problem. Here URL is the engine.
 if smoke=$(curl -s --max-time 300 "${AUTH[@]}" "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
              -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
            python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
-  log "OK: $smoke"
+  if [[ "$API_GATEWAY" == 1 ]]; then log "OK at the engine: $smoke"; else log "OK: $smoke"; fi
 else
   fail "the smoke test request failed (no reply text, or one character repeated); the ranks are still running"
-fi
-if [[ "$API_GATEWAY" == 1 ]]; then
-  if smoke=$(curl -s --max-time 300 "${AUTH[@]}" "http://127.0.0.1:$ENGINE_PORT/v1/chat/completions" -H 'Content-Type: application/json' \
-               -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
-             python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
-    log "OK (engine): $smoke"
-  else
-    fail "the engine's own smoke test on 127.0.0.1:$ENGINE_PORT failed; the ranks and the gateway are still running"
-  fi
 fi
 # Headroom: how far MemAvailable sits above memguard's floor once the weights, graphs and caches are loaded (issue #4). Nothing in
 # the engine holds MemAvailable above that floor while it runs: a long prompt's workspace comes out of this headroom, and memguard
@@ -445,14 +453,14 @@ if awk -v g="$MEMGUARD_GIB" 'BEGIN {exit !(g > 0)}'; then
       warn "only $v GiB available on ${pair%:*}, within 3 GiB of memguard's floor ($MEMGUARD_GIB GiB): a long prompt can take that and memguard then kills the rank. Free memory there (desktop, other containers: README, Memory and safety) before relying on this server"
   done
 fi
+trap 'kill $LOGS_PID 2>/dev/null || true; save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP" >/dev/null 2>&1 || true' EXIT
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
-STARTUP_DONE=1
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   $( [[ "$API_GATEWAY" == 1 ]] && echo "(gateway: DeepSeek API parity on; engine on 127.0.0.1:$ENGINE_PORT)" || echo "(model: $SERVED_NAME)" )
     Access   $( [[ "$API_KEY" == 1 ]] && echo "API key required: Authorization: Bearer \$(cat $API_KEY_FILE)" || echo "open: no key, anyone who reaches port $PORT can use it (API_KEY=1 requires one)")
-    Window   $CONTEXT tokens · $PARALLEL at once · EXL3 2.9 bpw · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images on
+    Window   $CONTEXT tokens · $PARALLEL at once · EXL3 2.9 bpw · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images on$(port_summary)
     Logs     docker logs -f $CONTAINER_NAME   (rank 1: ssh $(worker_host 1) docker logs -f $CONTAINER_NAME)
     Restart  ./start.sh restart
     Stop     ./stop.sh

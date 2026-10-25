@@ -26,6 +26,8 @@ while i < len(args):
         "--host", "--port", "--name", "--context", "--parallel", "--max-tokens", "--drafter", "--tp", "--rank",
         "--master", "--master-port", "--prompt-cache-gib", "--backend", "--temperature", "--top-p", "--top-k",
         "--min-p", "--reasoning-effort", "--alias", "--api-key", "--api-key-file", "--chat-template", "--device",
+        # the prompt cache's disk tier (scripts/port.sh)
+        "--spill-dir", "--spill-gib", "--spill-min-free-gib", "--spill-min-tokens", "--spill-quota",
     }
     if takes_value and not eq:
         value = args[i] if i < len(args) else ""

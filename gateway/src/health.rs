@@ -14,6 +14,7 @@ use crate::parity::Protocol;
 /// Assemble the full gateway router.
 pub fn router(state: AppState) -> Router {
     let api = api::router(state.clone());
+    let security_state = state.clone();
     let extra = Router::new()
         .route("/health", get(health))
         .route("/ds41/render/{protocol}", post(render))
@@ -22,7 +23,10 @@ pub fn router(state: AppState) -> Router {
         .fallback(any(crate::proxy::proxy_handler))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
-    api.merge(extra)
+    api.merge(extra).layer(axum::middleware::from_fn_with_state(
+        security_state,
+        crate::security::guard,
+    ))
 }
 
 async fn health(State(state): State<AppState>) -> Response {

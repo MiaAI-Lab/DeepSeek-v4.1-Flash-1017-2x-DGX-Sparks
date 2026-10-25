@@ -15,7 +15,7 @@ class RdmaSettingsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "scripts").mkdir()
-            for name in ("start.sh", "scripts/config.sh", "scripts/nodes.sh"):
+            for name in ("start.sh", "scripts/config.sh", "scripts/nodes.sh", "scripts/port.sh", "scripts/memavail.sh"):
                 shutil.copy2(ROOT / name, root / name)
             env = {"PATH": os.environ["PATH"], "HOME": folder, "ABLIT": "0", "IMAGE": "rdma-settings-test"}
             cases = [

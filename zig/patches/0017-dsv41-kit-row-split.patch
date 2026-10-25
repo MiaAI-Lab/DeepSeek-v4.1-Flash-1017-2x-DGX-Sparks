@@ -1,0 +1,2268 @@
+# dsv41 kit: 32-row rounds on the pinned kernel kit, the kit's variant tooling, and spill's plane staging kernel
+# (opt-in). With ROUND_ROWS above 16 a MoE gate the kit cannot run as one launch (asked of the kit's own lookup) now
+# runs as _rowmm_parts launches of at most 16 rows each, with variants a kit serving 16-row rounds has (tri_norm.zig,
+# tri.zig): the MissingTritonVariant that failed ROUND_ROWS=32 (an HTTP 500 at PARALLEL=8) is gone, kit abe07c7 still
+# pinned. Tooling under tools/dsv41-zig: kit/kit_variants.py audits a kit for a round-row bound and plans the missing
+# variants, kit/aot_extra.py compiles them (no GPU: triton.compile for sm_121), build_kit.sh gains EXTRA_ROWS,
+# BASE_KIT and --dry-run, verify_kit.sh gains --rows. tf-dsv41-port checks the GPU against the reference
+# (zig build test-dsv41-port on the host); --gate KIT compares the gate's per-row bytes across launch shapes.
+# dsv41_port.cu (pack, unpack or clear a spill point's blocks in one launch, behind spill_state.Packer's checks) is
+# opt-in at build time, -Dport_kernels, default off: the engine image neither compiles nor needs it.
+# No runtime switch: rounds of 16 rows or fewer, and gates the kit has, launch exactly as before.
+# Measured on the pair (engine 98370ef, before the rebase onto 0008): ROUND_ROWS=32 exact.py 31/31 identical to the
+# daily baseline; --gate 16 of 16 row counts equal; 32-row rounds neutral on throughput (+4.0 % decode, -0.5 % at 8
+# streams, 2 reps). By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/tools/dsv41-zig/build_kit.sh b/tools/dsv41-zig/build_kit.sh
+index 98ca80d56f31dea37526f5f9163ae92642e55e89..4256b830feca2d951dc5a5cc99d22162cc82fc86 100755
+--- a/tools/dsv41-zig/build_kit.sh
++++ b/tools/dsv41-zig/build_kit.sh
+@@ -1,5 +1,6 @@
+ #!/bin/bash
+-# build_kit.sh OUT: the dsv41 family's kernel kit (the folder TF_DS_KIT and tf-dsv41-lanes read) built from source.
++# build_kit.sh [--dry-run] OUT: the dsv41 family's kernel kit (the folder TF_DS_KIT and tf-dsv41-lanes read) built from
++# source, optionally with the Triton variants a wider round needs compiled in (step 6, below).
+ #
+ # Inputs, as environment variables:
+ #   IMAGE       the deepseek-v41-tp2 engine's container image (github.com/bertholomus/TensorFold, branch
+@@ -14,6 +15,17 @@
+ #               request shape you serve should be in one of them (a launch with no captured variant runs the
+ #               closest more general one, cuda/aot.zig)
+ #   MANIFEST    optional: a kit MANIFEST (sha256sum format) to check the result against
++# Optional, the extra variants (step 6; docs/port/kit.md). Unset, the kit is byte for byte what steps 1-5 make:
++#   EXTRA_ROWS  a round-row bound (17 .. 48, e.g. 32): every Triton variant rounds of 1..EXTRA_ROWS rows need that the
++#               kit lacks (kit/kit_variants.py plan: today _rowmm_parts RB 17..EXTRA_ROWS), compiled from the image's own
++#               kernel source with kit/aot_extra.py (Triton's compiler and ptxas, no GPU) and added to aot/
++#   EXTRA_HEADS64=1  also the 64-head attention variants of a single-launch owner decode (0118; not the planned path)
++#   EXTRA_GPU=1 pass --gpus all to step 6 (only if this image's Triton will not compile without a driver)
++#   BASE_KIT    a kit folder to start from instead of steps 1-5 (e.g. the published kit/ at the recipe's KIT_REF):
++#               copied to OUT, then step 6; needs only IMAGE and EXTRA_ROWS. Its MANIFEST is updated for the added
++#               files (the original kept as MANIFEST.base), so tools/verify_kit.sh checks the result.
++# --dry-run: prints the inputs, each step's command and (given a kit to plan from: BASE_KIT, or OUT holding a kit) the
++# variants step 6 would compile; runs no container and writes nothing.
+ # Steps (no GPU except the recordings): 1 the EXL3 extension cubins and 2 PyTorch's attention cubin, extracted with
+ # cuobjdump; 3 Engram's constants and the RoPE tables (zrec_fixtures.py, CPU); 4 the image routing bias
+ # (make_bias_vl.py); 5 the Triton kernel set packed from the recordings (triton_aot_manifest.py + aot_pack.py).
+@@ -21,11 +33,92 @@
+ # recordings. An extension rebuilt from source is not byte-identical (nvcc, build to build): its experts cubins
+ # then differ from the published ones in a few bytes (18 and 1,246 in our rebuild); the published kit stays the record.
+ set -eu
+-OUT=$(mkdir -p "$1" && cd "$1" && pwd)
++DRY=0
++if [ "${1:-}" = --dry-run ]; then DRY=1; shift; fi
++[ $# = 1 ] || { echo "usage: $0 [--dry-run] OUT" >&2; exit 2; }
+ T=$(cd "$(dirname "$0")" && pwd)            # tools/dsv41-zig
+ ROOT=$(cd "$T/../.." && pwd)
+-: "${IMAGE:?}" "${EXT_DIR:?}" "${MODEL:?}" "${ORIGINAL:?}" "${TOKEN_MAP:?}" "${RECORDINGS:?}"
++if [ $DRY = 1 ]; then
++  OUT=$1
++  echo "dry run: nothing is built, no container runs"
++  echo "OUT=$OUT IMAGE=${IMAGE:-<unset>} BASE_KIT=${BASE_KIT:-<unset>} EXTRA_ROWS=${EXTRA_ROWS:-<unset>} EXTRA_HEADS64=${EXTRA_HEADS64:-0}"
++  if [ -z "${BASE_KIT:-}" ]; then
++    echo "steps 1-5 (docker run ... \$IMAGE): EXL3 cubins from EXT_DIR=${EXT_DIR:-<unset>}; PyTorch's attention cubin;"
++    echo "  Engram constants and RoPE tables from MODEL=${MODEL:-<unset>} TOKEN_MAP=${TOKEN_MAP:-<unset>}; image bias from"
++    echo "  ORIGINAL=${ORIGINAL:-<unset>}; Triton set from RECORDINGS=${RECORDINGS:-<unset>}"
++  else
++    echo "steps 1-5 skipped: OUT starts as a copy of BASE_KIT"
++  fi
++  if [ -z "${EXTRA_ROWS:-}" ]; then echo "step 6 off (EXTRA_ROWS unset)"; exit 0; fi
++  SRC=${BASE_KIT:-$OUT}
++  if [ ! -f "$SRC/aot/aot.json" ]; then
++    echo "step 6: no kit at $SRC yet: the plan below is against the engine's recorded launches (kit_variants.py --kit"
++    echo "  fixtures: past 16 rows only, synthetic templates); the real step plans against the built kit"
++    SRC=fixtures
++  fi
++  echo "step 6: python3 $T/kit/kit_variants.py plan --kit $SRC --rows $EXTRA_ROWS${EXTRA_HEADS64:+ --heads64}, then in the image:"
++  echo "  python3 /tf/tools/dsv41-zig/kit/aot_extra.py /out spec.json   (adds to OUT/aot and OUT/MANIFEST)"
++  SPEC=$(mktemp); trap 'rm -f "$SPEC"' EXIT
++  h64=(); [ "${EXTRA_HEADS64:-0}" = 1 ] && h64=(--heads64)
++  python3 "$T/kit/kit_variants.py" plan --kit "$SRC" --rows "$EXTRA_ROWS" ${h64[@]+"${h64[@]}"} --out "$SPEC" >/dev/null
++  python3 - "$SPEC" <<'PY'
++import json, sys
++spec = json.load(open(sys.argv[1]))
++for v in spec["variants"]:
++    cs = " ".join(f"{n}={x}" for n, x in sorted(v["consts"].items()) if n in ("RB", "BN", "N", "H", "PDL", "POSTED", "WORLD"))
++    print(f"  would compile {v['fn']:<26} {v['why']:<22} {cs} ints {v['ints']}")
++print(f"  {len(spec['variants'])} variants")
++PY
++  exit 0
++fi
++: "${IMAGE:?}"
++if [ -n "${BASE_KIT:-}" ]; then
++  # never into the served kit: copying a folder onto itself (or into itself) corrupts it, and step 6 then rewrites
++  # its aot.json and MANIFEST in place. Checked on the resolved paths before OUT is created.
++  B=$(cd "$BASE_KIT" 2>/dev/null && pwd -P) || { echo "BASE_KIT: no folder $BASE_KIT" >&2; exit 2; }
++  O=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1")
++  case "$O/" in "$B"/*) echo "OUT ($O) is BASE_KIT or inside it ($B): pick a new folder" >&2; exit 2 ;; esac
++  case "$B/" in "$O"/*) echo "BASE_KIT ($B) is inside OUT ($O): pick a new folder" >&2; exit 2 ;; esac
++fi
++if [ -n "${EXTRA_ROWS:-}" ] && [ -z "${BASE_KIT:-}" ] && [ -z "${MANIFEST:-}" ]; then
++  echo "EXTRA_ROWS without BASE_KIT needs MANIFEST (the published kit's), so the kit ships one verify_kit.sh can check" >&2; exit 2
++fi
++OUT=$(mkdir -p "$1" && cd "$1" && pwd -P)
++if [ -n "${EXTRA_ROWS:-}" ] && ! { [ "$EXTRA_ROWS" -ge 1 ] && [ "$EXTRA_ROWS" -le 48 ]; } 2>/dev/null; then
++  echo "EXTRA_ROWS: 1 .. 48" >&2; exit 2
++fi
+ W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
++
++# step 6: the variants a round of up to EXTRA_ROWS rows needs that OUT's Triton set lacks, compiled into OUT/aot
++extra() {
++  echo "6/6 extra Triton variants for rounds of up to $EXTRA_ROWS rows"
++  local h64=(); [ "${EXTRA_HEADS64:-0}" = 1 ] && h64=(--heads64)
++  python3 "$T/kit/kit_variants.py" plan --kit "$OUT" --rows "$EXTRA_ROWS" ${h64[@]+"${h64[@]}"} --out "$W/spec.json"
++  local gpus=(); [ "${EXTRA_GPU:-0}" = 1 ] && gpus=(--gpus all)
++  docker run --rm --network none ${gpus[@]+"${gpus[@]}"} --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$W":/w -v "$OUT":/out \
++    -v "$ROOT":/tf:ro -w /w "$IMAGE" python3 /tf/tools/dsv41-zig/kit/aot_extra.py /out /w/spec.json
++  # the kit's own checker learns --rows: this verify_kit.sh and kit_variants.py replace the kit's, MANIFEST follows
++  mkdir -p "$OUT/tools"; cp "$T/kit/kit_variants.py" "$T/kit/verify_kit.sh" "$OUT/tools/"
++  python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import aot_extra
++aot_extra.update_manifest(Path(sys.argv[2]), ["tools/kit_variants.py", "tools/verify_kit.sh"])' "$T/kit" "$OUT"
++  # strict: every gate of up to EXTRA_ROWS rows as one launch, which is what step 6 is for; a miss fails the build
++  local audit rc=0
++  audit=$(python3 "$T/kit/kit_variants.py" audit --kit "$OUT" --rows "$EXTRA_ROWS") || rc=$?
++  printf '%s\n' "$audit" | grep -E '^MISSING' || true
++  printf '%s\n' "$audit" | tail -1
++  if [ $rc != 0 ]; then echo "step 6: the kit in $OUT still misses variants for rounds of up to $EXTRA_ROWS rows" >&2; exit 1; fi
++}
++
++if [ -n "${BASE_KIT:-}" ]; then
++  : "${EXTRA_ROWS:?BASE_KIT is for adding variants: set EXTRA_ROWS}"
++  [ -f "$BASE_KIT/aot/aot.json" ] || { echo "BASE_KIT: no aot/aot.json in $BASE_KIT" >&2; exit 2; }
++  echo "1-5/6 copying $BASE_KIT"
++  (cd "$BASE_KIT" && tar --exclude=.git -cf - .) | (cd "$OUT" && tar -xf -)
++  extra
++  echo "kit in $OUT"
++  exit 0
++fi
++: "${EXT_DIR:?}" "${MODEL:?}" "${ORIGINAL:?}" "${TOKEN_MAP:?}" "${RECORDINGS:?}"
+ run() { docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$W":/w -v "$OUT":/out \
+   -v "$EXT_DIR":/ext:ro -v "$MODEL":/model:ro -v "$TOKEN_MAP":/token_map.json:ro -v "$ROOT":/tf:ro -w /w "$IMAGE" "$@"; }
+ mkdir -p "$OUT/cubins" "$OUT/vision" "$OUT/aot"
+@@ -66,4 +159,8 @@ if [ -n "${MANIFEST:-}" ]; then
+   echo "checking against $MANIFEST"
+   (cd "$OUT" && grep -E '  (aot/|cubins/|engram.json|rope|vision/)' "$MANIFEST" | sha256sum -c --quiet) && echo "kit equals MANIFEST"
+ fi
++if [ -n "${EXTRA_ROWS:-}" ]; then
++  [ -n "${MANIFEST:-}" ] && cp "$MANIFEST" "$OUT/MANIFEST"   # step 6 updates it for the files it adds
++  extra
++fi
+ echo "kit in $OUT"
+diff --git a/tools/dsv41-zig/kit/aot_extra.py b/tools/dsv41-zig/kit/aot_extra.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..daa48e9b1b65a2f324bcfe519d835988a6e6beee
+--- /dev/null
++++ b/tools/dsv41-zig/kit/aot_extra.py
+@@ -0,0 +1,283 @@
++#!/usr/bin/env python3
++"""aot_extra.py KIT SPEC: compile the Triton variants a plan names (kit_variants.py plan) from the served engine's own
++kernel source and add them to KIT's aot/ (aot.json + cubins/), as aot_pack.py packs a recording's.
++
++UNTESTED: written without the engine image at hand; run it on a Spark inside the deepseek-v41-tp2 engine image (the
++same Triton and kernel source the kit was recorded with), e.g. through build_kit.sh's EXTRA step:
++
++  docker run --rm -v "$KIT":/kit -v "$TF":/tf:ro "$IMAGE" python3 /tf/tools/dsv41-zig/kit/aot_extra.py /kit SPEC
++
++It needs no GPU by design (triton.compile with an explicit GPUTarget only runs Triton's passes and its bundled ptxas);
++should this Triton insist on a driver anyway, add `--gpus all` (it still launches nothing).
++
++How a variant is made: the plan names a template, a variant of the same function already in the kit. Its runtime
++argument types and 16-byte assumptions are kept; the plan's constexprs replace the template's, and each `ints` value
++re-specializes that argument as Triton's JIT would (1: a constexpr; divisible by 16: tt.divisibility; else plain). The
++template's own launch options (num_warps, num_ctas, launch_pdl, num_stages) are recovered first by recompiling the
++template itself until its hash equals the recorded one (--no-check skips that, at the risk of a variant that differs
++from what the engine would have compiled). The hash is Triton's cache key, so a variant built here equals the
++engine's own JIT build of that specialization in this image, and aot.zig takes it by its constexprs exactly as a
++recorded one.
++
++  --dry-run   print what would be compiled (no Triton import)
++  --arch N    the SASS target (121: GB10)
++Exit 0: every variant added (or already present); 2: bad input; 3: a template does not reproduce.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import importlib
++import json
++import os
++import re
++import struct
++import sys
++from pathlib import Path
++
++
++def fail(code: int, msg: str):
++    print(f"aot_extra: {msg}", file=sys.stderr)
++    raise SystemExit(code)
++
++
++def value(v):
++    """A plan's constexpr as Python passes it: bool, int, or a float from its fp64 bits."""
++    if isinstance(v, dict) and "fp64_bits" in v:
++        return struct.unpack("<d", int(v["fp64_bits"], 16).to_bytes(8, "little"))[0]
++    if isinstance(v, dict) and "f32" in v:
++        return struct.unpack("<f", int(v["f32"]).to_bytes(4, "little"))[0]
++    return v
++
++
++def kit_const(v):
++    """aot_pack.py const(): ints and bools as integers, floats by their fp32 bits."""
++    if isinstance(v, bool):
++        return {"int": int(v)}
++    if isinstance(v, int):
++        return {"int": v}
++    if isinstance(v, float):
++        return {"f32": struct.unpack("<I", struct.pack("<f", v))[0]}
++    fail(2, f"constexpr {v!r} has no Zig form")
++
++
++def jit_functions() -> dict:
++    """Every Triton JITFunction of the engine's modules by function name (zrec_fixtures.jit_table's import walk)."""
++    from triton.runtime.jit import JITFunction
++
++    for base in ("tensorfold.families.deepseek_v41", "tensorfold.cuda"):
++        for p in list(importlib.import_module(base).__path__):
++            for dirpath, dirnames, filenames in os.walk(p):
++                dirnames[:] = sorted(d for d in dirnames if d != "__pycache__" and not d.startswith("."))
++                for fn in sorted(filenames):
++                    if fn.endswith(".py") and not fn.startswith("_"):
++                        name = base + "." + os.path.relpath(os.path.join(dirpath, fn), p)[:-3].replace(os.sep, ".")
++                        try:
++                            importlib.import_module(name)
++                        except Exception as e:  # a module the kit's kernels never came from may need a GPU to import
++                            print(f"aot_extra: skipped {name} ({e!r})", file=sys.stderr)
++    out: dict = {}
++    for mod in list(sys.modules.values()):
++        if getattr(mod, "__name__", "").startswith("tensorfold."):
++            for v in vars(mod).values():
++                if isinstance(v, JITFunction) and v not in out.setdefault(v.fn.__name__, []):
++                    out[v.fn.__name__].append(v)
++    return out
++
++
++def pick_fn(cands: list, tmpl: dict):
++    """The JITFunction whose arguments are exactly the template's runtime parameters plus its constexprs."""
++    want = {p["name"] for p in tmpl["params"]} | set(tmpl["consts"])
++    hits = [f for f in cands if set(f.arg_names) == want]
++    if len(hits) != 1:
++        fail(2, f"{tmpl['fn']}: {len(hits)} JIT functions take exactly the template's arguments")
++    return hits[0]
++
++
++def nospec_of(fn) -> set:
++    names = list(fn.arg_names)
++    return {names[i] if isinstance(i, int) else i for i in (fn.do_not_specialize or [])}
++
++
++def source(fn, tmpl: dict, consts: dict, ints: dict):
++    """The ASTSource of a specialization (the template's argument types and assumptions, these constexprs and ints),
++    with its signature, the arguments it assumes 16-divisible and its constexprs by name."""
++    from triton.compiler import ASTSource
++
++    params = {p["name"]: p for p in tmpl["params"]}
++    nospec = nospec_of(fn)
++    sig, cx, attrs, d16s = {}, {}, {}, set()
++    for i, n in enumerate(fn.arg_names):
++        if n in consts:
++            sig[n], cx[n] = "constexpr", value(consts[n])
++            continue
++        if n not in params:
++            fail(2, f"{tmpl['fn']}: argument {n} is neither a constexpr of the plan nor a template parameter")
++        p = params[n]
++        if n in ints and p["type"] == "i32" and ints[n] == 1 and n not in nospec:
++            sig[n], cx[n] = "constexpr", 1  # Triton folds an int argument of 1
++            continue
++        sig[n] = p["type"]
++        d16 = (n not in nospec and ints[n] % 16 == 0) if (n in ints and p["type"] == "i32") else p["div16"]
++        if d16:
++            attrs[(i,)] = [["tt.divisibility", 16]]
++            d16s.add(n)
++    return ASTSource(fn=fn, signature=sig, constexprs=cx, attrs=attrs), sig, d16s, cx
++
++
++def options_of(tmpl: dict, stages) -> dict:
++    from triton.backends.nvidia.compiler import CUDAOptions
++
++    fields = set(CUDAOptions.__dataclass_fields__)
++    o = {"num_warps": tmpl["num_warps"], "num_ctas": tmpl.get("num_ctas", 1)}
++    if "launch_pdl" in fields:
++        o["launch_pdl"] = bool(tmpl.get("pdl", False))
++    if stages is not None:
++        o["num_stages"] = stages
++    return o
++
++
++def compile_one(fn, tmpl: dict, consts: dict, ints: dict, opts: dict, arch: int):
++    """(compiled kernel, signature, 16-divisible arguments, constexprs)."""
++    import triton
++    from triton.backends.compiler import GPUTarget
++
++    src, sig, d16s, cx = source(fn, tmpl, consts, ints)
++    return triton.compile(src, target=GPUTarget("cuda", arch, 32), options=opts), sig, d16s, cx
++
++
++def template_consts(tmpl: dict) -> dict:
++    """The template's own constexprs typed as the engine passed them (bools and floats from the recorded fixtures)."""
++    sys.path.insert(0, str(Path(__file__).resolve().parent))
++    from kit_variants import typed_consts
++
++    raw = {n: (c["int"] if c.get("int") is not None else {"f32": c["f32"]}) for n, c in tmpl["consts"].items()}
++    return typed_consts(tmpl["fn"], raw)
++
++
++def reproduce(fn, tmpl: dict, arch: int, check: bool) -> dict:
++    """The launch options that rebuild the template's own hash (num_stages tried: Triton's default, then 1..4)."""
++    consts = template_consts(tmpl)
++    tried = []
++    for stages in (None, 1, 2, 3, 4):
++        opts = options_of(tmpl, stages)
++        ck = compile_one(fn, tmpl, consts, {}, opts, arch)[0]
++        if ck.hash == tmpl["hash"] or not check:
++            return opts
++        tried.append((stages, ck.hash[:12]))
++    fail(3, f"{tmpl['fn']}: no launch options rebuild template {tmpl['hash'][:12]} (num_stages, hash: {tried}); "
++            "this image's Triton or kernel source is not the kit's (or a constexpr's Python type differs): "
++            "record the variants instead (build_kit.sh RECORDINGS with TF_DS_ROUND_ROWS) or pass --no-check")
++
++
++def entry(fn, built) -> dict:
++    """aot_pack.py entry() of a compiled kernel."""
++    ck, sig, d16s, cx = built
++    md = ck.metadata._asdict() if hasattr(ck.metadata, "_asdict") else dict(vars(ck.metadata))
++    runtime = [n for n in fn.arg_names if sig[n] != "constexpr"]
++    m = re.search(r"\.entry\s+\S+\s*\((.*?)\)", ck.asm["ptx"], re.S)
++    nptx = len([x for x in m.group(1).split(",") if x.strip()]) if m else -1
++    if nptx != len(runtime) + 2:
++        fail(2, f"{fn.fn.__name__} {ck.hash}: PTX takes {nptx} parameters, not the {len(runtime)} runtime arguments + "
++                "global and profile scratch (aot_pack.py's ABI)")
++    if md.get("global_scratch_size", 0) or md.get("profile_scratch_size", 0):
++        fail(2, f"{fn.fn.__name__} {ck.hash}: needs scratch memory, which cuda/aot.zig refuses")
++    nospec = nospec_of(fn)
++    return {
++        "fn": fn.fn.__name__, "hash": ck.hash, "name": md["name"], "num_warps": md["num_warps"],
++        "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
++        "global_scratch": md.get("global_scratch_size", 0), "global_align": md.get("global_scratch_align", 1),
++        "profile_scratch": md.get("profile_scratch_size", 0), "pdl": bool(md.get("launch_pdl", False)),
++        "params": [{"name": n, "type": sig[n], "div16": n in d16s, "nospec": n in nospec} for n in runtime],
++        "consts": {n: kit_const(v) for n, v in cx.items()},
++    }
++
++
++def sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as fh:
++        for chunk in iter(lambda: fh.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def update_manifest(kit: Path, files: list[str]) -> None:
++    """MANIFEST (sha256sum format) with aot/aot.json's new sum and the added cubins; the original kept as MANIFEST.base.
++    A kit with no MANIFEST gets a fresh one over every file it holds, so its verify_kit.sh has something to check."""
++    mf = kit / "MANIFEST"
++    if not mf.exists():
++        files = sorted(str(f.relative_to(kit)) for f in kit.rglob("*")
++                       if f.is_file() and f.name not in ("MANIFEST", "MANIFEST.base") and ".git" not in f.parts)
++        mf.write_text("".join(f"{sha256_file(kit / f)}  {f}\n" for f in files))
++        return
++    base = kit / "MANIFEST.base"
++    if not base.exists():
++        base.write_text(mf.read_text())
++    lines = {}
++    for ln in mf.read_text().splitlines():
++        if ln.strip():
++            s, p = ln.split(None, 1)
++            lines[p.strip()] = s
++    for f in files:
++        lines[f] = sha256_file(kit / f)
++    mf.write_text("".join(f"{s}  {p}\n" for p, s in sorted(lines.items())))
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("kit", help="the kit folder (holding aot/aot.json)")
++    ap.add_argument("spec", help="kit_variants.py plan's output")
++    ap.add_argument("--arch", type=int, default=121)
++    ap.add_argument("--dry-run", action="store_true")
++    ap.add_argument("--no-check", action="store_true")
++    a = ap.parse_args()
++    kit = Path(a.kit)
++    aot = kit / "aot" / "aot.json"
++    meta = json.loads(aot.read_text())
++    by_hash = {k["hash"]: k for k in meta["kernels"]}
++    spec = json.loads(Path(a.spec).read_text())
++    if spec.get("pseudo_kit"):
++        fail(2, "this plan was made against the fixtures pseudo-kit (synthetic template hashes): plan against the kit itself")
++    todo = spec.get("variants", [])
++    for v in todo:
++        if v["template"] not in by_hash:
++            fail(2, f"{v['fn']}: template {v['template'][:12]} is not in {aot}")
++    if a.dry_run:
++        for v in todo:
++            cs = " ".join(f"{n}={value(x)}" for n, x in sorted(v["consts"].items()))
++            print(f"would compile {v['fn']} [{v.get('why', '')}] {cs} ints {v['ints']} from {v['template'][:12]}")
++        print(f"{len(todo)} variants; nothing compiled (--dry-run)")
++        return 0
++    fns = jit_functions()
++    opts_of: dict = {}
++    added, files = [], []
++    for v in todo:
++        tmpl = by_hash[v["template"]]
++        fn = pick_fn(fns.get(v["fn"], []), tmpl)
++        if tmpl["hash"] not in opts_of:
++            opts_of[tmpl["hash"]] = reproduce(fn, tmpl, a.arch, not a.no_check)
++        built = compile_one(fn, tmpl, v["consts"], v["ints"], opts_of[tmpl["hash"]], a.arch)
++        ck = built[0]
++        if ck.hash in by_hash:
++            print(f"have {v['fn']} {ck.hash[:12]} [{v.get('why', '')}]")
++            continue
++        e = entry(fn, built)
++        (kit / "aot" / "cubins").mkdir(parents=True, exist_ok=True)
++        (kit / "aot" / "cubins" / f"{ck.hash}.cubin").write_bytes(ck.asm["cubin"])
++        files.append(f"aot/cubins/{ck.hash}.cubin")
++        by_hash[ck.hash] = e
++        added.append(e)
++        print(f"added {v['fn']} {ck.hash[:12]} [{v.get('why', '')}]")
++    if added:
++        meta["kernels"] = sorted(by_hash.values(), key=lambda x: (x["fn"], x["hash"]))
++        meta["extra"] = sorted(set(meta.get("extra", [])) | {e["hash"] for e in added})
++        meta["extra_generator"] = "tools/dsv41-zig/kit/aot_extra.py"
++        aot.write_text(json.dumps(meta, indent=1) + "\n")
++        update_manifest(kit, files + ["aot/aot.json"])
++    print(json.dumps({"added": len(added), "planned": len(todo), "kit": str(kit)}))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/dsv41-zig/kit/kit_variants.py b/tools/dsv41-zig/kit/kit_variants.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdc81a1a51f55fa4d8f1452f150b0c0d809308d1
+--- /dev/null
++++ b/tools/dsv41-zig/kit/kit_variants.py
+@@ -0,0 +1,528 @@
++#!/usr/bin/env python3
++"""kit_variants.py: which captured Triton variants a dsv41 kit has, which a round-row bound needs, and the plan of the
++missing ones (standard library only; runs anywhere, no GPU, no Triton).
++
++  kit_variants.py list   --kit KIT [--fn NAME]              variants by function (constexprs, runtime specialization)
++  kit_variants.py audit  --kit KIT --rows N [--json]        every launch a round of 1..N rows makes whose variant
++                         [--engine-split]                   depends on its rows, resolved as cuda/aot.zig resolves it;
++                                                            exit 1 when one has no variant (MissingTritonVariant).
++                                                            --engine-split: as the engine serves it, a _rowmm_parts
++                                                            gate past 16 rows with no variant is covered ('split')
++                                                            when its 16-row pieces and leftover all resolve
++                                                            (tri_norm.rowmmPartsPiece); without it, strict: every
++                                                            gate as one launch (what plan builds)
++  kit_variants.py plan   --kit KIT --rows N [--out SPEC]    the missing variants as aot_extra.py's spec (dry run: print)
++                         [--heads64]                        ... plus a single-launch 64-head owner decode's variants
++  kit_variants.py selftest                                  the audit on a pseudo-kit made of the recorded launches
++
++KIT is a kit folder (its aot/aot.json), an aot.json, or `fixtures`: the engine's recorded launches
++(zig/src/families/dsv41/fixtures/launches.json) as a pseudo-kit, each launch a variant of exactly its specialization,
++for planning without a kit at hand (a real kit can only resolve more launches, by fallback, never fewer exactly). The launches modelled are the engine's own wrappers (Zig):
++tri_norm.rowmmGate (_rowmm_parts: RB = rows, BN by rpTile), tri_hc.mixPart (_hc_mix_part: RB = hcRb(rows), the
++`rows` argument) and tri_attn.sparseAttn's merges (_sparse_attn_merge_rot2 / _rot: the `rows` argument). Every other
++Triton launch of a round depends on its rows only through its grid, which needs no variant (docs/port/kit.md has the
++audit behind that). The draft's MoE gate (N = draft experts) runs only up to 16 rows whatever the round bound
++(draft.zig moe: tri.decode_rows is 16 outside round.forward), so its families are checked to 16.
++
++Matching follows zig/src/cuda/aot.zig exactly: the same constexprs, then the variant compiled for this specialization
++(an int is 1, divisible by 16, or neither; a pointer 16-aligned or not), else the fitting one that assumes less.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import sys
++from pathlib import Path
++
++ROUND_BOUND = 16           # the qualified round-row bound (TF_DS_ROUND_ROWS unset): families in use at 16 rows
++DRAFT_BOUND = 16           # the draft passes' row-invariant bound (tri.decode_rows outside round.forward)
++EXPERTS = 384              # config.experts: the round's MoE gate N
++HIDDEN = 5120
++FIXTURES = Path(__file__).resolve().parents[3] / "zig/src/families/dsv41/fixtures/launches.json"
++
++
++# -- the engine's row-dependent launch rules (mirrors of the Zig wrappers) ---------------------------------------------
++
++def rp_tile_bn(rows: int) -> int:
++    """tri_norm.rpTile(rows).bn."""
++    return 16 if rows <= 6 else 8
++
++
++HC_RB = [1, 2, 3, 2, 3, 2, 4, 4]
++
++
++def hc_rb(rows: int) -> int:
++    """tri_hc.hcRb(rows)."""
++    if 1 <= rows <= len(HC_RB):
++        return HC_RB[rows - 1]
++    return 4 if rows <= 12 else 8
++
++
++# fn -> (constexprs a row count sets, the int arguments it sets, keys that are not part of a family, round-bound filter)
++RULES = {
++    "_rowmm_parts": {
++        "consts": lambda r: {"RB": r, "BN": rp_tile_bn(r)},
++        "ints": lambda r: {"rows": r},
++        "row_keys": {"RB", "BN", "rows"},
++        # the round's gate (N = experts) follows the round bound; the draft's (any other N) stops at DRAFT_BOUND
++        "bound": lambda fam, rows: rows if fam.get("N") == EXPERTS else min(rows, DRAFT_BOUND),
++    },
++    "_hc_mix_part": {
++        "consts": lambda r: {"RB": hc_rb(r)},
++        "ints": lambda r: {"rows": r},
++        "row_keys": {"RB", "rows"},
++        "bound": lambda fam, rows: rows,
++    },
++    "_sparse_attn_merge_rot2": {
++        "consts": lambda r: {},
++        "ints": lambda r: {"rows": r},
++        "row_keys": {"rows"},
++        "bound": lambda fam, rows: rows,
++    },
++    "_sparse_attn_merge_rot": {
++        "consts": lambda r: {},
++        "ints": lambda r: {"rows": r},
++        "row_keys": {"rows"},
++        "bound": lambda fam, rows: rows,
++    },
++}
++
++# a single-launch owner decode (0118 stage 4, not the recommended path): these functions at H = 64
++HEADS64 = ("_sparse_attn_part", "_sparse_attn_merge_rot2", "_sparse_attn_merge")
++
++
++# -- kits and variants -------------------------------------------------------------------------------------------------
++
++def load_kit(path: str) -> list[dict]:
++    if path == "fixtures":  # the engine's recorded launches as a pseudo-kit (no kit at hand: a dry run's plan)
++        return pseudo_kit()
++    p = Path(path)
++    if p.is_dir():
++        p = p / "aot" / "aot.json" if (p / "aot" / "aot.json").exists() else p / "aot.json"
++    return json.loads(p.read_text())["kernels"]
++
++
++def cval(c: dict):
++    """An aot.json constexpr as compared: ints (bools as 0/1), floats by their fp32 bits."""
++    return ("f32", c["f32"]) if c.get("f32") is not None else ("int", c.get("int"))
++
++
++def spec_class(x: int, nospec: bool) -> str:
++    """How Triton specializes an int argument: 'one' (folded to a constexpr), 'd16' or 'any'."""
++    if nospec:
++        return "any"
++    if x == 1:
++        return "one"
++    return "d16" if x % 16 == 0 else "any"
++
++
++class Launch:
++    """A launch as aot.zig sees it: constexprs (name -> cval) and runtime args (name -> ('ptr', type, aligned) |
++    ('i32', value) | ('fp32',))."""
++
++    def __init__(self, fn: str, consts: dict, args: dict):
++        self.fn, self.consts, self.args = fn, consts, args
++
++    def key(self):
++        return (self.fn, tuple(sorted(self.consts.items())), tuple(sorted((k, self._cls(k)) for k in self.args)))
++
++    def _cls(self, name):
++        a = self.args[name]
++        if a[0] == "i32":
++            return ("i32", "one" if a[1] == 1 else ("d16" if a[1] % 16 == 0 else "any"))
++        if a[0] == "ptr":
++            return ("ptr", a[1], a[2])
++        return a
++
++
++def matches(k: dict, ln: Launch) -> bool:
++    """aot.zig matches()."""
++    kc = k["consts"]
++    for n, v in ln.consts.items():
++        if n not in kc or cval(kc[n]) != v:
++            return False
++    params = {p["name"]: p for p in k["params"]}
++    runtime = 0
++    for n, a in ln.args.items():
++        p = params.get(n)
++        if a[0] == "i32":
++            if p is None:
++                if a[1] != 1 or n not in kc or cval(kc[n]) != ("int", 1):
++                    return False
++                continue
++            if p["type"] != "i32" or (not p["nospec"] and a[1] == 1):
++                return False
++            if p["div16"] != (not p["nospec"] and a[1] % 16 == 0):
++                return False
++        elif a[0] == "ptr":
++            if p is None or p["type"] != a[1] or p["div16"] != a[2]:
++                return False
++        else:
++            if p is None or p["type"] != "fp32":
++                return False
++        runtime += 1
++    return runtime == len(k["params"])
++
++
++def fits(k: dict, ln: Launch) -> int | None:
++    """aot.zig fits(): how many of the launch's specializations a narrower-or-equal variant shares, or None."""
++    kc = k["consts"]
++    for n, v in ln.consts.items():
++        if n not in kc or cval(kc[n]) != v:
++            return None
++    params = {p["name"]: p for p in k["params"]}
++    held = runtime = 0
++    for n, a in ln.args.items():
++        p = params.get(n)
++        if a[0] == "i32":
++            if p is None:
++                if a[1] != 1 or n not in kc or cval(kc[n]) != ("int", 1):
++                    return None
++                held += 1
++                continue
++            if p["type"] != "i32":
++                return None
++            d16 = not p["nospec"] and a[1] != 1 and a[1] % 16 == 0
++            if p["div16"] and not d16:
++                return None
++            if p["div16"] == d16 and (p["nospec"] or a[1] != 1):
++                held += 1
++        elif a[0] == "ptr":
++            if p is None or p["type"] != a[1]:
++                return None
++            if p["div16"] and not a[2]:
++                return None
++            if p["div16"] == a[2]:
++                held += 1
++        else:
++            if p is None or p["type"] != "fp32":
++                return None
++            held += 1
++        runtime += 1
++    return held if runtime == len(k["params"]) else None
++
++
++def find(kit: list[dict], ln: Launch):
++    """aot.zig Set.find: (variant, 'exact' | 'fallback') or (None, 'missing')."""
++    for k in kit:
++        if k["fn"] == ln.fn and matches(k, ln):
++            return k, "exact"
++    best, held = None, -1
++    for k in kit:
++        if k["fn"] != ln.fn:
++            continue
++        h = fits(k, ln)
++        if h is not None and h > held:
++            best, held = k, h
++    return (best, "fallback") if best is not None else (None, "missing")
++
++
++def template_args(k: dict) -> dict:
++    """The runtime arguments of a launch like the one variant k was compiled for (ints by a representative value)."""
++    args = {}
++    for p in k["params"]:
++        if p["type"] == "i32":
++            args[p["name"]] = ("i32", 16 if p["div16"] else 3)
++        elif p["type"] == "fp32":
++            args[p["name"]] = ("fp32",)
++        else:
++            args[p["name"]] = ("ptr", p["type"], p["div16"])
++    for n, c in k["consts"].items():
++        # an int argument Triton folded because it was 1 (not a declared constexpr of the wrapper): `rows` here
++        if n in ("rows",) and cval(c) == ("int", 1):
++            args[n] = ("i32", 1)
++    return args
++
++
++def families(kit: list[dict], fn: str, row_keys: set) -> dict:
++    """fn's variants grouped by their constexprs other than the row-dependent ones."""
++    fams: dict = {}
++    for k in kit:
++        if k["fn"] != fn:
++            continue
++        fam = tuple(sorted((n, cval(c)) for n, c in k["consts"].items() if n not in row_keys))
++        fams.setdefault(fam, []).append(k)
++    return fams
++
++
++def launch_for(fn: str, rule: dict, fam: tuple, tmpl: dict, rows: int) -> Launch:
++    consts = dict(fam)
++    consts.update({n: ("int", v) for n, v in rule["consts"](rows).items()})
++    args = {n: a for n, a in template_args(tmpl).items() if n not in rule["ints"](rows)}
++    args.update({n: ("i32", v) for n, v in rule["ints"](rows).items()})
++    return Launch(fn, consts, args)
++
++
++SPLIT_PIECE = 16          # tri_norm.rowmm_parts_piece: the rows of each piece of a gate the kit cannot run in one launch
++
++
++def split_pieces(rows: int) -> list[int]:
++    """tri_norm.rowmmGate's pieces of a gate past SPLIT_PIECE rows: 16-row pieces, then the leftover."""
++    return [SPLIT_PIECE] * (rows // SPLIT_PIECE) + ([rows % SPLIT_PIECE] if rows % SPLIT_PIECE else [])
++
++
++def audit(kit: list[dict], rows: int, engine_split: bool = False) -> list[dict]:
++    """Every distinct row-dependent launch of rounds of 1..rows rows of each family in use at ROUND_BOUND rows; a launch
++    is listed once, at the fewest rows that make it (rows 32 specializes as 16 does, so a family's launch at 32 rows
++    is its 16-row one). engine_split: a _rowmm_parts launch past SPLIT_PIECE rows with no variant is 'split' when
++    every piece the engine would launch instead resolves (the pieces keep X's and S's alignment, as in the engine)."""
++    out, seen = [], set()
++    for fn, rule in RULES.items():
++        for fam, ks in sorted(families(kit, fn, rule["row_keys"]).items(), key=lambda kv: str(kv[0])):
++            # a template: prefer a variant whose `rows` is a runtime argument (not folded to 1)
++            tmpl = sorted(ks, key=lambda k: (any(p["name"] == "rows" for p in k["params"]) is False, k["hash"]))[0]
++            famd = dict((n, v[1]) for n, v in fam)
++            if find(kit, launch_for(fn, rule, fam, tmpl, min(ROUND_BOUND, rule["bound"](famd, ROUND_BOUND))))[1] == "missing":
++                continue  # a family the qualified 16-row config never launches at 16 rows (or a pinned shape)
++            for r in range(1, rule["bound"](famd, rows) + 1):
++                ln = launch_for(fn, rule, fam, tmpl, r)
++                if ln.key() in seen:
++                    continue
++                seen.add(ln.key())
++                k, how = find(kit, ln)
++                pieces = None
++                if engine_split and how == "missing" and fn == "_rowmm_parts" and r > SPLIT_PIECE:
++                    got = [find(kit, launch_for(fn, rule, fam, tmpl, pr))[0] for pr in split_pieces(r)]
++                    if all(g is not None for g in got):
++                        how, pieces = "split", "+".join(str(pr) for pr in split_pieces(r))
++                out.append({"fn": fn, "rows": r, "family": famd, "consts": {n: v[1] for n, v in ln.consts.items()},
++                            "ints": {n: a[1] for n, a in ln.args.items() if a[0] == "i32"},
++                            "how": how, "variant": k["hash"][:12] if k else pieces, "template": tmpl["hash"]})
++    return out
++
++
++def heads64(kit: list[dict]) -> list[dict]:
++    """A single-launch 64-head owner decode: every family of HEADS64 at H = 32, wanted again at H = 64."""
++    out, seen = [], set()
++    for fn in HEADS64:
++        for k in kit:
++            if k["fn"] != fn or cval(k["consts"].get("H", {"int": 0})) != ("int", 32):
++                continue
++            consts = {n: cval(c) for n, c in k["consts"].items()}
++            consts["H"] = ("int", 64)
++            ln = Launch(fn, consts, template_args(k))
++            if ln.key() in seen:
++                continue
++            seen.add(ln.key())
++            v, how = find(kit, ln)
++            out.append({"fn": fn, "rows": None, "family": {}, "consts": {n: x[1] for n, x in consts.items()},
++                        "ints": {n: a[1] for n, a in ln.args.items() if a[0] == "i32"}, "how": how,
++                        "variant": v["hash"][:12] if v else None, "template": k["hash"]})
++    return out
++
++
++# -- typed constexprs for the compiler (aot.json keeps bools as ints and floats as fp32 bits) --------------------------
++
++def typed_consts(fn: str, consts: dict) -> dict:
++    """The constexprs as Python passed them, from the recorded launches (fixtures/launches.json): a bool stays a bool,
++    a float keeps its fp64 bits. Unknown names stay ints."""
++    kinds: dict = {}
++    try:
++        fx = json.loads(FIXTURES.read_text()).get(fn, [])
++    except OSError:
++        fx = []
++    for e in fx:
++        for n, v in e["consts"].items():
++            if isinstance(v, bool):
++                kinds[n] = "bool"
++            elif isinstance(v, dict) and "fp64_bits" in v:
++                kinds.setdefault(n, ("float", v["fp64_bits"]))
++    out = {}
++    for n, v in consts.items():
++        k = kinds.get(n)
++        if k == "bool":
++            out[n] = bool(v)
++        elif isinstance(k, tuple):
++            out[n] = {"fp64_bits": k[1]}
++        else:
++            out[n] = v
++    return out
++
++
++def plan(kit: list[dict], rows: int, with_heads64: bool) -> dict:
++    need = [a for a in audit(kit, rows) if a["how"] == "missing"]
++    if with_heads64:
++        need += [a for a in heads64(kit) if a["how"] == "missing"]
++    variants = []
++    for a in need:
++        # the row-set ints only; every other argument keeps its template's specialization
++        rule = RULES.get(a["fn"])
++        ints = {n: v for n, v in a["ints"].items() if rule and n in rule["ints"](1)}
++        variants.append({"fn": a["fn"], "consts": typed_consts(a["fn"], a["consts"]), "ints": ints,
++                         "template": a["template"], "why": f"rows {a['rows']}" if a["rows"] else "64-head owner decode"})
++    return {"generator": "tools/dsv41-zig/kit/kit_variants.py", "rows": rows, "heads64": with_heads64,
++            "variants": variants}
++
++
++# -- the commands ------------------------------------------------------------------------------------------------------
++
++def cmd_list(a) -> int:
++    kit = load_kit(a.kit)
++    by: dict = {}
++    for k in kit:
++        by.setdefault(k["fn"], []).append(k)
++    for fn in sorted(by):
++        if a.fn and fn != a.fn:
++            continue
++        print(f"{fn}: {len(by[fn])} variants")
++        if a.fn:
++            for k in sorted(by[fn], key=lambda k: json.dumps(k["consts"], sort_keys=True)):
++                cs = " ".join(f"{n}={cval(c)[1]}" for n, c in sorted(k["consts"].items()))
++                ps = " ".join(f"{p['name']}:{p['type']}{'/16' if p['div16'] else ''}" for p in k["params"])
++                print(f"  {k['hash'][:12]} w{k['num_warps']} {cs} | {ps}")
++    return 0
++
++
++def beyond_published(a, res: list[dict]) -> list[dict]:
++    """With the fixtures pseudo-kit, only the launches past the qualified bound: the fixtures record a sample of the
++    launches, while the published kit serves every round of 1..16 rows (the deployed config), so a pseudo-kit miss at
++    16 rows or fewer is a sampling gap, not a kit gap."""
++    if a.kit != "fixtures":
++        return res
++    return [r for r in res if r["rows"] is None or r["rows"] > ROUND_BOUND]
++
++
++def cmd_audit(a) -> int:
++    kit = load_kit(a.kit)
++    res = beyond_published(a, audit(kit, a.rows, a.engine_split))
++    miss = [r for r in res if r["how"] == "missing"]
++    split = [r for r in res if r["how"] == "split"]
++    if a.json:
++        print(json.dumps({"rows": a.rows, "engine_split": a.engine_split, "launches": res, "missing": len(miss),
++                          "split": len(split)}, indent=1))
++    else:
++        for r in res:
++            fam = " ".join(f"{n}={v}" for n, v in sorted(r["family"].items()))
++            mark = {"exact": "ok      ", "fallback": "fallback", "missing": "MISSING ", "split": "split   "}[r["how"]]
++            print(f"{mark} {r['fn']:<26} rows {r['rows']:>2}  {fam}  -> {r['variant'] or '-'}")
++        how = f", {len(split)} served by the engine's 16-row split" if a.engine_split else " (strict: one launch a gate)"
++        print(f"{len(res)} distinct row-dependent launches for rounds of 1..{a.rows} rows; {len(miss)} missing{how}")
++    return 1 if miss else 0
++
++
++def cmd_plan(a) -> int:
++    spec = plan(load_kit(a.kit), a.rows, a.heads64)
++    if a.kit == "fixtures":  # a dry run's table: its templates are synthetic, aot_extra.py refuses it
++        spec["pseudo_kit"] = True
++        spec["variants"] = [v for v in spec["variants"] if not v["why"].startswith("rows ") or int(v["why"][5:]) > ROUND_BOUND]
++    text = json.dumps(spec, indent=1) + "\n"
++    if a.out:
++        Path(a.out).write_text(text)
++        print(f"{len(spec['variants'])} variants to build -> {a.out}")
++    else:
++        sys.stdout.write(text)
++    return 0
++
++
++def pseudo_kit() -> list[dict]:
++    """The recorded launches (fixtures/launches.json) as aot.json variants: each distinct launch a variant compiled
++    for exactly its specialization (no do_not_specialize known)."""
++    ty = {"bfloat16": "*bf16", "float32": "*fp32", "float16": "*fp16", "int64": "*i64", "int32": "*i32",
++          "uint8": "*u8", "bool": "*u8"}
++    out, seen = [], set()
++    for fn, launches in json.loads(FIXTURES.read_text()).items():
++        for e in launches:
++            params = []
++            for n, t in e["tensors"].items():
++                params.append({"name": n, "type": ty[t[0]], "div16": bool(t[3]), "nospec": False})
++            for n, v in e.get("scalars", {}).items():
++                if isinstance(v, dict):
++                    params.append({"name": n, "type": "fp32", "div16": False, "nospec": False})
++                else:
++                    params.append({"name": n, "type": "i32", "div16": v % 16 == 0, "nospec": False})
++            consts = {}
++            for n, v in e["consts"].items():
++                if isinstance(v, dict):
++                    consts[n] = {"f32": int(v["fp32_bits"], 16)}
++                else:
++                    consts[n] = {"int": int(v)}
++            h = json.dumps([fn, consts, params], sort_keys=True)
++            if h in seen:
++                continue
++            seen.add(h)
++            out.append({"fn": fn, "hash": hashlib.sha256(h.encode()).hexdigest()[:32], "num_warps": e.get("num_warps", 4),
++                        "params": params, "consts": consts})
++    return out
++
++
++def cmd_selftest(_a) -> int:
++    kit = pseudo_kit()
++    ok = True
++
++    def check(what, cond):
++        nonlocal ok
++        print(("ok   " if cond else "FAIL ") + what)
++        ok = ok and cond
++
++    r16 = audit(kit, 16)
++    r32 = audit(kit, 32)
++    rb32 = sorted(a["consts"]["RB"] for a in r32 if a["fn"] == "_rowmm_parts" and a["how"] == "missing"
++                  and a["family"].get("N") == EXPERTS)
++    check("_rowmm_parts N=384 RB 17..32 missing at 32 rows", set(range(17, 33)) <= set(rb32))
++    check("no draft (N=128) family checked past 16 rows",
++          all(a["rows"] <= 16 for a in r32 if a["fn"] == "_rowmm_parts" and a["family"].get("N") != EXPERTS))
++    check("_rowmm_parts RB=16 resolves exactly", any(a["fn"] == "_rowmm_parts" and a["rows"] == 16 and a["how"] == "exact"
++                                                     for a in r16))
++    check("_hc_mix_part needs no launch shape past 16 rows (RB 8 from 13 rows; rows 32 specializes as 16 does)",
++          not any(a["fn"] == "_hc_mix_part" and a["rows"] > 16 for a in r32))
++    check("_sparse_attn_merge_rot2 needs no launch shape past 16 rows",
++          not any(a["fn"] == "_sparse_attn_merge_rot2" and a["rows"] > 16 for a in r32))
++    pl = plan(kit, 32, False)
++    check("the plan builds RB 17..32 of _rowmm_parts",
++          {v["consts"]["RB"] for v in pl["variants"] if v["fn"] == "_rowmm_parts" and v["consts"]["N"] == EXPERTS}
++          >= set(range(17, 33)))
++    check("the plan types PDL as a bool (as Triton hashed it)",
++          all(v["consts"].get("PDL") is True for v in pl["variants"] if v["fn"] == "_rowmm_parts"))
++    rb = [v for v in pl["variants"] if v["fn"] == "_rowmm_parts" and v["consts"]["RB"] == 32]
++    check("RB=32 is planned with rows=32 (divisible by 16, as the launch is)", bool(rb) and rb[0]["ints"]["rows"] == 32)
++    s32 = [a for a in audit(kit, 32, engine_split=True) if a["fn"] == "_rowmm_parts" and a["family"].get("N") == EXPERTS
++           and a["rows"] == 32]
++    check("engine split: a 32-row gate on a kit without RB 32 is covered as 16+16", bool(s32) and s32[0]["how"] == "split"
++          and s32[0]["variant"] == "16+16")
++    check("split pieces: 33 rows are 16+16+1, 16 rows one piece", split_pieces(33) == [16, 16, 1] and split_pieces(16) == [16])
++    check("strict audit never reports a split", not any(a["how"] == "split" for a in r32))
++    h = heads64(kit)
++    check("heads64 lists the attention functions at H=64", {a["fn"] for a in h} >= {"_sparse_attn_part", "_sparse_attn_merge"}
++          and all(a["consts"]["H"] == 64 for a in h))
++    # matching edge cases straight from aot.zig: a d16 variant cannot run an odd launch; an 'any' one can run d16
++    k_any = {"fn": "f", "hash": "a" * 32, "params": [{"name": "n", "type": "i32", "div16": False, "nospec": False}], "consts": {}}
++    k_d16 = {"fn": "f", "hash": "b" * 32, "params": [{"name": "n", "type": "i32", "div16": True, "nospec": False}], "consts": {}}
++    check("aot.zig fallback: div16 variant refuses n=17", fits(k_d16, Launch("f", {}, {"n": ("i32", 17)})) is None)
++    check("aot.zig fallback: plain variant takes n=32", find([k_any], Launch("f", {}, {"n": ("i32", 32)}))[1] == "fallback")
++    check("aot.zig fallback: n=1 runs a plain variant", find([k_any, k_d16], Launch("f", {}, {"n": ("i32", 1)}))[1] == "fallback")
++    check("aot.zig: n=1 has no variant among div16 ones", find([k_d16], Launch("f", {}, {"n": ("i32", 1)}))[1] == "missing")
++    print("selftest " + ("passed" if ok else "FAILED"))
++    return 0 if ok else 1
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    p = sub.add_parser("list")
++    p.add_argument("--kit", required=True)
++    p.add_argument("--fn")
++    p.set_defaults(run=cmd_list)
++    p = sub.add_parser("audit")
++    p.add_argument("--kit", required=True)
++    p.add_argument("--rows", type=int, default=ROUND_BOUND)
++    p.add_argument("--json", action="store_true")
++    p.add_argument("--engine-split", action="store_true")
++    p.set_defaults(run=cmd_audit)
++    p = sub.add_parser("plan")
++    p.add_argument("--kit", required=True)
++    p.add_argument("--rows", type=int, default=32)
++    p.add_argument("--heads64", action="store_true")
++    p.add_argument("--out")
++    p.set_defaults(run=cmd_plan)
++    p = sub.add_parser("selftest")
++    p.set_defaults(run=cmd_selftest)
++    a = ap.parse_args()
++    if getattr(a, "rows", 1) is not None and not 1 <= getattr(a, "rows", 1) <= 48:
++        ap.error("--rows: 1 .. 48 (round.max_rows)")
++    return a.run(a)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/dsv41-zig/kit/verify_kit.sh b/tools/dsv41-zig/kit/verify_kit.sh
+index a3118ee86469f633311c07d3fc6cfb37fd07f076..6c3b7b6797dad09337c4617a7b0561db82b5a0b6 100755
+--- a/tools/dsv41-zig/kit/verify_kit.sh
++++ b/tools/dsv41-zig/kit/verify_kit.sh
+@@ -1,5 +1,6 @@
+ #!/bin/bash
+-# verify_kit.sh [--rope EXL3_MODEL_DIR TP2_SRC] [--bias ORIGINAL_CHECKPOINT_DIR]: check this kit against MANIFEST.
++# verify_kit.sh [--rope EXL3_MODEL_DIR TP2_SRC] [--bias ORIGINAL_CHECKPOINT_DIR] [--rows N [--strict]]: check this kit against
++# MANIFEST, and (--rows) that its Triton set has a variant for every row-dependent launch of rounds of 1..N rows.
+ #
+ # Run from anywhere; it checks the kit folder it lives in (tools/..). Every file MANIFEST lists must be present with
+ # its sha256. Two kinds of file are generated rather than stored in git, and this script can make them first:
+@@ -9,15 +10,28 @@
+ #   --bias ORIGINAL_CHECKPOINT_DIR  vision/gate_bias_vl.safetensors, copied by tools/make_bias_vl.py from your own
+ #                                   copy of deepseek-ai/DeepSeek-V4.1-Flash (standard library only).
+ # The Hugging Face mirror of this kit ships both, so a download needs neither option.
+-# Exit 0: every file matches. Exit 1: a file is missing or differs (each one is printed).
++#   --rows N                        also audit aot/aot.json for rounds of up to N rows (TF_DS_ROUND_ROWS) with
++#                                   kit_variants.py (beside this script; standard library only), as cuda/aot.zig would
++#                                   resolve each launch; a launch with no variant is a MissingTritonVariant at serve time.
++#                                   As the engine serves it: a MoE gate past 16 rows with no single-launch variant
++#                                   counts as covered ('split') when its 16-row pieces and leftover all resolve
++#                                   (tri_norm.rowmmGate runs it that way).
++#   --strict                        with --rows: every gate as one launch (the kit build_kit.sh EXTRA_ROWS makes).
++# Exit 0: every file matches (and every audited launch has a variant). Exit 1: a file is missing or differs (each one
++# is printed), or a launch has no variant.
+ set -u
+ KIT=$(cd "$(dirname "$0")/.." && pwd)
++HERE=$(cd "$(dirname "$0")" && pwd)
+ cd "$KIT"
++ROWS=
++SPLIT=--engine-split
+ while [ $# -gt 0 ]; do
+   case "$1" in
++    --rows) ROWS=$2; shift 2 ;;
++    --strict) SPLIT=; shift ;;
+     --rope) PYTHONPATH="$3${PYTHONPATH:+:$PYTHONPATH}" python3 tools/make_rope.py "$2" "$KIT" || exit 1; shift 3 ;;
+     --bias) python3 tools/make_bias_vl.py "$2" "$KIT/vision/gate_bias_vl.safetensors" || exit 1; shift 2 ;;
+-    *) echo "usage: $0 [--rope EXL3_MODEL_DIR TP2_SRC] [--bias ORIGINAL_CHECKPOINT_DIR]"; exit 2 ;;
++    *) echo "usage: $0 [--rope EXL3_MODEL_DIR TP2_SRC] [--bias ORIGINAL_CHECKPOINT_DIR] [--rows N [--strict]]"; exit 2 ;;
+   esac
+ done
+ bad=0; n=0
+@@ -27,5 +41,15 @@ while read -r sum path; do
+   got=$(sha256sum "$path" | cut -d' ' -f1)
+   [ "$got" = "$sum" ] || { echo "DIFFERS  $path"; bad=$((bad + 1)); }
+ done < MANIFEST
+-if [ $bad = 0 ]; then echo "kit OK: $n files match MANIFEST"; exit 0; fi
+-echo "kit NOT OK: $bad of $n files missing or different"; exit 1
++if [ -n "$ROWS" ]; then
++  audit=$(python3 "$HERE/kit_variants.py" audit --kit "$KIT" --rows "$ROWS" $SPLIT); rc=$?
++  printf '%s\n' "$audit" | grep -E '^(MISSING|fallback|split)|launches'
++  if [ $rc != 0 ]; then echo "kit NOT OK: rounds of up to $ROWS rows would miss a Triton variant"; [ $bad = 0 ] && bad=-1; fi
++fi
++how=
++if [ -n "$ROWS" ]; then
++  how="; every launch of rounds up to $ROWS rows has a variant"
++  [ -n "$SPLIT" ] && how="$how (or is served by the engine 16-row split)"
++fi
++if [ $bad = 0 ]; then echo "kit OK: $n files match MANIFEST$how"; exit 0; fi
++[ $bad -lt 0 ] || echo "kit NOT OK: $bad of $n files missing or different"; exit 1
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 70f8426f65d298f2cff79a4b59ab0d4e4956885d..57f775050b8449d2c7aa09099abe5a9fae62b02b 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -3,7 +3,9 @@
+ const std = @import("std");
+ 
+ /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
+-const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
++/// opt_in: built and embedded only with -Dport_kernels (a kernel no served path calls yet, not yet through nvcc on a
++/// Spark): without it the fatbin step, -Dfatbins and the dist build neither compile nor need it, and its image is empty.
++const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false, opt_in: bool = false };
+ 
+ /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
+ const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
+@@ -31,6 +33,7 @@ const kernels = [_]Kernel{
+     .{ .name = "dsv41_torch", .flags = torch_ops }, // ours: DeepSeek-V4.1 torch arithmetic at torch's rounding points
+     .{ .name = "dsv41_shard", .flags = torch_ops }, // ours: TF_DS_KV_SHARD's fetch and select byte movers (GLM 0118 port)
+     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // ours: the decode gathers' RDMA kernel pair
++    .{ .name = "dsv41_port", .flags = torch_ops, .opt_in = true }, // ours: the GLM port's spill block staging (port_kernels.zig; fetch/select/union are dsv41_shard)
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+@@ -48,16 +51,22 @@ fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
+     return b.createModule(.{ .root_source_file = b.path("zig/src/core/stagger.zig"), .target = target, .optimize = optimize });
+ }
+ 
+-/// The runtime module for `target`; `with_kernels` false builds it host-only (empty images).
++/// The runtime module for `target`; `with_kernels` false builds it host-only (empty images). An opt-in kernel's image
++/// may be null (not built): `has_<name>` says whether it is embedded.
+ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, images: []const ?std.Build.LazyPath) *std.Build.Module {
+     const options = b.addOptions();
+     var with = images.len > 0;
+-    for (images) |i| with = with and i != null;
++    if (with) for (kernels, images) |k, i| {
++        if (!k.opt_in and i == null) with = false;
++    };
+     options.addOption(bool, "with_kernels", with);
++    for (kernels, 0..) |k, i| {
++        if (k.opt_in) options.addOption(bool, b.fmt("has_{s}", .{k.name}), with and images[i] != null);
++    }
+     const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     cuda.addOptions("kernel_options", options);
+     cuda.addImport("stagger", stagger(b, target, optimize));
+-    if (with) for (kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
++    if (with) for (kernels, images) |k, image| if (image) |file| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = file });
+     return cuda;
+ }
+ 
+@@ -79,6 +88,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const nvcc = b.option([]const u8, "nvcc", "nvcc (or a wrapper) that builds the CUDA kernel fatbins");
+     const prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files to embed");
+     const sms = b.option([]const u8, "sm", "SASS targets, comma separated (121; later 120,89)") orelse "121";
++    const port_kernels = b.option(bool, "port_kernels", "also build and embed the GLM port's opt-in kernels (dsv41_port.cu: tf-dsv41-port, spill v2's one-launch staging)") orelse false;
+     // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
+     const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
+         const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
+@@ -88,6 +98,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     var images: [kernels.len]?std.Build.LazyPath = @splat(null);
+     const fatbin_step = b.step("fatbins", "Build and install the CUDA kernel fatbins alone");
+     for (kernels, &images) |k, *image| {
++        if (k.opt_in and !port_kernels) continue;
+         if (prebuilt) |dir| {
+             image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
+         } else if (nvcc) |tool| {
+@@ -152,6 +163,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     ds_lanes.addImport("cuda", cuda);
+     ds_lanes.addImport("lanes", mods.lanes);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-lanes", .root_module = ds_lanes }));
++    // the GLM port's spill block staging kernel (dsv41_port.cu) against its CPU reference, one GPU
++    const ds_port = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/port_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    ds_port.addImport("cuda", cuda);
++    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-port", .root_module = ds_port }));
+     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.core, mods.tokenizer, build_options, true);
+ }
+ 
+@@ -213,6 +228,18 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
+     cli.addImport("lanes", mods.lanes);
+     cli.addImport("nemotron", mods.nemotron);
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
++    // port_kernels.zig's CPU references and launch geometry (the GLM port's kernels; their GPU check is tf-dsv41-port)
++    const port = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/port_kernels.zig"), .target = host, .optimize = .debug, .link_libc = true });
++    port.addImport("cuda", cuda);
++    const port_run = b.addRunArtifact(b.addTest(.{ .root_module = port }));
++    step.dependOn(&port_run.step);
++    // tri_norm.zig alone (no dsv41 module): the kit-driven _rowmm_parts split for rounds past 16 rows, every recorded launch
++    const norm = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/tri_norm.zig"), .target = host, .optimize = .debug, .link_libc = true });
++    norm.addImport("cuda", cuda);
++    const norm_run = b.addRunArtifact(b.addTest(.{ .root_module = norm }));
++    const port_step = b.step("test-dsv41-port", "The GLM port kernels' CPU references and launch geometry, and tri_norm's gate split (no GPU)");
++    port_step.dependOn(&port_run.step);
++    port_step.dependOn(&norm_run.step);
+ }
+ 
+ /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
+@@ -236,6 +263,7 @@ fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kerne
+ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, prebuilt: ?[]const u8) *std.Build.Step.Compile {
+     var images: [kernels.len]?std.Build.LazyPath = @splat(null);
+     if (prebuilt) |dir| for (kernels, &images) |k, *image| {
++        if (k.opt_in) continue; // no served path calls one
+         image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
+     };
+     const cuda = runtime(b, target, .fast, if (prebuilt != null) &images else &.{});
+@@ -246,6 +274,6 @@ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *s
+ /// Validate the complete named input set, including images unused by today's server.
+ pub fn checkDistFatbins(b: *std.Build, dir: []const u8) *std.Build.Step {
+     const check = b.addSystemCommand(&.{ "sh", "-c", "for file do [ -f \"$file\" ] && [ -s \"$file\" ] || { echo \"missing or empty CUDA fatbin: $file\" >&2; exit 1; }; done", "check-fatbins" });
+-    for (kernels) |k| check.addFileArg(b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) })));
++    for (kernels) |k| if (!k.opt_in) check.addFileArg(b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) })));
+     return &check.step;
+ }
+diff --git a/zig/kernels/cuda/dsv41_port.cu b/zig/kernels/cuda/dsv41_port.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..9564bbfd7e09f5736764e61f50c0831a79b63f11
+--- /dev/null
++++ b/zig/kernels/cuda/dsv41_port.cu
+@@ -0,0 +1,130 @@
++// Port of wojo's GLM 0110 (PR #124, spill v2: block pack/unpack through a bounded device pack buffer) and 0118 (PR
++// #152, a failed or carried destination's rows reset): the one byte mover those features need that no existing kernel
++// does. zig/src/families/dsv41/port_kernels.zig launches it.
++//
++// UNTESTED ON A GPU: written on a Mac without nvcc. zig/src/families/dsv41/port_main.zig (tf-dsv41-port) checks it
++// against port_kernels.zig's CPU reference on a Spark; run it before anything relies on this kernel.
++//
++// Built like dsv41_ops.cu (torch's flags: no half/bf16 operators, --fmad=false --ftz=false): it only moves bytes, so no
++// arithmetic flag changes a result. Raw device pointers (a mapped pinned host buffer works too: UVA), the caller's
++// stream, no allocation, no host sync; capturable in a CUDA graph (the plane set is passed by value).
++//
++// What already exists and is used instead (docs/port/kit.md has the full map):
++//   dsv41_shard.cu tf_ds_kv_fetch_kernel        the sparse fetch: picked compressed rows (codes + scales) by base + pick,
++//                                               the renumbered pick list, and owner decode's mask (shard_ops.fetch)
++//   dsv41_shard.cu tf_ds_select_rows_kernel     owner decode's return rows (shard_ops.select)
++//   dsv41_shard.cu tf_ds_union_*                the prompt fetch's union: mark, scan, compact, renumber
++//   torch_ops/movement.cu tf_gather_rows_kernel dst row i = src row idx[i] (ops.gatherRows)
++//   dsv41_ops.cu tf_ds_scatter_rows_kernel      dst row idx[r] = src row r (ops.scatterRows)
++//   dsv41_ops.cu tf_ds_copy_rows16_kernel       one strided 2-D copy (ops.copyRows)
++//   cuMemcpy*Async / cuMemsetD8Async            spill_state.Packer's per-plane copies (16 a block) and clears
++// The kernel below adds the one thing those lack: up to 32 planes x n blocks moved to or from one contiguous staging
++// buffer (or reset to their fill bytes) in a single launch, in spill_state's block layout.
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++// Copies n bytes from s to d with the widest unit all three allow (16, 8, 4 or 1 bytes), lanes `lane` of `lanes`.
++__device__ __forceinline__ void tf_ds_port_copy(uint8_t* d, const uint8_t* s, unsigned long long n,
++                                                unsigned long long lane, unsigned long long lanes) {
++    const unsigned long long a = (unsigned long long)(uintptr_t)d | (unsigned long long)(uintptr_t)s | n;
++    if ((a & 15) == 0) {
++        uint4* d4 = (uint4*)d;
++        const uint4* s4 = (const uint4*)s;
++        for (unsigned long long i = lane; i < n / 16; i += lanes) d4[i] = s4[i];
++    } else if ((a & 7) == 0) {
++        uint2* d2 = (uint2*)d;
++        const uint2* s2 = (const uint2*)s;
++        for (unsigned long long i = lane; i < n / 8; i += lanes) d2[i] = s2[i];
++    } else if ((a & 3) == 0) {
++        uint32_t* d1 = (uint32_t*)d;
++        const uint32_t* s1 = (const uint32_t*)s;
++        for (unsigned long long i = lane; i < n / 4; i += lanes) d1[i] = s1[i];
++    } else {
++        for (unsigned long long i = lane; i < n; i += lanes) d[i] = s[i];
++    }
++}
++
++// Sets n bytes at d to `v`, lanes `lane` of `lanes` (16-byte words when d and n allow).
++__device__ __forceinline__ void tf_ds_port_set(uint8_t* d, uint8_t v, unsigned long long n, unsigned long long lane,
++                                               unsigned long long lanes) {
++    if ((((unsigned long long)(uintptr_t)d | n) & 15) == 0) {
++        const uint32_t w = 0x01010101u * v;
++        const uint4 q = make_uint4(w, w, w, w);
++        uint4* d4 = (uint4*)d;
++        for (unsigned long long i = lane; i < n / 16; i += lanes) d4[i] = q;
++    } else {
++        for (unsigned long long i = lane; i < n; i += lanes) d[i] = v;
++    }
++}
++
++// A plane's rows a staged block holds: rows row0 + b * rows .. + rows of the plane at ptr (rows ld bytes apart,
++// row_bytes each) for block b of the call, at stage_off within each staged block (rows packed row_bytes apart).
++struct TfDsPortPlane {
++    unsigned long long ptr;
++    unsigned long long ld;
++    unsigned long long row_bytes;
++    unsigned long long row0;
++    unsigned long long rows;
++    unsigned long long stage_off;
++    unsigned int fill;
++    unsigned int pad;
++};
++struct TfDsPortPlanes {
++    TfDsPortPlane plane[32];
++    unsigned int n;
++    unsigned int pad;
++};
++
++// Planes to and from a contiguous staging buffer (0110's block staging; spill_state's block layout when the set is
++// built by port_kernels.spillBlocks): mode 0 packs (plane rows -> staging + b * block_bytes + stage_off), mode 1 unpacks
++// (the reverse), mode 2 fills the planes' rows with their fill byte (a failed restore's destination; staging unused).
++// Grid (x, planes, n_blocks): a (plane, block) pair's bytes grid-strided over gridDim.x blocks. A packed plane
++// (ld == row_bytes: every spill plane) is one contiguous span, moved in the widest unit its addresses and length allow;
++// a strided one in 16-byte words when its address, ld, row_bytes, stage_off, block_bytes and staging allow, else bytes.
++extern "C" __global__ void tf_ds_port_planes_kernel(TfDsPortPlanes set, uint8_t* staging, unsigned long long block_bytes,
++                                                    unsigned int n_blocks, int mode) {
++    const unsigned z = blockIdx.y;
++    const unsigned b = blockIdx.z;
++    if (z >= set.n || b >= n_blocks) return;
++    const TfDsPortPlane p = set.plane[z];
++    const unsigned long long first = p.row0 + (unsigned long long)b * p.rows;
++    uint8_t* plane = (uint8_t*)p.ptr;
++    const unsigned long long lanes = (unsigned long long)gridDim.x * blockDim.x;
++    const unsigned long long lane = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
++    const unsigned long long span = p.rows * p.row_bytes;
++    if (p.ld == p.row_bytes) {
++        uint8_t* rows = plane + first * p.ld;
++        if (mode == 2) {
++            tf_ds_port_set(rows, (uint8_t)p.fill, span, lane, lanes);
++            return;
++        }
++        uint8_t* stage = staging + (unsigned long long)b * block_bytes + p.stage_off;
++        if (mode == 0) tf_ds_port_copy(stage, rows, span, lane, lanes);
++        else tf_ds_port_copy(rows, stage, span, lane, lanes);
++        return;
++    }
++    if (mode == 2) {
++        for (unsigned long long e = lane; e < span; e += lanes)
++            plane[(first + e / p.row_bytes) * p.ld + e % p.row_bytes] = (uint8_t)p.fill;
++        return;
++    }
++    uint8_t* stage = staging + (unsigned long long)b * block_bytes + p.stage_off;
++    const unsigned long long a =
++        p.ptr | p.ld | p.row_bytes | p.stage_off | block_bytes | (unsigned long long)(uintptr_t)staging;
++    if ((a & 15) == 0) {
++        const unsigned long long w = p.row_bytes / 16;
++        for (unsigned long long e = lane; e < p.rows * w; e += lanes) {
++            uint4* pl = (uint4*)(plane + (first + e / w) * p.ld) + e % w;
++            uint4* st = (uint4*)stage + e;
++            if (mode == 0) *st = *pl;
++            else *pl = *st;
++        }
++        return;
++    }
++    for (unsigned long long e = lane; e < span; e += lanes) {
++        uint8_t* pl = plane + (first + e / p.row_bytes) * p.ld + e % p.row_bytes;
++        uint8_t* st = stage + e;
++        if (mode == 0) *st = *pl;
++        else *pl = *st;
++    }
++}
+diff --git a/zig/src/cuda/aot.zig b/zig/src/cuda/aot.zig
+index 16532276fd4bb3fb03eebb84184814df20e97037..b12428f1c6ea3d5ebd40765b8841a71be117f6fe 100644
+--- a/zig/src/cuda/aot.zig
++++ b/zig/src/cuda/aot.zig
+@@ -7,9 +7,9 @@ const Stream = @import("stream.zig").Stream;
+ const launch = @import("launch.zig");
+ const triton = @import("triton.zig");
+ 
+-const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
+-const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
+-const KernelJson = struct {
++pub const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
++pub const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
++pub const KernelJson = struct {
+     @"fn": []const u8,
+     hash: []const u8,
+     name: []const u8,
+@@ -23,7 +23,7 @@ const KernelJson = struct {
+     params: []ParamJson,
+     consts: std.json.ArrayHashMap(ConstJson),
+ };
+-const SetJson = struct { kernels: []KernelJson };
++pub const SetJson = struct { kernels: []KernelJson };
+ 
+ /// One argument of a launch, by the kernel's parameter name.
+ pub const Arg = struct {
+@@ -139,6 +139,13 @@ pub const Set = struct {
+         return error.MissingTritonVariant;
+     }
+ 
++    /// Whether a launch of `function` with these arguments and constexprs resolves in this set (find's exact or
++    /// fallback answer), asked without find's logging: a caller choosing between launch shapes (tri_norm.rowmmGate).
++    pub fn has(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) bool {
++        for (self.variants) |v| if (specResolves(v.spec, function, args, consts)) return true;
++        return false;
++    }
++
+     /// The smallest value of constexpr `name` at or above `at_least` among `function`'s variants.
+     pub fn smallestConst(self: *const Set, function: []const u8, name: []const u8, at_least: i64) ?i64 {
+         var best: ?i64 = null;
+@@ -167,6 +174,18 @@ pub const Set = struct {
+     }
+ };
+ 
++/// Set.has over bare variant specs (an aot.json's `kernels`, parsed as SetJson): a host test's in-memory kit.
++pub fn specsHave(specs: []const KernelJson, function: []const u8, args: []const Arg, consts: []const Const) bool {
++    for (specs) |k| if (specResolves(k, function, args, consts)) return true;
++    return false;
++}
++
++/// Whether find could pick variant `k` for this launch: its exact one, or a fallback that fits.
++fn specResolves(k: KernelJson, function: []const u8, args: []const Arg, consts: []const Const) bool {
++    if (!std.mem.eql(u8, k.@"fn", function)) return false;
++    return matches(k, args, consts) or fits(k, args, consts) != null;
++}
++
+ fn lookup(args: []const Arg, name: []const u8) ?Arg {
+     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;
+     return null;
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 0bfb4e53178f0351e21372694bf9750feb1041b2..15b1421f6ab3417c95feeaeabcdbaa8306aebf29 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -34,6 +34,9 @@ pub const dsv41_ops: []const u8 = if (available) &Blob("fatbin_dsv41_ops").bytes
+ pub const dsv41_torch: []const u8 = if (available) &Blob("fatbin_dsv41_torch").bytes else &.{};
+ pub const dsv41_shard: []const u8 = if (available) &Blob("fatbin_dsv41_shard").bytes else &.{};
+ pub const dsv41_rdma: []const u8 = if (available) &Blob("fatbin_dsv41_rdma").bytes else &.{};
++/// The GLM port's spill block staging (dsv41_port.cu; families/dsv41/port_kernels.zig). Opt in: embedded only by a
++/// build with -Dport_kernels, else empty (Port.load: error.NoPortKernels).
++pub const dsv41_port: []const u8 = if (available and options.has_dsv41_port) &Blob("fatbin_dsv41_port").bytes else &.{};
+ 
+ /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
+ pub const gdn_symbols = struct {
+diff --git a/zig/src/families/dsv41/port_kernels.zig b/zig/src/families/dsv41/port_kernels.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..36a71dedb7c1d1b8e3705b024252cc078e6da3cb
+--- /dev/null
++++ b/zig/src/families/dsv41/port_kernels.zig
+@@ -0,0 +1,468 @@
++//! Port of wojo's GLM 0110 (PR #124, spill v2 block staging) and 0118 (PR #152, a carried or failed destination's
++//! reset): the launcher of zig/kernels/cuda/dsv41_port.cu's one kernel, `tf_ds_port_planes_kernel`, with its CPU
++//! reference (the host tests here, and tf-dsv41-port's GPU check on a Spark, port_main.zig).
++//!
++//! UNTESTED ON A GPU: the .cu is compiled by nvcc on a Spark (`-Dnvcc=...`); run `tf-dsv41-port` there before any
++//! feature relies on it. Nothing in the served engine calls it yet (every switch that would is off by default).
++//!
++//! `Port.planes`: up to 32 planes' rows of n blocks to or from one contiguous staging buffer, or reset to their fill
++//! bytes, in one launch. A spill caller goes through `packBlocksDev`, `unpackBlocksDev` and `clearBlocksDev`: each is
++//! the spill_state.Packer call of the same name with Packer's own checks (checkBlocks, the pin current, clear's
++//! generation bump) and Ticket, its copies one launch into or out of a device pack buffer (PORT-SPILL-V2: "one
++//! measured device pack buffer"), the planes built from the extent's base at call time. A pack followed by one
++//! cuMemcpyDtoHAsync of the buffer stages exactly the bytes `Packer.packBlocks` stages with 16 copies a block.
++//! `spillBlocks` (the plane set alone, no extent or generation checks) is for those three and tf-dsv41-port only.
++//!
++//! Everything else the GLM port moves is covered by kernels that exist (docs/port/kit.md has the map): the sparse fetch,
++//! owner-decode mask and select and the prompt union (dsv41_shard.cu, shard_ops.zig), row gathers/scatters
++//! (ops.gatherRows / scatterRows), a strided 2-D copy (ops.copyRows), and the cross-part carry (Comm.sendSpans /
++//! recvSpans straight from the planes, no staging).
++const std = @import("std");
++const cuda = @import("cuda");
++const spill = @import("spill_state.zig");
++
++/// Threads a block.
++pub const threads = 256;
++/// The grid's y/z cap the call checks against (blocks a call).
++pub const max_grid_z = 65535;
++
++/// dsv41_port.cu TfDsPortPlane: rows row0 + b * rows .. + rows of the plane at ptr (rows ld bytes apart, row_bytes each)
++/// for block b of a call, at stage_off within each staged block; fill: the byte mode `fill` writes.
++pub const Plane = extern struct { ptr: u64 = 0, ld: u64 = 0, row_bytes: u64 = 0, row0: u64 = 0, rows: u64 = 0, stage_off: u64 = 0, fill: u32 = 0, pad: u32 = 0 };
++pub const max_planes = 32;
++/// dsv41_port.cu TfDsPortPlanes, passed by value (1,800 bytes; a launch's arguments fit cuda.Args' 2,048).
++pub const Planes = extern struct {
++    plane: [max_planes]Plane = @splat(Plane{}),
++    n: u32 = 0,
++    pad: u32 = 0,
++
++    pub fn add(s: *Planes, p: Plane) !void {
++        if (s.n == max_planes) return error.TooManyPlanes;
++        s.plane[s.n] = p;
++        s.n += 1;
++    }
++
++    pub fn slice(s: *Planes) []Plane {
++        return s.plane[0..s.n];
++    }
++
++    pub fn constSlice(s: *const Planes) []const Plane {
++        return s.plane[0..s.n];
++    }
++
++    /// Each plane's rows one after another in a staged block, every offset 16-byte aligned (stage_off set here);
++    /// returns the block's bytes.
++    pub fn layout(s: *Planes) !u64 {
++        var off: u64 = 0;
++        for (s.slice()) |*p| {
++            try checkPlane(p.*);
++            off = std.mem.alignForward(u64, off, 16);
++            p.stage_off = off;
++            off += p.rows * p.row_bytes;
++        }
++        return std.mem.alignForward(u64, off, 16);
++    }
++
++    /// Every plane well formed and inside a staged block of block_bytes; no two planes' staged rows overlap.
++    pub fn check(s: *const Planes, block_bytes: u64) !void {
++        if (s.n > max_planes) return error.TooManyPlanes;
++        const ps = s.constSlice();
++        for (ps, 0..) |p, i| {
++            try checkPlane(p);
++            const end = std.math.add(u64, p.stage_off, p.rows * p.row_bytes) catch return error.BadPlane;
++            if (end > block_bytes) return error.StagedPastBlock;
++            for (ps[0..i]) |q| {
++                const qe = q.stage_off + q.rows * q.row_bytes;
++                if (p.rows > 0 and q.rows > 0 and p.stage_off < qe and q.stage_off < end) return error.StagedOverlap;
++            }
++        }
++    }
++};
++
++fn checkPlane(p: Plane) !void {
++    if (p.row_bytes == 0 or p.ld < p.row_bytes or p.fill > 255) return error.BadPlane;
++    _ = std.math.mul(u64, p.rows, p.ld) catch return error.BadPlane;
++    _ = std.math.mul(u64, p.rows, p.row_bytes) catch return error.BadPlane;
++}
++
++comptime {
++    // the CUDA structs' layout (dsv41_port.cu): 8-byte fields, no padding but the explicit one
++    std.debug.assert(@sizeOf(Plane) == 56 and @sizeOf(Planes) == max_planes * 56 + 8);
++    std.debug.assert(@offsetOf(Planes, "n") == max_planes * 56);
++}
++
++/// The kernel's modes (its `mode`).
++pub const Mode = enum(c_int) { pack = 0, unpack = 1, fill = 2 };
++
++/// The kernel's grid x: blocks enough for the largest plane's 16-byte words, 1 .. 1024.
++pub fn planesGridX(s: *const Planes) u32 {
++    var most: u64 = 0;
++    for (s.constSlice()) |p| most = @max(most, p.rows * p.row_bytes);
++    const blocks = (most / 16 + threads - 1) / threads;
++    return @intCast(std.math.clamp(blocks, 1, 1024));
++}
++
++/// The plane set of a spill point's blocks [first_block, first_block + count) of the extent at pool position `base`, in
++/// spill_state's block layout: block plane i of `l` at stage offset l.blockOffset(i), rows base / ratio +
++/// (first_block + b) * (block_tokens / ratio) of the plane whose row 0 is `addr[i]` (Model.SpillDev.blockPlane), its
++/// fill byte the plane's sentinel. Staging block b is at b * l.block_bytes: the bytes Packer.packBlocks stages.
++/// Refused: owner_sharded (not served: the Packer's copies pack a sharded point; this kit path would need the owner's
++/// planes only, with the point's owner, through Packer.checkBlocks' seam), a base off a block boundary (BadView), an
++/// address of 0 (a plane this rank does not hold) or more planes than one launch takes. It checks no extent bounds
++/// and no generations: serving code calls the *Dev functions below, never this.
++pub fn spillBlocks(l: *const spill.StateLayout, addr: []const u64, base: usize, first_block: usize) !Planes {
++    if (l.owner_layout != .replicated) return error.OwnerShardedNotPorted;
++    const bt = l.geo.block_tokens;
++    if (bt == 0 or base % bt != 0) return error.BadView;
++    const bp = l.blockPlanes();
++    if (addr.len != bp.len) return error.BadPlane;
++    if (bp.len > max_planes) return error.TooManyPlanes;
++    var s: Planes = .{};
++    for (bp, addr, 0..) |p, a, i| {
++        if (a == 0) return error.BadPlane;
++        const rows: u64 = bt / p.ratio;
++        const row0 = std.math.add(u64, base / p.ratio, try std.math.mul(u64, first_block, rows)) catch return error.Overflow;
++        try s.add(.{ .ptr = a, .ld = p.row, .row_bytes = p.row, .row0 = row0, .rows = rows, .stage_off = l.blockOffset(i), .fill = p.sentinel });
++    }
++    try s.check(l.block_bytes);
++    return s;
++}
++
++/// spillBlocks with the addresses from a spill Dev (Model.SpillDev, or a test's).
++fn spillBlocksOf(dev: anytype, l: *const spill.StateLayout, base: usize, first_block: usize) !Planes {
++    var addr: [spill.max_planes]u64 = undefined;
++    const bp = l.blockPlanes();
++    for (bp, 0..) |p, i| addr[i] = dev.blockPlane(p);
++    return spillBlocks(l, addr[0..bp.len], base, first_block);
++}
++
++pub const Port = struct {
++    module: cuda.Module,
++    planes_fn: cuda.Function,
++
++    /// cuda.kernels.dsv41_port (or the fatbin's bytes).
++    pub fn load(d: *const cuda.Driver, image: []const u8) !Port {
++        if (image.len == 0) return error.NoPortKernels;
++        var m = try cuda.Module.load(d, image);
++        errdefer m.unload();
++        return .{ .module = m, .planes_fn = try m.function("tf_ds_port_planes_kernel") };
++    }
++
++    pub fn unload(p: *Port) void {
++        p.module.unload();
++        p.* = undefined;
++    }
++
++    /// This port on a stream: the launcher packBlocksDev, unpackBlocksDev and clearBlocksDev take.
++    pub fn on(p: *const Port, s: cuda.Stream) On {
++        return .{ .port = p, .stream = s };
++    }
++
++    pub const On = struct {
++        port: *const Port,
++        stream: cuda.Stream,
++
++        pub fn planes(o: On, set: *const Planes, staging: u64, block_bytes: u64, n_blocks: usize, mode: Mode) !void {
++            return o.port.planes(o.stream, set, staging, block_bytes, n_blocks, mode);
++        }
++    };
++
++    /// n_blocks blocks of every plane of `set` to (pack) or from (unpack) staging, block b at staging + b * block_bytes,
++    /// or (fill) the planes' rows set to their fill byte (staging unused).
++    pub fn planes(p: *const Port, s: cuda.Stream, set: *const Planes, staging: u64, block_bytes: u64, n_blocks: usize, mode: Mode) !void {
++        if (set.n == 0 or n_blocks == 0) return;
++        try checkCall(set, block_bytes, n_blocks, mode);
++        if (mode != .fill and staging == 0) return error.BadStaging;
++        var args: cuda.Args = .{};
++        args.add(set.*);
++        args.add(staging);
++        args.add(block_bytes);
++        args.add(@as(c_uint, @intCast(n_blocks)));
++        args.add(@intFromEnum(mode));
++        try cuda.launch.launch(p.planes_fn, .{ .grid = .{ .x = planesGridX(set), .y = set.n, .z = @intCast(n_blocks) }, .block = .{ .x = threads } }, s, &args);
++    }
++};
++
++// -- spill_state.Packer's block calls in one launch -----------------------------------------------------------------
++// `pk`: a *spill_state.Packer(Dev); `launcher`: Port.on(stream), or ref.On over host memory in the tests; `done`:
++// the Dev's event, recorded after the launch (and on an error after the checks, as Packer records it).
++
++/// Packer.packBlocks in one launch: blocks [first_block, first_block + count) of the point pinned as `src` into the
++/// device buffer `staging` (staging_bytes = count * block_bytes); one DtoH of it then holds packBlocks' bytes.
++/// error.StaleExtent: the rows were given away since the pin.
++pub fn packBlocksDev(pk: anytype, launcher: anytype, src: spill.ExtentRef, first_block: usize, count: usize, staging: u64, staging_bytes: usize, done: anytype) !spill.Ticket {
++    try pk.checkBlocks(src, first_block, count, staging_bytes);
++    if (!pk.gens.current(src)) return error.StaleExtent;
++    try blocksCall(pk, launcher, src.lo, first_block, count, staging, .pack, done);
++    return .{ .op = .pack_blocks, .extent = src, .first_block = first_block, .blocks = count, .bytes = staging_bytes };
++}
++
++/// Packer.unpackBlocks in one launch: the staged blocks in the device buffer `staging` (after one HtoD) back into the
++/// reserved destination `dst`. The restore publishes only while Generations.valid(ticket) holds after `done`.
++pub fn unpackBlocksDev(pk: anytype, launcher: anytype, dst: spill.ExtentRef, first_block: usize, count: usize, staging: u64, staging_bytes: usize, done: anytype) !spill.Ticket {
++    try pk.checkBlocks(dst, first_block, count, staging_bytes);
++    if (!pk.gens.current(dst)) return error.StaleExtent;
++    try blocksCall(pk, launcher, dst.lo, first_block, count, staging, .unpack, done);
++    return .{ .op = .unpack_blocks, .extent = dst, .first_block = first_block, .blocks = count, .bytes = staging_bytes };
++}
++
++/// Packer.clearExtent in one launch, for a destination of whole blocks (lo and hi on block boundaries; error.BadView
++/// otherwise, where clearExtent's ratio-aligned fills still serve): every block plane's rows at its sentinel. Bumps
++/// the rows' generation first, as clearExtent does, so a restore still in flight over them goes stale.
++pub fn clearBlocksDev(pk: anytype, launcher: anytype, dst: spill.ExtentRef, done: anytype) !spill.Ticket {
++    const bt = pk.layout.geo.block_tokens;
++    if (dst.hi <= dst.lo or dst.hi > pk.dev.capacity()) return error.BadRange;
++    if (bt == 0 or dst.lo % bt != 0 or dst.hi % bt != 0) return error.BadView;
++    const count = (dst.hi - dst.lo) / bt;
++    if (count > max_grid_z) return error.BadShape;
++    if (!pk.gens.current(dst)) return error.StaleExtent;
++    const set = try spillBlocksOf(pk.dev, pk.layout, dst.lo, 0); // a refusal here leaves the generations alone
++    pk.gens.bump(dst.lo, dst.hi);
++    errdefer pk.dev.record(done) catch {};
++    try launcher.planes(&set, 0, 0, count, .fill);
++    try pk.dev.record(done);
++    return .{ .op = .clear_extent, .extent = try pk.gens.pin(dst.lo, dst.hi), .bytes = 0 };
++}
++
++fn blocksCall(pk: anytype, launcher: anytype, base: usize, first_block: usize, count: usize, staging: u64, mode: Mode, done: anytype) !void {
++    if (staging == 0) return error.BadStaging;
++    if (count > max_grid_z) return error.BadShape;
++    errdefer pk.dev.record(done) catch {};
++    const set = try spillBlocksOf(pk.dev, pk.layout, base, first_block); // the extent's base now, not when it was pinned
++    try launcher.planes(&set, staging, pk.layout.block_bytes, count, mode);
++    try pk.dev.record(done);
++}
++
++fn checkCall(set: *const Planes, block_bytes: u64, n_blocks: usize, mode: Mode) !void {
++    if (n_blocks > max_grid_z) return error.BadShape;
++    if (mode == .fill) return set.check(std.math.maxInt(u64));
++    try set.check(block_bytes);
++    _ = std.math.mul(u64, block_bytes, n_blocks) catch return error.BadStaging;
++}
++
++/// The kernel's semantics on the host: `mem` stands for device memory, every address an offset into it. The host tests
++/// check them here; tf-dsv41-port compares the GPU's bytes with them on a Spark.
++pub const ref = struct {
++    fn copy(mem: []u8, dst: u64, src: u64, n: u64) void {
++        @memmove(mem[@intCast(dst)..][0..@intCast(n)], mem[@intCast(src)..][0..@intCast(n)]);
++    }
++
++    fn set(mem: []u8, dst: u64, v: u8, n: u64) void {
++        @memset(mem[@intCast(dst)..][0..@intCast(n)], v);
++    }
++
++    /// Port.On over host memory: the launcher the *Dev functions' tests pass.
++    pub const On = struct {
++        mem: []u8,
++
++        pub fn planes(o: On, s: *const Planes, staging: u64, block_bytes: u64, n_blocks: usize, mode: Mode) !void {
++            return ref.planes(o.mem, s, staging, block_bytes, n_blocks, mode);
++        }
++    };
++
++    /// Port.planes.
++    pub fn planes(mem: []u8, s: *const Planes, staging: u64, block_bytes: u64, n_blocks: usize, mode: Mode) !void {
++        if (s.n == 0 or n_blocks == 0) return;
++        try checkCall(s, block_bytes, n_blocks, mode); // (staging 0 is mem[0] here; the device call refuses null)
++        for (0..n_blocks) |b| for (s.constSlice()) |p| for (0..@intCast(p.rows)) |r| {
++            const row = p.ptr + (p.row0 + b * p.rows + r) * p.ld;
++            const st = staging + b * block_bytes + p.stage_off + r * p.row_bytes;
++            switch (mode) {
++                .pack => copy(mem, st, row, p.row_bytes),
++                .unpack => copy(mem, row, st, p.row_bytes),
++                .fill => set(mem, row, @intCast(p.fill), p.row_bytes),
++            }
++        };
++    }
++};
++
++// -- host tests ---------------------------------------------------------------------------------------------------
++
++const testing = std.testing;
++
++test "launch arguments fit cuda.Args" {
++    var a: cuda.Args = .{};
++    const s: Planes = .{};
++    a.add(s);
++    a.add(@as(u64, 0));
++    a.add(@as(u64, 0));
++    a.add(@as(c_uint, 0));
++    a.add(@as(c_int, 0));
++    try testing.expect(a.used <= cuda.Args.max_bytes);
++}
++
++test "planes pack, unpack and fill round-trip" {
++    var mem: [16384]u8 = @splat(0);
++    var prng: std.Random.DefaultPrng = .init(110);
++    prng.random().bytes(mem[0..8192]);
++    var s: Planes = .{};
++    // a packed plane (ld = row_bytes), a strided one, an odd-sized one: 3 blocks from rows 2, 1 and 0
++    try s.add(.{ .ptr = 0, .ld = 48, .row_bytes = 48, .row0 = 2 * 4, .rows = 4 });
++    try s.add(.{ .ptr = 2048, .ld = 80, .row_bytes = 64, .row0 = 2, .rows = 2, .fill = 127 });
++    try s.add(.{ .ptr = 4096, .ld = 13, .row_bytes = 13, .row0 = 0, .rows = 5 });
++    const bb = try s.layout();
++    for (s.constSlice()) |p| try testing.expect(p.stage_off % 16 == 0);
++    try s.check(bb);
++    const staging: u64 = 8192;
++    const before = mem;
++    try ref.planes(&mem, &s, staging, bb, 3, .pack);
++    for (0..3) |b| for (s.constSlice()) |p| for (0..@intCast(p.rows)) |r| {
++        const row = p.ptr + (p.row0 + b * p.rows + r) * p.ld;
++        try testing.expectEqualSlices(u8, before[@intCast(row)..][0..@intCast(p.row_bytes)], mem[@intCast(staging + b * bb + p.stage_off + r * p.row_bytes)..][0..@intCast(p.row_bytes)]);
++    };
++    // fill the planes' rows, then unpack: every byte back as it was (the ld gaps untouched throughout)
++    try ref.planes(&mem, &s, 0, 0, 3, .fill);
++    try testing.expect(std.mem.allEqual(u8, mem[2048 + 2 * 80 ..][0..64], 127));
++    try testing.expect(!std.mem.eql(u8, before[0..8192], mem[0..8192]));
++    try ref.planes(&mem, &s, staging, bb, 3, .unpack);
++    try testing.expectEqualSlices(u8, before[0..8192], mem[0..8192]);
++}
++
++test "planes checks" {
++    var s: Planes = .{};
++    try s.add(.{ .ld = 4, .row_bytes = 8 });
++    try testing.expectError(error.BadPlane, s.layout());
++    s = .{};
++    try s.add(.{ .ld = 8, .row_bytes = 8, .rows = 2 });
++    try s.add(.{ .ld = 8, .row_bytes = 8, .rows = 2, .stage_off = 8 });
++    try testing.expectError(error.StagedOverlap, s.check(64));
++    try testing.expectError(error.StagedPastBlock, s.check(16));
++    var full: Planes = .{};
++    for (0..max_planes) |_| try full.add(.{ .ld = 1, .row_bytes = 1 });
++    try testing.expectError(error.TooManyPlanes, full.add(.{ .ld = 1, .row_bytes = 1 }));
++    var one: Planes = .{};
++    try one.add(.{ .ld = 16, .row_bytes = 16, .rows = 1 });
++    try testing.expectError(error.BadShape, checkCall(&one, 16, max_grid_z + 1, .pack));
++    try testing.expectError(error.StagedPastBlock, checkCall(&one, 8, 1, .pack));
++    try checkCall(&one, 0, 1, .fill);
++}
++
++test "grid" {
++    var s: Planes = .{};
++    try s.add(.{ .ld = 288, .row_bytes = 288, .rows = 2048 });
++    try testing.expectEqual(@as(u32, 144), planesGridX(&s));
++    s = .{};
++    try s.add(.{ .ld = 4, .row_bytes = 4, .rows = 1 });
++    try testing.expectEqual(@as(u32, 1), planesGridX(&s));
++}
++
++/// A spill Dev over a host array (addresses are offsets into `mem`), copies immediate: enough of Model.SpillDev for
++/// spill_state.Packer's block calls.
++const HostDev = struct {
++    mem: []u8,
++    cap: usize,
++    addr: []const u64, // block plane i's row 0
++    l: *const spill.StateLayout,
++
++    pub const Event = u32;
++
++    pub fn blockPlane(d: HostDev, p: spill.Plane) u64 {
++        for (d.l.blockPlanes(), d.addr) |q, a| if (q.kind == p.kind and q.layer == p.layer) return a;
++        return 0;
++    }
++    pub fn slotPlane(_: HostDev, _: spill.Plane, _: usize) u64 {
++        return 0;
++    }
++    pub fn capacity(d: HostDev) usize {
++        return d.cap;
++    }
++    pub fn slots(_: HostDev) usize {
++        return 1;
++    }
++    pub fn d2h(d: HostDev, dst: []u8, src: u64) !void {
++        @memcpy(dst, d.mem[@intCast(src)..][0..dst.len]);
++    }
++    pub fn h2d(d: HostDev, dst: u64, src: []const u8) !void {
++        @memcpy(d.mem[@intCast(dst)..][0..src.len], src);
++    }
++    pub fn fill(d: HostDev, dst: u64, value: u8, bytes: usize) !void {
++        @memset(d.mem[@intCast(dst)..][0..bytes], value);
++    }
++    pub fn record(_: HostDev, _: Event) !void {}
++};
++
++test "spillBlocks stages exactly what spill_state.Packer.packBlocks stages" {
++    const gpa = testing.allocator;
++    // the served checkpoint's block planes (sources at ratios 2, 2, 2, 1, all with index keys; head_dim 512, index
++    // head_dim 128) over a 64-block-token geometry so the pool fits a test array
++    const shapes = [_]spill.LayerShape{
++        .{},
++        .{ .ratio = 2, .kv = true, .idx = true, .raw = true },
++        .{ .ratio = 2, .kv = true, .idx = true, .raw = true },
++        .{},
++        .{ .ratio = 2, .kv = true, .idx = true, .raw = true },
++        .{ .ratio = 1, .kv = true, .idx = true },
++    };
++    const g: spill.Geometry = .{ .block_tokens = 64, .window = 128, .ring_extra = 16, .raw_rows = 64, .head_dim = 512, .index_head_dim = 128 };
++    const l = try spill.StateLayout.init(&shapes, g, .replicated);
++    try testing.expectEqual(@as(usize, 16), l.blockPlanes().len);
++    try testing.expectEqual(@as(usize, 890), l.token_bytes);
++    const cap: usize = 6 * 64; // six blocks of positions
++    // carve each plane's (cap / ratio + 2) rows as Caches.init does, from offset 64 (0 stays "no plane")
++    var addr: [16]u64 = undefined;
++    var at: u64 = 64;
++    for (l.blockPlanes(), 0..) |p, i| {
++        addr[i] = at;
++        at += (cap / p.ratio + 2) * p.row;
++    }
++    const pool_end = at;
++    const count = 3;
++    const staging_dev = std.mem.alignForward(u64, pool_end, 16);
++    const mem = try gpa.alloc(u8, @intCast(staging_dev + count * l.block_bytes));
++    defer gpa.free(mem);
++    var prng: std.Random.DefaultPrng = .init(0x0110);
++    prng.random().bytes(mem);
++    const dev: HostDev = .{ .mem = mem, .cap = cap, .addr = &addr, .l = &l };
++    var gens = try spill.Generations.init(gpa, cap, 64);
++    defer gens.deinit(gpa);
++    var pk = spill.Packer(HostDev){ .dev = dev, .layout = &l, .gens = &gens };
++    // the extent at base 128 (block 2 of the pool), blocks 1 .. 3 of it
++    const base: usize = 128;
++    const pin = try gens.pin(base, cap);
++    const host = try gpa.alloc(u8, count * l.block_bytes);
++    defer gpa.free(host);
++    _ = try pk.packBlocks(pin, 1, count, host, 0);
++    // the same blocks in one launch into a device pack buffer: packBlocks' bytes, packBlocks' ticket
++    const on: ref.On = .{ .mem = mem };
++    const t = try packBlocksDev(&pk, on, pin, 1, count, staging_dev, host.len, 0);
++    try testing.expectEqual(spill.Op.pack_blocks, t.op);
++    try testing.expectEqual(@as(usize, count), t.blocks);
++    try testing.expectEqualSlices(u8, host, mem[@intCast(staging_dev)..][0..host.len]);
++    try testing.expectEqual(@as(u32, 16), (try spillBlocksOf(dev, &l, base, 1)).n);
++    // unpack the device staging into a reserved extent (base 0), then Packer's pack of it gives the same bytes again
++    const dst = try gens.reserve(0, count * 64);
++    const ut = try unpackBlocksDev(&pk, on, dst, 0, count, staging_dev, host.len, 0);
++    try testing.expect(gens.valid(ut));
++    const again = try gpa.alloc(u8, host.len);
++    defer gpa.free(again);
++    _ = try pk.packBlocks(try gens.pin(0, cap), 0, count, again, 0);
++    try testing.expectEqualSlices(u8, host, again);
++    // Packer's checks hold: blocks past the extent's end, a staging size off count blocks, a stale pin, null staging
++    try testing.expectError(error.BadRange, packBlocksDev(&pk, on, dst, 1, count, staging_dev, host.len, 0));
++    try testing.expectError(error.BadStaging, packBlocksDev(&pk, on, pin, 1, count, staging_dev, host.len - 1, 0));
++    try testing.expectError(error.StaleExtent, packBlocksDev(&pk, on, pin, 1, count, staging_dev, host.len, 0)); // dst's reserve took [128, 192)
++    try testing.expectError(error.BadStaging, packBlocksDev(&pk, on, try gens.pin(base, cap), 1, count, 0, host.len, 0));
++    try testing.expectError(error.BadRange, unpackBlocksDev(&pk, on, .{ .lo = base, .hi = cap + 64, .stamp = 0 }, 0, 1, staging_dev, l.block_bytes, 0));
++    // clearBlocksDev is clearExtent: generations bumped first (the restore into dst goes stale), every block plane's
++    // rows of those blocks at its sentinel (index scales 127, else 0), a fresh pin in the ticket
++    const ct = try clearBlocksDev(&pk, on, dst, 0);
++    try testing.expect(!gens.valid(ut));
++    try testing.expect(gens.valid(ct));
++    try testing.expectError(error.StaleExtent, unpackBlocksDev(&pk, on, dst, 0, count, staging_dev, host.len, 0));
++    try testing.expectError(error.StaleExtent, clearBlocksDev(&pk, on, dst, 0));
++    for (l.blockPlanes(), 0..) |p, i| {
++        const rows = count * 64 / p.ratio;
++        try testing.expect(std.mem.allEqual(u8, mem[@intCast(addr[i])..][0 .. rows * p.row], p.sentinel));
++    }
++    // clearExtent takes ratio-aligned ranges; the one-launch clear only whole blocks, past the pool never
++    try testing.expectError(error.BadView, clearBlocksDev(&pk, on, try gens.pin(64, 64 + 32), 0));
++    try testing.expectError(error.BadRange, clearBlocksDev(&pk, on, .{ .lo = 0, .hi = cap + 64, .stamp = 0 }, 0));
++    // refusals: a base off a block, a missing plane, owner_sharded
++    try testing.expectError(error.BadView, spillBlocks(&l, &addr, 32, 0));
++    var holed = addr;
++    holed[3] = 0;
++    try testing.expectError(error.BadPlane, spillBlocks(&l, &holed, 0, 0));
++    try testing.expectError(error.BadPlane, spillBlocks(&l, addr[0..15], 0, 0));
++    const ls = try spill.StateLayout.init(&shapes, g, .owner_sharded);
++    try testing.expectError(error.OwnerShardedNotPorted, spillBlocks(&ls, &addr, 0, 0));
++}
+diff --git a/zig/src/families/dsv41/port_main.zig b/zig/src/families/dsv41/port_main.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..270cacacea0c78e4ccfbe53815076f888d2cbab7
+--- /dev/null
++++ b/zig/src/families/dsv41/port_main.zig
+@@ -0,0 +1,236 @@
++//! tf-dsv41-port: dsv41_port.cu's plane staging kernel on this GPU against port_kernels.zig's CPU reference, every byte
++//! of a 4 MiB arena compared (the GLM 0110/0118 port's block pack/unpack/fill; docs/port/kit.md). No model, no kit, one
++//! GPU; a few seconds. Exit 0: every case equal; 1: a case differs (its first differing byte printed).
++//! (The sparse fetch, select and union kernels are dsv41_shard.cu's: their host emulation is tools/dsv41_shard_emulate.)
++//!
++//! Needs a build with the kernels (`-Dnvcc=...` or `-Dfatbins=...`) and `-Dport_kernels`; otherwise it exits 2.
++//!
++//! `tf-dsv41-port --gate KIT [ROWS ...]` (default rows 17 .. 32): the MoE gate's chunk sums (tri_norm.rowmmGate, K
++//! 5120, N 384, PDL on) of one random round on KIT's Triton set (KIT/aot), every row's bytes compared across launch
++//! shapes: the engine's 16-row pieces against each row launched alone (RB 1, as 1-row rounds run it), and, when the
++//! kit has the single-launch variant (build_kit.sh EXTRA_ROWS), against one RB = rows launch. Row invariance is what
++//! the split relies on (docs/port/kit.md section 4); this shows it or not, before any token-hash comparison. Needs
++//! no -Dport_kernels and no model. UNTESTED ON A GPU.
++const std = @import("std");
++const cuda = @import("cuda");
++const pk = @import("port_kernels.zig");
++const spill = @import("spill_state.zig");
++const tri = @import("tri.zig");
++const tri_norm = @import("tri_norm.zig");
++
++const arena_bytes = 4 << 20;
++
++/// One launch, its addresses offsets into the arena plus `base` (0 for the reference, the device buffer for the GPU).
++const Call = union(enum) {
++    planes: struct { set: pk.Planes, staging: u64, block_bytes: u64, n_blocks: usize, mode: pk.Mode },
++};
++
++const Case = struct {
++    name: []const u8,
++    /// Writes the case's inputs (indices, not addresses) into the arena.
++    prepare: *const fn (mem: []u8, rnd: std.Random) void,
++    /// The case's call with its addresses at `base`.
++    call: *const fn (base: u64) anyerror!Call,
++};
++
++fn nothing(mem: []u8, rnd: std.Random) void {
++    _ = mem;
++    _ = rnd;
++}
++
++/// A spill block's planes: comp codes/scales of four sources (ratios 2, 2, 2, 1) and their index planes, packed (ld =
++/// row) the way prompt.Caches lays them out, plus one strided odd plane; two blocks from block 3 on.
++fn planesCase(comptime mode: pk.Mode) Case {
++    const S = struct {
++        fn call(base: u64) anyerror!Call {
++            const tokens: u64 = 256; // a 2048-token block scaled down 8x so the planes fit the arena
++            var set: pk.Planes = .{};
++            var at: u64 = 0;
++            for ([_]u64{ 2, 2, 2, 1 }) |ratio| for ([_]u64{ 256, 32, 64, 4 }) |rb| {
++                const rows = tokens / ratio;
++                try set.add(.{ .ptr = base + at, .ld = rb, .row_bytes = rb, .row0 = 3 * rows, .rows = rows, .fill = if (rb == 4) 127 else 0 });
++                at += 6 * rows * rb;
++            };
++            try set.add(.{ .ptr = base + at, .ld = 37, .row_bytes = 29, .row0 = 1, .rows = 7, .fill = 0x5A });
++            const bb = try set.layout();
++            return .{ .planes = .{ .set = set, .staging = base + (5 << 19), .block_bytes = bb, .n_blocks = 2, .mode = mode } };
++        }
++    };
++    return .{ .name = "planes " ++ @tagName(mode) ++ " (16 spill planes + an odd strided one, 2 blocks)", .prepare = nothing, .call = S.call };
++}
++
++/// The served checkpoint's block planes in spill_state's layout (spillBlocks), 256-token blocks, 3 blocks of an extent
++/// at pool block 2: the bytes spill_state.Packer would stage with 48 copies, in one launch.
++fn spillCase(comptime mode: pk.Mode) Case {
++    const S = struct {
++        fn call(base: u64) anyerror!Call {
++            const shapes = [_]spill.LayerShape{
++                .{ .ratio = 2, .kv = true, .idx = true, .raw = true },
++                .{ .ratio = 2, .kv = true, .idx = true, .raw = true },
++                .{ .ratio = 2, .kv = true, .idx = true, .raw = true },
++                .{ .ratio = 1, .kv = true, .idx = true },
++            };
++            const g: spill.Geometry = .{ .block_tokens = 256, .window = 128, .ring_extra = 16, .raw_rows = 64, .head_dim = 512, .index_head_dim = 128 };
++            const l = try spill.StateLayout.init(&shapes, g, .replicated);
++            const cap: usize = 8 * 256;
++            var addr: [16]u64 = undefined;
++            var at: u64 = 0;
++            for (l.blockPlanes(), 0..) |p, i| {
++                addr[i] = base + at;
++                at += (cap / p.ratio + 2) * p.row;
++            }
++            const set = try pk.spillBlocks(&l, &addr, 2 * 256, 1);
++            return .{ .planes = .{ .set = set, .staging = base + (3 << 20), .block_bytes = l.block_bytes, .n_blocks = 3, .mode = mode } };
++        }
++    };
++    return .{ .name = "spill blocks " ++ @tagName(mode) ++ " (spill_state layout, 16 planes, 3 blocks of 256 tokens)", .prepare = nothing, .call = S.call };
++}
++
++const cases = [_]Case{
++    planesCase(.pack),
++    planesCase(.unpack),
++    planesCase(.fill),
++    spillCase(.pack),
++    spillCase(.unpack),
++    spillCase(.fill),
++};
++
++fn runRef(mem: []u8, c: Call) !void {
++    switch (c) {
++        .planes => |p| try pk.ref.planes(mem, &p.set, p.staging, p.block_bytes, p.n_blocks, p.mode),
++    }
++}
++
++fn runGpu(port: *const pk.Port, s: cuda.Stream, c: Call) !void {
++    switch (c) {
++        .planes => |p| try port.planes(s, &p.set, p.staging, p.block_bytes, p.n_blocks, p.mode),
++    }
++}
++
++/// --gate: the round's gate at its served shape, every row's chunk sums compared bitwise across launch shapes.
++fn gateCheck(gpa: std.mem.Allocator, io: std.Io, kit: []const u8, rows_list: []const usize) !u8 {
++    const k: usize = 5120;
++    const n: usize = 384;
++    const kc = k / 256;
++    const most: usize = 48;
++    for (rows_list) |r| if (r == 0 or r > most) return error.BadRows;
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    const aot_dir = try std.fs.path.join(gpa, &.{ kit, "aot" });
++    defer gpa.free(aot_dir);
++    var set = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, aot_dir);
++    defer set.deinit();
++    // X [48, K] bf16 in [-1, 1), W [N, K] fp16 in [-1/16, 1/16): the gate's magnitudes, no inf or NaN
++    const x_bytes = most * k * 2;
++    const w_bytes = n * k * 2;
++    const s_bytes = most * kc * n * 4;
++    const x_off: usize = 0;
++    const w_off = std.mem.alignForward(usize, x_off + x_bytes, 256);
++    var so: [3]usize = undefined;
++    so[0] = std.mem.alignForward(usize, w_off + w_bytes, 256);
++    so[1] = std.mem.alignForward(usize, so[0] + s_bytes, 256);
++    so[2] = std.mem.alignForward(usize, so[1] + s_bytes, 256);
++    var dev = try cuda.DeviceBuffer.alloc(&driver, so[2] + s_bytes);
++    defer dev.free();
++    var prng: std.Random.DefaultPrng = .init(0x0118_0032);
++    const rnd = prng.random();
++    const xw = try gpa.alloc(u8, w_off + w_bytes);
++    defer gpa.free(xw);
++    @memset(xw, 0);
++    for (0..most * k) |i| std.mem.writeInt(u16, xw[x_off + 2 * i ..][0..2], @truncate(@as(u32, @bitCast(rnd.float(f32) * 2 - 1)) >> 16), .little);
++    for (0..n * k) |i| std.mem.writeInt(u16, xw[w_off + 2 * i ..][0..2], @bitCast(@as(f16, @floatCast((rnd.float(f32) * 2 - 1) / 16))), .little);
++    try dev.upload(0, xw);
++    const got = [3][]u8{ try gpa.alloc(u8, s_bytes), try gpa.alloc(u8, s_bytes), try gpa.alloc(u8, s_bytes) };
++    defer for (got) |g| gpa.free(g);
++    const t: tri.Tri = .{ .set = &set, .stream = stream };
++    const x = dev.ptr + x_off;
++    const w = dev.ptr + w_off;
++    const row_bytes = kc * n * 4;
++    var failed: usize = 0;
++    for (rows_list) |rows| {
++        // 0: the engine's 16-row pieces; 1: each row alone; 2: one launch, when the kit resolves it
++        const single = rows > tri_norm.rowmm_parts_piece and tri_norm.rowmmPartsPiece(t, x, k, w, dev.ptr + so[2], rows, k, n) == rows;
++        const pieces = [3]usize{ tri_norm.rowmm_parts_piece, 1, rows };
++        const shapes: usize = if (single) 3 else 2;
++        for (0..shapes) |i| {
++            try tri_norm.rowmmGatePieces(t, x, k, w, dev.ptr + so[i], rows, k, n, pieces[i]);
++        }
++        try stream.synchronize();
++        for (0..shapes) |i| try dev.download(so[i], got[i][0 .. rows * row_bytes]);
++        var bad = false;
++        for (1..shapes) |i| if (std.mem.indexOfDiff(u8, got[0][0 .. rows * row_bytes], got[i][0 .. rows * row_bytes])) |at| {
++            bad = true;
++            std.debug.print("FAIL gate {d} rows: 16-row pieces differ from {s} at row {d} (byte {d} of the row)\n", .{ rows, if (i == 1) "rows alone" else "one launch", at / row_bytes, at % row_bytes });
++        };
++        if (bad) failed += 1 else std.debug.print("ok   gate {d} rows: 16-row pieces == rows alone{s}\n", .{ rows, if (single) " == one RB-rows launch" else " (kit has no single launch)" });
++    }
++    std.debug.print("{d} of {d} gate row counts equal\n", .{ rows_list.len - failed, rows_list.len });
++    return if (failed == 0) 0 else 1;
++}
++
++pub fn main(init: std.process.Init) !u8 {
++    const gpa = init.gpa;
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len >= 2 and std.mem.eql(u8, args[1], "--gate")) {
++        if (args.len < 3) {
++            std.debug.print("usage: tf-dsv41-port --gate KIT [ROWS ...]\n", .{});
++            return 2;
++        }
++        var list: std.ArrayList(usize) = .empty;
++        defer list.deinit(gpa);
++        for (args[3..]) |r| try list.append(gpa, try std.fmt.parseInt(usize, r, 10));
++        if (list.items.len == 0) for (17..33) |r| try list.append(gpa, r);
++        return gateCheck(gpa, init.io, args[2], list.items);
++    }
++    if (!cuda.kernels.available) {
++        std.debug.print("tf-dsv41-port: built without kernel images (build with -Dnvcc=... or -Dfatbins=...)\n", .{});
++        return 2;
++    }
++    if (cuda.kernels.dsv41_port.len == 0) {
++        std.debug.print("tf-dsv41-port: built without the opt-in dsv41_port fatbin (build with -Dport_kernels)\n", .{});
++        return 2;
++    }
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    var port = try pk.Port.load(&driver, cuda.kernels.dsv41_port);
++    defer port.unload();
++    var dev = try cuda.DeviceBuffer.alloc(&driver, arena_bytes);
++    defer dev.free();
++    const host = try gpa.alloc(u8, arena_bytes);
++    defer gpa.free(host);
++    const want = try gpa.alloc(u8, arena_bytes);
++    defer gpa.free(want);
++    const got = try gpa.alloc(u8, arena_bytes);
++    defer gpa.free(got);
++    var failed: usize = 0;
++    for (cases, 0..) |c, ci| {
++        var prng: std.Random.DefaultPrng = .init(0x0118_0110 + ci);
++        const rnd = prng.random();
++        rnd.bytes(host);
++        c.prepare(host, rnd);
++        const ref_call = try c.call(0);
++        const gpu_call = try c.call(dev.ptr);
++        @memcpy(want, host);
++        try runRef(want, ref_call);
++        try dev.upload(0, host);
++        try runGpu(&port, stream, gpu_call);
++        try stream.synchronize();
++        try dev.download(0, got);
++        if (std.mem.indexOfDiff(u8, want, got)) |at| {
++            failed += 1;
++            std.debug.print("FAIL {s}: first difference at byte {d} (want {x:0>2}, got {x:0>2})\n", .{ c.name, at, want[at], got[at] });
++        } else {
++            std.debug.print("ok   {s}\n", .{c.name});
++        }
++    }
++    std.debug.print("{d} of {d} cases equal\n", .{ cases.len - failed, cases.len });
++    return if (failed == 0) 0 else 1;
++}
+diff --git a/zig/src/families/dsv41/spill_state.zig b/zig/src/families/dsv41/spill_state.zig
+index 0cacdf7344b01214831f321dcb3f0e7ff40619a9..58baebf5dc2b8bf159ef3704b451729f23134cb3 100644
+--- a/zig/src/families/dsv41/spill_state.zig
++++ b/zig/src/families/dsv41/spill_state.zig
+@@ -400,7 +400,8 @@ pub fn Packer(comptime Dev: type) type {
+         layout: *const StateLayout,
+         gens: *Generations,
+ 
+-        fn checkBlocks(p: *const Self, r: ExtentRef, first_block: usize, count: usize, staged: usize) !void {
++        /// The block calls' range checks (also port_kernels' one-launch pack, unpack and clear).
++        pub fn checkBlocks(p: *const Self, r: ExtentRef, first_block: usize, count: usize, staged: usize) !void {
+             const l = p.layout;
+             if (l.owner_layout != .replicated) return error.OwnerShardedNotPorted; // PORT(round2): the owner per point
+             const bt = l.geo.block_tokens;
+diff --git a/zig/src/families/dsv41/tri.zig b/zig/src/families/dsv41/tri.zig
+index 10a3264b653541b21264183dd154eeaaaafe48d7..3ed3e2760ffc4db601469d38e3e05f5751782c2c 100644
+--- a/zig/src/families/dsv41/tri.zig
++++ b/zig/src/families/dsv41/tri.zig
+@@ -15,6 +15,9 @@ pub const Tri = struct {
+     log: ?*Log = null,
+     /// The "pdl" switch (TF_DS_TRITON_PDL, on in the served build): decode kernels as programmatic dependent launches.
+     pdl: bool = true,
++    /// Tests with a log (no set to ask): a kit's variant specs (aot.json `kernels`) that launch-shape choices ask
++    /// instead of a set (aot.specsHave; tri_norm.rowmmPartsPiece). Null with a log: every launch resolves, as recorded.
++    kit: ?[]const aot.KernelJson = null,
+ 
+     pub fn run(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
+         if (t.log) |l| return l.add(name, grid, args, consts);
+diff --git a/zig/src/families/dsv41/tri_norm.zig b/zig/src/families/dsv41/tri_norm.zig
+index 4198dfab8e61f642cb0b7a8085c014eff61ca578..0cd984d9a21aa2ff8e198126644f17258908680a 100644
+--- a/zig/src/families/dsv41/tri_norm.zig
++++ b/zig/src/families/dsv41/tri_norm.zig
+@@ -124,12 +124,70 @@ pub fn rowmmGate(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: us
+         try rowmm2(t, x, xs, w, out, rows, k, n);
+         return 0;
+     }
+-    const args = [_]aot.Arg{ p("X", "*bf16", x), aot.int("xs", @intCast(xs)), p("W", "*fp16", w), p("S", "*fp32", out), aot.int("rows", @intCast(rows)) };
+-    const consts = [_]aot.Const{ ci("K", k), ci("N", n), ci("BN", tile.bn), ci("BK", 256), ci("CPG", tile.cpg), ci("RB", rows), t.pdlConst() };
+-    try t.run("_rowmm_parts", .{ tri.cdiv(n, tile.bn), u(kc / tile.cpg), 1 }, &args, &consts);
++    try rowmmGatePieces(t, x, xs, w, out, rows, k, n, rowmmPartsPiece(t, x, xs, w, out, rows, k, n));
+     return kc;
+ }
+ 
++/// rowmm_gate's chunk sums as _rowmm_parts launches of at most `piece` rows over consecutive rows (rowmmGate's
++/// launches past its checks; tf-dsv41-port --gate compares the piece sizes on a GPU).
++pub fn rowmmGatePieces(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize, piece: usize) !void {
++    if (piece == 0) return error.BadPiece;
++    const kc = k / 256;
++    var r0: usize = 0;
++    while (r0 < rows) : (r0 += piece) {
++        const nr = @min(piece, rows - r0);
++        // row r0 of X [R, xs] bf16 and of S [R, kc, N] fp32 (16-byte aligned: xs and kc * N are whole 16-byte rows)
++        try rowmmParts(t, x + r0 * xs * 2, xs, w, out + r0 * kc * n * 4, nr, k, n);
++    }
++}
++
++/// The most rows one _rowmm_parts launch takes when the kit cannot run the whole gate in one: RB 16, which every round
++/// of the served 16-row config launches (as RB 1..16 with the leftover piece's rows).
++pub const rowmm_parts_piece = decode_rows;
++
++/// Said once on stderr when a gate first runs as 16-row pieces.
++var told_split: std.atomic.Value(bool) = .init(false);
++
++/// Rows a _rowmm_parts launch of a `rows`-row gate takes: all of them, unless rows passes the qualified bound and that
++/// one launch would not resolve in the kit (Set.has: the exact launch rowmmParts makes, its RB, BN, PDL and the rows
++/// argument's specialization, exact or by fallback): a round of TF_DS_ROUND_ROWS > 16 rows on the published kit,
++/// which stops at RB 16 (the R32 MissingTritonVariant). Then the gate runs as launches of at most 16 rows over
++/// consecutive rows of X and S. A kit with the RB 17..32 variants (tools/dsv41-zig/build_kit.sh EXTRA_ROWS=32) keeps
++/// the single launch. Rounds of up to 16 rows are untouched (one launch, no kit check).
++///
++/// Expected, not yet shown on a GPU: the kernel is row-invariant (a row's chunk sums do not depend on the rows beside
++/// it or on RB), so each row's bytes equal one launch's. The pieces' tiles differ from a single 17..32-row launch's
++/// (a leftover of 1..6 rows takes BN 16, a 17..32-row launch BN 8), so docs/port/kit.md section 8 compares S per row,
++/// bitwise, before token hashes.
++///
++/// The check costs one scan of the set's variants per gate past 16 rows; Set.find already scans them on every launch.
++pub fn rowmmPartsPiece(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize) usize {
++    if (rows <= rowmm_parts_piece) return rows;
++    const l = partsLaunch(t, x, xs, w, out, rows, k, n);
++    const one = if (t.set) |set| set.has("_rowmm_parts", &l.args, &l.consts) else if (t.kit) |specs| aot.specsHave(specs, "_rowmm_parts", &l.args, &l.consts) else true;
++    if (one) return rows;
++    if (!told_split.swap(true, .monotonic)) std.log.info("_rowmm_parts: the kit has no variant for a {d}-row gate (N {d}); rounds past {d} rows run it as launches of at most {d} rows", .{ rows, n, rowmm_parts_piece, rowmm_parts_piece });
++    return rowmm_parts_piece;
++}
++
++/// One _rowmm_parts launch as rowmm_gate's wrapper makes it: grid, runtime arguments, constexprs.
++const PartsLaunch = struct { grid: [3]u32, args: [5]aot.Arg, consts: [7]aot.Const };
++
++fn partsLaunch(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize) PartsLaunch {
++    const tile = rpTile(rows);
++    const kc = k / 256;
++    return .{
++        .grid = .{ tri.cdiv(n, tile.bn), u(kc / tile.cpg), 1 },
++        .args = .{ p("X", "*bf16", x), aot.int("xs", @intCast(xs)), p("W", "*fp16", w), p("S", "*fp32", out), aot.int("rows", @intCast(rows)) },
++        .consts = .{ ci("K", k), ci("N", n), ci("BN", tile.bn), ci("BK", 256), ci("CPG", tile.cpg), ci("RB", rows), t.pdlConst() },
++    };
++}
++
++fn rowmmParts(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize) !void {
++    const l = partsLaunch(t, x, xs, w, out, rows, k, n);
++    try t.run("_rowmm_parts", l.grid, &l.args, &l.consts);
++}
++
+ /// route: picks [R, SLOTS] i32 and weights [R, SLOTS] fp32 (shared expert last) from logits [R, NE] (kc 0) or chunk sums [R, kc, NE].
+ pub fn route(t: Tri, logits: u64, kc: usize, bias: u64, topk: usize, scale: f32, shared_id: usize, pick: u64, wts: u64, rows: usize, ne: usize, slots: usize) !void {
+     if (kc > 0) return t.run("_route_parts", .{ u(rows), 1, 1 }, &.{
+@@ -227,6 +285,93 @@ test "rowmm_gate launches _rowmm_parts as recorded" {
+     }.call);
+ }
+ 
++/// An in-memory kit of _rowmm_parts variants at the round's gate (K 5120, N 384), one per (RB, rows specialization,
++/// PDL): what aot.zig's Set holds as specs. rows: "one" (folded to a constexpr), "d16" or "any".
++const PartsVariant = struct { rb: usize, rows: []const u8, pdl: u1 = 1 };
++
++fn partsKit(gpa: std.mem.Allocator, variants: []const PartsVariant) !std.json.Parsed(aot.SetJson) {
++    var text: std.ArrayList(u8) = .empty;
++    defer text.deinit(gpa);
++    try text.appendSlice(gpa, "{\"kernels\": [");
++    for (variants, 0..) |v, i| {
++        const one = std.mem.eql(u8, v.rows, "one");
++        const rows_param = if (one) "" else try std.fmt.allocPrint(gpa, ",{{\"name\":\"rows\",\"type\":\"i32\",\"div16\":{},\"nospec\":false}}", .{std.mem.eql(u8, v.rows, "d16")});
++        defer if (!one) gpa.free(rows_param);
++        const ptr = "\"div16\":true,\"nospec\":false";
++        const entry = try std.fmt.allocPrint(gpa,
++            \\{s}{{"fn":"_rowmm_parts","hash":"h{d}","name":"k{d}","num_warps":2,"params":[
++            \\{{"name":"X","type":"*bf16",{s}}},{{"name":"xs","type":"i32",{s}}},{{"name":"W","type":"*fp16",{s}}},
++            \\{{"name":"S","type":"*fp32",{s}}}{s}],
++            \\"consts":{{"K":{{"int":5120}},"N":{{"int":384}},"BN":{{"int":{d}}},"BK":{{"int":256}},"CPG":{{"int":1}},"RB":{{"int":{d}}},"PDL":{{"int":{d}}}{s}}}}}
++        , .{ if (i == 0) "" else ",", i, i, ptr, ptr, ptr, ptr, rows_param, rpTile(v.rb).bn, v.rb, v.pdl, if (one) ",\"rows\":{\"int\":1}" else "" });
++        defer gpa.free(entry);
++        try text.appendSlice(gpa, entry);
++    }
++    try text.appendSlice(gpa, "]}");
++    return std.json.parseFromSlice(aot.SetJson, gpa, text.items, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
++}
++
++test "rowmm_gate past 16 rows: one launch when the kit resolves it, else 16-row pieces over consecutive rows" {
++    const gpa = std.testing.allocator;
++    const saved = tri.decode_rows;
++    defer tri.decode_rows = saved;
++    tri.decode_rows = 32; // a TF_DS_ROUND_ROWS=32 round
++    const x: u64 = 0x1000_0000;
++    const s: u64 = 0x2000_0000;
++    // the published kit's shape: RB 1..16 (rows folded at 1, plain, div16 at 16), no RB > 16
++    const base = [_]PartsVariant{ .{ .rb = 1, .rows = "one" }, .{ .rb = 16, .rows = "d16" } };
++    const published = try partsKit(gpa, &base);
++    defer published.deinit();
++    // RB = rows present but compiled with PDL 0 while the launch passes PDL 1: a different constexpr never resolves
++    const wrong_pdl = try partsKit(gpa, &(base ++ [_]PartsVariant{ .{ .rb = 17, .rows = "any", .pdl = 0 }, .{ .rb = 32, .rows = "d16", .pdl = 0 } }));
++    defer wrong_pdl.deinit();
++    // RB = 32 compiled for rows div16 only: a 32-row launch fits it, and no 17-row one
++    const r32 = try partsKit(gpa, &(base ++ [_]PartsVariant{ .{ .rb = 17, .rows = "any" }, .{ .rb = 32, .rows = "d16" } }));
++    defer r32.deinit();
++    for ([_]usize{ 17, 32 }) |rows| {
++        // RB absent, and RB present with the wrong PDL: the split, each piece resolving in that kit
++        for ([_][]const aot.KernelJson{ published.value.kernels, wrong_pdl.value.kernels }) |kit| {
++            var log: tri.Log = .{ .gpa = gpa };
++            defer log.deinit();
++            const kc = try rowmmGate(.{ .log = &log, .kit = kit }, x, 5120, 0x3000_0000, s, rows, 5120, 384);
++            try std.testing.expectEqual(@as(usize, 20), kc);
++            try std.testing.expectEqual(@as(usize, 2), log.items.items.len);
++            const want_rows = [_]usize{ 16, rows - 16 };
++            for (log.items.items, 0..) |l, i| {
++                try std.testing.expectEqualStrings("_rowmm_parts", l.name);
++                try std.testing.expectEqual(x + i * 16 * 5120 * 2, l.args[0].value.ptr.addr);
++                try std.testing.expectEqual(s + i * 16 * 20 * 384 * 4, l.args[3].value.ptr.addr);
++                try std.testing.expectEqual(@as(i32, @intCast(want_rows[i])), l.args[4].value.i32);
++                for (l.consts) |c| if (std.mem.eql(u8, c.name, "RB")) try std.testing.expectEqual(@as(?i64, @intCast(want_rows[i])), c.int);
++                try std.testing.expectEqual(tri.cdiv(384, rpTile(want_rows[i]).bn), l.grid[0]);
++                try std.testing.expect(aot.specsHave(kit, l.name, l.args, l.consts));
++            }
++        }
++        // RB = rows present and fitting: one launch, which that kit resolves
++        var one: tri.Log = .{ .gpa = gpa };
++        defer one.deinit();
++        _ = try rowmmGate(.{ .log = &one, .kit = r32.value.kernels }, x, 5120, 0x3000_0000, s, rows, 5120, 384);
++        try std.testing.expectEqual(@as(usize, 1), one.items.items.len);
++        try std.testing.expect(aot.specsHave(r32.value.kernels, "_rowmm_parts", one.items.items[0].args, one.items.items[0].consts));
++        // PDL off in the engine (TF_DS_TRITON_PDL=0) against that PDL-1 kit: the single launch does not resolve, so the split
++        var off: tri.Log = .{ .gpa = gpa };
++        defer off.deinit();
++        _ = try rowmmGate(.{ .log = &off, .kit = r32.value.kernels, .pdl = false }, x, 5120, 0x3000_0000, s, rows, 5120, 384);
++        try std.testing.expectEqual(@as(usize, 2), off.items.items.len);
++    }
++    // an argument specialization the variant does not hold (S off 16 bytes; RB 32 assumes it aligned) is not "has":
++    // the split (whose pieces miss in this kit as well, so Set.run reports MissingTritonVariant as before)
++    var mis: tri.Log = .{ .gpa = gpa };
++    defer mis.deinit();
++    _ = try rowmmGate(.{ .log = &mis, .kit = r32.value.kernels }, x, 5120, 0x3000_0000, s + 4, 32, 5120, 384);
++    try std.testing.expectEqual(@as(usize, 2), mis.items.items.len);
++    // 16 rows and fewer: one launch whatever the kit
++    var log: tri.Log = .{ .gpa = gpa };
++    defer log.deinit();
++    _ = try rowmmGate(.{ .log = &log, .kit = published.value.kernels }, x, 5120, 0x3000_0000, s, 16, 5120, 384);
++    try std.testing.expectEqual(@as(usize, 1), log.items.items.len);
++}
++
+ /// route() on a recorded case: rowmm_gate's chunk sums S [R, KC, NE] or plain logits L [R, NE].
+ fn callRoute(t: Tri, c: Case) !void {
+     const parts = c.has("S");

@@ -125,7 +125,7 @@ worker_files_check 1
         self.assertIn("if (( ! DRY )); then\n  # Preparation's marker", start)
         check = start.index("worker_files_check 1")
         self.assertLess(start.index("./scripts/prepare.sh\n"), check)
-        self.assertLess(check, start.index("if running_here || running_worker 1; then ./stop.sh; fi"))
+        self.assertLess(check, start.index("if exists_here || exists_worker 1; then ./stop.sh; fi"))
         self.assertLess(check, start.index("# ---------------------------------------------------------------- 3. launch"))
         prepare = (ROOT / "scripts/prepare.sh").read_text()
         self.assertIn("ensure_nfs_volume 1\nworker_files_check 1\n", prepare)

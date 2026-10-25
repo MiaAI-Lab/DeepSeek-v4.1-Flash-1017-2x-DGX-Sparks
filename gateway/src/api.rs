@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -43,6 +43,7 @@ pub struct AppState {
     pub gateway: Arc<Gateway>,
     pub engine: EngineClient,
     pub config: Arc<GatewayConfig>,
+    pub semaphore: Arc<Semaphore>,
 }
 
 /// The API routes, with the contract's 64 MiB body limit.
@@ -165,16 +166,6 @@ where
     R: ProtocolRequest + DeserializeOwned,
     ChunkOf<R>: Serialize + Send,
 {
-    if state.config.require_key && !has_key(headers) {
-        let (status, body) = state.engine.models(headers).await?;
-        if status != 200 {
-            return Err(ApiError {
-                status,
-                body,
-                fallback_reason: None,
-            });
-        }
-    }
     let value = parse_body(body)?;
     if let Some(reason) =
         crate::parity::detect_fallback(&value, protocol, state.config.engine_logprobs)
@@ -654,13 +645,6 @@ fn anthropic_error(error: &ApiError) -> Response {
         .headers_mut()
         .insert("x-ds41-gateway", HeaderValue::from_static("api"));
     response
-}
-
-/// Whether the request carries either accepted credential header.
-fn has_key(headers: &HeaderMap) -> bool {
-    ["authorization", "x-api-key"]
-        .iter()
-        .any(|name| headers.get(*name).is_some_and(|value| !value.is_empty()))
 }
 
 /// Send a request that must go to the engine untouched and mark the response.

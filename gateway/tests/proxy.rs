@@ -12,6 +12,7 @@ use ds41_gateway::api::AppState;
 use ds41_gateway::engine::EngineClient;
 use ds41_gateway::health;
 use ds41_gateway::parity::GatewayConfig;
+use ds41_gateway::security::ApiKeys;
 use ds41_gateway::{Gateway, GatewaySettings};
 use serde_json::{Value, json};
 
@@ -112,6 +113,7 @@ async fn spawn_gateway(engine: &str, config: GatewayConfig) -> String {
         gateway: Arc::new(gateway()),
         engine: EngineClient::new(engine).expect("engine client"),
         config: Arc::new(config),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -237,12 +239,13 @@ async fn other_engine_routes_are_proxied() {
 }
 
 #[tokio::test]
-async fn require_key_relays_the_engine_401_without_rendering() {
+async fn require_key_rejects_locally_without_touching_the_engine() {
     let (engine, mock) = spawn_mock(true).await;
     let url = spawn_gateway(
         &engine,
         GatewayConfig {
             require_key: true,
+            api_keys: Some(ApiKeys::parse("sk-test\n").expect("key")),
             ..GatewayConfig::default()
         },
     )
@@ -261,12 +264,8 @@ async fn require_key_relays_the_engine_401_without_rendering() {
         .expect("request");
     assert_eq!(response.status(), 401);
     let body: Value = response.json().await.expect("body");
-    assert_eq!(body["error"]["message"], "missing key");
-    {
-        let records = mock.records.lock().unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].path, "/v1/models");
-    }
+    assert_eq!(body["error"]["message"], "missing or invalid API key");
+    assert!(mock.records.lock().unwrap().is_empty());
 
     let response = reqwest::Client::new()
         .get(format!("{url}/v1/models"))

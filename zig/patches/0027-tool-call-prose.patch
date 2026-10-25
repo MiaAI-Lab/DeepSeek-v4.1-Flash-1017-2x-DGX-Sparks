@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Coinupbtc <coinupbtc@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:27:42 -0500
+Subject: [PATCH] server: the text before DeepSeek-V4.1's tool calls is the
+ reply's content, without the calls' two newlines
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DeepSeek-V4.1's reference parser (encoding/encoding.py, parse_message_from_completion_text) starts the calls at
+"\n\n<｜DSML｜ calls": the newlines belong to the calls, the text before them is the content, and render_message writes
+content + "\n\n" + calls back. The server did neither:
+
+- a reply without streaming returned "content": null whenever it made calls, so the client never saw the text the
+  model wrote before them and sent the turn back without it;
+- a streamed reply sent the two newlines as content, so a client that keeps the content as it arrived sends back
+  "text\n\n\n\n<｜DSML｜ calls>", and the next prompt stops matching the generated tokens right before the calls.
+
+reply_text.calls gets DeepSeek-V4.1's opener with its two newlines (before the one without, which still reads a block
+opened without them): the streamed text leaves them out and holds a trailing newline back until the next token shows
+whether calls follow. wholeBody keeps the parsed text as the content (null only when there is none). A call written
+inside the think block ends the reasoning where the calls start, as the reference reads it.
+
+Test: reply_text.zig: every streamed prefix grows toward the text without the newlines; paragraph breaks still stream
+with the next token or at the end; a block opened without them; a third newline stays the text's.
+---
+ zig/src/server/openai.zig     |  3 ++-
+ zig/src/server/reply_text.zig | 33 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index de52b3a..9d1e473 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -365,7 +365,8 @@ const Run = struct {
+         if (r.is_chat) {
+             const message = try json.newObject(a);
+             try message.put(a, "role", .{ .string = "assistant" });
+-            try message.put(a, "content", if (calls != null) .null else .{ .string = reply.content });
++            // the text before the calls is the reply's too (DeepSeek-V4.1's reference parser keeps it as the content)
++            try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
+             if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
+             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
+             try choice.put(a, "message", .{ .object = message });
+diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
+index 8b132bc..4e2cca7 100644
+--- a/zig/src/server/reply_text.zig
++++ b/zig/src/server/reply_text.zig
+@@ -8,11 +8,16 @@ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
+ /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
+ const think_open = "<think>";
+ pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
+-/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, DeepSeek-V4.1's.
++/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, DeepSeek-V4.1's. DeepSeek-V4.1's
++/// reference parser (encoding.py, parse_message_from_completion_text) starts the calls at "\n\n<｜DSML｜ calls": the two
++/// newlines are the calls', not the text's, and the template writes them back in front of the block. The entry with them
++/// keeps them out of the streamed text and holds a trailing newline back until the next token says whether calls follow;
++/// the one without still reads a block the model opened without them.
+ pub const calls = [_][2][]const u8{
+     .{ "<tool_call>", "</tool_call>" },
+     .{ "<|tool_call>", "<tool_call|>" },
+     .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
++    .{ "\n\n<\u{ff5c}DSML\u{ff5c} calls>", "</\u{ff5c}DSML\u{ff5c} calls>" },
+     .{ "<\u{ff5c}DSML\u{ff5c} calls>", "</\u{ff5c}DSML\u{ff5c} calls>" },
+ };
+ 
+@@ -341,3 +346,29 @@ test "a reply that writes its own think opener keeps the tag out of its reasonin
+         try std.testing.expectEqualStrings("Done.", s.answer);
+     }
+ }
++
++test "DeepSeek-V4.1's calls take their two newlines: text streams without them, and they wait for the next token" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const block = "<\u{ff5c}DSML\u{ff5c} calls>\n<\u{ff5c}DSML\u{ff5c} invoke name=\"t\">\n</\u{ff5c}DSML\u{ff5c} invoke>\n</\u{ff5c}DSML\u{ff5c} calls>";
++    const reply = "I will check.\n\n" ++ block;
++    // every prefix streams the text and nothing past it, and only ever grows
++    var sent: []const u8 = "";
++    for (1..reply.len + 1) |n| {
++        const shown = try hideToolCalls(a, reply[0..n], false);
++        try std.testing.expect(std.mem.startsWith(u8, "I will check.", shown) and std.mem.startsWith(u8, shown, sent));
++        sent = shown;
++    }
++    try std.testing.expectEqualStrings("I will check.", try hideToolCalls(a, reply, true));
++    // newlines that end a paragraph come out with the next token, or at the reply's end
++    try std.testing.expectEqualStrings("a", try hideToolCalls(a, "a\n\n", false));
++    try std.testing.expectEqualStrings("a\n\nb", try hideToolCalls(a, "a\n\nb", false));
++    try std.testing.expectEqualStrings("a\n\n", try hideToolCalls(a, "a\n\n", true));
++    // a block opened without them, and a third newline, which stays the text's
++    try std.testing.expectEqualStrings("a", try hideToolCalls(a, "a" ++ block, true));
++    try std.testing.expectEqualStrings("a\n", try hideToolCalls(a, "a\n\n\n" ++ block, true));
++    // a call written inside the think block: the reasoning ends where the calls start, as the reference reads it
++    const t = try splitThinking(a, "plan\n\n" ++ block, true, think_markers);
++    try std.testing.expectEqualStrings("plan", t.reasoning);
++}
+-- 
+2.43.0

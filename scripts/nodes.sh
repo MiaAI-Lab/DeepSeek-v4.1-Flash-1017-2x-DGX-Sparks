@@ -339,7 +339,12 @@ head_hf_mount() {
 }
 
 # mem_available_gib: MemAvailable here, in GiB (one decimal)
-mem_available_gib() { awk '/^MemAvailable:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo; }
+# mem_available_gib: what start.sh's MIN_AVAIL_GIB check counts here, MemAvailable plus the pages parked on the per-CPU
+# free lists (mem_counting below; plain MemAvailable if /proc/zoneinfo cannot be read)
+mem_available_gib() { local m; m=$(mem_counting 2>/dev/null) && echo "${m%% *}" || awk '/^MemAvailable:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo; }
+# mem_counting: MemAvailable plus the pages parked on the per-CPU free lists, as the engine's startup budget counts it
+# (scripts/memavail.sh; start.sh's MIN_AVAIL_GIB check)
+source "${_cfg_root:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/memavail.sh"
 
 # await_memory: sets HERE_GB and WORKER_GB (GiB) to the memory available on this Spark and on worker 1, once both reach
 # MIN_AVAIL_GIB or after MIN_AVAIL_WAIT_S seconds at the latest (returns 1 then; the caller words the refusal). A build or a large
@@ -349,7 +354,7 @@ await_memory() {
   local waited=0
   while :; do
     HERE_GB=$(mem_available_gib)
-    WORKER_GB=$(worker 1 "awk '/^MemAvailable:/ {printf \"%.1f\", \$2 / 1048576}' /proc/meminfo" 2>/dev/null || echo 0)
+    WORKER_GB=$(worker 1 "$(declare -f mem_counting mem_available_gib); mem_available_gib" 2>/dev/null || echo 0)
     awk -v a="$HERE_GB" -v b="$WORKER_GB" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a >= m && b >= m)}' && return 0
     (( waited < MIN_AVAIL_WAIT_S )) || return 1
     sleep 2

@@ -26,6 +26,7 @@ pub mod images;
 pub mod paridad;
 pub mod parity;
 pub mod proxy;
+pub mod security;
 
 /// Load the real tokenizer shared by unit and integration tests.  Tests can set
 /// `DS41_TOKENIZER`; otherwise use the tokenizer distributed next to the crate.

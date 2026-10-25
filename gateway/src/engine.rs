@@ -111,23 +111,6 @@ impl EngineClient {
         &self.base
     }
 
-    /// A cheap `/v1/models` request used by `--require-key` to let the engine decide
-    /// whether the client's credentials are acceptable.
-    pub async fn models(&self, headers: &HeaderMap) -> Result<(u16, Value), ApiError> {
-        let mut builder = self.client.get(format!("{}/v1/models", self.base));
-        for name in ["authorization", "x-api-key"] {
-            if let Some(value) = headers.get(name) {
-                builder = builder.header(name, value);
-            }
-        }
-        let response = builder.send().await.map_err(|error| {
-            ApiError::bad_gateway(format!("the model server is unreachable: {error}"))
-        })?;
-        let status = response.status().as_u16();
-        let body = response.json().await.unwrap_or(Value::Null);
-        Ok((status, body))
-    }
-
     /// The shared HTTP client, used by the transparent proxy.
     pub fn http(&self) -> &reqwest::Client {
         &self.client

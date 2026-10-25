@@ -146,6 +146,7 @@ async fn spawn_gateway_config(engine: &str, gateway: Gateway, config: GatewayCon
         gateway: Arc::new(gateway),
         engine: EngineClient::new(engine).expect("engine client"),
         config: Arc::new(config),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

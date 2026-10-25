@@ -30,6 +30,7 @@ async fn spawn_gateway(gateway: Gateway) -> String {
         gateway: Arc::new(gateway),
         engine: EngineClient::new("http://127.0.0.1:1").expect("engine client"),
         config: Arc::new(GatewayConfig::default()),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

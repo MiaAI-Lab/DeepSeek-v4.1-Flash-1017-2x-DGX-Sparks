@@ -1,0 +1,145 @@
+diff --git a/zig/src/families/dsv41/plan.zig b/zig/src/families/dsv41/plan.zig
+index 0b04524..ab8966f 100644
+--- a/zig/src/families/dsv41/plan.zig
++++ b/zig/src/families/dsv41/plan.zig
+@@ -8,6 +8,7 @@
+ const std = @import("std");
+ const Config = @import("config.zig").Config;
+ const DType = @import("rank_cache.zig").DType;
++const checkpoint = @import("checkpoint.zig");
+ 
+ /// What a split means for one rank.
+ pub const Split = struct {
+@@ -112,11 +113,16 @@ pub fn restPair(e: usize, n_routed: usize) u32 {
+ 
+ /// One tensor a rank loads: the loader's key, the dtype it is stored in (null: the checkpoint's own), and for an EXL3
+ /// trellis its K / 16 and N / 16 when the split fixes them.
++/// plain: a mixed pack's float linear (EAQ v1.1 stores 27 indexer/compressor linears as BF16 `.weight` instead of
++/// trellis/suh/svh), with its [n, k] for the rank cache's validation. A pack without those tensors plans EXL3 as before.
+ pub const Want = struct {
+     key: []const u8,
+     dtype: ?DType = null,
+     k16: ?usize = null,
+     n16: ?usize = null,
++    plain: bool = false,
++    n: usize = 0,
++    k: usize = 0,
+ };
+ 
+ /// plain(name, dtype)'s key: f"{name}|{dtype}", the dtype as torch prints it.
+@@ -141,6 +147,9 @@ pub fn partKey(buf: []u8, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize,
+ const Builder = struct {
+     a: std.mem.Allocator,
+     out: std.ArrayList(Want) = .empty,
++    /// The checkpoint, when planning a mixed pack: an EXL3 linear whose whole `.weight` is a BF16 tensor there is
++    /// planned as that plain linear instead of its trellis parts.
++    shards: ?*const checkpoint.Shards = null,
+ 
+     fn plain(b: *Builder, tensor: []const u8, dtype: ?DType) !void {
+         var buf: [256]u8 = undefined;
+@@ -148,6 +157,24 @@ const Builder = struct {
+     }
+ 
+     fn exl3(b: *Builder, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize, k: ?usize, n: ?usize) !void {
++        // A mixed pack's float linear: the checkpoint holds one BF16 `.weight` [n, k] where an EXL3 pack holds
++        // trellis/suh/svh. Only whole, replicated linears are taken this way; a split linear keeps its parts.
++        if (b.shards) |sh| if (cols == null and rows == null) {
++            var pb: [256]u8 = undefined;
++            const name = try std.fmt.bufPrint(&pb, "{s}.weight", .{prefix});
++            if (sh.get(name)) |t| {
++                if (t.rank == 2 and t.dtype == .bf16) {
++                    var kb: [256]u8 = undefined;
++                    try b.out.append(b.a, .{
++                        .key = try b.a.dupe(u8, try plainKey(&kb, name, null)),
++                        .plain = true,
++                        .n = t.shape[0],
++                        .k = t.shape[1],
++                    });
++                    return;
++                }
++            }
++        };
+         const k16: ?usize = if (rows) |r| (r[1] - r[0]) / 16 else if (k) |x| x / 16 else null;
+         const n16: ?usize = if (cols) |c| (c[1] - c[0]) / 16 else if (n) |x| x / 16 else null;
+         for ([_][]const u8{ "tr", "suh", "svh" }) |part| {
+@@ -220,7 +247,12 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
+ 
+ /// Every tensor rank `s` loads, in load order (`dspark`: the DSpark stages and heads too). Keys live in `a`.
+ pub fn wants(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
+-    var b: Builder = .{ .a = a };
++    return wantsShards(a, c, s, dspark, null);
++}
++
++/// The same, with the checkpoint's headers: a mixed pack's BF16 `.weight` linear replaces its EXL3 parts.
++pub fn wantsShards(a: std.mem.Allocator, c: Config, s: Split, dspark: bool, shards: ?*const checkpoint.Shards) ![]Want {
++    var b: Builder = .{ .a = a, .shards = shards };
+     try b.plain("embed.weight", null);
+     try b.plain("norm.weight", null);
+     try b.exl3("head", s.headCols(c), null, c.hidden, null);
+@@ -266,6 +298,42 @@ test "a rank's tensors in load order: the split's ranges, keys as Python prints
+     try std.testing.expectEqualStrings("mtp.2.confidence_head.proj.weight|None", w[w.len - 1].key);
+ }
+ 
++test "a mixed pack plans its BF16 .weight linears in place of the EXL3 parts" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    // One BF16 [4, 8] linear where an EXL3 pack would hold layers.0.attn.wq_a's trellis/suh/svh.
++    const json = "{\"layers.0.attn.wq_a.weight\":{\"dtype\":\"BF16\",\"shape\":[4,8],\"data_offsets\":[0,64]}}";
++    var body: [64]u8 = @splat(0);
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    try file.appendSlice(a, &body);
++    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var sh = try checkpoint.Shards.open(a, io, dir);
++    defer sh.close(io);
++    var why: @import("config.zig").Why = .{};
++    const c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
++    const w = try wantsShards(a, c, .{ .rank = 1, .world = 2 }, true, &sh);
++    var seen = false;
++    for (w) |x| {
++        if (std.mem.eql(u8, x.key, "layers.0.attn.wq_a.weight|None")) {
++            seen = true;
++            try std.testing.expect(x.plain and x.n == 4 and x.k == 8);
++        }
++        try std.testing.expect(!std.mem.startsWith(u8, x.key, "layers.0.attn.wq_a|"));
++    }
++    try std.testing.expect(seen);
++}
++
+ test "each split tensor's ranges: TP2's slices, a 2D node's pair parts of them" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+diff --git a/zig/src/families/dsv41/rank_cache_main.zig b/zig/src/families/dsv41/rank_cache_main.zig
+index 879be3c..bafd5d4 100644
+--- a/zig/src/families/dsv41/rank_cache_main.zig
++++ b/zig/src/families/dsv41/rank_cache_main.zig
+@@ -49,9 +49,10 @@ pub fn main(init: std.process.Init) !u8 {
+     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the file is still rank g of 4
+     const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2, .parity = parity } else .{ .rank = rank, .world = world };
+     const cfg = try dsv41.Config.read(a, io, args[1]);
+-    const want = try dsv41.plan.wants(a, cfg, split, dspark);
+     var sh = try dsv41.checkpoint.Shards.open(gpa, io, args[1]);
+     defer sh.close(io);
++    // A mixed pack (EAQ v1.1) plans its BF16 `.weight` linears as plain entries instead of EXL3 parts.
++    const want = try dsv41.plan.wantsShards(a, cfg, split, dspark, &sh);
+ 
+     // every entry's layout first, and from the layouts the index: a missing tensor or a layout the split does not
+     // expect stops before a byte is written
+@@ -70,6 +71,7 @@ pub fn main(init: std.process.Init) !u8 {
+         if (x.dtype) |d| bad = bad or d != s.dtype;
+         if (x.k16) |k| bad = bad or dim(s.*, 0) != k;
+         if (x.n16) |n| bad = bad or dim(s.*, 1) != n;
++        if (x.plain) bad = bad or s.rank != 2 or s.dtype != .bf16 or s.shape[0] != x.n or s.shape[1] != x.k;
+         if (bad) {
+             std.debug.print("{s}: the checkpoint's {t} {any} is not the split's\n", .{ x.key, s.dtype, s.shape[0..s.rank] });
+             return 1;

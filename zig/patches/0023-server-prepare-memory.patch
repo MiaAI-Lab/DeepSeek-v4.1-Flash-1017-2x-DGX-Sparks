@@ -1,0 +1,854 @@
+# server + core: a long prompt's preparation no longer runs rank 0 out of memory. A fix to the base engine (no switch
+# of the port's, no model code). chat.prepare renders and tokenizes a conversation twice, its prompt and its history,
+# and the tokenizer's and the template's scratch arenas were backed by the request's arena, so nothing they freed went
+# back until the request ended: ~160 bytes a prompt byte for each tokenization and ~28 for each render (a byte-level
+# BPE with DeepSeek-V4's pre-tokenizer, 4 MB of text). On the pair a resumed ~948K-token conversation held ~1.3-1.5 GB
+# on rank 0 through its whole reply, and eight such resumes at once took rank 0's MemAvailable from 6 GiB to 0.16 GiB:
+# the memory guard killed it.
+# - core tokenizer and template: encode and decode take their scratch from the page allocator, render's scratch arena
+#   too; only the ids and the text come from the caller's allocator. Pre-tokenization walks depth first, each step's
+#   parts of one piece in that step's own arena (reset for the next piece) and BPE's scratch reset for each word:
+#   ~6 bytes a text byte of transient scratch instead of ~117, the same ids (a test compares the two walks on a long
+#   text with numbers, CJK runs, added tokens and invalid UTF-8; another checks that a request's arena keeps only the
+#   ids).
+# - server/prepare_gate.zig: each prepare reserves 24 bytes a text byte; while others are in flight, a prepare waits
+#   if MemAvailable less their reservations would fall under the floor with its own. A prepare with none in flight
+#   always goes, so the gate never deadlocks and only turns concurrent prepares into queued ones; a waiting prepare
+#   whose client leaves is cancelled. Without /proc/meminfo it lets everything through.
+# - a kept-alive connection's request arena keeps at most 1 MiB and is reset as soon as its request is answered (it
+#   held its largest request's memory until the connection closed).
+# Switch: TENSORFOLD_PREPARE_FLOOR_GIB, the MemAvailable a prepare leaves while others are in flight (default 3 GiB;
+# 0 turns the gate off; start.sh passes TENSORFOLD_* to both ranks). Replies are unchanged: zig build test-golden
+# parity 312/319 equal to the frozen Python answers, 0 unexpected differences, as before the fix.
+# Applies after the port's patches: this recipe's 0011 export or the per-feature series 0011-0022, the same files and
+# bytes either way (engine 0d6850f and 3959dc0). Also offered alone, as a separate pull request on Mia's main
+# (0011-server-prepare-memory.patch, after 0010); whichever lands first, the other copy goes as a duplicate.
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/zig/src/core/template/template.zig b/zig/src/core/template/template.zig
+index fe64adb8e594c9613cd8ed3fe04565292f90b52e..2872709423a6c5952b048dfb08faf704c6cc0306 100644
+--- a/zig/src/core/template/template.zig
++++ b/zig/src/core/template/template.zig
+@@ -99,8 +99,10 @@ pub fn compile(gpa: Allocator, source: []const u8, diag: ?*Diag) Error!Compiled
+ }
+ 
+ /// Renders with Hugging Face's variables: messages, tools (none when absent), documents, add_generation_prompt, then `context`.
++/// Only the text (and a refusal's message) comes from `gpa`: the render's scratch is the page allocator's, given back
++/// when it returns, so an arena `gpa` (a server request's) keeps nothing else of it (~28 bytes a prompt byte otherwise).
+ pub fn render(gpa: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error![]u8 {
+-    var arena = std.heap.ArenaAllocator.init(gpa);
++    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+     var out: std.ArrayList(u8) = .empty;
+@@ -138,6 +140,30 @@ pub fn renderChat(gpa: Allocator, source: []const u8, messages: std.json.Value,
+     return render(gpa, &t, messages, tools, context, add_generation_prompt, diag);
+ }
+ 
++test "a render keeps only its text in the caller's arena" {
++    const gpa = std.testing.allocator;
++    var diag: Diag = .{};
++    var t = try compile(gpa, "{% for m in messages %}<{{ m.role }}>{{ m.content | trim }}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}", &diag);
++    defer t.deinit();
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var msgs = std.json.Array.init(a);
++    const body = try a.alloc(u8, 64 << 10);
++    @memset(body, 'x');
++    for (0..64) |i| {
++        var o: std.json.ObjectMap = .empty;
++        try o.put(a, "role", .{ .string = if (i % 2 == 0) "user" else "assistant" });
++        try o.put(a, "content", .{ .string = body });
++        try msgs.append(.{ .object = o });
++    }
++    var request = std.heap.ArenaAllocator.init(gpa);
++    defer request.deinit();
++    const out = try render(request.allocator(), &t, .{ .array = msgs }, .null, .{ .object = .empty }, true, &diag);
++    try std.testing.expectEqual(64 * body.len + 32 * "<user>".len + 33 * "<assistant>".len, out.len);
++    try std.testing.expect(request.queryCapacity() <= 2 * out.len + (64 << 10));
++}
++
+ test {
+     _ = @import("tests.zig");
+     _ = @import("unicode.zig");
+diff --git a/zig/src/core/tokenizer/model.zig b/zig/src/core/tokenizer/model.zig
+index 40716adde98f6afe7e4e5426dad433efe096a5d8..f2714227203eb945dbbd66b0d29d3894ac4ffbfa 100644
+--- a/zig/src/core/tokenizer/model.zig
++++ b/zig/src/core/tokenizer/model.zig
+@@ -45,7 +45,7 @@ pub const Model = struct {
+         switch (m.kind) {
+             .bpe => try m.bpe(ctx, vocab, word, out),
+             .wordpiece => try m.wordpiece(ctx, vocab, word, out),
+-            .wordlevel => try out.append(ctx.a, m.id(vocab, word) orelse try m.unk(vocab)),
++            .wordlevel => try out.append(steps.outOf(ctx), m.id(vocab, word) orelse try m.unk(vocab)),
+         }
+     }
+ 
+@@ -63,7 +63,7 @@ pub const Model = struct {
+ 
+     fn bpe(m: *const Model, ctx: *steps.Context, vocab: *const Vocab, word: []const u8, out: *std.ArrayList(u32)) Error!void {
+         const a = ctx.a;
+-        if (m.ignore_merges) if (m.id(vocab, word)) |whole| return out.append(a, whole);
++        if (m.ignore_merges) if (m.id(vocab, word)) |whole| return out.append(steps.outOf(ctx), whole);
+         var symbols: std.ArrayList(Symbol) = .empty;
+         var pending_unk: ?u32 = null;
+         var piece: std.ArrayList(u8) = .empty;
+@@ -125,12 +125,12 @@ pub const Model = struct {
+             if (s.next >= 0) if (m.pair(s.id, syms[@intCast(s.next)].id)) |hit|
+                 try queue.push(a, .{ .rank = hit.rank, .pos = top.pos, .id = hit.id });
+         }
+-        for (syms) |s| if (s.alive) try out.append(a, s.id);
++        for (syms) |s| if (s.alive) try out.append(steps.outOf(ctx), s.id);
+     }
+ 
+     fn wordpiece(m: *const Model, ctx: *steps.Context, vocab: *const Vocab, word: []const u8, out: *std.ArrayList(u32)) Error!void {
+         const a = ctx.a;
+-        if ((std.unicode.utf8CountCodepoints(word) catch return error.InvalidTokenizer) > m.max_chars) return out.append(a, try m.unk(vocab));
++        if ((std.unicode.utf8CountCodepoints(word) catch return error.InvalidTokenizer) > m.max_chars) return out.append(steps.outOf(ctx), try m.unk(vocab));
+         const mark = out.items.len;
+         var piece: std.ArrayList(u8) = .empty;
+         var start: usize = 0;
+@@ -145,9 +145,9 @@ pub const Model = struct {
+                 while (word[end] & 0xC0 == 0x80) end -= 1;
+             } else {
+                 out.shrinkRetainingCapacity(mark);
+-                return out.append(a, try m.unk(vocab));
++                return out.append(steps.outOf(ctx), try m.unk(vocab));
+             };
+-            try out.append(a, found);
++            try out.append(steps.outOf(ctx), found);
+             start = end;
+         }
+     }
+diff --git a/zig/src/core/tokenizer/steps.zig b/zig/src/core/tokenizer/steps.zig
+index ebd1369ca7ce3f3379bf6b398d86a54d7117ea23..d9e342248999fc421e8d84f8b5d14a8776c14808 100644
+--- a/zig/src/core/tokenizer/steps.zig
++++ b/zig/src/core/tokenizer/steps.zig
+@@ -10,12 +10,19 @@ pub const Error = error{ UnsupportedNormalizer, UnsupportedPreTokenizer, Unsuppo
+ /// Per-call scratch: `a` is an arena freed when the call returns.
+ pub const Context = struct {
+     a: Allocator,
++    /// What the model's output list grows in, when it is not `a` (encode's depth-first walk: `a` is reset for each part).
++    out: ?Allocator = null,
+     matcher: regex.Matcher,
+     spans: std.ArrayList(Span) = .empty,
+     hits: std.ArrayList([2]usize) = .empty,
+ };
+ 
+ pub const Span = struct { start: usize, end: usize, matched: bool };
++
++/// The allocator a model's output list grows in (Context.out, else a).
++pub fn outOf(ctx: *const Context) Allocator {
++    return ctx.out orelse ctx.a;
++}
+ pub const Piece = struct { text: []const u8, first: bool };
+ 
+ pub fn field(v: Value, key: []const u8) ?Value {
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index 176d9958e33eb9395b31868b3cc100e47092547c..0ff7e24639571473939a04165c961f13bde335dc 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -80,6 +80,52 @@ const Trie = struct {
+ 
+ const Segment = struct { start: usize, end: usize, id: ?u32 };
+ 
++/// A pre-tokenizer's steps run depth first: step d's parts of one piece in arena d, reset before the next piece, and
++/// the model's scratch for one part in the last arena, reset for each part. Every step maps a piece to its own parts
++/// alone, in order (PreTokenizer.apply's loop), so the parts and their order are those of the steps over every piece
++/// at once; only the scratch is one piece's a step. `n` is 0 when the steps do not fit (nested deeper than max_steps).
++const Walk = struct {
++    backing: Allocator,
++    steps: [max_steps]*const steps.PreTokenizer = undefined,
++    n: usize = 0,
++    arenas: [max_steps + 1]?std.heap.ArenaAllocator = @splat(null),
++
++    const max_steps = 16;
++
++    fn deinit(w: *Walk) void {
++        for (&w.arenas) |*x| if (x.*) |*ar| ar.deinit();
++    }
++
++    /// The steps of `p`, its Sequences flattened; none when they are more than max_steps.
++    fn flatten(w: *Walk, p: *const steps.PreTokenizer) void {
++        if (!w.add(p)) w.n = 0;
++    }
++
++    fn add(w: *Walk, p: *const steps.PreTokenizer) bool {
++        if (p.* == .sequence) {
++            for (p.sequence) |*step| if (!w.add(step)) return false;
++            return true;
++        }
++        if (w.n == max_steps) return false;
++        w.steps[w.n] = p;
++        w.n += 1;
++        return true;
++    }
++
++    /// `piece` through steps d.. and the model, its ids appended to `ids` (grown in `ids_a`).
++    fn run(w: *Walk, t: *const Tokenizer, d: usize, piece: steps.Piece, ids: *std.ArrayList(u32), ids_a: Allocator) Error!void {
++        if (w.arenas[d] == null) w.arenas[d] = .init(w.backing);
++        const ar = &w.arenas[d].?;
++        _ = ar.reset(.retain_capacity);
++        var cx = steps.Context{ .a = ar.allocator(), .matcher = .{ .a = ar.allocator() }, .out = ids_a };
++        if (d == w.n) return t.model.tokenize(&cx, &t.vocab, piece.text, ids);
++        var parts: std.ArrayList(steps.Piece) = .empty;
++        try parts.append(cx.a, piece);
++        try w.steps[d].apply(&cx, &parts);
++        for (parts.items) |x| try w.run(t, d + 1, x, ids, ids_a);
++    }
++};
++
+ pub const Tokenizer = struct {
+     allocator: Allocator,
+     arena: ?*std.heap.ArenaAllocator = null,
+@@ -113,10 +159,25 @@ pub const Tokenizer = struct {
+     }
+ 
+     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
++    /// The call's scratch comes from the page allocator, never from `a`, and is given back when it returns: with an
++    /// arena `a` (a server request's) the scratch of a long prompt would stay with the request (~160 bytes a text
++    /// byte, over a GiB for a prompt of a million tokens). Pre-tokenization walks depth first (Walk), so it holds the
++    /// parts of one piece a step at a time; the ids are those of `apply` over every piece at once.
+     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
+-        var arena = std.heap.ArenaAllocator.init(a);
++        return t.encodeWith(a, text, .{});
++    }
++
++    /// How encode works: where its scratch comes from, and whether pre-tokenization walks depth first (tests compare
++    /// the two walks and count the scratch).
++    pub const EncodeOptions = struct { scratch: Allocator = std.heap.page_allocator, depth_first: bool = true };
++
++    pub fn encodeWith(t: *const Tokenizer, a: Allocator, text: []const u8, o: EncodeOptions) Error![]u32 {
++        var arena = std.heap.ArenaAllocator.init(o.scratch);
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
++        var walk: Walk = .{ .backing = o.scratch };
++        defer walk.deinit();
++        if (t.pre_tokenizer) |*p| if (o.depth_first) walk.flatten(p);
+         var valid = text;
+         if (!std.unicode.utf8ValidateSlice(text)) {
+             var fixed: std.ArrayList(u8) = .empty;
+@@ -125,12 +186,12 @@ pub const Tokenizer = struct {
+         }
+         var ids: std.ArrayList(u32) = .empty;
+         for (try t.splitAdded(&ctx, &t.raw, valid)) |seg| {
+-            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, valid[seg.start..seg.end], seg.start == 0, &ids);
++            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, &walk, valid[seg.start..seg.end], seg.start == 0, &ids);
+         }
+         return a.dupe(u32, ids.items);
+     }
+ 
+-    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
++    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, walk: *Walk, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
+         var zero: usize = if (first) unicode.decodeAt(text, 0).len else 0;
+         const normalized = if (t.normalizer) |*n| try n.apply(ctx, text, &zero) else text;
+         for (try t.splitAdded(ctx, &t.normalized, normalized)) |seg| {
+@@ -139,10 +200,16 @@ pub const Tokenizer = struct {
+                 continue;
+             }
+             if (seg.end == seg.start) continue;
+-            var pieces: std.ArrayList(steps.Piece) = .empty;
+-            try pieces.append(ctx.a, .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero });
+-            if (t.pre_tokenizer) |*p| try p.apply(ctx, &pieces);
+-            for (pieces.items) |piece| try t.model.tokenize(ctx, &t.vocab, piece.text, ids);
++            const piece: steps.Piece = .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero };
++            if (t.pre_tokenizer != null and walk.n == 0) {
++                // every piece at once (a pre-tokenizer nested past Walk's steps, or depth_first off)
++                var pieces: std.ArrayList(steps.Piece) = .empty;
++                try pieces.append(ctx.a, piece);
++                try t.pre_tokenizer.?.apply(ctx, &pieces);
++                for (pieces.items) |x| try t.model.tokenize(ctx, &t.vocab, x.text, ids);
++                continue;
++            }
++            try walk.run(t, 0, piece, ids, ctx.a);
+         }
+     }
+ 
+@@ -181,7 +248,7 @@ pub const Tokenizer = struct {
+ 
+     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
+     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
+-        var arena = std.heap.ArenaAllocator.init(a);
++        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator); // (scratch never kept in `a`: see encode)
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+         var tokens = try std.ArrayList([]const u8).initCapacity(ctx.a, ids.len);
+@@ -363,3 +430,163 @@ test "without a decoder, decode joins known ids' tokens with spaces" {
+     try std.testing.expectEqualStrings("t1 t4", text);
+     try std.testing.expectEqual(@as(?u32, null), t.unk_id);
+ }
++
++/// Counts what an allocator holds now and at most (the tests' measure of encode's scratch).
++const Counting = struct {
++    child: Allocator,
++    live: usize = 0,
++    peak: usize = 0,
++
++    fn allocator(c: *Counting) Allocator {
++        return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
++    }
++    fn note(c: *Counting, add: usize, sub: usize) void {
++        c.live = c.live + add - sub;
++        c.peak = @max(c.peak, c.live);
++    }
++    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        const p = c.child.rawAlloc(len, al, ra) orelse return null;
++        c.note(len, 0);
++        return p;
++    }
++    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        if (!c.child.rawResize(m, al, n, ra)) return false;
++        c.note(n, m.len);
++        return true;
++    }
++    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        const p = c.child.rawRemap(m, al, n, ra) orelse return null;
++        c.note(n, m.len);
++        return p;
++    }
++    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        c.child.rawFree(m, al, ra);
++        c.note(0, m.len);
++    }
++};
++
++/// A byte-level BPE tokenizer with DeepSeek-V3/V4's pre-tokenizer (digits, CJK runs, the word regex, ByteLevel), every
++/// byte in the vocabulary and merges that join each of `words` (with and without its leading space) left to right.
++fn deepseekLike(a: Allocator, words: []const []const u8) !Tokenizer {
++    var out: std.Io.Writer.Allocating = .init(a);
++    defer out.deinit();
++    const w = &out.writer;
++    try w.writeAll(
++        \\{"added_tokens":[{"id":0,"content":"<｜User｜>","special":true,"lstrip":false,"rstrip":false,"normalized":false,"single_word":false}],
++        \\ "normalizer":null,
++        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[
++        \\  {"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},
++        \\  {"type":"Split","pattern":{"Regex":"[一-龥぀-ゟ゠-ヿ]+"},"behavior":"Isolated","invert":false},
++        \\  {"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},
++        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
++        \\ "decoder":{"type":"ByteLevel"},
++        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{
++    );
++    var vocab: std.StringArrayHashMapUnmanaged(void) = .empty;
++    defer vocab.deinit(a);
++    var merges: std.ArrayList([2][]const u8) = .empty;
++    defer merges.deinit(a);
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    const aa = arena.allocator();
++    for (0..256) |b| {
++        var buf: [4]u8 = undefined;
++        const n = try std.unicode.utf8Encode(steps.byte_chars[b], &buf);
++        try vocab.put(a, try aa.dupe(u8, buf[0..n]), {});
++    }
++    for (words) |word| for ([_][]const u8{ "", " " }) |lead| {
++        const raw = try std.mem.concat(aa, u8, &.{ lead, word });
++        var cur: []const u8 = "";
++        for (raw) |b| {
++            var buf: [4]u8 = undefined;
++            const sym = try aa.dupe(u8, buf[0..try std.unicode.utf8Encode(steps.byte_chars[b], &buf)]);
++            if (cur.len == 0) {
++                cur = sym;
++                continue;
++            }
++            const next = try std.mem.concat(aa, u8, &.{ cur, sym });
++            if (!vocab.contains(next)) {
++                try vocab.put(a, next, {});
++                try merges.append(a, .{ cur, sym });
++            }
++            cur = next;
++        }
++    };
++    for (vocab.keys(), 1..) |k, id| {
++        if (id > 1) try w.writeAll(",");
++        try w.print("{f}:{d}", .{ std.json.fmt(k, .{}), id });
++    }
++    try w.writeAll("},\"merges\":[");
++    for (merges.items, 0..) |m, i| {
++        if (i > 0) try w.writeAll(",");
++        try w.print("[{f},{f}]", .{ std.json.fmt(m[0], .{}), std.json.fmt(m[1], .{}) });
++    }
++    try w.writeAll("]}}");
++    return parse(a, out.written());
++}
++
++/// A long prompt's text: sentences of `words`, numbers, CJK runs, tabs and blank lines, an added token now and then.
++fn longText(a: Allocator, words: []const []const u8, bytes: usize) ![]u8 {
++    var out: std.ArrayList(u8) = .empty;
++    var rng = std.Random.DefaultPrng.init(17);
++    const r = rng.random();
++    while (out.items.len < bytes) {
++        const n = 4 + r.uintLessThan(usize, 14);
++        for (0..n) |i| {
++            if (i > 0) try out.append(a, ' ');
++            try out.appendSlice(a, words[r.uintLessThan(usize, words.len)]);
++        }
++        switch (r.uintLessThan(u8, 10)) {
++            0 => try out.print(a, " {d}", .{r.uintLessThan(u32, 1_000_000)}),
++            1 => try out.appendSlice(a, " 日本語のテキスト、"),
++            2 => try out.appendSlice(a, "\t(x+y)=z;"),
++            3 => try out.appendSlice(a, "<｜User｜>"),
++            else => {},
++        }
++        try out.appendSlice(a, if (r.uintLessThan(u8, 6) == 0) ".\n\n" else ". ");
++    }
++    return out.toOwnedSlice(a);
++}
++
++const test_words = [_][]const u8{ "the", "model", "reads", "a", "long", "prompt", "of", "many", "tokens", "and", "keeps", "its", "state", "while", "another", "conversation", "resumes", "from", "memory", "There", "Each", "stream", "decodes" };
++
++test "encode's ids are the breadth-first walk's, and it keeps no scratch in the caller's arena" {
++    const gpa = std.testing.allocator;
++    var t = try deepseekLike(gpa, &test_words);
++    defer t.deinit();
++    const text = try longText(gpa, &test_words, 256 << 10);
++    defer gpa.free(text);
++    // the same ids either walk (and on a few short texts with edge cases)
++    for ([_][]const u8{ text, "", " ", "\n\n\n", "<｜User｜>", "12345 6789", "a  b\t\tc \n d", "\xff\xfe broken", "日本語abc123" }) |s| {
++        const deep = try t.encodeWith(gpa, s, .{});
++        defer gpa.free(deep);
++        const wide = try t.encodeWith(gpa, s, .{ .depth_first = false });
++        defer gpa.free(wide);
++        try std.testing.expectEqualSlices(u32, wide, deep);
++        const back = try t.decode(gpa, deep, false);
++        defer gpa.free(back);
++        if (std.unicode.utf8ValidateSlice(s)) try std.testing.expectEqualStrings(s, back);
++    }
++    // a request arena keeps only the ids: the scratch was the page allocator's
++    var held: Counting = .{ .child = gpa };
++    {
++        var request = std.heap.ArenaAllocator.init(held.allocator());
++        defer request.deinit();
++        const ids = try t.encode(request.allocator(), text);
++        try std.testing.expect(ids.len > text.len / 8);
++        try std.testing.expect(held.peak <= 2 * ids.len * 4 + (64 << 10)); // (an arena's buffer for the one dupe)
++    }
++    // the scratch itself, counted: depth first it is a few bytes a text byte (breadth first: ~100)
++    var deep: Counting = .{ .child = gpa };
++    gpa.free(try t.encodeWith(gpa, text, .{ .scratch = deep.allocator() }));
++    var wide: Counting = .{ .child = gpa };
++    gpa.free(try t.encodeWith(gpa, text, .{ .scratch = wide.allocator(), .depth_first = false }));
++    std.debug.print("scratch for {d} text bytes: depth first {d} B, breadth first {d} B\n", .{ text.len, deep.peak, wide.peak });
++    try std.testing.expectEqual(@as(usize, 0), deep.live);
++    try std.testing.expect(deep.peak * 4 < wide.peak);
++    try std.testing.expect(deep.peak < 40 * text.len);
++}
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index dfd151b6271a8f775b28238daab6beef7aec4e57..924fce3c64b9658a9e3cb49f21124d8c1c0a59b1 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -13,6 +13,7 @@ const ids = @import("ids.zig");
+ const clock = @import("clock.zig");
+ const Server = @import("server.zig").Server;
+ const chunk_plan = @import("chunk_plan.zig");
++const prepare_gate = @import("prepare_gate.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+@@ -154,6 +155,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     var thinking = flag(f, "enable_thinking") orelse srv.config.enable_thinking;
+     if (input.prompt != null) thinking = false;
+     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
++    // the render and tokenization take memory in proportion to the text (twice: prompt and history); under the memory
++    // floor they wait for the ones in flight (prepare_gate), and hold the reservation until prepare returns
++    const ticket = try srv.gate.enter(io, srv.gate.need(promptBytes(input)), gone);
++    defer srv.gate.leave(io, ticket);
+     const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
+     if (gone.check()) return error.Cancelled;
+     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
+@@ -268,6 +273,17 @@ pub fn run(srv: *Server, cx: *Cx, input: Input, sink: ?Sink, gone: anytype) Fail
+     return @import("compact.zig").run(srv, cx, input, sink, gone);
+ }
+ 
++/// The text a request's prepare renders and tokenizes, in bytes (its reservation's measure).
++fn promptBytes(input: Input) usize {
++    var n = prepare_gate.textBytes(input.messages);
++    for (input.tools) |t| n +|= prepare_gate.textBytes(t);
++    if (input.prompt) |p| switch (p) {
++        .text => |t| n +|= t.len,
++        .ids => |toks| n +|= 4 * toks.len,
++    };
++    return n;
++}
++
+ /// Give back a foreground request's preparing count: at its submit, or when it is never generated.
+ pub fn release(srv: *Server, preparing: bool) void {
+     if (preparing) _ = srv.preparing.fetchSub(1, .acq_rel);
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index 1e5fc6c1bbecfbcc53443d2e84425ce4e0c57547..b173b15958f3a6ebee8a65f1b01fe60a3b995efb 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -2,6 +2,7 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const api = @import("engine_api");
++const prepare_gate = @import("prepare_gate.zig");
+ const Allocator = std.mem.Allocator;
+ 
+ pub const Kind = enum {
+@@ -358,7 +359,8 @@ pub fn capabilities(w: *std.Io.Writer, e: Engines) !void {
+         try w.writeAll("}");
+     }
+     try w.writeAll("}}, \"env\": [");
+-    for (env, 0..) |name, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", name });
++    // (the prepare gate's floor is the server's own: prepare_gate.zig)
++    for (env ++ prepare_gate.env, 0..) |name, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", name });
+     try w.writeAll("]}\n");
+ }
+ 
+diff --git a/zig/src/server/prepare_gate.zig b/zig/src/server/prepare_gate.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ac6d057555bef2ec1d72c19d9997496566cca79
+--- /dev/null
++++ b/zig/src/server/prepare_gate.zig
+@@ -0,0 +1,249 @@
++//! The memory gate before a prompt is rendered and tokenized (rank 0's host side). A conversation's text is rendered
++//! twice and tokenized twice (prompt.prepare: the prompt and its history), so a resumed conversation of a million
++//! tokens needs memory in proportion to its text while it prepares, and on a unified-memory machine (a GB10, where the
++//! KV pool leaves a few GiB free) eight of them at once can take MemAvailable to zero. Each prepare reserves
++//! `per_byte` bytes for every byte of its text; a prepare waits while others are in flight and MemAvailable, less
++//! what the ones in flight reserved, would fall under the floor with its own reservation. A prepare with none in
++//! flight always goes (it can never wait on itself), so the gate only ever turns concurrent prepares into queued ones;
++//! it changes no reply. Off with a floor of 0, and where MemAvailable cannot be read (no /proc/meminfo).
++const std = @import("std");
++const json = @import("json.zig");
++const log = @import("log.zig");
++const Value = json.Value;
++
++/// The variable that sets the floor (serve.zig reads it; capabilities lists it beside cli.env).
++pub const env = [_][]const u8{"TENSORFOLD_PREPARE_FLOOR_GIB"};
++/// TENSORFOLD_PREPARE_FLOOR_GIB unset: the MemAvailable a prepare leaves at least, in GiB.
++pub const default_floor_gib: f64 = 3;
++/// Bytes reserved a text byte: the two renders' and tokenizations' transient scratch (~11 and ~6 bytes a text byte,
++/// one at a time) over what the request holds meanwhile (its body, the parsed messages, two rendered texts and two
++/// id lists: ~8), with room to spare.
++pub const default_per_byte: u64 = 24;
++/// How often a waiting prepare reads MemAvailable again.
++const poll_ms = 10;
++
++pub const Gate = struct {
++    mutex: std.Io.Mutex = .init,
++    floor: u64 = 0, // bytes; 0: off
++    per_byte: u64 = default_per_byte,
++    reserved: u64 = 0,
++    inflight: u32 = 0,
++    /// Prepares that had to wait, and the longest wait (ns): for the log and the tests.
++    waited: u64 = 0,
++    longest_ns: u64 = 0,
++    /// MemAvailable in bytes, null when it cannot be read (the gate lets everything through then).
++    avail: *const fn (io: std.Io) ?u64 = memAvailable,
++
++    pub const Ticket = struct { need: u64 = 0, held: bool = false };
++
++    /// A gate leaving `floor_gib` GiB (0: off).
++    pub fn init(floor_gib: f64) Gate {
++        return .{ .floor = if (floor_gib > 0) @intFromFloat(floor_gib * (1 << 30)) else 0 };
++    }
++
++    /// The reservation of a prepare of `text_bytes` bytes of text.
++    pub fn need(g: *const Gate, text_bytes: usize) u64 {
++        return std.math.mul(u64, text_bytes, g.per_byte) catch std.math.maxInt(u64);
++    }
++
++    /// Waits until a prepare reserving `bytes` fits (or none is in flight), then holds its reservation until leave.
++    /// error.Cancelled when `gone` says the client left while it waited.
++    pub fn enter(g: *Gate, io: std.Io, bytes: u64, gone: anytype) error{Cancelled}!Ticket {
++        if (g.floor == 0) return .{};
++        var started: ?i96 = null;
++        while (true) {
++            g.mutex.lockUncancelable(io);
++            if (g.fits(io, bytes)) {
++                g.reserved +|= bytes;
++                g.inflight += 1;
++                if (started) |t0| {
++                    const ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).toNanoseconds() - t0));
++                    g.waited += 1;
++                    g.longest_ns = @max(g.longest_ns, ns);
++                }
++                g.mutex.unlock(io);
++                return .{ .need = bytes, .held = true };
++            }
++            const queued = g.inflight;
++            const reserved = g.reserved;
++            g.mutex.unlock(io);
++            if (started == null) {
++                started = std.Io.Clock.awake.now(io).toNanoseconds();
++                log.line("prepare waits for memory: {d} MiB reserved for it, {d} prepares in flight hold {d} MiB, floor {d} MiB", .{ bytes >> 20, queued, reserved >> 20, g.floor >> 20 });
++            }
++            if (gone.check()) return error.Cancelled;
++            std.Io.sleep(io, .fromMilliseconds(poll_ms), .awake) catch {};
++        }
++    }
++
++    /// (locked) A reservation of `bytes` leaves MemAvailable, less every reservation in flight, at the floor or over.
++    fn fits(g: *Gate, io: std.Io, bytes: u64) bool {
++        if (g.inflight == 0) return true;
++        const avail = g.avail(io) orelse return true;
++        return avail >= g.reserved +| bytes +| g.floor;
++    }
++
++    pub fn leave(g: *Gate, io: std.Io, t: Ticket) void {
++        if (!t.held) return;
++        g.mutex.lockUncancelable(io);
++        defer g.mutex.unlock(io);
++        g.reserved -|= t.need;
++        g.inflight -|= 1;
++    }
++};
++
++/// TENSORFOLD_PREPARE_FLOOR_GIB: GiB, 0 turns the gate off; unset or blank: the default.
++pub fn floorGib(raw: ?[]const u8) error{BadPrepareFloor}!f64 {
++    const t = std.mem.trim(u8, raw orelse "", " \t\r\n");
++    if (t.len == 0) return default_floor_gib;
++    const v = std.fmt.parseFloat(f64, t) catch return error.BadPrepareFloor;
++    if (!(v >= 0) or v > 1 << 20) return error.BadPrepareFloor;
++    return v;
++}
++
++/// The bytes of text a request renders: every string in `v` (message contents, tool specs, names), keys included.
++pub fn textBytes(v: Value) usize {
++    return switch (v) {
++        .string => |s| s.len,
++        .int => |s| s.len,
++        .array => |items| blk: {
++            var n: usize = 0;
++            for (items) |x| n +|= textBytes(x);
++            break :blk n;
++        },
++        .object => |o| blk: {
++            var n: usize = 0;
++            for (o.keys(), o.values()) |k, x| n +|= k.len +| textBytes(x);
++            break :blk n;
++        },
++        else => 8,
++    };
++}
++
++/// /proc/meminfo's MemAvailable in bytes (null where there is none, or it does not parse).
++pub fn memAvailable(io: std.Io) ?u64 {
++    var buf: [4096]u8 = undefined;
++    const text = std.Io.Dir.cwd().readFile(io, "/proc/meminfo", &buf) catch return null;
++    return parseAvailable(text);
++}
++
++pub fn parseAvailable(text: []const u8) ?u64 {
++    var lines = std.mem.splitScalar(u8, text, '\n');
++    while (lines.next()) |line| {
++        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
++        var it = std.mem.tokenizeAny(u8, line["MemAvailable:".len..], " \t");
++        const n = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
++        const unit = it.next() orelse return null;
++        if (!std.mem.eql(u8, unit, "kB")) return null;
++        return std.math.mul(u64, n, 1024) catch null;
++    }
++    return null;
++}
++
++const Never = struct {
++    pub fn check(_: Never) bool {
++        return false;
++    }
++};
++
++test "MemAvailable from /proc/meminfo's text" {
++    try std.testing.expectEqual(@as(?u64, 6 << 30), parseAvailable("MemTotal:       127535424 kB\nMemFree:         1048576 kB\nMemAvailable:    6291456 kB\n"));
++    try std.testing.expectEqual(@as(?u64, null), parseAvailable("MemTotal: 1 kB\n"));
++    try std.testing.expectEqual(@as(?u64, null), parseAvailable("MemAvailable: 12 MB\n"));
++    try std.testing.expectEqual(@as(?u64, null), parseAvailable("MemAvailable: x kB\n"));
++}
++
++test "the floor's setting" {
++    try std.testing.expectEqual(default_floor_gib, try floorGib(null));
++    try std.testing.expectEqual(default_floor_gib, try floorGib(" "));
++    try std.testing.expectEqual(@as(f64, 0), try floorGib("0"));
++    try std.testing.expectEqual(@as(f64, 2.5), try floorGib("2.5"));
++    try std.testing.expectError(error.BadPrepareFloor, floorGib("-1"));
++    try std.testing.expectError(error.BadPrepareFloor, floorGib("nan"));
++    try std.testing.expectError(error.BadPrepareFloor, floorGib("lots"));
++    try std.testing.expectEqual(@as(u64, 0), Gate.init(0).floor);
++    try std.testing.expectEqual(@as(u64, 3 << 30), Gate.init(3).floor);
++}
++
++test "a request's text bytes" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const parsed = try json.parse(a, "[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi there\"}]}]");
++    try std.testing.expect(parsed == .ok);
++    // keys and strings: role+user, content+hello; role+assistant, content, type+text, text+hi there
++    try std.testing.expectEqual(@as(usize, 4 + 4 + 7 + 5 + 4 + 9 + 7 + 4 + 4 + 4 + 8), textBytes(parsed.ok));
++}
++
++var fake_avail: std.atomic.Value(u64) = .init(0);
++fn fakeAvail(_: std.Io) ?u64 {
++    return fake_avail.load(.acquire);
++}
++fn noAvail(_: std.Io) ?u64 {
++    return null;
++}
++
++test "the first prepare always goes; a second waits while it would take MemAvailable under the floor" {
++    const io = std.testing.io;
++    var g = Gate.init(3);
++    g.avail = fakeAvail;
++    fake_avail.store(4 << 30, .release);
++    // the first goes whatever MemAvailable says: none is in flight
++    const a = try g.enter(io, 2 << 30, Never{});
++    try std.testing.expect(a.held);
++    // a second of 1 GiB fits only with 2 (reserved) + 1 + 3 (floor) = 6 GiB available
++    const Waiter = struct {
++        fn run(gate: *Gate, done: *std.atomic.Value(bool), t: *Gate.Ticket) void {
++            t.* = gate.enter(std.testing.io, 1 << 30, Never{}) catch unreachable;
++            done.store(true, .release);
++        }
++    };
++    var done: std.atomic.Value(bool) = .init(false);
++    var second: Gate.Ticket = .{};
++    const th = try std.Thread.spawn(.{}, Waiter.run, .{ &g, &done, &second });
++    std.Io.sleep(io, .fromMilliseconds(5 * poll_ms), .awake) catch {};
++    try std.testing.expect(!done.load(.acquire));
++    // the first leaves: the second goes (none in flight)
++    g.leave(io, a);
++    th.join();
++    try std.testing.expect(done.load(.acquire) and second.held);
++    try std.testing.expectEqual(@as(u64, 1), g.waited);
++    try std.testing.expectEqual(@as(u64, 1 << 30), g.reserved);
++    // with room, a third goes beside it at once
++    fake_avail.store(16 << 30, .release);
++    const third = try g.enter(io, 1 << 30, Never{});
++    try std.testing.expectEqual(@as(u32, 2), g.inflight);
++    g.leave(io, third);
++    g.leave(io, second);
++    try std.testing.expectEqual(@as(u64, 0), g.reserved);
++    try std.testing.expectEqual(@as(u32, 0), g.inflight);
++}
++
++test "a waiting prepare whose client leaves is cancelled; off and unreadable gates never wait" {
++    const io = std.testing.io;
++    var g = Gate.init(3);
++    g.avail = fakeAvail;
++    fake_avail.store(1 << 30, .release);
++    const a = try g.enter(io, 1 << 30, Never{});
++    const Left = struct {
++        pub fn check(_: @This()) bool {
++            return true;
++        }
++    };
++    try std.testing.expectError(error.Cancelled, g.enter(io, 1 << 30, Left{}));
++    try std.testing.expectEqual(@as(u32, 1), g.inflight);
++    g.leave(io, a);
++    var off = Gate.init(0);
++    off.avail = fakeAvail;
++    const x = try off.enter(io, 1 << 40, Never{});
++    const y = try off.enter(io, 1 << 40, Never{});
++    try std.testing.expect(!x.held and !y.held);
++    off.leave(io, x);
++    var blind = Gate.init(3);
++    blind.avail = noAvail;
++    const p = try blind.enter(io, 1 << 40, Never{});
++    const q = try blind.enter(io, 1 << 40, Never{});
++    blind.leave(io, p);
++    blind.leave(io, q);
++    try std.testing.expectEqual(@as(u32, 0), blind.inflight);
++}
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 7efe9b4ef8a3e7cf2f2be712a227e084d8cc45f4..86285acce84a5b4c9ad875d42d904ac7f9e6068f 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -41,4 +41,5 @@ test {
+     _ = @import("compact_test.zig");
+     _ = @import("decisions.zig");
+     _ = @import("decisions_test.zig");
++    _ = @import("prepare_gate.zig");
+ }
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index cef3e6c3f39f80d46c0816e878c4c9140e4320ee..e3e3333b820ac44ee00a35647c512b055f15a1f3 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -9,6 +9,7 @@ const live = @import("live.zig");
+ const listener_mod = @import("listener.zig");
+ const model_text = @import("model_text.zig");
+ const server_mod = @import("server.zig");
++const prepare_gate = @import("prepare_gate.zig");
+ const Allocator = std.mem.Allocator;
+ const posix = std.posix;
+ 
+@@ -118,6 +119,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
+         .compact_keep = args.compact_keep,
+         .compact_memory = args.compact_memory,
++        .prepare_floor_gib = prepare_gate.floorGib(env(s, "TENSORFOLD_PREPARE_FLOOR_GIB")) catch {
++            std.debug.print("tensorfold: TENSORFOLD_PREPARE_FLOOR_GIB={s}: a number of GiB, 0 for no gate\n", .{env(s, "TENSORFOLD_PREPARE_FLOOR_GIB").?});
++            return 1;
++        },
+     };
+     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
+         std.debug.print("tensorfold: the server could not start\n", .{});
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 0001a3e448ccbc32b54d8741c788eaa28693d638..62701b528e7f8cc997c60e43dad41d8a886feeab 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -18,10 +18,14 @@ const prompt = @import("prompt.zig");
+ const tool_specs = @import("tool_specs.zig");
+ const chunk_plan = @import("chunk_plan.zig");
+ const log = @import("log.zig");
++const prepare_gate = @import("prepare_gate.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+ 
++/// A kept-alive connection's arena keeps at most this much between its requests.
++const connection_keep: usize = 1 << 20;
++
+ /// auto compacts near the window. fraction compacts past that share of it.
+ pub const CompactAt = union(enum) { auto, fraction: f64 };
+ 
+@@ -50,6 +54,9 @@ pub const Config = struct {
+     /// Directory of the stored note, or null when notes are not stored.
+     compact_memory: ?[]const u8 = null,
+     timeouts: http_conn.Timeouts = .{},
++    /// TENSORFOLD_PREPARE_FLOOR_GIB: the MemAvailable a prompt's render and tokenization leave at least while others
++    /// are in flight (prepare_gate); 0: no gate.
++    prepare_floor_gib: f64 = prepare_gate.default_floor_gib,
+ };
+ 
+ pub const Server = struct {
+@@ -78,12 +85,14 @@ pub const Server = struct {
+     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
+     keepalive: ?*api.keepalive.Keepalive = null,
+     preparing: std.atomic.Value(i64) = .init(0),
++    /// Concurrent prompt preparations held under the memory floor (prepare_gate).
++    gate: prepare_gate.Gate = .{},
+     arena: std.heap.ArenaAllocator,
+ 
+     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
+     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
+         const srv = try gpa.create(Server);
+-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa) };
++        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .gate = .init(config.prepare_floor_gib), .arena = .init(gpa) };
+         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
+             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
+                 log.line("idle keepalive off: {s}", .{@errorName(e)});
+@@ -277,7 +286,9 @@ pub const Server = struct {
+         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
+         defer arena.deinit();
+         while (true) {
+-            _ = arena.reset(.retain_capacity);
++            // a kept-alive connection keeps at most this much of its last request between requests (a long prompt's
++            // text and ids are tens of MiB, and retain_capacity held them until the connection closed)
++            _ = arena.reset(.{ .retain_with_limit = connection_keep });
+             const a = arena.allocator();
+             const outcome = conn.readRequest(a, true) catch break;
+             switch (outcome) {
+@@ -289,6 +300,7 @@ pub const Server = struct {
+             if (conn.header("Expect")) |expect| if (std.ascii.eqlIgnoreCase(expect, "100-continue") and std.mem.order(u8, conn.version, "HTTP/1.1") != .lt) conn.sendContinue();
+             routes.dispatch(srv, &conn, a);
+             if (conn.close or conn.broken) break;
++            _ = arena.reset(.{ .retain_with_limit = connection_keep }); // (before waiting for the next request)
+         }
+     }
+ 

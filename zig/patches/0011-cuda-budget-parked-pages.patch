@@ -1,0 +1,244 @@
+# The startup budget counts the pages parked on the kernel's per-CPU free lists (port of GLM 0119,
+# MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#149). On a unified GPU (the GB10) the native engine sizes the
+# weights check and the --parallel streams' admission from MemAvailable when a rank starts. On kernel 6.7+ (6.17 on
+# the GB10) a bulk free (an image copy, docker save | load, a compiler's exit, the first start of a new image) leaves
+# 2-9 GiB of free pages on the per-CPU lists for a minute or two; the kernel drains them when an allocation needs them,
+# but neither MemFree nor MemAvailable counts them, so the first start after an image load budgeted several GiB too
+# little (here: a fixed --parallel 8 refused with error.TooMany, or a failed weights check).
+# native/cuda_memory.zig parkedBytes() sums the ``count:`` lines under each zone's ``pagesets`` in /proc/zoneinfo less
+# their ``high_min:`` lines (the level they hold at rest; 512 MiB when a kernel prints none), so a warm start's budget
+# does not move; 0 on anything unparsable, never an error. native/cuda.zig pool() reads /proc/meminfo first and
+# /proc/zoneinfo right after (pages that drain in between are undercounted, never counted twice), adds the excess to
+# MemAvailable capped at MemTotal, and logs it from 0.25 GiB. Unified GPUs only; the 10 % reserve is unchanged.
+# No switch: sizing only, the same replies. Tests: GLM's tools/parked_pages_check.py cases translated
+# (zig test zig/src/native/cuda_memory.zig, 9 pass) and a Linux-only test on the host's own /proc/zoneinfo. Part of
+# every port image run on the pair (every exact.py run identical to the daily baseline). The recipe's own start check
+# (scripts/memavail.sh) counts the same pages.
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index ba8f5efeed3b349e2177a274463e26fd49f291d1..8576cc1b4a1bacf8cf1ece7826837f752cb0746a 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -111,10 +111,15 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
+     const unified = (try ctx.attribute(.integrated)) != 0;
+     const card = try ctx.memInfo();
+     const text = if (unified) procText(a, io, "/proc/meminfo") else null;
+-    const available = budget.counts(unified, .{ .total = card.total, .available = card.free }, text) catch {
++    // MemAvailable first, the per-CPU page lists right after, one reading for both figures: pages that drain from the
++    // lists in between are counted by neither (an undercount), never by both
++    const zones = if (unified) procText(a, io, "/proc/zoneinfo") else null;
++    const parked = if (zones) |z| budget.parkedBytes(z, std.heap.pageSize()) else 0;
++    const read = budget.counts(unified, .{ .total = card.total, .available = card.free }, text) catch {
+         problem.* = "cannot read or parse /proc/meminfo's MemTotal and MemAvailable; refusing CUDA unified-memory admission";
+         return null;
+     };
++    const available = if (unified) budget.counting(read, parked) else read;
+     const free = available.available;
+     const total = available.total;
+     const reserve = budget.reserveBytes(getenv("TENSORFOLD_MEMORY_RESERVE_GIB"), total) catch {
+@@ -125,7 +130,7 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
+         problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_MEMORY_LIMIT_GB={s}: a positive number of GiB whose byte count fits in a 64-bit size", .{getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB").?});
+         return null;
+     };
+-    return .{ .free = free, .total = total, .reserve = reserve, .limit = limit, .unified = unified };
++    return .{ .free = free, .total = total, .reserve = reserve, .limit = limit, .unified = unified, .parked = if (unified) available.available - read.available else 0 };
+ }
+ 
+ fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
+@@ -352,6 +357,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     defer if (!opened) loaded.deinit(loaded.ctx);
+     const model = cuda.usage(false).device - held0;
+     const after = try pool(a, io, &g.ctx, problem) orelse return null;
++    for ([_]Pool{ before, after }, [_][]const u8{ "the weights' check", "the streams' admission" }) |p, what| if (p.parked >= 1 << 28) {
++        std.log.info("CUDA budget for {s} counts the {d:.2} GiB free on the per-CPU page lists beyond their resting level (neither MemFree nor MemAvailable does)", .{ what, toGib(p.parked) });
++    };
+     const room = after.room(model);
+     const streams = budget.admit(room, loaded.stream_bytes, o.lanes, o.lanes_fixed) catch |e| {
+         problem.* = switch (e) {
+@@ -405,6 +413,16 @@ test "this host's /proc/meminfo reads whole and parses (Linux)" {
+     try std.testing.expect(budget.meminfo(text) != null);
+ }
+ 
++test "this host's /proc/zoneinfo reads whole; its page lists count less than the host's memory (Linux)" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const a = std.testing.allocator;
++    const zones = procText(a, std.testing.io, "/proc/zoneinfo") orelse return error.Unreadable;
++    defer a.free(zones);
++    const mem = procText(a, std.testing.io, "/proc/meminfo") orelse return error.Unreadable;
++    defer a.free(mem);
++    try std.testing.expect(budget.parkedBytes(zones, std.heap.pageSize()) < budget.meminfo(mem).?.total);
++}
++
+ test "chip classes name the compute capability as gate entries do" {
+     const a = std.testing.allocator;
+     const name = chipClass(a, 121).?;
+diff --git a/zig/src/native/cuda_memory.zig b/zig/src/native/cuda_memory.zig
+index 180c664071aa0620cdbfdd4033a4cff0daeca541..757b8426636344e44b6d53b692ddc2b2f42fc73e 100644
+--- a/zig/src/native/cuda_memory.zig
++++ b/zig/src/native/cuda_memory.zig
+@@ -30,6 +30,44 @@ pub fn meminfo(text: []const u8) ?MemInfo {
+     return if (t > 0 and a <= t) .{ .total = t, .available = a } else null;
+ }
+ 
++/// What the per-CPU page lists hold at rest when /proc/zoneinfo prints no high_min (kernels before 6.7).
++pub const parked_rest: u64 = 1 << 29;
++
++/// Bytes free on the kernel's per-CPU page lists beyond what they hold at rest: the `count:` lines under each zone's
++/// `pagesets` less their `high_min:` lines (parked_rest when there are none). A bulk free (an image copy, a compiler's
++/// exit) leaves GiBs there on kernel 6.7+; they are free and the kernel drains them when an allocation needs them, but
++/// neither MemFree nor MemAvailable counts them and they drain back at ~0.05-0.1 GiB/s. A warm start parks ~0.3 GiB,
++/// which the budget never counted: that stays ~0. 0 when the text has no page lists or a field does not parse.
++/// (Port of wojo's GLM 0119, PR #149.)
++pub fn parkedBytes(text: []const u8, page: u64) u64 {
++    var count: u64 = 0;
++    var rest: u64 = 0;
++    var listed = false;
++    var rows = std.mem.splitScalar(u8, text, '\n');
++    while (rows.next()) |row| {
++        var words = std.mem.tokenizeAny(u8, row, " \t\r");
++        const first = words.next();
++        if (std.mem.eql(u8, std.mem.trim(u8, row, " \t\r"), "pagesets")) {
++            listed = true;
++        } else if (listed and !std.mem.startsWith(u8, row, "    ") and !std.mem.startsWith(u8, row, "  vm stats")) {
++            listed = false; // the next zone's or the next field of this one
++        } else if (listed and first != null and (std.mem.eql(u8, first.?, "count:") or std.mem.eql(u8, first.?, "high_min:"))) {
++            const n = std.fmt.parseInt(u64, words.next() orelse return 0, 10) catch return 0;
++            const sum = if (first.?[0] == 'c') &count else &rest;
++            sum.* = std.math.add(u64, sum.*, n) catch return 0;
++        }
++    }
++    if (count == 0) return 0;
++    const held = std.math.mul(u64, count, page) catch return 0;
++    const resting = if (rest > 0) std.math.mul(u64, rest, page) catch return 0 else parked_rest;
++    return held -| resting;
++}
++
++/// A /proc/meminfo reading with `parked` (parkedBytes) added to MemAvailable, at most MemTotal.
++pub fn counting(m: MemInfo, parked: u64) MemInfo {
++    return .{ .total = m.total, .available = @min(m.total, m.available +| parked) };
++}
++
+ /// CUDA allocation room after the reserve and optional process-memory cap.
+ pub const Pool = struct {
+     free: u64,
+@@ -37,6 +75,7 @@ pub const Pool = struct {
+     reserve: u64,
+     limit: ?u64,
+     unified: bool,
++    parked: u64 = 0, // counted into `free`: pages on the per-CPU lists past their resting level (parkedBytes)
+ 
+     /// Bytes the engine may still allocate on top of `held`.
+     pub fn room(p: Pool, held: u64) u64 {
+@@ -136,3 +175,112 @@ test "memory limit refuses an oversized finite value and the rounded u64 boundar
+     try std.testing.expectError(error.Invalid, limitBytes("17179869183.9999995")); // parses to 2^34: 2^64 bytes
+     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64) - 2047), try limitBytes("17179869183.9999980926513671875"));
+ }
++
++/// tools/parked_pages_check.py's /proc/zoneinfo blocks: one zone's stats, its page lists when `counts` is given.
++fn zoneText(a: std.mem.Allocator, out: *std.ArrayList(u8), node: u32, name: []const u8, counts_: ?[]const u64, high_min: ?u64) !void {
++    try out.print(a, "Node {d}, zone {s:>8}\n  pages free     10\n        managed  1000\n      nr_free_cma  0\n", .{ node, name });
++    if (counts_) |cs| {
++        try out.appendSlice(a, "  pagesets\n");
++        for (cs, 0..) |c, n| {
++            try out.print(a, "    cpu: {d}\n              count:    {d}\n              high:     5000\n              batch:    63\n", .{ n, c });
++            if (high_min) |h| try out.print(a, "              high_min: {d}\n", .{h});
++            try out.appendSlice(a, "              high_max: 198283\n  vm stats threshold: 110\n");
++        }
++    }
++    try out.appendSlice(a, "  start_pfn:           4096\n");
++}
++
++test "parked pages: every CPU, zone and node, less each list's resting level" {
++    const a = std.testing.allocator;
++    const page: u64 = 4096;
++    const hm: u64 = 2146; // a CPU list's high_min as the kernel prints it on a Spark
++    var t: std.ArrayList(u8) = .empty;
++    defer t.deinit(a);
++    const ca = [_]u64{ 200000, 3143, 2332, 17 };
++    const cb = [_]u64{ 100000, 100000, 100000 };
++    const cc = [_]u64{400000};
++    try zoneText(a, &t, 0, "DMA", &ca, hm);
++    try zoneText(a, &t, 0, "DMA32", null, hm);
++    try zoneText(a, &t, 0, "Normal", &cb, hm);
++    try zoneText(a, &t, 1, "Normal", &cc, hm);
++    try zoneText(a, &t, 1, "Movable", null, hm);
++    var sum: u64 = 0;
++    for (ca ++ cb ++ cc) |c| sum += c;
++    const excess = (sum - 8 * hm) * page;
++    try std.testing.expectEqual(excess, parkedBytes(t.items, page));
++    const m = counting(.{ .total = 128 << 30, .available = 100 << 30 }, excess);
++    try std.testing.expectEqual(@as(u64, (100 << 30) + excess), m.available);
++    try std.testing.expectEqual(@as(u64, 128 << 30), m.total);
++    try std.testing.expectEqual(@as(u64, 128 << 30), counting(.{ .total = 128 << 30, .available = 120 << 30 }, 200 << 30).available); // capped at MemTotal
++}
++
++test "parked pages: an image copy's 6 GiB raise the budget by 6 GiB; a warm start counts ~nothing" {
++    const a = std.testing.allocator;
++    const page: u64 = 4096;
++    const hm: u64 = 2146;
++    const six = (6 << 30) / page;
++    var t: std.ArrayList(u8) = .empty;
++    defer t.deinit(a);
++    try zoneText(a, &t, 0, "Normal", &.{ six / 4 + hm, six / 4 + hm, six / 4 + hm, six / 4 + hm }, hm);
++    try std.testing.expectEqual(@as(u64, 6 << 30), parkedBytes(t.items, page));
++    const warm = [_][20]u64{ @splat(hm), @splat(hm + 1440), @splat(0) };
++    for (warm) |cs| {
++        t.clearRetainingCapacity();
++        try zoneText(a, &t, 0, "Normal", &cs, hm);
++        try std.testing.expect(parkedBytes(t.items, page) < 1 << 28); // under the log line's 0.25 GiB
++    }
++    t.clearRetainingCapacity();
++    try zoneText(a, &t, 0, "Normal", &@as([20]u64, @splat(100)), hm);
++    try std.testing.expectEqual(@as(u64, 0), parkedBytes(t.items, page)); // below the resting level: nothing
++}
++
++test "parked pages: no high_min (before 6.7) rests the first 512 MiB" {
++    const a = std.testing.allocator;
++    const page: u64 = 4096;
++    var t: std.ArrayList(u8) = .empty;
++    defer t.deinit(a);
++    const half = ((1 << 30) + (1 << 29)) / page / 2;
++    try zoneText(a, &t, 0, "Normal", &.{ half, half }, null);
++    try std.testing.expectEqual(@as(u64, 1 << 30), parkedBytes(t.items, page));
++    t.clearRetainingCapacity();
++    try zoneText(a, &t, 0, "Normal", &.{ 1000, 1000, 1000, 1000 }, null);
++    try std.testing.expectEqual(@as(u64, 0), parkedBytes(t.items, page));
++}
++
++test "parked pages: only the count: and high_min: lines under pagesets" {
++    const a = std.testing.allocator;
++    const page: u64 = 4096;
++    var t: std.ArrayList(u8) = .empty;
++    defer t.deinit(a);
++    try t.appendSlice(a, "  count: 5\n      count: 6\n");
++    try zoneText(a, &t, 0, "Normal", &.{2146 + 10}, 2146);
++    try t.appendSlice(a, "      count:    99999\n      high_min: 7\n"); // after start_pfn: not a list
++    try t.appendSlice(a, "Node 0, zone Other\n      count:    77777\n  pagesets\n    cpu: 0\n              high:     1\n");
++    try std.testing.expectEqual(10 * page, parkedBytes(t.items, page));
++    // a list that ends at the next field of its zone
++    const other = "Node 0, zone Normal\n  pagesets\n    cpu: 0\n              count: 2200\n              high: 9\n" ++
++        "              high_min: 2000\n  vm stats threshold: 8\n    cpu: 1\n              count: 2100\n" ++
++        "              high_min: 2000\n  all_unreclaimable: 0\n";
++    try std.testing.expectEqual(300 * page, parkedBytes(other, page));
++}
++
++test "parked pages: no lists, empty, garbled or binary text counts nothing" {
++    const a = std.testing.allocator;
++    const page: u64 = 4096;
++    var t: std.ArrayList(u8) = .empty;
++    defer t.deinit(a);
++    try zoneText(a, &t, 0, "DMA", null, 2146);
++    try zoneText(a, &t, 0, "Normal", null, 2146);
++    try std.testing.expectEqual(@as(u64, 0), parkedBytes(t.items, page));
++    try std.testing.expectEqual(@as(u64, 0), parkedBytes("", page));
++    var bad: std.ArrayList(u8) = .empty;
++    defer bad.deinit(a);
++    try zoneText(a, &bad, 0, "Normal", &.{1000000}, 2146);
++    for ([_][2][]const u8{ .{ "count:    1000000", "count:    x" }, .{ "count:    1000000", "count:" }, .{ "high_min: 2146", "high_min: x" }, .{ "count:    1000000", "count:    \xff\xfe" } }) |swap| {
++        const garbled = try std.mem.replaceOwned(u8, a, bad.items, swap[0], swap[1]);
++        defer a.free(garbled);
++        try std.testing.expectEqual(@as(u64, 0), parkedBytes(garbled, page));
++    }
++    try std.testing.expectEqual(@as(u64, 0), parkedBytes("\x00\xff\xfe" ++ "\x00\xff\xfe" ++ "\x00\xff\xfe\n  pagesets\x00", page));
++    try std.testing.expectEqual(@as(u64, 0), parkedBytes("Node 0, zone Normal\n  pagesets\n    cpu: 0\n      count: 18446744073709551615\n      count: 1\n", page)); // overflow: nothing, not a wrap
++}

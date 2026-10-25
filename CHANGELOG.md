@@ -2,25 +2,118 @@
 
 ## Unreleased
 
-- `gateway/` (`ds41-gateway`, Rust): the DeepSeek API front end over TensorFold's token-in/token-out route, with
-  `zig/patches/0011-token-route.patch` (`TENSORFOLD_TOKEN_ROUTE=1`) and the API's effort table behind
-  `TF_DS_API_EFFORTS=1`. Off by default; `API_GATEWAY=1` moves the engine to `127.0.0.1:ENGINE_PORT`, starts the gateway
-  on `HOST:PORT`, waits for `/health`, runs a second smoke test against the engine and stops the gateway first. The image
-  is built by `scripts/prepare.sh` from `gateway/Dockerfile` (multi-stage Rust 1.97 to Debian slim, unprivileged, no GPU,
-  no Python, no OpenCV); `GATEWAY_MEMORY`, `GATEWAY_CPUS`, `GATEWAY_STRICT`, `GATEWAY_BLOCK_PRIVATE_URLS`,
-  `GATEWAY_API_SAMPLING`, `GATEWAY_IMAGE_TOKEN`, `GATEWAY_LOG`, `GATEWAY_MAX_IMAGES` and `GATEWAY_MAX_IMAGE_MB` are the
-  gateway's settings. `API_GATEWAY=0` keeps the previous output except the derived engine image tag, which changes when
-  0011 enters `zig/patches/`; `scripts/test_api_gateway_settings.py` compares every other byte.
-  See the README section "DeepSeek API parity (gateway)" and `docs/api-gateway.md`. The comparator (`ds41-paridad`) is
-  built into the image and runs `casos`, `render` and `e2e` with or without a GPU (the CPU run uses the TensorFold
-  checkout's `fake_serve`); it writes `informes/cpu/informe.{json,html}`.
-- `zig/patches/0009-disk-cache.patch` (off by default; `DISK_CACHE=1`): kept conversation states go to disk, each rank its
-  half, before they lose their place in memory, and come back from it; a stop writes every kept state, so a restart
-  resumes them. `start.sh` makes `DISK_CACHE_DIR` on both Sparks, mounts it in both containers and checks its free
-  space; `STOP_TIMEOUT` follows `DISK_CACHE_FLUSH_S`. Replies identical with and without it (`tools/exact.py` 31/31);
-  a 52K turn resumed from disk in 1.1-2.8 s instead of ~32 s; reading a 198,656-token state back pauses the other streams
-  for ~0.35 s. `/health` shows the prompt cache's counts (`prompt_cache`). See the README section "Disk cache of kept
-  conversations".
+- Feature 004 is additive on Mia main at `27741e1`: the optional DeepSeek API gateway and comparator in `gateway/`, the
+  `API_GATEWAY=1` wiring, and `zig/patches/0030-token-route.patch` (renumbered from 0011 after Mia's 0011-0029 series).
+  With `API_KEY=1`, gateway middleware loads `API_KEY_FILE` once, rejects a missing or empty key at startup, and requires
+  the actual Bearer or `x-api-key` value on every route except public `/health`, before reading a body; comparisons are
+  constant-time and failures are API-shaped 401 responses. `GATEWAY_MAX_CONCURRENT` (default 3) queues excess requests
+  instead of rejecting them, holding each permit through its response body/SSE. The 512 MiB sizing is
+  `floor((512-235)/70)=3` (four requests would need 515 MiB); `GATEWAY_MEMORY` remains `1g` because the former 512m
+  container cap stalled Hernan's startup. Sufyan's MIT attribution and the derived parity cases' notice are in
+  `gateway/NOTICE`. The duplicate `zig/patches/0009-disk-cache.patch` bundle and `tools/disk_cache_check.py` are removed;
+  Mia's current spill-v2/cache implementation and all other main-branch changes are preserved.
+
+- `ABLIT=1` on a read-only Hugging Face blob cache: `prepare.sh` gives the overlay's work folder its own writable copy of
+  the checkpoint index (the shards stay hard links), so the graft no longer fails with `PermissionError` when it rewrites
+  the index (issue #42, reported by unitea1992). By **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,
+  [@rwojo](https://x.com/rwojo) on X)**, [pull request #45](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/45);
+  regression test `scripts/test_ablit_index_writable.sh`.
+- Each rank's container log rotates (`LOG_MAX_SIZE`, default `100m`, and `LOG_MAX_FILE`, 3; `LOG_MAX_SIZE=` leaves the
+  docker daemon's settings): the engine writes an access line for every response, so a 1 s monitoring poll grew rank 0's
+  log by ~265k lines a day for as long as it ran (issue #49, reported by eleata). Checked by the `start.sh` dry-run
+  golden test (`scripts/port_test.sh`).
+- README: what one stream reserves out of the pool at admission (`prompt + max_tokens + ROUND_ROWS + 2`, aligned to
+  2,048), with a measurement of four concurrent 500,601-token prompts in a 2,097,152-position pool. By **Maciej Kowalik
+  ([koniaik](https://github.com/koniaik))**, [pull request #56](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/56).
+- `zig/patches/0029-anthropic-budget-default.patch` (always on): the Anthropic frontend accepts `thinking: {"type":
+  "enabled"}` without `budget_tokens`; such a request gets the server's `--thinking-budget` default, as an OpenAI-format
+  request without `thinking_budget` already does (stock refused it: `thinking.budget_tokens must be positive and less than
+  max_tokens`). A `budget_tokens` that is sent is checked and passed on as before (zero, negative, not an integer or not
+  below `max_tokens` is still refused). By **Maciej Kowalik ([koniaik](https://github.com/koniaik))**, [pull request #53](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/53) (sent as `0014`; the refusal of a `budget_tokens` that is sent but invalid kept when ported).
+- `zig/patches/0028-plain-request-text.patch` (always on): a request's own text never becomes a control token (issue #21).
+  The server renders the chat template to text and encodes it with the added vocabulary, so a control token's spelling
+  in request text came back as the token: a tool result holding `<｜User｜>`, a DSML call or `</think>` gave the model a
+  role marker, a call or the end of its thinking. Every string of the request's messages and tools now gets the
+  tokenizer's plain mark inside each such spelling before rendering (`Tokenizer.maskAdded`, `messages.maskControls`), and
+  the encoder drops the mark before the pre-tokenizer. Measured through `/tokenize` on a pair: four prompts whose tool
+  result spells role markers, think tags, a DSML call or the sequence tokens held 30-34 control ids before, 28 after
+  (the template's own); three clean conversations (plain, Unicode, JSON) give identical ids; reply ids unchanged
+  (greedy, seeded temperature 1, thinking, a tool call, a 10K-token prompt); `tools/validate.py` passes (video aside).
+  The output side (`reply_text.splitThinking` reads `</think>` from text) is not changed. The Anthropic `count_tokens` route masks the same way (added when ported). By **[Coinupbtc](https://github.com/Coinupbtc)**, [pull request #43](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/43) (sent as `0013`).
+- `zig/patches/0027-tool-call-prose.patch` (always on): the text a reply writes before its tool calls is the reply's
+  content, without the two newlines that start the calls, as the checkpoint's reference parser reads it
+  (`encoding/encoding.py`, `parse_message_from_completion_text`: the calls start at `\n\n<｜DSML｜ calls`; `render_message`
+  writes `content + "\n\n" + calls` back). A reply without streaming used to return `"content": null` whenever it made
+  calls, so the client never saw the text (in one case a 3,671-character plan) and sent the turn back without it. A
+  streamed reply sent the two newlines as content, so a client that keeps the content as it arrived sent back
+  `text\n\n\n\n<｜DSML｜ calls>`. Measured on a pair: three long tool-calling replies (thinking high, 780-4,757 characters of
+  reasoning, 2,369-3,645 of text) sent back as they streamed now give the next prompt exactly the generated tokens (3 of 3;
+  before: 0 of 3, each diverging right before the calls), and the non-streamed reply's turn sent back as returned does
+  too. Reply ids are unchanged (greedy, seeded temperature 1, thinking, a tool call, a 10K-token prompt). A streamed
+  paragraph break now waits for the next token before it is sent. By **[Coinupbtc](https://github.com/Coinupbtc)**, [pull request #44](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/44) (sent as `0012`).
+- **Rank 0's memory with long prompts:** `zig/patches/0023-server-prepare-memory.patch`, a fix to the base engine after
+  the port's series (also offered alone as its own pull request). A prompt's render and tokenization kept their scratch
+  in the request's memory until the reply ended: a resumed ~948K-token conversation held ~1.3-1.5 GB on rank 0, and
+  eight at once took its MemAvailable from 6 GiB to 0.16 GiB until the memory guard killed it. The tokenizer and the
+  template give their scratch back, a prepare waits while others are in flight and MemAvailable would fall under
+  `TENSORFOLD_PREPARE_FLOOR_GIB` (default 3; `0` off), and a kept-alive connection keeps at most 1 MiB between its
+  requests. Replies are unchanged (`zig build test-golden`). By **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)**.
+- **Port of Robert Wojciechowski's (**[wojo](https://github.com/wojo)** on GitHub, **[@rwojo](https://x.com/rwojo)** on X) GLM-5.3-Flash patches, off by default**
+  ([docs/PORT-RECIPE.md](docs/PORT-RECIPE.md), README "Spill v2 and KV sharding"): the spill tier and its v2 block store
+  with quotas and crash recovery (GLM `0088`/`0110`, PRs #78 and #124, on **[BadAd84](https://github.com/BadAd84)**'s
+  block-tier design, #118), chat continuation (`0111`, #128), KV sharding with prompt borrowing and the ring exchange
+  (`0118`, #152) and the parked-page startup budget (`0119`, #149), ported to the native engine as twelve
+  patches, `zig/patches/0011` to `0022`, one per feature with a header in the GLM recipe's style (each checked with
+  `git apply --check` on a clean `TF_REF` after `0001`-`0010` and the ones before it; the new `scripts/port-patches.sh`
+  exports later engine work on top). **KV sharding builds on `0008`'s pool:** one `POOL` setting; with
+  `KV_SHARD=1` the same pool is cut into one part a Spark, each holding a whole window (empty `POOL`: the pool that
+  needs, 2,101,248 at the 1M window), and each Spark keeps only its part's compressed KV, about half the KV memory a
+  Spark for the same `POOL` (measured at 2,101,248: 1,062 MiB a rank against 1,783 MiB replicated; decode 1-4%
+  slower). Settings `SPILL_GIB`, `SPILL_DIR`, `WORKER_SPILL_DIR`, `SPILL_FLOOR_GIB`, `SPILL_QUOTA_GIB`, `KV_SHARD`,
+  `KV_SHARD_DECODE` and friends, mapped in one place (`scripts/port.sh`) and passed to both ranks alike; each Spark's
+  own spill folder checked on both (local disk, outside the NFS export, the model folders and archives, not
+  root-owned, above the floor) and mounted at `/spill`; a set setting that cannot run refuses the start. With
+  everything off the only change in the docker commands is a `tf.recipe.port=off` label. Also: a broken rank pair
+  ends rank 0 with status 75 instead of hanging it (`0020`; on with two ranks whatever the settings, since it acts only
+  after a failure; `TF_DS_PAIR_BROKEN=degrade` opts out), for a supervisor such as the systemd service below to restart,
+  and `start.sh` hands an exited container to `stop.sh`, which saves its log before it is removed; spill files are
+  handed back to the folder's owner by a minimal container (only the marked folder, root-owned files and directories
+  only, no symlinks, no network, `CHOWN` + `DAC_READ_SEARCH` only); `MIN_AVAIL_GIB` counts parked per-CPU pages
+  (`scripts/memavail.sh`); the end-to-end tools in `tools/` read an API key only from `API_KEY` or `--api-key-file`
+  and never write it to receipts; `ZIG_MIRRORS` for the compiler download. Validated on the pair:
+  replies byte-identical to the stock engine in every configuration; resuming a 237k-token conversation from disk
+  after a restart takes 1.7 s against 118 s recomputed. By **Robert Wojciechowski** ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), pull request
+  [#30](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/30).
+- The default checkpoint stays EAQ v1 (`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw` @ `45ee5d0f`, 39 shards,
+  ~196 GiB); the experimental EAQ v1.1 pack is opt-in with `EAQ_V1_1=1` (`...-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2`). v1.1
+  keeps EAQ v1's widths but stores 27 indexer/compressor linears as BF16, so the engine must have the mixed-pack loader.
+  `ABLIT=1` works with the v1 default and is refused when v1.1 is selected. `scripts/test_checkpoint_pin.py` checks both
+  pins. The recorded `tools/exact.py` token hashes are EAQ v1's; v1.1's weights differ, so record a new baseline before
+  comparing replies. EAQ v1.1 support by **Mykhailo Tamarin** ([MykhailoTamarin](https://github.com/MykhailoTamarin)), pull request
+  [#57](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/57) (this entry and the three below; its engine
+  patches rebased after the port's series as `0024`-`0026`).
+- Mixed-pack loader: `zig/patches/0024-mixed-pack.patch` and `zig/patches-inputs/0001-mixed-pack-rank-cache.patch`.
+  The rank-cache planner reads the checkpoint's headers and, for a whole replicated linear stored as a BF16 `.weight`
+  instead of trellis/suh/svh, plans one plain entry. The serving engine loads that entry as a plain BF16 linear and runs
+  it through cuBLAS (`cublas.Blas.linearBf16`, torch's bf16 `nn.Linear`) in decode and prefill, with the exact
+  bf16 -> fp32 widen where the caller wants fp32. EAQ v1.1's 27 linears are 8 `attn.wq_a`, 8 `attn.indexer.wq_b`,
+  4 `attn.compressor.wkv`, 3 `attn.compressor.wgate` and 4 `attn.indexer.wk`; the load prints
+  `mixed pack: 27 float linears`. An EXL3-only pack (EAQ v1) plans no plain entries and runs exactly as before, so the
+  same image serves both. The patch is checked against `TF_REF`/`INPUTS_REF` by `scripts/test_mixed_pack_patch.py`. (#57)
+- BF16 sources widen to the f32 entries the loaders plan: `zig/patches-inputs/0002-widen-bf16.patch` in the rank-cache
+  writer, and `zig/patches/0025-widen-bf16.patch` in the engine's checkpoint reader. EAQ v1.1 (as v1) stores the eight
+  `attn.indexer.weights_proj.weight` tensors as BF16 while both plans ask for f32, so the first rank-cache write stopped
+  with `error: UnsupportedConversion`; the widen is exact (BF16's bits in the high half, zeros below), the loader's
+  `.to(torch.float32)`. `scripts/test_mixed_pack_patch.py` checks both patches. (#57)
+- A mixed pack's plain (cuBLAS) linear runs over a fixed number of rows: `zig/patches/0026-plain-rows.patch` and
+  `TF_DS_PLAIN_ROWS` (default 16, never beyond a round's rows; `0` turns the padding off). cuBLAS picks its kernel and
+  split-K from the GEMM's shape and its rounding follows the pick, so a decode round whose row count changes with the
+  streams or the draft block could change a token's bits. On the pair, without it, drafts-on and drafts-off replies
+  matched 4 of 8 `tools/validate.py` prompts, and its 8-concurrent check matched 4 of 8 with drafts off (6 of 8 with
+  drafts on); with it, the saved replies matched 8 of 8, the 8-at-once check matched 8 of 8 with drafts on and off, and
+  all 31 `tools/exact.py` cases were identical with drafts on vs off. The EXL3 linears are untouched: their kernels
+  compute each row in a fixed order, which is why EAQ v1 kept the same bits across round shapes. (#57)
+
 - Optional `systemd/dsv41-tensorfold.service` and `docs/systemd.md`: a manually configured user service for the existing
   foreground launcher, with `PREPARE=0`, a 60-second failure restart delay and at most three starts in 30 minutes.
   Nothing installs or enables it automatically. Unit validation and opt-in transient stub tests cover failure exits,
@@ -158,7 +251,7 @@
   (`TF_DS_CACHE_PLACEMENT=1`, **on**: a resumed turn no longer misses the cache because another conversation's kept rows were in
   the way), a second Engram AIO ring (`TF_DS_ENGRAM_LANES=2`, off: 1.5-2.6% slower) and a prefill indexer row split
   (`TF_DS_IDX_SPLIT=1`, off: no measurable gain). `tools/exact.py` records and compares replies.
-- `zig/patches/0004-call-gate.patch`: the engine enforces `tool_choice` `"required"` and a named function (taken from a two-Spark
+- `zig/patches/0004-call-gate.patch`: the engine enforces `tool_choice` `"required"` and a named function (taken from the spark1/spark2
   deployment's copy; built into the running image `exl3-tp2-7c9bf5d36350`: required, named, streaming and thinking-on requests
   return valid tool calls, auto/none/absent are unchanged).
 - `RANK1_PROFILE` (rank 1 `--profile`); both GPUs must share one clock ceiling; each Spark can run from a local copy of the

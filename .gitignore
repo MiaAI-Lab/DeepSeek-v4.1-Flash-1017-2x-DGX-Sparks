@@ -1,4 +1,5 @@
 scripts/local.sh
 .env
+__pycache__/
 target/
 informes/

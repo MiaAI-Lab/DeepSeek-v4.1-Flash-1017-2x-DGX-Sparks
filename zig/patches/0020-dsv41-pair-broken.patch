@@ -1,0 +1,3465 @@
+# dsv41 + core: a broken rank pair ends the server instead of hanging it. Without this patch, rank 0 of the stock engine
+# waits forever when rank 1 dies or hangs: requests stay stuck, the ranks fall out of sync, and no supervisor can
+# restart a process that never exits. comm.zig abortAll: ncclCommAbort (looked up in the libnccl already loaded) and the
+# RDMA rings' abort word, safe from any thread and never under an enqueue (a gate), after which every collective refuses
+# (CommAborted); RingFailed is fatal. TF_DS_PAIR_BROKEN=exit, the default (unset or empty), admits nothing new, fails
+# everything that waits at once ("the engine's rank pair broke (<cause>); the server restarts"), lets streams that can
+# still run finish for 5 s, aborts the communicator and exits with status 75 for the service's supervisor to restart
+# both ranks (the recipe's systemd user service, docs/systemd.md, restarts on any failure; without a supervisor the
+# server stays down instead of hanging); rank 0's start-up log says so. degrade opts out: the behaviour before this
+# patch (requests fail one by one, the spill tier stops, the server stays up); anything else is refused at start. A
+# follower whose process ended (killed, crashed) closes its link at once: rank 0 watches the followers' links
+# (link.Watch: POLLRDHUP, a hang-up or a reset, looked at every 100 ms) and, 500 ms later (a stop of both ranks at once
+# ends as a shutdown), stops the collectives, so a round blocked on the dead peer returns, and breaks the pair with
+# nothing to drain. A follower that hangs keeps its socket open: a stall monitor breaks the pair when the engine thread
+# is busy without progress for 120 s. The exit is enforced 15 s after a break (both bounds fixed), and a clean shutdown
+# that meets a break still finishes. /health answers 503 "stalled" or "broken" past those bounds; /health and /metrics
+# count service_refused and pair_failed. A restore the tier refuses only for capacity (Tier.full, TierFull: the restores
+# in flight hold the room) waits up to TF_SPILL_DEFER_MS (5000; 0: never) instead of prefilling from 0, counted in
+# restores_deferred.
+# Switches: TF_DS_PAIR_BROKEN unset (exit; degrade opts out), TF_SPILL_DEFER_MS 5000. A server without followers has no
+# pair and no policy. The policy acts only after a failure, so replies are unchanged: exact.py 39/39 identical with it
+# armed (spill and KV sharding on, which armed it before it became the default: the series with the display-reserve
+# patch beside it) and with it off (every switch off, engine 8d26890, before the rebase onto 0008); every switch at its
+# default, which now arms it, is still to be run on the pair. Host test: a follower killed mid-round (its socket closed
+# while rank 0's round waits on it) ends the pair, its streams failed and one exit 75, within a second. On the pair
+# (spill and KV sharding on), rank 1 killed with kill -9 under 8 decoding streams: every stream ended 1.29 s later (the
+# link watch; the stall monitor alone had caught it at +135 s), /health went down at 1.78 s and rank 0 exited 75; a stop
+# of both ranks ended as a shutdown (exit 0). Builds on 0014, 0018 and 0019. By Robert Wojciechowski (GitHub @wojo, X @rwojo).
+# Apache-2.0.
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 08a0078f49c22cb2aea20e9b030c23b1df1c6e21..047ff037fc40c093afa4c60fcf4186d454e3316d 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -197,6 +197,9 @@ pub const Spill = struct {
+     load_ms: u32 = 40,
+     /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore before it is admitted without it.
+     load_wait_ms: u32 = 30_000,
++    /// TF_SPILL_DEFER_MS: how long a request whose restore the tier refused for capacity (restores or read slots in
++    /// flight) waits to ask again before it is admitted on what memory holds (0: at once).
++    defer_ms: u32 = 5_000,
+     /// TF_SPILL_FLUSH_MS: a clean shutdown's bound for draining writes.
+     flush_ms: u32 = 60_000,
+ 
+@@ -244,6 +247,8 @@ pub const CacheStats = struct {
+     restore_wait_timeouts: u64 = 0,
+     restore_wait_ns: u64 = 0,
+     restore_wait_max_ns: u64 = 0,
++    restores_deferred: u64 = 0,
++    restores_deferred_expired: u64 = 0,
+     writes_enqueued: u64 = 0,
+     shared_promoted: u64 = 0,
+     flushes: u64 = 0,
+@@ -277,7 +282,7 @@ pub const CacheStats = struct {
+         .restores_failed = "Disk restores aborted on every rank (missing, damaged, guarded).",
+         .restores_cancelled = "Disk restores stopped: no request waited for them any more, or shutdown.",
+         .restores_dropped = "Installed disk restores not adopted: no room, or memory already had them.",
+-        .restores_refused = "Disk restores not begun: the memory budget could not hold their destination.",
++        .restores_refused = "Disk restores not begun: the memory budget could not hold their destination, or the tier was at its capacity (once a request).",
+         .restores_active = "Disk restore jobs in flight.",
+         .restoring_bytes = "Memory the disk restores in flight reserved, charged to the prompt cache's budget.",
+         .restore_blocks_done = "Blocks the restores in flight have copied so far.",
+@@ -287,6 +292,8 @@ pub const CacheStats = struct {
+         .restore_wait_timeouts = "Requests admitted without their disk restore after TF_SPILL_LOAD_WAIT_MS.",
+         .restore_wait_ns = "Nanoseconds requests waited for disk restores.",
+         .restore_wait_max_ns = "The longest wait for a disk restore, in nanoseconds.",
++        .restores_deferred = "Requests whose disk restore was refused for capacity (restores or read slots in flight) and retried shortly instead of prefilling.",
++        .restores_deferred_expired = "Of them, requests admitted on what memory holds after TF_SPILL_DEFER_MS without the restore starting.",
+         .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
+         .shared_promoted = "Disk points promoted to shared prefixes.",
+         .flushes = "Clean-shutdown flushes of the disk tier.",
+@@ -334,6 +341,42 @@ pub const Status = struct {
+     cache: ?CacheStats = null,
+     /// KV ownership's counters and parts (a backend that shards its pool over the ranks: dsv41's TF_DS_KV_SHARD).
+     kv_parts: ?KvParts = null,
++    /// The rank pair's robustness counters and state (a backend with a broken-pair policy, or the prompt cache's
++    /// disk tier); null otherwise (no /health or /metrics output).
++    pair: ?PairStatus = null,
++};
++
++/// LaneHost's broken-pair policy and service fence, for /health and /metrics.
++pub const PairStatus = struct {
++    /// Services asked for inside a round, a prompt chunk or a CUDA graph capture, skipped (an engine bug).
++    service_refused: u64 = 0,
++    /// Requests failed because the rank pair broke.
++    pair_failed: u64 = 0,
++    /// Milliseconds the engine thread has been busy (a round, a prompt chunk) without progress; 0: idle or no policy.
++    busy_ms: u64 = 0,
++    /// The stall bound in milliseconds (0: no stall monitor or no policy).
++    stall_ms: u64 = 0,
++    /// Busy without progress for at least the stall bound: /health answers 503 "stalled".
++    stalled: bool = false,
++    /// The pair broke (the server ends shortly): /health answers 503 "broken".
++    broken: bool = false,
++
++    pub const help = .{
++        .service_refused = "Parked-work services asked for inside a round, a prompt chunk or a CUDA graph capture, skipped.",
++        .pair_failed = "Requests failed because the rank pair broke.",
++        .busy_ms = "Milliseconds the engine thread has been busy without progress (0: idle).",
++        .stall_ms = "The stall bound: busy this long without progress breaks the pair (0: no stall monitor).",
++        .stalled = "1 while the engine thread has been busy past the stall bound.",
++        .broken = "1 once the rank pair broke.",
++    };
++    pub const gauges = [_][]const u8{ "busy_ms", "stall_ms", "stalled", "broken" };
++
++    /// What /health's status says: "ok", else why the server is unhealthy.
++    pub fn health(p: PairStatus) []const u8 {
++        if (p.broken) return "broken";
++        if (p.stalled) return "stalled";
++        return "ok";
++    }
+ };
+ 
+ /// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd72456123b 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -5,6 +5,16 @@
+ //! prompt cache's tier (shared by every request that wants the same point). Parked requests hold no lane, count as
+ //! waiting work and wake back to the front of the queue, where an ordinary lookup runs again. With no tier nothing is
+ //! parked, nothing is serviced and nothing else changes.
++//!
++//! Robustness (round 3, docs/port/robustness.md), each off unless its backend or tier asks for it:
++//! - A broken rank pair (`pair`, the backend's TF_DS_PAIR_BROKEN=exit): nothing new is admitted, waiting requests
++//!   fail at once, decoding streams finish within a drain bound or fail, the backend's collectives stop, and the
++//!   process exits with a distinct code for its supervisor to restart both ranks; a deadline thread enforces the exit
++//!   even when a round is blocked on a dead peer.
++//! - Restores the tier refuses for capacity are deferred briefly and asked again (bounded), keeping the best memory
++//!   state meanwhile, instead of a prefill from 0 (`restores_deferred`).
++//! - The service fence: parked work's service and the lone driver's pump never run inside a round, inside a prompt
++//!   pass except between its chunks (Stream.between), or while the backend reports a CUDA graph capture (`quiet`).
+ const std = @import("std");
+ const lanes = @import("lanes");
+ const api = @import("engine_api.zig");
+@@ -76,6 +86,32 @@ pub const LaneHost = struct {
+     /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
+     kv_parts: ?lanes.kv_parts.Source = null,
+     kv_tele: ?api.KvParts = null,
++    // -- a broken rank pair (the backend's policy, set before start; null: off, nothing below runs) ---------------
++    pair: ?PairPolicy = null,
++    pair_state: std.atomic.Value(u8) = .init(0), // 0 whole, 1 a cause being recorded, 2 broken (why/drain/since set)
++    pair_why: [pair_why_max]u8 = undefined,
++    pair_why_len: usize = 0,
++    pair_drain: bool = true,
++    pair_since: i96 = 0,
++    pair_thread: ?std.Thread = null, // the deadline: aborts and exits even when the engine thread is stuck
++    pair_done: std.atomic.Value(bool) = .init(false), // the deadline thread may leave (the host stopped or exits)
++    pair_aborted: std.atomic.Value(bool) = .init(false),
++    pair_exited: std.atomic.Value(bool) = .init(false),
++    pair_failed: u64 = 0, // requests failed because the pair broke (engine thread)
++    pair_monitor: ?std.Thread = null, // the stall monitor: a round or a prompt chunk that never ends is a break too
++    busy_depth: u32 = 0, // engine thread: inside a round, a prompt pass or the lone driver (nested)
++    progress_at: std.atomic.Value(i64) = .init(0), // the engine thread's last progress while busy (awake ns); 0: idle
++    // -- the service fence (cache-tier's lifetime rules) -------------------------------------------------------
++    /// The backend's word that its device is between launches it may interleave with (dsv41: no CUDA graph capture
++    /// on its stream); null: always.
++    quiet: ?Quiet = null,
++    rounds_open: u32 = 0, // engine thread: inside the lane core's step (a round's launches)
++    in_between: bool = false, // engine thread: inside Stream.between (the filling pass stands between two chunks)
++    /// A service asked for where it must not run panics (debug builds), else is skipped and counted.
++    fence_panic: bool = @import("builtin").mode == .debug,
++    service_refused: u64 = 0,
++    // -- restores the tier refused for capacity, asked again shortly (engine thread's; changes take the lock) --
++    deferred: std.ArrayList(Defer) = .empty,
+ 
+     const Mark = struct { at: i96, tokens: u64 };
+     const full_retry_ns: i96 = std.time.ns_per_s;
+@@ -89,6 +125,48 @@ pub const LaneHost = struct {
+     const lone_pump_commits: u32 = 16;
+ 
+     const Load = struct { job: *Job, restore: *pc.Restore, since: i96 };
++    const Defer = struct { job: *Job, retry_at: i96 };
++    const pair_why_max = 240;
++    const monitor_ms = 250;
++
++    /// The backend's device state for the service fence.
++    pub const Quiet = struct { ctx: *anyopaque, check: *const fn (ctx: *anyopaque) bool };
++
++    /// A backend error that means the rank pair broke, wherever it surfaces (a prompt pass, a round, the lone
++    /// driver); `drain`: rounds can still run, so decoding streams may finish first.
++    pub const Fatal = struct { err: anyerror, drain: bool };
++
++    /// What the host does once the backend's rank pair cannot go on (dsv41: TF_DS_PAIR_BROKEN=exit). The backend
++    /// reports a break through `pairBroken` (its hooks) or through an error in `fatal`.
++    pub const PairPolicy = struct {
++        ctx: *anyopaque,
++        /// Stop the backend's collectives so a device stream blocked on the peer drains (dsv41: ncclCommAbort).
++        /// Called once, from the engine thread or the deadline thread, possibly while the other is blocked on it.
++        abort: *const fn (ctx: *anyopaque) void,
++        /// End the process with `code` (the service's supervisor restarts the pair); returns only in tests.
++        exit: *const fn (ctx: *anyopaque, code: u8) void,
++        code: u8 = pair_exit_code,
++        /// Decoding streams may finish for this long after a break that leaves rounds runnable (`drain`).
++        drain_ns: i96 = 5 * std.time.ns_per_s,
++        /// The deadline thread aborts the collectives this long after the break if the engine thread has not exited
++        /// by then (a round blocked on a dead peer), and exits `grace_ns` later.
++        deadline_ns: i96 = pair_deadline_ns,
++        /// Before the exit: the HTTP threads send the failed requests' last events.
++        grace_ns: i96 = 300 * std.time.ns_per_ms,
++        /// A round, a prompt chunk or a lone-driver token taking longer than this is a break too (a peer that hangs
++        /// without erroring: stopped, a GPU hang, a follower stuck in its own device wait, whose RDMA writes still
++        /// complete at the NIC so nothing on this rank fails). Longer than every rank_wire reply deadline (validate:
++        /// 90 s) and any one chunk; 0: no monitor.
++        stall_ns: i96 = pair_stall_ns,
++        fatal: []const Fatal = &.{},
++    };
++
++    /// PairPolicy's bounds: the deadline thread's after a break, and the stall monitor's.
++    pub const pair_deadline_ns: i96 = 15 * std.time.ns_per_s;
++    pub const pair_stall_ns: i96 = 120 * std.time.ns_per_s;
++
++    /// The process exit status after a broken pair (EX_TEMPFAIL: restart and retry).
++    pub const pair_exit_code: u8 = 75;
+ 
+     /// How parked work is serviced (LaneHost.configure; the defaults are off).
+     pub const TierPolicy = struct {
+@@ -100,6 +178,12 @@ pub const LaneHost = struct {
+         load_wait_ns: i96 = 30 * std.time.ns_per_s,
+         /// A clean shutdown's bound for draining writes (TF_SPILL_FLUSH_MS).
+         flush_ns: u64 = 60 * std.time.ns_per_s,
++        /// A restore the tier refused for capacity (Store.deferrable) is asked again every defer_retry_ns, and when a
++        /// restore in flight ends, for at most defer_ns (TF_SPILL_DEFER_MS; 0: never, admitted on memory at once),
++        /// when it would save at least defer_min tokens over memory (0: the store's grid, or 1).
++        defer_ns: i96 = 5 * std.time.ns_per_s,
++        defer_retry_ns: i96 = 25 * std.time.ns_per_ms,
++        defer_min: u32 = 0,
+     };
+ 
+     pub const HostCounts = struct {
+@@ -109,6 +193,8 @@ pub const LaneHost = struct {
+         restore_wait_max_ns: u64 = 0,
+         cached_tokens: u64 = 0, // prompt tokens passes resumed (memory or restored)
+         computed_tokens: u64 = 0, // and computed
++        restores_deferred: u64 = 0, // requests whose restore was refused for capacity and asked again
++        restores_deferred_expired: u64 = 0, // of them, admitted on memory at defer_ns
+     };
+ 
+     const Job = struct {
+@@ -127,6 +213,7 @@ pub const LaneHost = struct {
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
+         tried_disk: bool = false, // it waited for a restore once: a later lookup takes what memory has
++        deferred_since: ?i96 = null, // its restore was first refused for capacity then (asked again until defer_ns)
+         join: pc.Join = .{}, // its conversation (0111)
+         parent: ?u64 = null, // the durable point its pass resumes from, and where
+         fork: u32 = 0,
+@@ -190,12 +277,19 @@ pub const LaneHost = struct {
+         h.tier.pump_ns = @min(h.tier.pump_ns, h.tier.service_ns);
+         h.tier.load_wait_ns = @as(i96, @max(sp.load_wait_ms, 1)) * std.time.ns_per_ms;
+         h.tier.flush_ns = @as(u64, sp.flush_ms) * std.time.ns_per_ms;
++        h.tier.defer_ns = @as(i96, sp.defer_ms) * std.time.ns_per_ms;
+         const store_on = if (h.cache) |s| s.tier != null or s.groups else false;
+         h.tele = if (store_on) .{} else null;
+     }
+ 
+     pub fn start(h: *LaneHost) !void {
+         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
++        if (h.pair) |pol| if (pol.stall_ns > 0) {
++            h.pair_monitor = std.Thread.spawn(.{}, pairMonitor, .{h}) catch |e| blk: {
++                noteErr("the rank pair's stall monitor did not start ({s}): a hung peer is caught only by its errors", .{@errorName(e)});
++                break :blk null;
++            };
++        };
+     }
+ 
+     /// Stops admitting, cancels what is left and joins the engine thread.
+@@ -206,6 +300,12 @@ pub const LaneHost = struct {
+         h.mutex.unlock(h.io);
+         if (h.thread) |t| t.join();
+         h.thread = null;
++        h.pair_done.store(true, .release);
++        if (h.pair_monitor) |t| t.join(); // (first: a break it reported started the deadline thread below)
++        h.pair_monitor = null;
++        if (h.pair_thread) |t| t.join();
++        h.pair_thread = null;
++        h.deferred.deinit(h.gpa);
+         h.queued.deinit(h.gpa);
+         h.admitted.deinit(h.gpa);
+         h.cancels.deinit(h.gpa);
+@@ -238,7 +338,7 @@ pub const LaneHost = struct {
+         job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
+         h.mutex.lockUncancelable(h.io);
+         defer h.mutex.unlock(h.io);
+-        if (h.closing) {
++        if (h.closing or h.isBroken()) { // (a broken pair admits nothing more: the process restarts)
+             h.gpa.destroy(job);
+             return error.Closed;
+         }
+@@ -275,7 +375,7 @@ pub const LaneHost = struct {
+         @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
+         out.* = .{
+             .running = @intCast(h.admitted.items.len),
+-            .waiting = @intCast(h.queued.items.len + h.ready.items.len + h.loading.items.len),
++            .waiting = @intCast(h.queued.items.len + h.waitingCount()),
+             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
+             .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
+             .preemptions = 0,
+@@ -283,9 +383,26 @@ pub const LaneHost = struct {
+             .generation_tokens = h.live_generated,
+             .cache = h.tele,
+             .kv_parts = h.kv_tele,
++            .pair = h.pairStatus(now),
+         };
+     }
+ 
++    /// The broken-pair policy's state and the fence's counter (any thread; the counters are the engine thread's,
++    /// read as they stand); null with neither the policy nor a disk tier.
++    fn pairStatus(h: *const LaneHost, now: i96) ?api.PairStatus {
++        const tier = if (h.cache) |s| s.tier != null else false;
++        if (h.pair == null and !tier) return null;
++        var p: api.PairStatus = .{ .service_refused = h.service_refused, .pair_failed = h.pair_failed };
++        const pol = h.pair orelse return p;
++        p.broken = h.isBroken();
++        const at = h.progress_at.load(.acquire);
++        const idle: i96 = if (at == 0) 0 else @max(now - at, 0);
++        p.busy_ms = @intCast(@divTrunc(idle, std.time.ns_per_ms));
++        p.stall_ms = @intCast(@divTrunc(@max(pol.stall_ns, 0), std.time.ns_per_ms));
++        p.stalled = pol.stall_ns > 0 and at != 0 and idle >= pol.stall_ns;
++        return p;
++    }
++
+     fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?Memory {
+         const source = self(ctx).memory orelse return null;
+         return source.read(source.ctx, reset_peak);
+@@ -298,6 +415,8 @@ pub const LaneHost = struct {
+     /// A job's cancel hook for its prompt pass: its id is in `cancels`, or the host is closing (read under the lock).
+     fn cancelled(ctx: *anyopaque) bool {
+         const job: *Job = @ptrCast(@alignCast(ctx));
++        job.host.progressed(); // (asked once a prompt chunk: the stall monitor's clock restarts)
++        if (job.host.isBroken()) return true; // (a broken pair: the pass stops at its next chunk, failed below)
+         job.host.lock();
+         defer job.host.unlock();
+         return job.host.closing or std.mem.indexOfScalar(Id, job.host.cancels.items, job.id) != null;
+@@ -383,6 +502,10 @@ pub const LaneHost = struct {
+                 unloaded.append(h.gpa, l.restore) catch {};
+                 break;
+             };
++            for (h.deferred.items, 0..) |d, i| if (d.job.id == id) {
++                dropped.append(h.gpa, h.deferred.orderedRemove(i).job) catch {};
++                break;
++            };
+         }
+         h.mutex.unlock(h.io);
+         // a restore no request waits for any more stops (its reads, DMA and reservations go), exactly once
+@@ -420,6 +543,7 @@ pub const LaneHost = struct {
+ 
+     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+     fn admitOne(h: *LaneHost) bool {
++        if (h.isBroken()) return false;
+         h.lock();
+         if ((h.queued.items.len == 0 and h.ready.items.len == 0) or h.admitted.items.len >= h.info_.lanes) {
+             h.unlock();
+@@ -508,11 +632,17 @@ pub const LaneHost = struct {
+         if (r.images.len == 0 and (h.interleave_ns > 0 or h.servicing())) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
+         h.filling = job;
+         defer h.filling = null;
+-        h.core.addStream(&job.stream) catch |e| {
++        h.busyEnter();
++        const added = h.core.addStream(&job.stream);
++        h.busyLeave();
++        added catch |e| {
++            if (h.isBroken()) return h.dropBroken(job);
+             if (e == error.Cancelled) return h.cancel(job);
+             if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
++            h.checkFatal(e);
+             return h.drop(job, h.words(e));
+         };
++        if (h.aborted()) return h.dropBroken(job); // (the collectives were stopped under it: its rows are not the model's)
+         h.prefilled(job, began);
+         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         if (now - began >= long_pass_ns) {
+@@ -536,15 +666,22 @@ pub const LaneHost = struct {
+     fn between(ptr: *anyopaque) anyerror!void {
+         const h: *LaneHost = @ptrCast(@alignCast(ptr));
+         if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
++        h.in_between = true; // (the filling pass stands between two chunks: the service fence's one way in)
++        defer h.in_between = false;
++        h.progressed(); // (a chunk ended: the stall monitor's clock restarts)
+         if (h.interleave_ns > 0) {
+             const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+             while (true) {
+                 h.takeCancelsKeeping(if (h.filling) |f| f.id else null);
+                 if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
+-                h.core.step() catch |e| {
++                h.stepRound() catch |e| {
+                     h.between_err = e; // the pass fails with it; run() then fails the streams the round held
+                     return e;
+                 };
++                if (h.aborted()) { // (the collectives were stopped under the round: its tokens are not the model's)
++                    h.between_err = error.CommAborted;
++                    return error.CommAborted;
++                }
+                 var i: usize = 0;
+                 while (i < h.admitted.items.len) {
+                     const job = h.admitted.items[i];
+@@ -602,7 +739,7 @@ pub const LaneHost = struct {
+ 
+     /// Requests parked or woken (the lock held).
+     fn waitingCount(h: *const LaneHost) usize {
+-        return h.ready.items.len + h.loading.items.len;
++        return h.ready.items.len + h.loading.items.len + h.deferred.items.len;
+     }
+ 
+     /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
+@@ -614,6 +751,8 @@ pub const LaneHost = struct {
+             fn committed(ctx: *anyopaque) void {
+                 const host: *LaneHost = @ptrCast(@alignCast(ctx));
+                 const j = host.lone_job.?;
++                host.progressed();
++                if (host.aborted()) return; // (stopped collectives: nothing more of it is sent; yield ends it)
+                 if (!j.prefill_sent) {
+                     j.prefill_sent = true;
+                     host.prefilled(j, j.began);
+@@ -624,20 +763,24 @@ pub const LaneHost = struct {
+                 host.lone_commits += 1;
+                 if (host.lone_commits >= lone_pump_commits and host.servicing()) {
+                     host.lone_commits = 0;
+-                    if (host.cache) |store| store.pump(host.tier.pump_ns);
++                    if (host.cache) |store| if (host.fenced("the lone driver's pump")) store.pump(host.tier.pump_ns);
+                 }
+             }
+             fn yield(ctx: *anyopaque) bool {
+                 const host: *LaneHost = @ptrCast(@alignCast(ctx));
+                 host.lock();
+                 defer host.unlock();
+-                return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing or host.waitingCount() > 0;
++                return host.queued.items.len > 0 or host.cancels.items.len > 0 or host.closing or host.waitingCount() > 0 or host.isBroken();
+             }
+         };
+         job.began = began;
+-        const paused = lone.run(lone.ctx, &job.stream, .{ .ctx = h, .committed = Hooks.committed, .yield = Hooks.yield });
++        h.busyEnter();
++        const ran = lone.run(lone.ctx, &job.stream, .{ .ctx = h, .committed = Hooks.committed, .yield = Hooks.yield });
++        h.busyLeave();
+         h.lone_job = null;
++        const paused = if (h.aborted()) error.CommAborted else ran;
+         const handed = paused catch |e| {
++            h.checkFatal(e);
+             if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
+             h.remove(job);
+             h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else h.words(e));
+@@ -658,6 +801,12 @@ pub const LaneHost = struct {
+         return x.text(x.ctx, e) orelse @errorName(e);
+     }
+ 
++    /// A prompt pass the broken pair stopped (or ran under an abort) fails with the pair's message.
++    fn dropBroken(h: *LaneHost, job: *Job) bool {
++        h.pair_failed += 1;
++        return h.drop(job, "the engine's rank pair broke; the server restarts");
++    }
++
+     fn drop(h: *LaneHost, job: *Job, message: []const u8) bool {
+         h.remove(job);
+         if (job.started and !job.stream.finished) h.core.discard(&job.stream);
+@@ -736,11 +885,16 @@ pub const LaneHost = struct {
+ 
+     fn run(h: *LaneHost) void {
+         while (true) {
++            if (h.isBroken()) {
++                if (h.brokenStep()) return;
++                continue;
++            }
+             h.takeCancels();
+             while (h.admitOne()) {}
+             if (h.servicing()) h.service(h.tier.service_ns); // restores, staged writes and deferred retries, between rounds and at idle
+             if (h.between_err) |e| {
+                 h.between_err = null;
++                h.checkFatal(e);
+                 h.failAll(@errorName(e));
+                 continue;
+             }
+@@ -762,10 +916,12 @@ pub const LaneHost = struct {
+                 continue;
+             }
+             h.unlock();
+-            h.core.step() catch |e| {
++            h.stepRound() catch |e| {
++                h.checkFatal(e);
+                 h.failAll(@errorName(e));
+                 continue;
+             };
++            if (h.aborted()) continue; // (stopped under the round: brokenStep fails its streams, nothing is delivered)
+             var i: usize = 0;
+             while (i < h.admitted.items.len) {
+                 const job = h.admitted.items[i];
+@@ -797,10 +953,45 @@ pub const LaneHost = struct {
+         for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+         for (h.ready.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+         for (h.loading.items) |l| h.cancels.append(h.gpa, l.job.id) catch {};
++        for (h.deferred.items) |d| h.cancels.append(h.gpa, d.job.id) catch {};
+         h.unlock();
+         h.takeCancels();
+     }
+ 
++    /// One round of the lane core, counted open while it runs (the service fence).
++    fn stepRound(h: *LaneHost) !void {
++        h.rounds_open += 1;
++        defer h.rounds_open -= 1;
++        h.busyEnter();
++        defer h.busyLeave();
++        return h.core.step();
++    }
++
++    // -- the stall monitor's clock (engine thread; nothing without `pair`) --------------------------------------
++
++    fn busyEnter(h: *LaneHost) void {
++        if (h.pair == null) return;
++        h.busy_depth += 1;
++        h.progressed();
++    }
++
++    fn busyLeave(h: *LaneHost) void {
++        if (h.pair == null) return;
++        h.busy_depth -= 1;
++        if (h.busy_depth == 0) h.progress_at.store(0, .release) else h.progressed();
++    }
++
++    /// The engine thread moved on (a round or a chunk ended, a lone token landed): the stall clock restarts.
++    fn progressed(h: *LaneHost) void {
++        if (h.pair == null or h.busy_depth == 0) return;
++        h.progress_at.store(@intCast(std.Io.Clock.awake.now(h.io).toNanoseconds()), .release);
++    }
++
++    /// Whether the collectives were stopped (an abort ran): what a round returns after it is not the model's.
++    fn aborted(h: *const LaneHost) bool {
++        return h.pair != null and h.pair_aborted.load(.acquire);
++    }
++
+     // -- parked work (0110) ---------------------------------------------------------------------------------------
+ 
+     /// Whether admission may park a request: the cache has a tier.
+@@ -816,7 +1007,7 @@ pub const LaneHost = struct {
+ 
+     /// Work in flight the host must poll (engine thread): restores, writes to stage, requests parked or woken.
+     fn pending(h: *const LaneHost) bool {
+-        if (h.loading.items.len > 0 or h.ready.items.len > 0) return true;
++        if (h.loading.items.len > 0 or h.ready.items.len > 0 or h.deferred.items.len > 0) return true;
+         const store = h.cache orelse return false;
+         return store.busy();
+     }
+@@ -836,18 +1027,75 @@ pub const LaneHost = struct {
+             const room = h.loading.ensureUnusedCapacity(h.gpa, 1);
+             h.unlock();
+             if (room) |_| {
+-                if (store.restoreBegin(p, key)) |rs| {
++                // (the best memory state stays while the budget holds it beside the restore: refused, the pass
++                // resumes it; a full tier refuses before any room is made)
++                if (store.restoreBeginOver(p, key, .{ .have = probe.memory, .again = job.deferred_since != null })) |rs| {
+                     h.lock();
+                     h.loading.appendAssumeCapacity(.{ .job = job, .restore = rs, .since = now });
+                     h.unlock();
+                     h.host_counts.restore_waits += 1;
++                    job.deferred_since = null;
+                     return true;
+-                } else |err| note("reading {d} kept tokens from disk did not start ({s}); prefilling", .{ p.at, @errorName(err) });
++                } else |err| {
++                    const left = store.find(key, r.chunks); // (the room may have evicted probe.memory: never read it now)
++                    if (h.deferRestore(job, p, left, err, now)) return true;
++                    if (left) |e| {
++                        note("reading {d} kept tokens from disk did not start ({s}); resuming the {d} memory holds", .{ p.at, @errorName(err), e.at });
++                    } else note("reading {d} kept tokens from disk did not start ({s}); prefilling", .{ p.at, @errorName(err) });
++                }
+             } else |_| {}
+         };
+         return false;
+     }
+ 
++    /// A restore of `p` the tier or the budget refused with `err`: when that may change shortly (Store.deferrable)
++    /// and the point saves at least defer_min tokens over `have` (the best memory state), `job` waits on the deferred
++    /// list (holding no lane) and asks again every defer_retry_ns or when a restore in flight ends, defer_ns at most
++    /// from its first refusal; true then. False: admit it now on what memory holds (`have` is never evicted for the
++    /// restore's room, so a usable shorter state still resumes).
++    fn deferRestore(h: *LaneHost, job: *Job, p: pc.Point, have: ?*pc.Entry, err: anyerror, now: i96) bool {
++        const store = h.cache orelse return false;
++        if (h.tier.defer_ns <= 0 or !store.deferrable(err)) return false;
++        const at: u32 = if (have) |e| e.at else 0;
++        const min = if (h.tier.defer_min > 0) h.tier.defer_min else @max(store.rules.grid, 1);
++        if (p.at <= at or p.at - at < min) return false;
++        const first = job.deferred_since orelse now;
++        if (now - first >= h.tier.defer_ns) {
++            h.host_counts.restores_deferred_expired += 1;
++            note("reading {d} kept tokens from disk was refused for capacity for {d} ms ({s}); admitted on what memory holds", .{ p.at, @divTrunc(now - first, std.time.ns_per_ms), @errorName(err) });
++            return false;
++        }
++        h.lock();
++        defer h.unlock();
++        h.deferred.append(h.gpa, .{ .job = job, .retry_at = now + h.tier.defer_retry_ns }) catch return false;
++        if (job.deferred_since == null) h.host_counts.restores_deferred += 1;
++        job.deferred_since = first;
++        job.tried_disk = false; // (it asks for the restore again when it wakes)
++        return true;
++    }
++
++    /// Deferred restores whose retry time came, or every one when a restore in flight ended (`ended`: its read slot
++    /// is free now), go to the ready list to ask again.
++    fn retryDeferred(h: *LaneHost, now: i96, ended: bool) void {
++        if (h.deferred.items.len == 0) return;
++        var moved = false;
++        var i: usize = 0;
++        while (i < h.deferred.items.len) {
++            if (!ended and h.deferred.items[i].retry_at > now) {
++                i += 1;
++                continue;
++            }
++            h.lock();
++            const d = h.deferred.orderedRemove(i);
++            h.toReady(d.job); // (releases the lock)
++            moved = true;
++        }
++        if (!moved) return;
++        h.lock();
++        h.wake.signal(h.io);
++        h.unlock();
++    }
++
+     /// A woken job to the ready list (the lock held; released here). Out of memory fails it alone.
+     fn toReady(h: *LaneHost, job: *Job) void {
+         h.ready.append(h.gpa, job) catch {
+@@ -864,8 +1112,10 @@ pub const LaneHost = struct {
+     /// stream valid (dsv41 joins Engram read-ahead before `between`, as recipe 0005 requires).
+     fn service(h: *LaneHost, budget_ns: u64) void {
+         const store = h.cache orelse return;
++        if (!h.fenced("parked work's service")) return;
+         const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         h.expireLoads(t0);
++        var ended = false;
+         const n = store.restoring.items.len;
+         if (n > 0) { // at most 64 a service, a different first one each time: every restore is polled in turn
+             var buf: [64]*pc.Restore = undefined;
+@@ -877,9 +1127,13 @@ pub const LaneHost = struct {
+                 if (spent >= budget_ns and k > 0) break;
+                 const share = (budget_ns -| spent) / (m - k);
+                 const st = store.restorePoll(r, share);
+-                if (st != .pending) h.restoreEnded(r);
++                if (st != .pending) {
++                    h.restoreEnded(r);
++                    ended = true;
++                }
+             }
+         }
++        h.retryDeferred(std.Io.Clock.awake.now(h.io).toNanoseconds(), ended);
+         const spent: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.io).toNanoseconds() - t0));
+         const idle = h.filling == null and h.core.activeCount() == 0; // nothing decodes: staging takes what is left
+         store.pump(if (idle) budget_ns -| spent else @min(budget_ns -| spent, h.tier.pump_ns));
+@@ -936,6 +1190,222 @@ pub const LaneHost = struct {
+         }
+     }
+ 
++    // -- the service fence --------------------------------------------------------------------------------------
++
++    /// Whether parked work may be serviced now (cache-tier's lifetime rules): no round open (its launches, or a graph
++    /// it captures, in flight), a prompt pass only from Stream.between (between two chunks, never between a chunk's
++    /// layers), and the backend not capturing a CUDA graph (`quiet`).
++    fn serviceSafe(h: *const LaneHost) bool {
++        if (h.rounds_open > 0) return false;
++        if (h.filling != null and !h.in_between) return false;
++        if (h.quiet) |q| if (!q.check(q.ctx)) return false;
++        return true;
++    }
++
++    /// serviceSafe, or the refusal: a panic in debug builds (an engine bug), else counted, logged once and skipped.
++    fn fenced(h: *LaneHost, comptime what: []const u8) bool {
++        if (h.serviceSafe()) return true;
++        h.service_refused += 1;
++        if (h.fence_panic) @panic("lane host: " ++ what ++ " asked for inside a round, a prompt chunk or a CUDA graph capture");
++        if (h.service_refused == 1) noteErr(what ++ " asked for inside a round, a prompt chunk or a CUDA graph capture: skipped (an engine bug)", .{});
++        return false;
++    }
++
++    // -- a broken rank pair ---------------------------------------------------------------------------------------
++
++    /// Whether the backend's pair broke (any thread).
++    pub fn isBroken(h: *const LaneHost) bool {
++        return h.pair_state.load(.acquire) == 2;
++    }
++
++    /// The backend's rank pair cannot go on (`why`, for the log and the failed requests; `drain`: rounds still run,
++    /// so decoding streams may finish within drain_ns). Any thread; the first cause only; nothing without `pair`.
++    /// The engine thread then admits nothing, fails what waits, ends the streams, stops the collectives and exits;
++    /// a deadline thread does the last two if the engine thread cannot (blocked on the peer).
++    pub fn pairBroken(h: *LaneHost, why: []const u8, drain: bool) void {
++        _ = h.pair orelse return;
++        if (h.pair_done.load(.acquire)) return; // stopped (a tier's teardown may still report): nothing to end
++        if (h.pair_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
++        const n = @min(why.len, pair_why_max);
++        @memcpy(h.pair_why[0..n], why[0..n]);
++        h.pair_why_len = n;
++        h.pair_drain = drain;
++        h.pair_since = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        h.pair_state.store(2, .release);
++        h.lock();
++        const closing = h.closing;
++        h.unlock();
++        if (closing) {
++            note("the rank pair broke during the shutdown ({s}): the streams left end, the shutdown goes on", .{why[0..n]});
++        } else noteErr("the rank pair broke ({s}): admitting nothing more; {s}", .{ why[0..n], if (drain) "decoding streams may finish first" else "every stream fails now" });
++        h.pair_thread = std.Thread.spawn(.{}, pairDeadline, .{h}) catch null;
++        h.lock();
++        h.wake.broadcast(h.io);
++        h.unlock();
++    }
++
++    /// pairBroken as a callback (a backend's hook: `ctx` is the LaneHost).
++    pub fn pairBrokenFn(ctx: *anyopaque, why: []const u8, drain: bool) void {
++        self(ctx).pairBroken(why, drain);
++    }
++
++    /// A backend error the policy names as a broken pair (`fatal`): the policy runs, its words as the cause.
++    fn checkFatal(h: *LaneHost, e: anyerror) void {
++        const pol = h.pair orelse return;
++        for (pol.fatal) |f| if (f.err == e) {
++            var buf: [pair_why_max]u8 = undefined;
++            const said = h.words(e);
++            const why = if (std.mem.eql(u8, said, @errorName(e))) said else std.fmt.bufPrint(&buf, "{s}: {s}", .{ @errorName(e), said }) catch @errorName(e);
++            return h.pairBroken(why, f.drain);
++        };
++    }
++
++    /// The engine thread's loop after the break: what waits fails; decoding streams step on within the drain bound;
++    /// then the collectives stop, every stream left fails and the process exits. True: the host is stopping (tests).
++    fn brokenStep(h: *LaneHost) bool {
++        const pol = h.pair.?;
++        var mbuf: [pair_why_max + 64]u8 = undefined;
++        const msg = std.fmt.bufPrint(&mbuf, "the engine's rank pair broke ({s}); the server restarts", .{h.pair_why[0..h.pair_why_len]}) catch "the engine's rank pair broke; the server restarts";
++        h.failWaiting(msg);
++        h.lock();
++        const closing = h.closing;
++        h.unlock();
++        if (closing and !h.pair_exited.load(.acquire)) {
++            // a break during a clean shutdown (stop.sh stops both ranks, rank 1 often first): the streams end, the
++            // communicator is stopped if a transfer may have wedged it, and the shutdown finishes as it would have
++            // (the tier's flush, an ordinary exit), not the restart exit
++            if (!h.pair_drain) h.abortPair();
++            h.failPair(msg, null);
++            h.shutdownTier();
++            return true;
++        }
++        if (h.pair_exited.load(.acquire)) { // (only when the exit hook returned: tests) idle until stopped
++            h.lock();
++            defer h.unlock();
++            if (h.closing) return true;
++            h.cancels.clearRetainingCapacity(); // (every request already ended)
++            h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
++            return false;
++        }
++        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        if (h.pair_drain and now - h.pair_since < pol.drain_ns and h.core.activeCount() > 0) {
++            h.takeCancels();
++            h.stepRound() catch |e| {
++                h.failPair(msg, e);
++                return false;
++            };
++            if (h.aborted()) { // (the deadline stopped the collectives under it)
++                h.failPair(msg, null);
++                return false;
++            }
++            var i: usize = 0;
++            while (i < h.admitted.items.len) {
++                const job = h.admitted.items[i];
++                if (h.deliver(job)) {
++                    h.lock();
++                    _ = h.admitted.orderedRemove(i);
++                    h.unlock();
++                } else i += 1;
++            }
++            h.noteLive();
++            return false;
++        }
++        h.abortPair(); // no round runs any more: a stream blocked on the peer drains
++        h.failPair(msg, null);
++        h.exitPair();
++        return false;
++    }
++
++    /// Every admitted stream fails with the pair's message (`e`: a round's error while draining, logged too).
++    fn failPair(h: *LaneHost, msg: []const u8, e: ?anyerror) void {
++        if (e) |x| noteErr("a round failed while the streams drained ({s}): every stream ends", .{@errorName(x)});
++        h.lock();
++        const n = h.admitted.items.len;
++        h.unlock();
++        h.pair_failed += n;
++        h.failAll(msg);
++    }
++
++    /// Everything that waits fails with `msg` (queued, woken, reading a restore, deferred), each restore it
++    /// waited for stopped once.
++    fn failWaiting(h: *LaneHost, msg: []const u8) void {
++        var jobs: std.ArrayList(*Job) = .empty;
++        defer jobs.deinit(h.gpa);
++        var restores: std.ArrayList(*pc.Restore) = .empty;
++        defer restores.deinit(h.gpa);
++        h.lock();
++        for ([_]*std.ArrayList(*Job){ &h.queued, &h.ready }) |list| {
++            for (list.items) |job| jobs.append(h.gpa, job) catch {};
++            list.clearRetainingCapacity();
++        }
++        for (h.loading.items) |l| {
++            jobs.append(h.gpa, l.job) catch {};
++            if (std.mem.indexOfScalar(*pc.Restore, restores.items, l.restore) == null) restores.append(h.gpa, l.restore) catch {};
++        }
++        h.loading.clearRetainingCapacity();
++        for (h.deferred.items) |d| jobs.append(h.gpa, d.job) catch {};
++        h.deferred.clearRetainingCapacity();
++        h.unlock();
++        if (h.cache) |store| for (restores.items) |r| store.restoreCancel(r);
++        h.pair_failed += jobs.items.len;
++        for (jobs.items) |job| h.finish(job, .failed, msg);
++    }
++
++    fn abortPair(h: *LaneHost) void {
++        const pol = h.pair orelse return;
++        if (!h.pair_aborted.swap(true, .acq_rel)) pol.abort(pol.ctx);
++    }
++
++    /// The distinct last line, a grace for the failed requests' events to leave, and the exit (once).
++    fn exitPair(h: *LaneHost) void {
++        const pol = h.pair orelse return;
++        if (h.pair_exited.swap(true, .acq_rel)) return;
++        noteErr("rank pair broken ({s}); {d} requests failed; exiting with status {d} for a restart of both ranks", .{ h.pair_why[0..h.pair_why_len], h.pair_failed, pol.code });
++        std.Io.sleep(h.io, .fromNanoseconds(@intCast(@max(pol.grace_ns, 0))), .awake) catch {};
++        h.pair_done.store(true, .release);
++        pol.exit(pol.ctx, pol.code);
++    }
++
++    /// The deadline thread: if the engine thread has not exited deadline_ns after the break (a round or a prompt
++    /// pass blocked on the dead peer), the collectives stop, which should let it fail its streams and exit; grace_ns
++    /// after that the process exits from here.
++    fn pairDeadline(h: *LaneHost) void {
++        const pol = h.pair.?;
++        if (!h.sleepUnlessDone(h.pair_since + pol.deadline_ns)) return;
++        noteErr("the engine thread did not end its streams within {d} ms of the broken pair: stopping the collectives", .{@divTrunc(pol.deadline_ns, std.time.ns_per_ms)});
++        h.abortPair();
++        if (!h.sleepUnlessDone(std.Io.Clock.awake.now(h.io).toNanoseconds() + pol.grace_ns + std.time.ns_per_s)) return;
++        if (h.pair_exited.swap(true, .acq_rel)) return;
++        noteErr("rank pair broken ({s}); the engine thread is stuck; exiting with status {d} for a restart of both ranks", .{ h.pair_why[0..h.pair_why_len], pol.code });
++        pol.exit(pol.ctx, pol.code);
++    }
++
++    /// The stall monitor: the engine thread busy (a round, a prompt pass, the lone driver) without progress for
++    /// stall_ns is a break that drains nothing (the deadline thread then stops the collectives and exits). Leaves at
++    /// the first break, or when the host stops.
++    fn pairMonitor(h: *LaneHost) void {
++        const pol = h.pair.?;
++        while (!h.pair_done.load(.acquire) and h.pair_state.load(.acquire) == 0) {
++            std.Io.sleep(h.io, .fromMilliseconds(monitor_ms), .awake) catch {};
++            const at = h.progress_at.load(.acquire);
++            if (at == 0) continue;
++            const idle = std.Io.Clock.awake.now(h.io).toNanoseconds() - at;
++            if (idle < pol.stall_ns) continue;
++            var buf: [pair_why_max]u8 = undefined;
++            const why = std.fmt.bufPrint(&buf, "a round or prompt chunk made no progress for {d} s (a peer that stopped answering, or a device hang)", .{@divTrunc(idle, std.time.ns_per_s)}) catch "a round made no progress";
++            return h.pairBroken(why, false);
++        }
++    }
++
++    /// Sleeps until `until` in 10 ms steps; false as soon as pair_done is set.
++    fn sleepUnlessDone(h: *LaneHost, until: i96) bool {
++        while (std.Io.Clock.awake.now(h.io).toNanoseconds() < until) {
++            if (h.pair_done.load(.acquire)) return false;
++            std.Io.sleep(h.io, .fromMilliseconds(10), .awake) catch {};
++        }
++        return !h.pair_done.load(.acquire);
++    }
++
+     /// Clean shutdown on the engine thread, nothing left to serve: restores stopped, writes drained within flush_ns.
+     fn shutdownTier(h: *LaneHost) void {
+         const store = h.cache orelse return;
+@@ -993,9 +1463,11 @@ pub const LaneHost = struct {
+         t.restore_wait_timeouts = hc.restore_wait_timeouts;
+         t.restore_wait_ns = hc.restore_wait_ns;
+         t.restore_wait_max_ns = hc.restore_wait_max_ns;
++        t.restores_deferred = hc.restores_deferred;
++        t.restores_deferred_expired = hc.restores_deferred_expired;
+         t.cached_tokens = hc.cached_tokens;
+         t.computed_tokens = hc.computed_tokens;
+-        t.parked = h.loading.items.len;
++        t.parked = h.loading.items.len + h.deferred.items.len;
+         return t;
+     }
+ };
+@@ -1006,6 +1478,12 @@ fn note(comptime fmt: []const u8, args: anytype) void {
+     std.log.warn("lane host: " ++ fmt, args);
+ }
+ 
++/// An error line (the broken pair's, the fence's); tests stay quiet too.
++fn noteErr(comptime fmt: []const u8, args: anytype) void {
++    if (@import("builtin").is_test) return;
++    std.log.err("lane host: " ++ fmt, args);
++}
++
+ test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
+     const gpa = std.testing.allocator;
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+@@ -1185,7 +1663,47 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
+     try std.testing.expectEqual(Reason.cancelled, a.wait());
+ }
+ 
++test "the service fence: never inside a round, a prompt pass's chunk or a graph capture; skipped and counted when not panicking" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    defer host.stop(); // (never started: frees the lists)
++    host.fence_panic = false;
++    try std.testing.expect(host.fenced("service")); // the run loop between rounds, or idle
++    host.rounds_open = 1; // inside the lane core's step: a round's launches in flight
++    try std.testing.expect(!host.fenced("service"));
++    host.rounds_open = 0;
++    var job: LaneHost.Job = undefined;
++    host.filling = &job; // a prompt pass running its chunk
++    try std.testing.expect(!host.fenced("service"));
++    host.in_between = true; // ... standing between two chunks (Stream.between)
++    try std.testing.expect(host.fenced("service"));
++    host.rounds_open = 1; // an interleaved round inside between
++    try std.testing.expect(!host.fenced("service"));
++    host.rounds_open = 0;
++    host.filling = null;
++    host.in_between = false;
++    const Capture = struct {
++        var on = true;
++        fn quiet(_: *anyopaque) bool {
++            return !on;
++        }
++    };
++    host.quiet = .{ .ctx = &host, .check = Capture.quiet }; // the backend capturing a CUDA graph
++    try std.testing.expect(!host.fenced("the lone driver's pump"));
++    Capture.on = false;
++    try std.testing.expect(host.fenced("the lone driver's pump"));
++    try std.testing.expectEqual(@as(u64, 4), host.service_refused);
++}
++
+ test {
+     _ = @import("lane_host_test.zig");
+     _ = @import("lane_host_tier_test.zig");
++    _ = @import("lane_host_robust_test.zig");
+ }
+diff --git a/zig/src/core/lane_host_robust_test.zig b/zig/src/core/lane_host_robust_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..edd7ebbefd9c79e0a8fc553861802d149cd5a2f2
+--- /dev/null
++++ b/zig/src/core/lane_host_robust_test.zig
+@@ -0,0 +1,642 @@
++//! LaneHost robustness (round 3, docs/port/robustness.md): restores the tier refuses for capacity (deferred and
++//! asked again, bounded; the shorter memory state kept meanwhile), and a broken rank pair (nothing admitted, waiting
++//! work failed, streams drained or failed, the collectives stopped once, one exit with the policy's status, also
++//! when the engine thread is stuck on the peer), through the fake lane backend, a fake tier and fake abort/exit hooks.
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const lh = @import("lane_host.zig");
++const tt = @import("lane_host_tier_test.zig");
++const LaneHost = lh.LaneHost;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++const Reason = api.Reason;
++const Rig = tt.Rig;
++const Box = tt.Box;
++const t2 = tt.t2;
++const gpa = std.testing.allocator;
++const io = std.testing.io;
++
++// -- restores refused for capacity -------------------------------------------------------------------------------
++
++test "a restore the tier refuses for capacity is asked again shortly, then resumes exactly" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.tier.refuse = 2; // two refusals (TooManyRestores: restores in flight), then the begin goes through
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached);
++    try b.exact(&t2);
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 1), s.restores_deferred); // once a request, however often it asked
++    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred_expired);
++    try std.testing.expectEqual(@as(u64, 1), s.disk_hits_committed);
++    try std.testing.expectEqual(@as(u64, 2), r.tier.refused);
++    try std.testing.expectEqual(@as(u64, 3), r.tier.begins);
++    try std.testing.expectEqual(@as(u64, 0), s.parked);
++}
++
++test "a full tier refuses before any room is made: the request asks again, the refusal counted once" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    try shortThenPoint(r);
++    r.tier.full = 3; // the restores in flight at the tier's cap for three asks
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(2, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached);
++    try b.exact(&t2);
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 1), s.restores_deferred);
++    try std.testing.expectEqual(@as(u64, 1), s.restores_refused); // once a request, not once an ask
++    try std.testing.expectEqual(@as(u64, 1), r.tier.begins); // never asked to begin while full
++    try std.testing.expectEqual(@as(u64, 0), s.evicted);
++}
++
++/// A memory state of t2 at 4 (a short turn's keep), then t2's durable point at 8.
++fn shortThenPoint(r: *Rig) !void {
++    var a: Box = .{};
++    defer a.deinit();
++    const short: Request = .{ .prompt = t2[0..6], .max_tokens = 1, .history_len = 4 };
++    try r.host.engine().submit(1, &short, a.sink());
++    try std.testing.expectEqual(Reason.length, a.wait());
++    _ = try r.point(&t2, 8);
++}
++
++test "a restore still refused past its deferral bound resumes the shorter memory state, never a prefill from 0" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.host.tier.defer_ns = 40 * std.time.ns_per_ms;
++    try shortThenPoint(r);
++    r.tier.refuse = 1 << 20; // at capacity throughout
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(2, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 4), b.cached); // the memory state, kept while the restore was refused
++    try b.exact(&t2);
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 1), s.restores_deferred);
++    try std.testing.expectEqual(@as(u64, 1), s.restores_deferred_expired);
++    try std.testing.expect(r.tier.refused >= 2); // asked again while deferred
++    try std.testing.expectEqual(@as(u64, 0), s.disk_hits_committed);
++    try std.testing.expectEqual(@as(u64, 0), s.parked);
++}
++
++test "with the deferral off a refused restore resumes what memory holds at once" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.host.tier.defer_ns = 0;
++    try shortThenPoint(r);
++    r.tier.refuse = 1 << 20;
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(2, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 4), b.cached);
++    try b.exact(&t2);
++    try std.testing.expectEqual(@as(u64, 0), r.stats().restores_deferred);
++    try std.testing.expectEqual(@as(u64, 1), r.tier.refused);
++}
++
++test "a refusal that waiting cannot cure is not deferred; a deferred request cancelled leaves every list once" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.tier.refuse = 1;
++    r.tier.refuse_err = error.PointMissing; // not a capacity refusal: admitted at once, prefilled
++    _ = try r.point(&t2, 8);
++    var a: Box = .{};
++    defer a.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    const e = r.host.engine();
++    try e.submit(1, &req, a.sink());
++    try std.testing.expectEqual(Reason.length, a.wait());
++    try std.testing.expectEqual(@as(?u32, 0), a.cached);
++    try std.testing.expectEqual(@as(u64, 0), r.stats().restores_deferred);
++    // at capacity for long: the request waits deferred (no lane, counted waiting), and its cancel ends it there
++    r.host.tier.defer_ns = 10 * std.time.ns_per_s;
++    r.tier.refuse = 1 << 20;
++    r.tier.refuse_err = error.TooManyRestores;
++    const other = [_]u32{ 9, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6 };
++    _ = try r.point(&other, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req_b: Request = .{ .prompt = &other, .max_tokens = 6, .history_len = 14 };
++    try e.submit(2, &req_b, b.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restores_deferred == 1 and s.parked == 1;
++        }
++    }.ok);
++    var st: api.Status = .{};
++    e.status(&st, &.{});
++    try std.testing.expectEqual(@as(u32, 1), st.waiting);
++    try std.testing.expectEqual(@as(u32, 0), st.running);
++    e.cancel(2);
++    try std.testing.expectEqual(Reason.cancelled, b.wait());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.parked == 0;
++        }
++    }.ok);
++    try std.testing.expectEqual(@as(usize, 0), r.tier.jobs.items.len); // nothing was ever begun for it
++}
++
++test "shutdown with a deferred request cancels it once" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    r.host.tier.defer_ns = 10 * std.time.ns_per_s;
++    r.tier.refuse = 1 << 20;
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restores_deferred == 1;
++        }
++    }.ok);
++    r.stop();
++    try std.testing.expectEqual(@as(?Reason, Reason.cancelled), b.finished());
++}
++
++// -- a broken rank pair --------------------------------------------------------------------------------------------
++
++/// The fake backend with failures on demand: a round's verify (and one-token rounds) or a prompt pass fails with
++/// `fail`, or a round blocks until the pair's abort (a round stuck on a dead peer).
++const Flaky = struct {
++    inner: lanes.backend.Backend,
++    rounds_fail: std.atomic.Value(bool) = .init(false),
++    prefill_fail: ?anyerror = null,
++    stuck: std.atomic.Value(bool) = .init(false),
++    /// A stuck round returns as if it succeeded once released (an RDMA collect kernel that gave up on its abort
++    /// word: the graph completes with rows that are not the model's).
++    stuck_ok: bool = false,
++    entered: std.atomic.Value(bool) = .init(false), // a round is stuck now
++    released: *std.atomic.Value(bool), // the pair's abort ran
++    fail: anyerror = error.PairBroken,
++
++    fn backend(f: *Flaky) lanes.backend.Backend {
++        return .{ .ptr = f, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
++    }
++    fn of(ptr: *anyopaque) *Flaky {
++        return @ptrCast(@alignCast(ptr));
++    }
++    fn round(f: *Flaky) !void {
++        if (f.stuck.load(.acquire)) {
++            f.entered.store(true, .release);
++            while (!f.released.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++            if (f.stuck_ok) return;
++            return error.CommAborted;
++        }
++        if (f.rounds_fail.load(.acquire)) return f.fail;
++    }
++    fn prefill(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
++        const f = of(ptr);
++        if (f.prefill_fail) |e| return e;
++        return f.inner.vtable.prefill(f.inner.ptr, s);
++    }
++    fn first(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
++        const f = of(ptr);
++        return f.inner.vtable.first(f.inner.ptr, s, position);
++    }
++    fn queue(ptr: *anyopaque, s: *lanes.Stream, feed: lanes.backend.Feed, position: u64) anyerror!u64 {
++        const f = of(ptr);
++        try f.round();
++        return f.inner.vtable.queue(f.inner.ptr, s, feed, position);
++    }
++    fn read(ptr: *anyopaque, handle: u64) anyerror!u32 {
++        const f = of(ptr);
++        return f.inner.vtable.read(f.inner.ptr, handle);
++    }
++    fn verify(ptr: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void {
++        const f = of(ptr);
++        try f.round();
++        return f.inner.vtable.verify(f.inner.ptr, windows, out);
++    }
++    fn keep(ptr: *anyopaque, windows: []const lanes.backend.Window, paths: []const []const u32) anyerror!void {
++        const f = of(ptr);
++        return f.inner.vtable.keep(f.inner.ptr, windows, paths);
++    }
++    fn draft(ptr: *anyopaque, requests: []const lanes.backend.DraftRequest) anyerror!void {
++        const f = of(ptr);
++        return f.inner.vtable.draft(f.inner.ptr, requests);
++    }
++    fn release(ptr: *anyopaque, s: *lanes.Stream) void {
++        const f = of(ptr);
++        f.inner.vtable.release(f.inner.ptr, s);
++    }
++};
++
++/// The policy's abort and exit, recorded (the real exit never returns).
++const Ends = struct {
++    aborts: std.atomic.Value(u32) = .init(0),
++    exits: std.atomic.Value(u32) = .init(0),
++    code: std.atomic.Value(u8) = .init(0),
++    released: std.atomic.Value(bool) = .init(false),
++
++    fn abort(ctx: *anyopaque) void {
++        const e: *Ends = @ptrCast(@alignCast(ctx));
++        _ = e.aborts.fetchAdd(1, .acq_rel);
++        e.released.store(true, .release);
++    }
++    fn exit(ctx: *anyopaque, code: u8) void {
++        const e: *Ends = @ptrCast(@alignCast(ctx));
++        e.code.store(code, .release);
++        _ = e.exits.fetchAdd(1, .acq_rel);
++    }
++    fn waitExit(e: *Ends) !void {
++        for (0..5000) |_| {
++            if (e.exits.load(.acquire) > 0) return;
++            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.Timeout;
++    }
++};
++
++/// A request's reply with its final reason and message.
++const Reply = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: usize = 0,
++    done: ?Reason = null,
++    message: [256]u8 = undefined,
++    message_len: usize = 0,
++
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *Reply = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(io);
++        defer b.mutex.unlock(io);
++        switch (e.*) {
++            .tokens => |t| b.tokens += t.len,
++            .finished => |f| {
++                b.done = f.reason;
++                const n = @min(f.message.len, b.message.len);
++                @memcpy(b.message[0..n], f.message[0..n]);
++                b.message_len = n;
++            },
++            else => {},
++        }
++    }
++    fn sink(b: *Reply) api.Sink {
++        return .{ .ctx = b, .event = event };
++    }
++    fn read(b: *Reply) struct { tokens: usize, done: ?Reason } {
++        b.mutex.lockUncancelable(io);
++        defer b.mutex.unlock(io);
++        return .{ .tokens = b.tokens, .done = b.done };
++    }
++    fn wait(b: *Reply) Reason {
++        while (true) {
++            if (b.read().done) |r| return r;
++            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++        }
++    }
++    fn says(b: *Reply, text: []const u8) bool {
++        b.mutex.lockUncancelable(io);
++        defer b.mutex.unlock(io);
++        return std.mem.indexOf(u8, b.message[0..b.message_len], text) != null;
++    }
++    fn decoding(b: *Reply) void {
++        while (b.read().tokens == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++};
++
++/// The fake backend behind Flaky, the lane core and a host with one lane, its pair policy set before start.
++const Pair = struct {
++    cfg: lanes.Config,
++    target: lanes.fake.Fake,
++    flaky: Flaky,
++    clock: lanes.fake.FixedClock = .{},
++    core: lanes.Engine,
++    host: LaneHost,
++    ends: Ends = .{},
++    stopped: bool = false,
++
++    const fatal = [_]LaneHost.Fatal{ .{ .err = error.PairBroken, .drain = false }, .{ .err = error.TransferTimeout, .drain = false } };
++
++    fn create(policy: bool, drain_ns: i96, deadline_ns: i96, lanes_n: u32) !*Pair {
++        return createWith(policy, drain_ns, deadline_ns, lanes_n, 0);
++    }
++    fn createWith(policy: bool, drain_ns: i96, deadline_ns: i96, lanes_n: u32, stall_ns: i96) !*Pair {
++        const p = try gpa.create(Pair);
++        errdefer gpa.destroy(p);
++        p.* = .{ .cfg = undefined, .target = .{ .gpa = gpa }, .flaky = undefined, .core = undefined, .host = undefined };
++        p.flaky = .{ .inner = p.target.backend(), .released = &p.ends.released };
++        p.cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        p.core = lanes.Engine.init(gpa, &p.cfg, p.flaky.backend(), p.clock.clock());
++        p.host = LaneHost.init(gpa, io, &p.core, .{ .lanes = lanes_n });
++        p.host.interleave_ns = 0;
++        if (policy) p.host.pair = .{ .ctx = &p.ends, .abort = Ends.abort, .exit = Ends.exit, .drain_ns = drain_ns, .deadline_ns = deadline_ns, .grace_ns = std.time.ns_per_ms, .stall_ns = stall_ns, .fatal = &fatal };
++        try p.host.start();
++        return p;
++    }
++    fn stop(p: *Pair) void {
++        if (p.stopped) return;
++        p.stopped = true;
++        p.host.stop();
++    }
++    fn destroy(p: *Pair) void {
++        p.stop();
++        p.core.deinit();
++        p.target.deinit();
++        p.cfg.deinit(gpa);
++        gpa.destroy(p);
++    }
++};
++
++const prompt_a = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++const prompt_b = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4 };
++
++test "a broken pair: what waits fails at once, a decoding stream drains, then one abort and one exit with the policy's status" {
++    const p = try Pair.create(true, 30 * std.time.ns_per_ms, 10 * std.time.ns_per_s, 1);
++    defer p.destroy();
++    const e = p.host.engine();
++    var a: Reply = .{};
++    const long: Request = .{ .prompt = &prompt_a, .max_tokens = 1 << 30 };
++    try e.submit(1, &long, a.sink());
++    a.decoding();
++    var c: Reply = .{};
++    const queued: Request = .{ .prompt = &prompt_b, .max_tokens = 4 };
++    try e.submit(2, &queued, c.sink()); // (one lane: it waits behind A)
++    p.host.pairBroken("rank 1 stopped answering (test)", true);
++    try std.testing.expect(p.host.isBroken());
++    try std.testing.expectEqual(Reason.failed, c.wait()); // failed right away, A still decoding
++    try std.testing.expect(c.says("rank pair broke (rank 1 stopped answering (test))"));
++    try std.testing.expectEqual(@as(?Reason, null), a.read().done);
++    try std.testing.expectError(error.Closed, e.submit(3, &queued, c.sink())); // nothing new is admitted
++    // A cannot finish in 30 ms: it fails at the drain's end, then the collectives stop and the process exits, once
++    try std.testing.expectEqual(Reason.failed, a.wait());
++    try std.testing.expect(a.says("the server restarts"));
++    try p.ends.waitExit();
++    try std.testing.expectEqual(LaneHost.pair_exit_code, p.ends.code.load(.acquire));
++    try std.testing.expectEqual(@as(u32, 1), p.ends.aborts.load(.acquire));
++    p.host.pairBroken("a second cause", false); // the first cause only
++    p.stop();
++    try std.testing.expectEqual(@as(u32, 1), p.ends.exits.load(.acquire));
++    try std.testing.expectEqual(@as(u32, 1), p.ends.aborts.load(.acquire));
++    try std.testing.expectEqualStrings("rank 1 stopped answering (test)", p.host.pair_why[0..p.host.pair_why_len]);
++    try std.testing.expectEqual(@as(u64, 2), p.host.pair_failed);
++}
++
++test "a broken pair with room to drain lets a short stream finish normally before the exit" {
++    const p = try Pair.create(true, 5 * std.time.ns_per_s, 10 * std.time.ns_per_s, 2);
++    defer p.destroy();
++    const e = p.host.engine();
++    var a: Reply = .{};
++    const short: Request = .{ .prompt = &prompt_a, .max_tokens = 2000 };
++    try e.submit(1, &short, a.sink());
++    a.decoding();
++    p.host.pairBroken("a spill command was refused (test)", true);
++    try std.testing.expectEqual(Reason.length, a.wait()); // finished within the drain (or before the break)
++    try std.testing.expectEqual(@as(usize, 2000), a.read().tokens);
++    try p.ends.waitExit();
++    try std.testing.expectEqual(@as(u32, 1), p.ends.aborts.load(.acquire));
++    try std.testing.expectEqual(@as(u64, 0), p.host.pair_failed);
++}
++
++test "a round failing with a fatal error breaks the pair: every stream fails at once, no drain" {
++    const p = try Pair.create(true, 10 * std.time.ns_per_s, 10 * std.time.ns_per_s, 2);
++    defer p.destroy();
++    const e = p.host.engine();
++    var a: Reply = .{};
++    const long: Request = .{ .prompt = &prompt_a, .max_tokens = 1 << 30 };
++    try e.submit(1, &long, a.sink());
++    a.decoding();
++    p.flaky.rounds_fail.store(true, .release); // the next round: error.PairBroken (drain = false in the policy)
++    try std.testing.expectEqual(Reason.failed, a.wait());
++    try p.ends.waitExit(); // well before the 10 s drain
++    try std.testing.expect(p.host.isBroken());
++    try std.testing.expect(std.mem.startsWith(u8, p.host.pair_why[0..p.host.pair_why_len], "PairBroken"));
++    try std.testing.expect(!p.host.pair_drain);
++    try std.testing.expectEqual(@as(u32, 1), p.ends.aborts.load(.acquire));
++}
++
++test "a prompt pass failing with a fatal error breaks the pair; another error fails its request alone" {
++    const p = try Pair.create(true, 10 * std.time.ns_per_s, 10 * std.time.ns_per_s, 2);
++    defer p.destroy();
++    const e = p.host.engine();
++    p.flaky.prefill_fail = error.SomethingElse;
++    var a: Reply = .{};
++    const req: Request = .{ .prompt = &prompt_a, .max_tokens = 4 };
++    try e.submit(1, &req, a.sink());
++    try std.testing.expectEqual(Reason.failed, a.wait());
++    try std.testing.expect(!p.host.isBroken()); // not the policy's: the host serves on
++    p.flaky.prefill_fail = null;
++    var b: Reply = .{};
++    try e.submit(2, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    p.flaky.prefill_fail = error.TransferTimeout; // a KV transfer that did not complete: the stream is wedged
++    var c: Reply = .{};
++    try e.submit(3, &req, c.sink());
++    try std.testing.expectEqual(Reason.failed, c.wait());
++    try p.ends.waitExit();
++    try std.testing.expect(std.mem.startsWith(u8, p.host.pair_why[0..p.host.pair_why_len], "TransferTimeout"));
++    try std.testing.expectEqual(@as(u32, 1), p.ends.aborts.load(.acquire));
++}
++
++test "a round blocked on the dead peer: the deadline thread aborts, the engine thread then fails its streams, one exit" {
++    const p = try Pair.create(true, 10 * std.time.ns_per_s, 40 * std.time.ns_per_ms, 2);
++    defer p.destroy();
++    const e = p.host.engine();
++    var a: Reply = .{};
++    const long: Request = .{ .prompt = &prompt_a, .max_tokens = 1 << 30 };
++    try e.submit(1, &long, a.sink());
++    a.decoding();
++    p.flaky.stuck.store(true, .release); // the next round waits on a peer that never answers, until the abort
++    p.host.pairBroken("rank 1's link closed (test)", true);
++    try std.testing.expectEqual(Reason.failed, a.wait()); // the abort unblocked the round; its error ended the drain
++    try p.ends.waitExit();
++    p.stop();
++    try std.testing.expectEqual(@as(u32, 1), p.ends.aborts.load(.acquire));
++    try std.testing.expectEqual(@as(u32, 1), p.ends.exits.load(.acquire)); // the engine thread's or the deadline's, once
++}
++
++test "without a pair policy a break is nothing and a fatal-looking error fails its request alone" {
++    const p = try Pair.create(false, 0, 0, 2);
++    defer p.destroy();
++    const e = p.host.engine();
++    p.host.pairBroken("ignored", false);
++    try std.testing.expect(!p.host.isBroken());
++    p.flaky.prefill_fail = error.PairBroken;
++    var a: Reply = .{};
++    const req: Request = .{ .prompt = &prompt_a, .max_tokens = 4 };
++    try e.submit(1, &req, a.sink());
++    try std.testing.expectEqual(Reason.failed, a.wait());
++    p.flaky.prefill_fail = null;
++    var b: Reply = .{};
++    try e.submit(2, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expect(!p.host.isBroken());
++    try std.testing.expectEqual(@as(u32, 0), p.ends.exits.load(.acquire));
++}
++
++test "a break reported after the host stopped (a tier's teardown) changes nothing and starts no deadline" {
++    const p = try Pair.create(true, 0, 0, 1);
++    defer p.destroy();
++    p.stop();
++    p.host.pairBroken("the spill tier's agreement: rank 1 went (teardown)", true);
++    try std.testing.expect(!p.host.isBroken());
++    try std.testing.expect(p.host.pair_thread == null);
++    try std.testing.expectEqual(@as(u32, 0), p.ends.exits.load(.acquire));
++}
++
++test "a peer that hangs without erroring: the stall monitor breaks the pair, nothing after the abort is delivered" {
++    const p = try Pair.createWith(true, 10 * std.time.ns_per_s, 20 * std.time.ns_per_ms, 2, 60 * std.time.ns_per_ms);
++    defer p.destroy();
++    const e = p.host.engine();
++    var a: Reply = .{};
++    const long: Request = .{ .prompt = &prompt_a, .max_tokens = 1 << 30 };
++    try e.submit(1, &long, a.sink());
++    a.decoding();
++    try std.testing.expect(!p.host.isBroken()); // decoding rounds keep the stall clock fresh
++    // the next round never ends and nothing reports an error (a SIGSTOPped follower), then returns as if it worked
++    p.flaky.stuck_ok = true;
++    p.flaky.stuck.store(true, .release);
++    while (!p.flaky.entered.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    const before = a.read().tokens; // (every earlier round delivered: the engine thread is inside this one)
++    try std.testing.expectEqual(Reason.failed, a.wait());
++    try p.ends.waitExit();
++    try std.testing.expectEqual(before, a.read().tokens); // the round that returned after the abort sent nothing
++    try std.testing.expect(p.host.isBroken());
++    try std.testing.expect(std.mem.startsWith(u8, p.host.pair_why[0..p.host.pair_why_len], "a round or prompt chunk made no progress"));
++    try std.testing.expect(!p.host.pair_drain);
++    try std.testing.expect(a.says("the server restarts"));
++    p.stop();
++    try std.testing.expectEqual(@as(u32, 1), p.ends.aborts.load(.acquire));
++    try std.testing.expectEqual(@as(u32, 1), p.ends.exits.load(.acquire));
++}
++
++test "status during a hang: past the stall bound it is not healthy (stalled, then broken); no policy, no pair status" {
++    const p = try Pair.createWith(true, 10 * std.time.ns_per_s, 20 * std.time.ns_per_ms, 2, 60 * std.time.ns_per_ms);
++    defer p.destroy();
++    const e = p.host.engine();
++    var a: Reply = .{};
++    const long: Request = .{ .prompt = &prompt_a, .max_tokens = 1 << 30 };
++    try e.submit(1, &long, a.sink());
++    a.decoding();
++    var st: api.Status = .{};
++    e.status(&st, &.{});
++    try std.testing.expect(st.pair != null);
++    try std.testing.expectEqualStrings("ok", st.pair.?.health());
++    try std.testing.expectEqual(@as(u64, 60), st.pair.?.stall_ms);
++    p.flaky.stuck_ok = true;
++    p.flaky.stuck.store(true, .release);
++    while (!p.flaky.entered.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    // the monitor ticks every 250 ms: between the bound and its tick the status says stalled, after it broken
++    var saw_stalled = false;
++    var i: usize = 0;
++    while (i < 5000) : (i += 1) {
++        e.status(&st, &.{});
++        const ps = st.pair.?;
++        if (ps.stalled and !ps.broken) {
++            saw_stalled = true;
++            try std.testing.expectEqualStrings("stalled", ps.health());
++            try std.testing.expect(ps.busy_ms >= 60);
++        }
++        if (ps.broken) break;
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    try std.testing.expect(saw_stalled);
++    try std.testing.expectEqualStrings("broken", st.pair.?.health());
++    try std.testing.expectEqual(Reason.failed, a.wait());
++    try p.ends.waitExit();
++    e.status(&st, &.{});
++    try std.testing.expect(st.pair.?.pair_failed >= 1);
++    p.stop();
++    const q = try Pair.create(false, 0, 0, 1);
++    defer q.destroy();
++    q.host.engine().status(&st, &.{});
++    try std.testing.expect(st.pair == null);
++}
++
++test "an idle host with the monitor on never breaks; it leaves with the host" {
++    const p = try Pair.createWith(true, 0, 0, 1, 30 * std.time.ns_per_ms);
++    defer p.destroy();
++    var a: Reply = .{};
++    const req: Request = .{ .prompt = &prompt_a, .max_tokens = 4 };
++    try p.host.engine().submit(1, &req, a.sink());
++    try std.testing.expectEqual(Reason.length, a.wait());
++    std.Io.sleep(io, .fromMilliseconds(120), .awake) catch {};
++    try std.testing.expect(!p.host.isBroken());
++    try std.testing.expectEqual(@as(i64, 0), p.host.progress_at.load(.acquire));
++    p.stop();
++    try std.testing.expect(p.host.pair_monitor == null);
++}
++
++test "a break during a clean shutdown ends the streams and lets the shutdown finish: no restart exit" {
++    const p = try Pair.create(true, 10 * std.time.ns_per_s, 20 * std.time.ns_per_ms, 2);
++    defer p.destroy();
++    const e = p.host.engine();
++    var a: Reply = .{};
++    const long: Request = .{ .prompt = &prompt_a, .max_tokens = 1 << 30 };
++    try e.submit(1, &long, a.sink());
++    a.decoding();
++    p.flaky.stuck.store(true, .release); // rank 1 stopped first: the round waits on it
++    while (!p.flaky.entered.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    const stopper = try std.Thread.spawn(.{}, Pair.stop, .{p}); // stop.sh stopping rank 0 meanwhile
++    while (true) { // (closing set: stop() now waits for the engine thread)
++        p.host.mutex.lockUncancelable(io);
++        const closing = p.host.closing;
++        p.host.mutex.unlock(io);
++        if (closing) break;
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    p.host.pairBroken("rank 1's link closed (test)", false);
++    stopper.join();
++    try std.testing.expectEqual(Reason.failed, a.wait());
++    try std.testing.expectEqual(@as(u32, 1), p.ends.aborts.load(.acquire)); // (the round was stuck: the deadline's)
++    try std.testing.expectEqual(@as(u32, 0), p.ends.exits.load(.acquire));
++}
++
++/// A prompt pass of slow chunks (15 ms each); at `break_at` the pair breaks mid-pass (null: never).
++const SlowChunks = struct {
++    host: *LaneHost,
++    break_at: ?usize = null,
++    fn hook(ctx: *anyopaque, _: *lanes.Stream, chunk: usize) void {
++        const c: *SlowChunks = @ptrCast(@alignCast(ctx));
++        std.Io.sleep(io, .fromMilliseconds(15), .awake) catch {};
++        if (c.break_at) |b| if (chunk == b) c.host.pairBroken("rank 1 went mid-pass (test)", true);
++    }
++};
++
++test "a long prompt pass that keeps making progress is never a stall: each chunk restarts the clock" {
++    const p = try Pair.createWith(true, 0, 10 * std.time.ns_per_s, 1, 60 * std.time.ns_per_ms);
++    defer p.destroy();
++    var slow: SlowChunks = .{ .host = &p.host };
++    p.target.prefill_chunks = 12; // 180 ms, three times the stall bound
++    p.target.prefill_hook = SlowChunks.hook;
++    p.target.prefill_hook_ctx = &slow;
++    var a: Reply = .{};
++    const req: Request = .{ .prompt = &prompt_a, .max_tokens = 4 };
++    try p.host.engine().submit(1, &req, a.sink());
++    try std.testing.expectEqual(Reason.length, a.wait());
++    try std.testing.expect(!p.host.isBroken());
++    try std.testing.expectEqual(@as(u32, 0), p.ends.exits.load(.acquire));
++}
++
++test "a break during a prompt pass stops it at its next chunk and fails it with the pair's message" {
++    const p = try Pair.create(true, 10 * std.time.ns_per_s, 10 * std.time.ns_per_s, 1);
++    defer p.destroy();
++    var slow: SlowChunks = .{ .host = &p.host, .break_at = 2 };
++    p.target.prefill_chunks = 400; // 6 s if it ran whole
++    p.target.prefill_hook = SlowChunks.hook;
++    p.target.prefill_hook_ctx = &slow;
++    var a: Reply = .{};
++    const req: Request = .{ .prompt = &prompt_a, .max_tokens = 4 };
++    try p.host.engine().submit(1, &req, a.sink());
++    try std.testing.expectEqual(Reason.failed, a.wait());
++    try std.testing.expect(a.says("rank pair broke"));
++    try p.ends.waitExit();
++    try std.testing.expect(p.target.prefill_count < 10);
++    try std.testing.expectEqual(@as(u64, 1), p.host.pair_failed);
++}
+diff --git a/zig/src/core/lane_host_tier_test.zig b/zig/src/core/lane_host_tier_test.zig
+index 9a8a4241e6e07a5a5cbd7f17783ffcf0904fa58c..8f85688abb08c339b39db67fb6e7e40ca67e6c09 100644
+--- a/zig/src/core/lane_host_tier_test.zig
++++ b/zig/src/core/lane_host_tier_test.zig
+@@ -15,13 +15,13 @@ const Reason = api.Reason;
+ const gpa = std.testing.allocator;
+ const io = std.testing.io;
+ 
+-const Box = struct {
++pub const Box = struct {
+     mutex: std.Io.Mutex = .init,
+     tokens: std.ArrayList(u32) = .empty,
+     cached: ?u32 = null,
+     done: ?Reason = null,
+ 
+-    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++    pub fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+         const b: *Box = @ptrCast(@alignCast(ctx));
+         b.mutex.lockUncancelable(io);
+         defer b.mutex.unlock(io);
+@@ -31,10 +31,10 @@ const Box = struct {
+             .finished => |f| b.done = f.reason,
+         }
+     }
+-    fn sink(b: *Box) api.Sink {
++    pub fn sink(b: *Box) api.Sink {
+         return .{ .ctx = b, .event = event };
+     }
+-    fn wait(b: *Box) Reason {
++    pub fn wait(b: *Box) Reason {
+         while (true) {
+             b.mutex.lockUncancelable(io);
+             const d = b.done;
+@@ -43,21 +43,21 @@ const Box = struct {
+             std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+         }
+     }
+-    fn deinit(b: *Box) void {
++    pub fn deinit(b: *Box) void {
+         b.tokens.deinit(gpa);
+     }
+-    fn finished(b: *Box) ?Reason {
++    pub fn finished(b: *Box) ?Reason {
+         b.mutex.lockUncancelable(io);
+         defer b.mutex.unlock(io);
+         return b.done;
+     }
+-    fn count(b: *Box) usize {
++    pub fn count(b: *Box) usize {
+         b.mutex.lockUncancelable(io);
+         defer b.mutex.unlock(io);
+         return b.tokens.items.len;
+     }
+     /// The reply equals the fake target's over `prompt` (any slip in the restored history changes it).
+-    fn exact(b: *Box, prompt: []const u32) !void {
++    pub fn exact(b: *Box, prompt: []const u32) !void {
+         var history: std.ArrayList(u32) = .empty;
+         defer history.deinit(gpa);
+         try history.appendSlice(gpa, prompt);
+@@ -69,7 +69,7 @@ const Box = struct {
+ };
+ 
+ /// The fake backend, a prompt cache over its states, an in-memory tier and the host, at stable addresses.
+-const Rig = struct {
++pub const Rig = struct {
+     cfg: lanes.Config,
+     target: lanes.fake.Fake,
+     clock: lanes.fake.FixedClock = .{},
+@@ -106,7 +106,12 @@ const Rig = struct {
+         return kept;
+     }
+ 
+-    fn create(sp: api.Spill) !*Rig {
++    pub fn create(sp: api.Spill) !*Rig {
++        return createWith(sp, null);
++    }
++
++    /// `pre` runs on the host before its thread starts (the robustness tests' policies).
++    pub fn createWith(sp: api.Spill, pre: ?*const fn (*Rig) void) !*Rig {
+         const r = try gpa.create(Rig);
+         errdefer gpa.destroy(r);
+         r.* = .{ .cfg = undefined, .target = .{ .gpa = gpa }, .core = undefined, .store = undefined, .tier = .{ .gpa = gpa, .codec = .{ .ctx = r, .pack = pack, .unpack = unpack } }, .host = undefined };
+@@ -118,17 +123,18 @@ const Rig = struct {
+         r.host.interleave_ns = 0;
+         r.host.cache = &r.store;
+         r.host.configure(sp);
++        if (pre) |f| f(r);
+         try r.host.start();
+         return r;
+     }
+ 
+-    fn stop(r: *Rig) void {
++    pub fn stop(r: *Rig) void {
+         if (r.stopped) return;
+         r.stopped = true;
+         r.host.stop();
+     }
+ 
+-    fn destroy(r: *Rig) void {
++    pub fn destroy(r: *Rig) void {
+         r.stop();
+         r.store.deinit();
+         r.tier.deinit();
+@@ -139,18 +145,18 @@ const Rig = struct {
+     }
+ 
+     /// A published point of `key[0..at]` whose state is those tokens (the fake backend's state is its history).
+-    fn point(r: *Rig, key: []const u32, at: u32) !u64 {
++    pub fn point(r: *Rig, key: []const u32, at: u32) !u64 {
+         return r.tier.put(key[0..at], at, std.mem.sliceAsBytes(key[0..at]), 0, 0, false);
+     }
+ 
+-    fn stats(r: *Rig) api.CacheStats {
++    pub fn stats(r: *Rig) api.CacheStats {
+         var st: api.Status = .{};
+         r.host.engine().status(&st, &.{});
+         return st.cache.?;
+     }
+ 
+     /// Waits (5 s at most) until the published counters satisfy `ok`.
+-    fn until(r: *Rig, comptime ok: fn (api.CacheStats) bool) !void {
++    pub fn until(r: *Rig, comptime ok: fn (api.CacheStats) bool) !void {
+         for (0..5000) |_| {
+             if (ok(r.stats())) return;
+             std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+@@ -159,8 +165,8 @@ const Rig = struct {
+     }
+ };
+ 
+-const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
+-const t2 = t1 ++ [_]u32{ 7, 7, 5, 3, 8, 8 };
++pub const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++pub const t2 = t1 ++ [_]u32{ 7, 7, 5, 3, 8, 8 };
+ 
+ test "a turn whose state left memory waits parked for its restore, resumes it exactly, and writes its own keeps forked from it" {
+     const r = try Rig.create(.{ .load_ms = 5, .flush_ms = 1000 });
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index b53e61b36613c0abea46af81c25c1bbcd5587e52..03280c53c46f604c0e32d0a95356607fcfe86aae 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -192,6 +192,12 @@ pub const TierCounts = struct {
+     };
+ };
+ 
++/// Tier.begin's refusals for capacity (robustness): nothing was reserved and the same begin may succeed once a
++/// restore in flight ends. dsv41's spill tier: TooManyRestores (its cap of restores in flight); core/spill's store:
++/// TooMany (its reads in flight), NoSlot (no staging slot); any tier: Busy.
++/// error.TierFull: the store's own refusal when the tier reports itself full (Tier.VTable.full) before any room is made.
++pub const capacity_errors = [_]anyerror{ error.TierFull, error.TooManyRestores, error.TooMany, error.NoSlot, error.Busy };
++
+ /// The ranks a tier reports counters for (TP ranks; more are not reported).
+ pub const max_ranks = 8;
+ 
+@@ -219,7 +225,14 @@ pub const Tier = struct {
+         /// The longest durable point `want` allows, from the tier's own index (no disk I/O, no CUDA); null: none.
+         lookup: *const fn (ptr: *anyopaque, want: *const Want) ?Point,
+         /// Start restoring `point` into a new family state (reserve on every rank, then read): a job for `poll`.
++        /// A refusal for capacity that a later call may not meet (too many restores in flight, no read slot) is one
++        /// of `capacity_errors` with nothing reserved: the host then defers the request briefly and asks again
++        /// (Store.deferrable), instead of prefilling a prompt a restore would have served.
+         begin: *const fn (ptr: *anyopaque, point: *const Point) anyerror!u64,
++        /// Whether `begin` would refuse for capacity now (the restores in flight at the tier's cap, no read slot), asked
++        /// before the store makes room for a restore, so a refusal costs no kept state (error.TierFull, nothing evicted).
++        /// Null: never full (a capacity refusal from `begin` then comes after the room was made).
++        full: ?*const fn (ptr: *anyopaque) bool = null,
+         /// Progress the job by at most `budget_ns` of engine-thread copies; after ready or failed the job is gone.
+         poll: *const fn (ptr: *anyopaque, job: u64, budget_ns: u64) Poll,
+         /// Stop a pending job: reads stop, issued DMA is waited for, reservations go (called once per job at most).
+@@ -268,7 +281,7 @@ pub const Stats = struct {
+     restores_failed: u64 = 0,
+     restores_cancelled: u64 = 0,
+     restores_dropped: u64 = 0, // adopted nothing: the budget cannot hold it, or memory had it meanwhile
+-    restores_refused: u64 = 0, // not begun: the budget could not hold its destination
++    restores_refused: u64 = 0, // not begun: the budget could not hold its destination, or the tier was full (once a request)
+     restored_tokens: u64 = 0,
+     writes_enqueued: u64 = 0,
+     shared_promoted: u64 = 0,
+@@ -391,6 +404,7 @@ pub const Store = struct {
+     roots: std.AutoHashMapUnmanaged(u64, u32) = .empty, // each conversation's first prompt length (join)
+     restoring: std.ArrayList(*Restore) = .empty,
+     restoring_bytes: u64 = 0, // destinations the restores in flight reserved (charged like kept states)
++    refused_for: Refusal = .none, // why the last restoreBeginOver returned NoRoom (deferrable)
+     next_lineage: u64 = 0,
+     stats: Stats = .{},
+ 
+@@ -521,15 +535,45 @@ pub const Store = struct {
+     /// destination is charged to the budget from here until it ends (room made first, as for a keep; nobody holds a
+     /// looked-up entry at admission, so any state may go): error.NoRoom when the budget cannot hold it.
+     pub fn restoreBegin(s: *Store, p: Point, key: []const u32) !*Restore {
++        return s.restoreBeginOver(p, key, .{});
++    }
++
++    /// How restoreBeginOver treats the prompt's own memory state and counts its refusals.
++    pub const Over = struct {
++        /// The best usable memory state for the key (Probe.memory): kept while the budget holds it beside the restore.
++        have: ?*Entry = null,
++        /// The same request asking again (a deferred restore): a refusal is not counted again.
++        again: bool = false,
++    };
++
++    /// Why a restore's room was refused (NoRoom): restores in flight hold the budget's rest (their charge goes when
++    /// they end, so asking again may succeed), or the budget cannot hold the destination however long one waits.
++    pub const Refusal = enum { none, restores_in_flight, budget };
++
++    /// restoreBegin for a request whose best memory state is `o.have`. A full tier (Tier.VTable.full) refuses first,
++    /// with error.TierFull and nothing evicted, so the shorter state is still there to resume. Otherwise the room
++    /// spares `have` when the budget holds both it and the restore (a refusal by the tier then leaves it), and evicts
++    /// it as restoreBegin does when the budget cannot hold both: a restore that can start always beats the shorter
++    /// state. After a refusal `have` may be gone: look it up again (Store.find), never through the old pointer.
++    pub fn restoreBeginOver(s: *Store, p: Point, key: []const u32, o: Over) !*Restore {
+         for (s.restoring.items) |r| if (r.point.id == p.id) {
+             s.stats.restores_shared += 1;
+             return r;
+         };
+         const t = s.tier orelse return error.NoTier;
+         if (p.tokens > key.len) return error.BadPoint;
++        if (t.vtable.full) |full| if (full(t.ptr)) {
++            if (!o.again) s.stats.restores_refused += 1;
++            return error.TierFull;
++        };
+         const bytes = s.pointBytes(p);
+-        if (!s.makeRoom(bytes, null, key)) {
+-            s.stats.restores_refused += 1;
++        s.refused_for = .none;
++        const spare_have = if (o.have) |e| s.restoring_bytes + bytes + e.bytes <= s.budget else false;
++        const made = s.makeRoom(bytes, if (spare_have) o.have else null, key) or (spare_have and s.makeRoom(bytes, null, key));
++        if (!made) {
++            if (!o.again) s.stats.restores_refused += 1;
++            // the room failed with nothing spared: only what the restores in flight hold stands in the way
++            s.refused_for = if (s.restoring.items.len > 0 and bytes <= s.budget) .restores_in_flight else .budget;
+             return error.NoRoom;
+         }
+         const r = try s.gpa.create(Restore);
+@@ -545,6 +589,14 @@ pub const Store = struct {
+         return r;
+     }
+ 
++    /// Whether a refused restoreBeginOver may succeed if asked again shortly: a refusal for capacity
++    /// (capacity_errors), or a NoRoom only the restores in flight caused (their charge goes when they end). Anything
++    /// else (a missing point, a damaged one, no tier, a budget that can never hold it) will not change by waiting.
++    pub fn deferrable(s: *const Store, err: anyerror) bool {
++        if (err == error.NoRoom) return s.refused_for == .restores_in_flight and s.restoring.items.len > 0;
++        return std.mem.indexOfScalar(anyerror, &capacity_errors, err) != null;
++    }
++
+     /// Progress `r` by at most `budget_ns`; once it is no longer pending `r` is freed. An installed state becomes a
+     /// shared or restored memory entry that the next lookup of its prompt finds (adopted).
+     pub fn restorePoll(s: *Store, r: *Restore, budget_ns: u64) Restored {
+diff --git a/zig/src/core/prompt_cache_fake_tier.zig b/zig/src/core/prompt_cache_fake_tier.zig
+index 919b31f1a23a645da5f0e3f5b7948e635d4b64fe..094d83cd497464eebd0957e54c4673414de6c419 100644
+--- a/zig/src/core/prompt_cache_fake_tier.zig
++++ b/zig/src/core/prompt_cache_fake_tier.zig
+@@ -23,6 +23,16 @@ pub const FakeTier = struct {
+     polls: u32 = 1,
+     /// The next restore fails with this error (on its first poll).
+     fail_next: ?anyerror = null,
++    /// The next `refuse` begins are refused with `refuse_err` before anything is reserved (a tier at its capacity:
++    /// dsv41's TooManyRestores, the store's TooMany/NoSlot); `refused` counts them.
++    refuse: u32 = 0,
++    refuse_err: anyerror = error.TooManyRestores,
++    refused: u64 = 0,
++    begins: u64 = 0,
++    /// The next `full` asks of Tier.VTable.full answer true (the tier at its cap before any room is made; `fulls`
++    /// counts the asks).
++    full: u32 = 0,
++    fulls: u64 = 0,
+     /// Shorter states are not written.
+     min_tokens: u32 = 0,
+     /// A flush cannot drain: its queue is left unpublished.
+@@ -65,7 +75,7 @@ pub const FakeTier = struct {
+     }
+ 
+     pub fn tier(t: *FakeTier) pc.Tier {
+-        return .{ .ptr = t, .vtable = &.{ .lookup = lookup, .begin = begin, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts } };
++        return .{ .ptr = t, .vtable = &.{ .lookup = lookup, .begin = begin, .full = isFull, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts } };
+     }
+ 
+     fn lock(t: *FakeTier) void {
+@@ -123,10 +133,26 @@ pub const FakeTier = struct {
+         return .{ .id = p.id, .at = p.at, .tokens = @intCast(p.key.len), .bytes = p.size, .group = p.group, .shared = p.shared };
+     }
+ 
++    fn isFull(ptr: *anyopaque) bool {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        t.fulls += 1;
++        if (t.full == 0) return false;
++        t.full -= 1;
++        return true;
++    }
++
+     fn begin(ptr: *anyopaque, p: *const pc.Point) anyerror!u64 {
+         const t = of(ptr);
+         t.lock();
+         defer t.unlock();
++        t.begins += 1;
++        if (t.refuse > 0) {
++            t.refuse -= 1;
++            t.refused += 1;
++            return t.refuse_err;
++        }
+         if (t.find(p.id) == null) {
+             t.c.presence_refused += 1;
+             return error.PointMissing;
+diff --git a/zig/src/core/prompt_cache_tier_test.zig b/zig/src/core/prompt_cache_tier_test.zig
+index b8780ffa4a66186d7d855bfa696b63f2f0870320..c7e22d7a278d786a20006f2f5a20fd75cf1d7ea9 100644
+--- a/zig/src/core/prompt_cache_tier_test.zig
++++ b/zig/src/core/prompt_cache_tier_test.zig
+@@ -742,3 +742,70 @@ test "lineage: a fresh pass starts its own, a resumed one forks its state's at t
+     try std.testing.expectEqual(@as(u32, 2), rc.n);
+     try std.testing.expectEqual(@as(u64, 1), rc.slice()[1].crc_errors);
+ }
++
++test "a restore refused for room or capacity: the shorter memory state stays when it can, a restore that can start wins" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 1 << 20); // states of 100 + at bytes
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(48, 1);
++    try std.testing.expect(keepAt(&s, &f, &a, 10, .{})); // memory: 110 bytes at 10
++    _ = try tier.put(a[0..30], 30, std.mem.asBytes(&Sum.State{ .at = 30, .sum = Sum.fresh(&a, 30) }), 0, 0, false);
++    const pr = s.probe(&a, &.{});
++    const hit = pr.memory.?;
++    const p = pr.durable.?;
++    // the tier full before any room is made: refused with nothing evicted and nothing asked of begin, counted once a
++    // request however often it asks again
++    tier.full = 2;
++    try std.testing.expectError(error.TierFull, s.restoreBeginOver(p, &a, .{ .have = hit }));
++    try std.testing.expectError(error.TierFull, s.restoreBeginOver(p, &a, .{ .have = hit, .again = true }));
++    try std.testing.expect(s.deferrable(error.TierFull));
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_refused);
++    try std.testing.expectEqual(@as(u64, 0), tier.begins);
++    try std.testing.expectEqual(hit, s.find(&a, &.{}).?); // the pass resumes at 10, not 0
++    // room for both: the tier's own capacity refusal at begin leaves the hit too
++    tier.refuse = 1;
++    try std.testing.expectError(error.TooManyRestores, s.restoreBeginOver(p, &a, .{ .have = hit }));
++    try std.testing.expect(s.deferrable(error.TooManyRestores));
++    for ([_]anyerror{ error.TooMany, error.NoSlot, error.Busy }) |e| try std.testing.expect(s.deferrable(e));
++    try std.testing.expect(!s.deferrable(error.PointMissing));
++    try std.testing.expectEqual(@as(usize, 0), s.restoring.items.len);
++    try std.testing.expectEqual(@as(u64, 0), s.restoring_bytes);
++    try std.testing.expectEqual(hit, s.find(&a, &.{}).?);
++    // a budget that holds the restore (130) but not both (240): the restore starts, evicting the shorter state as
++    // restoreBegin always did (a 2k memory hit never costs a 100k restore)
++    s.budget = 200;
++    const r = try s.restoreBeginOver(p, &a, .{ .have = hit });
++    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
++    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, r));
++    try std.testing.expectEqual(@as(u32, 30), s.find(&a, &.{}).?.at);
++}
++
++test "a NoRoom is worth waiting for only when the restores in flight hold the rest of the budget" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
++    defer tier.deinit();
++    tier.polls = 1 << 20; // restores stay in flight
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 300);
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const a = seq(48, 1);
++    const b = seq(48, 101);
++    _ = try tier.put(a[0..30], 30, std.mem.asBytes(&Sum.State{ .at = 30, .sum = Sum.fresh(&a, 30) }), 0, 0, false);
++    _ = try tier.put(b[0..40], 40, std.mem.asBytes(&Sum.State{ .at = 40, .sum = Sum.fresh(&b, 40) }), 0, 0, false);
++    const ra = try s.restoreBeginOver(s.probe(&a, &.{}).durable.?, &a, .{}); // 130 of 300 in flight
++    // b's 140 beside a's 130 fit; with the budget at 250 they do not, until a's ends
++    s.budget = 250;
++    try std.testing.expectError(error.NoRoom, s.restoreBeginOver(s.probe(&b, &.{}).durable.?, &b, .{}));
++    try std.testing.expect(s.deferrable(error.NoRoom));
++    try std.testing.expectEqual(@as(u64, 1), s.stats.restores_refused);
++    s.restoreCancel(ra);
++    try std.testing.expect(!s.deferrable(error.NoRoom)); // (nothing in flight: waiting frees nothing)
++    // a budget that can never hold it: never deferred (the probe already refuses such a point; asked directly here)
++    const pb = s.probe(&b, &.{}).durable.?;
++    s.budget = 100;
++    try std.testing.expectError(error.NoRoom, s.restoreBeginOver(pb, &b, .{}));
++    try std.testing.expect(!s.deferrable(error.NoRoom));
++}
+diff --git a/zig/src/core/spill/store.zig b/zig/src/core/spill/store.zig
+index a267554fc1ecf42d86f8f662e54d0f06fdf84284..795555cec8557002b627e5be3baf91946123f8c0 100644
+--- a/zig/src/core/spill/store.zig
++++ b/zig/src/core/spill/store.zig
+@@ -2402,6 +2402,14 @@ pub const Store = struct {
+         return null;
+     }
+ 
++    /// Whether beginRead would refuse for capacity now (TooMany: max_reads in flight; NoSlot: no restore slot free),
++    /// changing nothing: a tier asks before the prompt cache makes room for a restore (Tier.VTable.full).
++    pub fn readsFull(s: *Store) bool {
++        s.lockS();
++        defer s.unlockS();
++        return s.liveReads() >= s.cfg.max_reads or s.slots.available(.restore) == 0;
++    }
++
+     fn liveReads(s: *Store) usize {
+         var n: usize = 0;
+         for (s.reads.items) |r| n += @intFromBool(!r.ended);
+diff --git a/zig/src/families/dsv41/comm.zig b/zig/src/families/dsv41/comm.zig
+index 597ff0e6e288f317cceb813de7aaf18e2d93face..8f5b165a6b6d780cd3e00cbf054f1489329321a4 100644
+--- a/zig/src/families/dsv41/comm.zig
++++ b/zig/src/families/dsv41/comm.zig
+@@ -1,17 +1,34 @@
+ //! The TP ranks' collectives: NCCL opened at run time, its unique id passed from rank 0 over the link. Every model
+ //! reduction is an all-gather of fp32 partials that each rank then adds in rank order (DESIGN.md section 3), so the
+ //! ranks hold the same bits without a broadcast.
++//!
++//! Abort (robustness, round 3): a cross-part KV transfer that failed or timed out on one rank (docs/port/shard-lanes.md,
++//! "Failure": killing rank 1 during a carry) leaves the other rank's device stream behind an NCCL send or receive that
++//! will never be matched, so every later launch on that stream waits forever. `Comm.abort` (ncclCommAbort, looked up
++//! from the library the engine already opened) stops the communicator's kernels so the stream drains; the communicator
++//! cannot be rebuilt in place (a new one needs every rank's ncclCommInitRank over a fresh unique id), so after an abort
++//! every collective here refuses with error.CommAborted and the engine exits for its supervisor to restart the pair
++//! (docs/port/robustness.md).
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const Link = @import("link.zig").Link;
++const rdma = @import("rdma.zig");
+ 
+ const nccl = cuda.nccl;
+ 
++/// ncclCommAbort's signature (NCCL 2.4 and later; every NCCL the serving image carries has it).
++pub const AbortFn = *const fn (nccl.Comm) callconv(.c) nccl.Result;
++
+ pub const Comm = struct {
+     lib: nccl.Library,
+     comm: nccl.Comm,
+     rank: u32,
+     world: u32,
++    /// Set once by `abort` (any thread): every collective after it refuses (error.CommAborted) instead of reaching a
++    /// communicator NCCL has freed. Read through the methods' pointer, under the enqueue gate (never from a copy).
++    aborted: std.atomic.Value(bool) = .init(false),
++    /// ncclCommAbort; null: looked up in `lib` when first needed (tests set a fake).
++    abort_fn: ?AbortFn = null,
+ 
+     /// Rank 0 makes the id and sends it; the others take it from the link. Needs the CUDA context current.
+     pub fn init(link: Link, rank: u32, world: u32) !Comm {
+@@ -33,18 +50,76 @@ pub const Comm = struct {
+     }
+ 
+     pub fn deinit(c: *Comm) void {
+-        _ = c.lib.api.ncclCommDestroy(c.comm);
++        c.end();
+         c.lib.close();
+         c.* = undefined;
+     }
+ 
++    /// The communicator released: destroyed, unless an abort already freed it (NCCL: an aborted communicator is
++    /// gone, a destroy of it is a use after free).
++    fn end(c: *Comm) void {
++        if (!c.aborted.load(.acquire)) _ = c.lib.api.ncclCommDestroy(c.comm);
++    }
++
++    /// Stops this rank's communicator now (ncclCommAbort): its kernels in flight return, so a device stream wedged
++    /// behind an unmatched send or receive (a peer half that never ran) drains, and nothing waits on it afterwards.
++    /// Safe from any thread, including while the engine thread is blocked on that stream (NCCL's documented use).
++    /// Once only: true when this call aborted it. The communicator is unusable afterwards (CommAborted): the engine
++    /// must exit, since rebuilding it needs every rank. False when it was already aborted, or when the library has no
++    /// ncclCommAbort (logged; the communicator is then marked aborted all the same, so nothing new is enqueued).
++    ///
++    /// Never concurrent with an enqueue here: the gate every collective holds around its NCCL calls is taken first,
++    /// within abort_wait_ms. When the engine thread holds it that long (blocked inside NCCL itself, e.g. a group
++    /// waiting to connect to a dead peer), the communicator is only marked aborted (nothing new is enqueued) and not
++    /// freed under the call: false then, and the caller's exit ends the process.
++    pub fn abort(c: *Comm) bool {
++        if (c.aborted.load(.acquire)) return false;
++        if (!tryEnter(abort_wait_ms)) {
++            if (c.aborted.swap(true, .acq_rel)) return false;
++            logErr("dsv41: rank {d}'s NCCL communicator is busy in an enqueue for {d} ms: marked aborted, not freed under it", .{ c.rank, abort_wait_ms });
++            return false;
++        }
++        defer leave();
++        if (c.aborted.swap(true, .acq_rel)) return false;
++        const f = c.abort_fn orelse c.lib.lib.lookup(AbortFn, "ncclCommAbort") orelse {
++            logErr("dsv41: libnccl has no ncclCommAbort: the communicator cannot be stopped, only abandoned", .{});
++            return false;
++        };
++        const r = f(c.comm);
++        if (r != 0) {
++            const s = c.lib.api.ncclGetErrorString(r);
++            logErr("dsv41: ncclCommAbort: {s} ({d})", .{ if (s) |p| std.mem.span(p) else "?", r });
++            return false;
++        }
++        logErr("dsv41: rank {d}'s NCCL communicator aborted: its device stream no longer waits on a peer", .{c.rank});
++        return true;
++    }
++
++    /// Whether `abort` ran (the communicator is gone).
++    pub fn isAborted(c: *const Comm) bool {
++        return c.aborted.load(.acquire);
++    }
++
++    /// The enqueue gate taken and the communicator still live: the caller's NCCL calls, then `leave`.
++    fn enter(c: *const Comm) error{CommAborted}!void {
++        while (gate.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++        if (c.aborted.load(.acquire)) {
++            leave();
++            return error.CommAborted;
++        }
++    }
++
+     /// `count` elements of `dtype` from every rank into `recv`, rank after rank.
+-    pub fn allGather(c: Comm, send: u64, recv: u64, count: usize, dtype: nccl.DataType, stream: cuda.Stream) !void {
++    pub fn allGather(c: *const Comm, send: u64, recv: u64, count: usize, dtype: nccl.DataType, stream: cuda.Stream) !void {
++        try c.enter();
++        defer leave();
+         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream.handle), "ncclAllGather");
+     }
+ 
+     /// `count` elements of `dtype` to rank `peer` and `rcount` from it, in one NCCL group (point to point).
+-    pub fn exchange(c: Comm, send: u64, count: usize, recv: u64, rcount: usize, dtype: nccl.DataType, peer: u32, stream: cuda.Stream) !void {
++    pub fn exchange(c: *const Comm, send: u64, count: usize, recv: u64, rcount: usize, dtype: nccl.DataType, peer: u32, stream: cuda.Stream) !void {
++        try c.enter();
++        defer leave();
+         try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
+         const s = c.lib.api.ncclSend(send, count, dtype, @intCast(peer), c.comm, stream.handle);
+         const r = c.lib.api.ncclRecv(recv, rcount, dtype, @intCast(peer), c.comm, stream.handle);
+@@ -56,16 +131,18 @@ pub const Comm = struct {
+     /// TF_DS_KV_SHARD (GLM 0118's send_rows / recv_rows): device byte spans one way, `spans` to rank `peer` in one NCCL
+     /// group (the peer calls recvSpans with spans of the same sizes in the same order; each send meets its receive).
+     /// A plane's rows go straight from the sender's plane into the receiver's: no staging.
+-    pub fn sendSpans(c: Comm, spans: []const Span, peer: u32, stream: cuda.Stream) !void {
++    pub fn sendSpans(c: *const Comm, spans: []const Span, peer: u32, stream: cuda.Stream) !void {
+         try c.p2p(spans, peer, stream, true);
+     }
+ 
+-    pub fn recvSpans(c: Comm, spans: []const Span, peer: u32, stream: cuda.Stream) !void {
++    pub fn recvSpans(c: *const Comm, spans: []const Span, peer: u32, stream: cuda.Stream) !void {
+         try c.p2p(spans, peer, stream, false);
+     }
+ 
+-    fn p2p(c: Comm, spans: []const Span, peer: u32, stream: cuda.Stream, out: bool) !void {
++    fn p2p(c: *const Comm, spans: []const Span, peer: u32, stream: cuda.Stream, out: bool) !void {
+         if (peer == c.rank or peer >= c.world) return error.BadPeer;
++        try c.enter();
++        defer leave();
+         var any = false;
+         for (spans) |sp| any = any or sp.bytes > 0;
+         if (!any) return;
+@@ -85,10 +162,201 @@ pub const Comm = struct {
+ 
+     /// `count` bytes from this rank's slot of `buf` (buf + rank * count) to every rank's slot, in place (NCCL's
+     /// in-place all-gather: the send buffer is the receive buffer's own slot).
+-    pub fn allGatherInPlace(c: Comm, buf: u64, count: usize, stream: cuda.Stream) !void {
++    pub fn allGatherInPlace(c: *const Comm, buf: u64, count: usize, stream: cuda.Stream) !void {
+         try c.allGather(buf + c.rank * count, buf, count, .u8, stream);
+     }
+ };
+ 
++/// The gate every collective's NCCL calls hold against `Comm.abort` (process-wide: one engine thread enqueues, the
++/// abort is the only other taker, so it is never contended in the served path).
++var gate: std.atomic.Value(bool) = .init(false);
++
++/// How long an abort waits for an enqueue in progress before it marks the communicator aborted without freeing it.
++pub const abort_wait_ms = 200;
++
++fn leave() void {
++    gate.store(false, .release);
++}
++
++/// The gate within `ms` (1 ms steps); false: held all that time.
++fn tryEnter(ms: u32) bool {
++    var waited: u32 = 0;
++    while (gate.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
++        if (waited >= ms) return false;
++        const ts: std.c.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
++        _ = std.c.nanosleep(&ts, null);
++        waited += 1;
++    }
++    return true;
++}
++
++/// Every collective of this rank stopped after a broken pair, any thread, once each: the RDMA rings first (their
++/// abort word releases a collect kernel spinning on a dead peer's flags; TP2's decode gathers run there whenever
++/// TF_RDMA_DEVICES is set), then NCCL (a stream behind an unmatched send or receive). Returns whether NCCL aborted.
++pub fn abortAll(c: *Comm, rings: []const *rdma.Ring, why: []const u8) bool {
++    for (rings) |r| r.abort(why);
++    return c.abort();
++}
++
++/// The engine log's error line; host tests stay quiet (a test that logs an error fails).
++fn logErr(comptime fmt: []const u8, args: anytype) void {
++    if (@import("builtin").is_test) return;
++    std.log.err(fmt, args);
++}
++
+ /// A device byte span (Comm.sendSpans / recvSpans).
+ pub const Span = struct { ptr: u64, bytes: usize };
++
++/// A Comm over a fake NCCL (no library, no device): its calls are counted, ncclCommAbort included.
++const FakeNccl = struct {
++    var sends: usize = 0;
++    var recvs: usize = 0;
++    var gathers: usize = 0;
++    var aborts: usize = 0;
++    var destroys: usize = 0;
++    var abort_result: nccl.Result = 0;
++    var hold: std.atomic.Value(bool) = .init(false); // a send blocks inside NCCL while set
++    var holding: std.atomic.Value(bool) = .init(false);
++
++    fn reset() void {
++        sends = 0;
++        recvs = 0;
++        gathers = 0;
++        aborts = 0;
++        destroys = 0;
++        abort_result = 0;
++    }
++    fn ok() callconv(.c) nccl.Result {
++        return 0;
++    }
++    fn send(_: u64, _: usize, _: nccl.DataType, _: c_int, _: nccl.Comm, _: cuda.abi.Stream) callconv(.c) nccl.Result {
++        holding.store(true, .release);
++        while (hold.load(.acquire)) std.atomic.spinLoopHint();
++        holding.store(false, .release);
++        sends += 1;
++        return 0;
++    }
++    fn recv(_: u64, _: usize, _: nccl.DataType, _: c_int, _: nccl.Comm, _: cuda.abi.Stream) callconv(.c) nccl.Result {
++        recvs += 1;
++        return 0;
++    }
++    fn gather(_: u64, _: u64, _: usize, _: nccl.DataType, _: nccl.Comm, _: cuda.abi.Stream) callconv(.c) nccl.Result {
++        gathers += 1;
++        return 0;
++    }
++    fn destroy(_: nccl.Comm) callconv(.c) nccl.Result {
++        destroys += 1;
++        return 0;
++    }
++    fn abortIt(_: nccl.Comm) callconv(.c) nccl.Result {
++        aborts += 1;
++        return abort_result;
++    }
++    fn errString(_: nccl.Result) callconv(.c) ?[*:0]const u8 {
++        return "fake";
++    }
++
++    fn comm(rank: u32) Comm {
++        var a: nccl.Api = undefined;
++        a.ncclSend = send;
++        a.ncclRecv = recv;
++        a.ncclAllGather = gather;
++        a.ncclGroupStart = ok;
++        a.ncclGroupEnd = ok;
++        a.ncclCommDestroy = destroy;
++        a.ncclGetErrorString = errString;
++        return .{ .lib = .{ .lib = undefined, .api = a }, .comm = @ptrFromInt(0x1000), .rank = rank, .world = 2, .abort_fn = abortIt };
++    }
++};
++
++test "an aborted communicator stops once, refuses every later collective, and is never destroyed again" {
++    FakeNccl.reset();
++    var c = FakeNccl.comm(0);
++    const s: cuda.Stream = .{ .d = undefined, .handle = null };
++    const spans = [_]Span{ .{ .ptr = 0x10, .bytes = 64 }, .{ .ptr = 0x80, .bytes = 0 }, .{ .ptr = 0x100, .bytes = 32 } };
++    try c.sendSpans(&spans, 1, s); // a carry's send half: two non-empty spans in one group
++    try std.testing.expectEqual(@as(usize, 2), FakeNccl.sends);
++    try c.allGather(0x10, 0x20, 4, .f32, s);
++    try std.testing.expect(!c.isAborted());
++    // the peer's half never ran: rank 0 aborts (the lane host's deadline thread or the transfer's own failure path)
++    try std.testing.expect(c.abort());
++    try std.testing.expectEqual(@as(usize, 1), FakeNccl.aborts);
++    try std.testing.expect(c.isAborted());
++    try std.testing.expect(!c.abort()); // once: a second cause does not abort a freed communicator again
++    try std.testing.expectEqual(@as(usize, 1), FakeNccl.aborts);
++    // nothing reaches NCCL any more (each call reads the flag through its pointer, under the gate)
++    try std.testing.expectError(error.CommAborted, c.sendSpans(&spans, 1, s));
++    try std.testing.expectError(error.CommAborted, c.recvSpans(&spans, 1, s));
++    try std.testing.expectError(error.CommAborted, c.allGather(0x10, 0x20, 4, .f32, s));
++    try std.testing.expectError(error.CommAborted, c.exchange(0x10, 4, 0x20, 4, .u8, 1, s));
++    try std.testing.expectError(error.CommAborted, c.allGatherInPlace(0x10, 4, s));
++    try std.testing.expectEqual(@as(usize, 2), FakeNccl.sends);
++    try std.testing.expectEqual(@as(usize, 0), FakeNccl.recvs);
++    try std.testing.expectEqual(@as(usize, 1), FakeNccl.gathers);
++    c.end(); // (deinit's first half: the library itself is fake here)
++    try std.testing.expectEqual(@as(usize, 0), FakeNccl.destroys);
++}
++
++test "a live communicator is destroyed at the end; a failed abort still marks it unusable" {
++    FakeNccl.reset();
++    var c = FakeNccl.comm(1);
++    c.end();
++    try std.testing.expectEqual(@as(usize, 1), FakeNccl.destroys);
++    FakeNccl.reset();
++    var d = FakeNccl.comm(1);
++    FakeNccl.abort_result = 3; // ncclInternalError
++    try std.testing.expect(!d.abort());
++    try std.testing.expect(d.isAborted());
++    const s: cuda.Stream = .{ .d = undefined, .handle = null };
++    try std.testing.expectError(error.CommAborted, d.recvSpans(&.{.{ .ptr = 1, .bytes = 1 }}, 0, s));
++    try std.testing.expectEqual(@as(usize, 0), FakeNccl.recvs);
++}
++
++test "an abort never frees the communicator under an enqueue in progress: it marks it, and nothing new goes in" {
++    FakeNccl.reset();
++    var c = FakeNccl.comm(0);
++    const s: cuda.Stream = .{ .d = undefined, .handle = null };
++    const spans = [_]Span{.{ .ptr = 0x10, .bytes = 64 }};
++    FakeNccl.hold.store(true, .release); // the engine thread blocked inside NCCL (a group waiting on a dead peer)
++    const T = struct {
++        fn run(cc: *Comm, sp: []const Span, st: cuda.Stream) void {
++            cc.sendSpans(sp, 1, st) catch unreachable;
++        }
++    };
++    const t = try std.Thread.spawn(.{}, T.run, .{ &c, &spans, s });
++    while (!FakeNccl.holding.load(.acquire)) std.atomic.spinLoopHint();
++    try std.testing.expect(!c.abort()); // the gate stayed held for abort_wait_ms: marked, ncclCommAbort not called
++    try std.testing.expectEqual(@as(usize, 0), FakeNccl.aborts);
++    try std.testing.expect(c.isAborted());
++    FakeNccl.hold.store(false, .release);
++    t.join();
++    try std.testing.expectEqual(@as(usize, 1), FakeNccl.sends); // the call in progress finished on a live communicator
++    try std.testing.expectError(error.CommAborted, c.sendSpans(&spans, 1, s));
++    try std.testing.expect(!c.abort());
++    try std.testing.expectEqual(@as(usize, 0), FakeNccl.aborts);
++}
++
++/// A ring with only what `abort` touches (its failure flag, reason and metadata block's abort word).
++var test_meta: [4096]u8 align(std.heap.page_size_min) = @splat(0);
++
++test "abortAll stops the RDMA rings (their abort word: a collect kernel spinning on a dead peer returns) and NCCL" {
++    FakeNccl.reset();
++    var c = FakeNccl.comm(0);
++    var ring: rdma.Ring = undefined;
++    ring.failed = .init(false);
++    ring.why = @splat(0);
++    ring.s = .{ .slots = 2, .max_bytes = 64 };
++    ring.world = 2;
++    ring.meta.mem = &test_meta;
++    @memset(&test_meta, 0);
++    const rings = [_]*rdma.Ring{&ring};
++    try std.testing.expect(abortAll(&c, &rings, "rank pair broken"));
++    try std.testing.expectEqualStrings("rank pair broken", ring.failure().?);
++    const words: [*]const u64 = @ptrCast(@alignCast(&test_meta));
++    try std.testing.expectEqual(@as(u64, 1), words[2 * 2 + 1 + 2 + 2]); // flags[slots][world], doorbell, sizes, sent, abort
++    try std.testing.expectEqual(@as(usize, 1), FakeNccl.aborts);
++    // a second cause: the ring keeps its first reason, NCCL is not aborted again
++    try std.testing.expect(!abortAll(&c, &rings, "a later cause"));
++    try std.testing.expectEqualStrings("rank pair broken", ring.failure().?);
++    try std.testing.expectEqual(@as(usize, 1), FakeNccl.aborts);
++}
+diff --git a/zig/src/families/dsv41/kv_lanes.zig b/zig/src/families/dsv41/kv_lanes.zig
+index 6fb5c988a7e654461957974f33bf4f94b595a0a1..72a0d5be5128a9a77cc924fbaf3f3fe72cbbe9d3 100644
+--- a/zig/src/families/dsv41/kv_lanes.zig
++++ b/zig/src/families/dsv41/kv_lanes.zig
+@@ -290,6 +290,12 @@ pub const Kv = struct {
+     peers_n: usize = 0,
+     stats_at: u64 = 0,
+     stats_wanted: bool = false, // /health or /metrics read the parts' stats since the last stats ask (wantStats)
++    /// robustness: told when rank 0 ends the pair for a transfer of its own (endPair: one across parts failed to
++    /// enqueue, or a side did not complete in time), whose device stream may then hold an unmatched NCCL half; the
++    /// server's broken-pair policy aborts the communicator and exits (native.zig). null: the error alone.
++    on_end: ?End = null,
++
++    pub const End = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, err: anyerror) void };
+ 
+     const Wait = struct { key: usize, tag: u64, id: u64 };
+     /// Waiting requests remembered at most (a request the host gave up while it waited is never told to the backend:
+@@ -505,6 +511,7 @@ pub const Kv = struct {
+     /// Rank 0 ends the pair for a cause of its own (rank_wire's Leader.fail: `broken` names rank 0 and the cause,
+     /// the first cause wins). No followers: the cause itself.
+     fn endPair(kv: *Kv, err: anyerror) anyerror {
++        defer if (kv.on_end) |e| e.call(e.ctx, err); // (after `broken` names the cause)
+         kv.counts.failed_sides += 1;
+         const l = kv.leader orelse return err;
+         return l.fail(0, err);
+@@ -1713,6 +1720,46 @@ test "a carry across parts: a follower half that fails to enqueue, or rank 0's s
+     }
+ }
+ 
++test "rank 0 ending the pair for its own transfer tells the broken-pair policy once, with the cause; a refused carry does not" {
++    const gpa = testing.allocator;
++    const Seen = struct {
++        calls: usize = 0,
++        err: ?anyerror = null,
++        broken_first: bool = false,
++        leader: ?*rank_wire.Leader = null,
++        fn call(ctx: *anyopaque, err: anyerror) void {
++            const x: *@This() = @ptrCast(@alignCast(ctx));
++            x.calls += 1;
++            x.err = err;
++            x.broken_first = x.leader.?.broken != null; // the cause is recorded before the policy hears it
++        }
++    };
++    for ([_]bool{ false, true }) |timeout| {
++        const p = try Pair.init(gpa, sharded, .{ .twins = false });
++        defer p.deinit();
++        var seen: Seen = .{ .leader = &p.leader };
++        p.kv.on_end = .{ .ctx = &seen, .call = Seen.call };
++        _ = try carrySetup(p);
++        if (timeout) p.dev0.fail_wait = true else p.dev0.fail_next = true;
++        try testing.expectError(error.PairBroken, p.kv.admit(4, 4, 0, 12 * C, 500, false));
++        try testing.expectEqual(@as(usize, 1), seen.calls);
++        try testing.expectEqual(@as(anyerror, if (timeout) error.TransferTimeout else error.InjectedFailure), seen.err.?);
++        try testing.expect(seen.broken_first);
++    }
++    {
++        const p = try Pair.init(gpa, sharded, .{ .twins = false });
++        defer p.deinit();
++        var seen: Seen = .{ .leader = &p.leader };
++        p.kv.on_end = .{ .ctx = &seen, .call = Seen.call };
++        _ = try carrySetup(p);
++        p.dev0.fail_check = true;
++        p.dev1.fail_check = true;
++        _ = try p.kv.admit(4, 4, 0, 12 * C, 500, false); // refused alike: finished failed, the pair goes on
++        try testing.expectEqual(@as(usize, 0), seen.calls);
++        try testing.expect(p.leader.broken == null);
++    }
++}
++
+ test "a carry refused alike on every rank (nothing enqueued) finishes failed on both and the pair goes on" {
+     const gpa = testing.allocator;
+     const p = try Pair.init(gpa, sharded, .{ .twins = false });
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 711c47b788e65c6df519418aaf3d0f1e8ad5033c..48032ead6c4ee6bfc0f06a37b2b6bb174b293db3 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -926,6 +926,7 @@ pub const Lanes = struct {
+         }
+         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
+         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
++        if (m.ringFailed()) return error.RingFailed; // (robustness: a graph's collect gave up on a dead peer's flags)
+         const t3 = m.now();
+         defer if (self.prof) |*p| {
+             p.send += t1 - t0;
+diff --git a/zig/src/families/dsv41/link.zig b/zig/src/families/dsv41/link.zig
+index 65480228a2467a080e703cb7aef993f2d56e0ee5..fc388933ad951f497df0d73555f2107e09d960a8 100644
+--- a/zig/src/families/dsv41/link.zig
++++ b/zig/src/families/dsv41/link.zig
+@@ -2,7 +2,9 @@
+ //! multi.py's Link sends them. One connection, TCP_NODELAY, SO_BUSY_POLL, blocking reads (recvSpin polls first).
+ //! The other direction carries only the followers' replies to rank 0's asking rank_wire frames (recvWithin,
+ //! readableAny: bounded waits; see rank_wire.zig and docs/port/rank-wire.md for the rules that keep it deadlock-free).
++//! Rank 0 also watches the followers' links for a close (Watch): a follower that died breaks the pair at once.
+ const std = @import("std");
++const builtin = @import("builtin");
+ const c = std.c;
+ 
+ pub const Link = struct {
+@@ -210,6 +212,85 @@ pub fn readableAny(links: []const Link, ready: []bool, timeout_ns: u64) !usize {
+     }
+ }
+ 
++/// Linux reports a peer's close (FIN or reset) as POLLRDHUP even while unread bytes wait; elsewhere (the host tests'
++/// macOS) a close is the peeked end of the stream, seen once nothing is left to read.
++const rdhup: i16 = if (builtin.os.tag == .linux) 0x2000 else 0; // POLLRDHUP (asm-generic/poll.h; not in std's aarch64 POLL)
++
++/// Which of `links` is gone (the peer closed it, reset it, or it errs), looking for up to `ms` (0: only now); null if
++/// none. Never consumes a byte: replies still waiting stay for their reader.
++pub fn gone(links: []const Link, ms: c_int) ?usize {
++    std.debug.assert(links.len <= 8);
++    var fds: [8]c.pollfd = undefined;
++    const ev: i16 = if (rdhup != 0) rdhup else c.POLL.IN;
++    for (links, 0..) |l, i| fds[i] = .{ .fd = l.fd, .events = ev, .revents = 0 };
++    const n = c.poll(&fds, @intCast(links.len), ms);
++    if (n <= 0) return null;
++    for (fds[0..links.len], 0..) |f, i| {
++        if (f.revents & (c.POLL.HUP | c.POLL.ERR | c.POLL.NVAL | rdhup) != 0) return i;
++        if (rdhup == 0 and f.revents & c.POLL.IN != 0) {
++            var b: [1]u8 = undefined;
++            const r = c.recv(f.fd, &b, 1, c.MSG.PEEK | c.MSG.DONTWAIT);
++            if (r == 0) return i; // the end of the stream
++            if (r < 0) switch (c.errno(r)) {
++                .AGAIN, .INTR => {},
++                else => return i,
++            };
++        }
++    }
++    // bytes wait to be read and nothing closed: elsewhere than Linux the next poll would return at once, so wait here
++    if (rdhup == 0 and ms > 0) _ = c.poll(&fds, 0, ms);
++    return null;
++}
++
++/// Rank 0's watch over its followers' links (TF_DS_PAIR_BROKEN=exit): a follower whose process ended (killed,
++/// crashed) closes its socket at once, so the pair is known broken within `period_ms` instead of the stall monitor's
++/// bound, even while rank 0's engine thread is blocked in a round on that peer. `lost` runs once, on this thread, with
++/// the follower's index (0: rank 1), `grace_ms` after the close was seen (a stop of both ranks at once, stop.sh's,
++/// reaches rank 0 meanwhile and ends as a shutdown); then the watch ends. A stopped follower keeps its socket open:
++/// that stays the stall monitor's. End it (`end`) before rank 0 itself closes the links.
++pub const Watch = struct {
++    links: [7]Link = undefined,
++    n: usize = 0,
++    ctx: *anyopaque,
++    lost: *const fn (ctx: *anyopaque, follower: usize) void,
++    period_ms: c_int = 100,
++    grace_ms: u32 = 500,
++    stop: std.atomic.Value(bool) = .init(false),
++    thread: ?std.Thread = null,
++
++    pub fn init(followers: []const ?Link, ctx: *anyopaque, lost: *const fn (*anyopaque, usize) void) Watch {
++        var w: Watch = .{ .ctx = ctx, .lost = lost };
++        for (followers) |f| if (f) |l| {
++            w.links[w.n] = l;
++            w.n += 1;
++        };
++        return w;
++    }
++
++    pub fn start(w: *Watch) !void {
++        if (w.n == 0) return;
++        w.thread = try std.Thread.spawn(.{}, run, .{w});
++    }
++
++    /// Stops the watch: it never reports after this returns. Idempotent.
++    pub fn end(w: *Watch) void {
++        w.stop.store(true, .release);
++        if (w.thread) |t| t.join();
++        w.thread = null;
++    }
++
++    fn run(w: *Watch) void {
++        while (!w.stop.load(.acquire)) {
++            const i = gone(w.links[0..w.n], w.period_ms) orelse continue;
++            var none: [1]c.pollfd = undefined; // (poll over no descriptors: a 10 ms sleep)
++            var waited: u32 = 0;
++            while (waited < w.grace_ms and !w.stop.load(.acquire)) : (waited += 10) _ = c.poll(&none, 0, 10);
++            if (!w.stop.load(.acquire)) w.lost(w.ctx, i);
++            return;
++        }
++    }
++};
++
+ /// "192.0.2.7" as four bytes.
+ pub fn parseIp(text: []const u8) ![4]u8 {
+     var out: [4]u8 = undefined;
+@@ -283,3 +364,99 @@ test "a reply that does not come in time is a timeout, a readable link says so"
+     _ = c.recv(l.fd, &rest, rest.len, 0); // "ello"
+     try std.testing.expectError(error.PeerDown, l.recvWithin(&buf, std.time.ns_per_s));
+ }
++
++/// What a test's Watch saw: how many reports, the follower, and when (Link.monotonicNs).
++const Seen = struct {
++    n: std.atomic.Value(u32) = .init(0),
++    follower: std.atomic.Value(usize) = .init(99),
++    at: std.atomic.Value(u64) = .init(0),
++
++    fn lost(ctx: *anyopaque, follower: usize) void {
++        const s: *Seen = @ptrCast(@alignCast(ctx));
++        s.follower.store(follower, .release);
++        s.at.store(Link.monotonicNs(), .release);
++        _ = s.n.fetchAdd(1, .acq_rel);
++    }
++    fn waitReport(s: *Seen, ms: u32) bool {
++        var waited: u32 = 0;
++        while (s.n.load(.acquire) == 0 and waited < ms) : (waited += 5) std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
++        return s.n.load(.acquire) > 0;
++    }
++};
++
++/// A follower that sends a reply, waits for "go", then ends (its socket closes as a killed process's would).
++const Ending = struct {
++    fn run(p: u16) void {
++        var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
++        l.send("reply") catch {};
++        var buf: [8]u8 = undefined;
++        _ = l.recv(&buf) catch {};
++        l.close();
++    }
++};
++
++test "the watch sees a follower's link close within its period and grace, once; a reply waiting is no close" {
++    const io = std.testing.io;
++    const port: u16 = 28100 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
++    const t = try std.Thread.spawn(.{}, Ending.run, .{port});
++    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
++    defer l.close();
++    try std.testing.expect(try l.readable(2 * std.time.ns_per_s));
++    try std.testing.expectEqual(@as(?usize, null), gone(&.{l}, 50)); // the unread reply is not a close
++    var buf: [16]u8 = undefined;
++    try std.testing.expectEqualStrings("reply", try l.recv(&buf));
++    var seen: Seen = .{};
++    var w = Watch.init(&.{@as(?Link, l)}, &seen, Seen.lost);
++    w.grace_ms = 200;
++    try w.start();
++    defer w.end();
++    std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
++    try std.testing.expectEqual(@as(u32, 0), seen.n.load(.acquire)); // an open, quiet link: nothing
++    const t0 = Link.monotonicNs();
++    try l.send("go");
++    t.join(); // the follower's socket is closed
++    try std.testing.expect(seen.waitReport(2000));
++    try std.testing.expect(seen.at.load(.acquire) - t0 < std.time.ns_per_s);
++    try std.testing.expectEqual(@as(usize, 0), seen.follower.load(.acquire));
++    std.Io.sleep(io, .fromMilliseconds(150), .awake) catch {};
++    try std.testing.expectEqual(@as(u32, 1), seen.n.load(.acquire)); // once
++}
++
++test "an ended watch never reports, even when the follower then goes" {
++    const io = std.testing.io;
++    const port: u16 = 28600 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
++    const t = try std.Thread.spawn(.{}, Ending.run, .{port});
++    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
++    defer l.close();
++    var buf: [16]u8 = undefined;
++    try std.testing.expectEqualStrings("reply", try l.recv(&buf));
++    var seen: Seen = .{};
++    var w = Watch.init(&.{ null, @as(?Link, l) }, &seen, Seen.lost);
++    try std.testing.expectEqual(@as(usize, 1), w.n); // (an absent follower is not watched)
++    try w.start();
++    w.end();
++    w.end(); // (idempotent)
++    try l.send("go");
++    t.join();
++    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
++    try std.testing.expectEqual(@as(u32, 0), seen.n.load(.acquire));
++    try std.testing.expectEqual(@as(?usize, 0), gone(&.{l}, 1000)); // (the close is there to see)
++}
++
++test "Linux: a close behind bytes not yet read is seen at once (POLLRDHUP)" {
++    if (builtin.os.tag != .linux) return error.SkipZigTest;
++    const io = std.testing.io;
++    const port: u16 = 29100 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
++    const Peer = struct {
++        fn run(p: u16) void {
++            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
++            l.send("unread") catch {};
++            l.close();
++        }
++    };
++    const t = try std.Thread.spawn(.{}, Peer.run, .{port});
++    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
++    defer l.close();
++    t.join();
++    try std.testing.expectEqual(@as(?usize, 0), gone(&.{l}, 1000));
++}
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index cb73b4d0f5a2defcd693e00147b94cee23262bef..2027b3bfb2d6a207eac184de0cf9b16dd2365a04 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -622,6 +622,30 @@ pub const Model = struct {
+         }
+     }
+ 
++    /// This rank's RDMA rings (TP2's decode gathers, or world 4's three), into `buf`: what a broken pair's abort stops.
++    pub fn rdmaRings(m: *Model, buf: *[3]*rdma.Ring) []const *rdma.Ring {
++        var n: usize = 0;
++        if (m.ring) |r| {
++            buf[n] = r;
++            n += 1;
++        }
++        if (m.rdma_rings) |rs| for ([_]*rdma.Ring{ rs.all4, rs.col, rs.pair }) |r| {
++            if (n == buf.len) break;
++            buf[n] = r;
++            n += 1;
++        };
++        return buf[0..n];
++    }
++
++    /// A ring that failed (its proxy saw a dead peer, or an abort): a round replayed from a graph does not ask the
++    /// ring, its collect kernel just gave up on the abort word, so the round's rows are not the model's. Rounds check
++    /// this after reading their tokens back (error.RingFailed: rank pair broken).
++    pub fn ringFailed(m: *Model) bool {
++        var buf: [3]*rdma.Ring = undefined;
++        for (m.rdmaRings(&buf)) |r| if (r.failure() != null) return true;
++        return false;
++    }
++
+     /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
+     /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
+     /// codes and scales and its index keys, the rows view() places at those positions.
+@@ -630,18 +654,27 @@ pub const Model = struct {
+     /// (the other rank holds none), across parts (a carry) the source's owner sends them straight from its plane and the
+     /// destination's owner receives them into its own, both ranks in this same order (lanes.zig runs copyExtent on
+     /// every rank in its frame order). The source's rows stay; nothing is freed.
++    ///
++    /// Every refusal comes first (checkExtent: the pool's bounds, the parts, every source's ratio, overlapping extents),
++    /// so a refused copy enqueues nothing: never a partial copy that leaves some layers' rows moved and others not.
++    /// With every argument valid the copies are the same, in the same order, as before the check moved up front.
+     pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
+-        // PORT(round3): copyExtent may call checkExtent first so a refusal never follows a partial copy; kept as it
+-        // was here so the switch-off path is unchanged (kv_lanes calls checkExtent before every transfer)
++        return m.copyExtentPinned(from, to, at, null);
++    }
++
++    /// copyExtent whose source rows must still be the ones `pin` recorded (its generation stamp, spill_state's
++    /// Generations): a source rewritten since then (a placement staled it, a stream wrote over it) is refused with
++    /// error.StaleExtent before anything is enqueued, so a late copy never attaches old bytes to a reused extent.
++    pub fn copyExtentPinned(m: *Model, from: usize, to: usize, at: usize, pin: ?ExtentPin) !void {
++        const mv = try m.checkExtentPinned(from, to, at, pin);
+         const c = m.eng.c;
+         const cs = &m.caches;
+-        const mv: ?shard.Move = if (cs.shard) |sh| try sh.extentMove(from, to, at) else null;
+-        var spans: [2 * 64]comm_mod.Span = undefined;
++        var spans: [2 * max_extent_sources]comm_mod.Span = undefined;
+         var ns: usize = 0;
+         for (m.eng.w.layers, 0..) |lay, i| {
+             if (lay.comp_wkv == null) continue;
+             const r: usize = lay.ratio;
+-            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
++            std.debug.assert(from % r == 0 and to % r == 0 and at % r == 0 and ns + 2 <= spans.len); // (checkExtent)
+             const n = at / r;
+             const cb = c.head_dim / 2;
+             const sb = c.head_dim / 16;
+@@ -690,12 +723,48 @@ pub const Model = struct {
+     /// kv source's ratio (BadView). Deterministic: every rank refuses the same arguments alike under the agreed
+     /// layout (kv_lanes.zig checks before any rank enqueues its side, so a refused carry leaves no NCCL half waiting).
+     pub fn checkExtent(m: *const Model, from: usize, to: usize, at: usize) !void {
+-        if (m.caches.shard) |sh| _ = try sh.extentMove(from, to, at);
++        _ = try m.checkExtentPinned(from, to, at, null);
++    }
++
++    /// The kv-source layers a copyExtent carries at most (its span list: codes and scales of each).
++    pub const max_extent_sources = 64;
++
++    /// A copyExtent source's generation, recorded when its rows were the caller's (Generations.pin over
++    /// [from, from + at)): copyExtentPinned refuses the copy when they changed since.
++    pub const ExtentPin = struct { gens: *const spill.Generations, src: spill.ExtentRef };
++
++    /// checkExtent with an optional source pin; the compressed rows' move on this rank (null: replicated).
++    fn checkExtentPinned(m: *const Model, from: usize, to: usize, at: usize, pin: ?ExtentPin) !?shard.Move {
++        var ratios: [16]usize = undefined;
++        var nr: usize = 0;
++        var sources: usize = 0;
+         for (m.eng.w.layers) |lay| {
+             if (lay.comp_wkv == null) continue;
++            sources += 1;
++            if (sources > max_extent_sources) return error.BadView; // (copyExtent's spans: two a source)
+             const r: usize = lay.ratio;
+-            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
++            if (std.mem.indexOfScalar(usize, ratios[0..nr], r) != null) continue;
++            if (nr == ratios.len) return error.BadView;
++            ratios[nr] = r;
++            nr += 1;
+         }
++        return extentRefusal(m.caches.cap, ratios[0..nr], m.caches.shard, from, to, at, pin);
++    }
++
++    /// copyExtent's refusals as plain data (host-testable): the extents [from, from + at) and [to, to + at) inside the
++    /// pool's `cap` positions (ExtentOutOfPool), in one part each (shard.Shard.extentMove: CrossesPart), on every
++    /// source's ratio (BadView), not overlapping unless they are the same extent (ExtentsOverlap: a device copy over
++    /// its own source is undefined), and the source still at its pin's generation (StaleExtent). Returns the
++    /// compressed rows' move on this rank (sharded), else null.
++    pub fn extentRefusal(cap: usize, ratios: []const usize, sh: ?shard.Shard, from: usize, to: usize, at: usize, pin: ?ExtentPin) !?shard.Move {
++        if (from > cap or to > cap or at > cap - from or at > cap - to) return error.ExtentOutOfPool;
++        const mv: ?shard.Move = if (sh) |x| try x.extentMove(from, to, at) else null;
++        for (ratios) |r| if (r == 0 or from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
++        if (from != to and at > 0 and from < to + at and to < from + at) return error.ExtentsOverlap;
++        if (pin) |p| {
++            if (p.src.lo > from or p.src.hi < from + at or !p.gens.current(p.src)) return error.StaleExtent;
++        }
++        return mv;
+     }
+ 
+     /// Rows [from, from + n) of `plane` (rows of `row` bytes; a sharded plane's rows of this rank's part) to rows
+@@ -1256,6 +1325,45 @@ pub const Model = struct {
+     }
+ };
+ 
++test "copyExtent's refusals come before anything is enqueued: pool bounds, parts, ratios, overlap, a stale source" {
++    const R = Model.extentRefusal;
++    const ratios = [_]usize{ 1, 2 };
++    const cap: usize = 16384;
++    // valid: replicated (no move), the same extent (a copy onto itself stays as before), an empty copy
++    try std.testing.expectEqual(@as(?shard.Move, null), try R(cap, &ratios, null, 0, 4096, 2048, null));
++    try std.testing.expectEqual(@as(?shard.Move, null), try R(cap, &ratios, null, 2048, 2048, 2048, null));
++    _ = try R(cap, &ratios, null, 0, 14336, 2048, null); // ends exactly at the pool's end
++    // bounds: either extent past the pool (no wrap-around through a huge `at`)
++    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, null, 15360, 0, 2048, null));
++    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, null, 0, 15360, 2048, null));
++    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, null, 20000, 0, 0, null));
++    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, null, 2048, 0, std.math.maxInt(usize) - 1024, null));
++    // ratios: every source's rows whole
++    try std.testing.expectError(error.BadView, R(cap, &ratios, null, 0, 4096, 2047, null));
++    try std.testing.expectError(error.BadView, R(cap, &ratios, null, 1, 4096, 2048, null));
++    // overlapping extents (a device copy over its own source): either direction
++    try std.testing.expectError(error.ExtentsOverlap, R(cap, &ratios, null, 0, 1024, 2048, null));
++    try std.testing.expectError(error.ExtentsOverlap, R(cap, &ratios, null, 1024, 0, 2048, null));
++    _ = try R(cap, &ratios, null, 0, 2048, 2048, null); // adjacent: fine
++    // sharded (two 8192-position parts): within a part the owner copies, across parts rank 0 sends to rank 1
++    const sh = try shard.Shard.init(0, 2, cap, 48);
++    try std.testing.expectEqual(shard.Move{ .local = .{ .from = 0, .to = 4096 } }, (try R(cap, &ratios, sh, 0, 4096, 2048, null)).?);
++    try std.testing.expectEqual(shard.Move{ .send = .{ .from = 0, .peer = 1 } }, (try R(cap, &ratios, sh, 0, 8192, 2048, null)).?);
++    try std.testing.expectError(error.CrossesPart, R(cap, &ratios, sh, 7168, 0, 2048, null));
++    // a source pinned at its generation: refused once its rows changed, or when the pin does not cover them
++    var gens = try Model.spill.Generations.init(std.testing.allocator, cap, 2048);
++    defer gens.deinit(std.testing.allocator);
++    const pin: Model.ExtentPin = .{ .gens = &gens, .src = try gens.pin(4096, 8192) };
++    _ = try R(cap, &ratios, null, 4096, 0, 4096, pin);
++    try std.testing.expectError(error.StaleExtent, R(cap, &ratios, null, 4096, 10240, 6144, pin)); // past the pin
++    try std.testing.expectError(error.StaleExtent, R(cap, &ratios, null, 2048, 8192, 2048, pin)); // before it
++    gens.bump(6000, 6001); // a stream wrote over one of its rows
++    try std.testing.expectError(error.StaleExtent, R(cap, &ratios, null, 4096, 0, 4096, pin));
++    // bounds come first, then the parts, then the ratios (each refusal alike on every rank)
++    try std.testing.expectError(error.ExtentOutOfPool, R(cap, &ratios, sh, 15360, 7168, 2047, null));
++    try std.testing.expectError(error.CrossesPart, R(cap, &ratios, sh, 7168, 0, 2047, null));
++}
++
+ test "pickWindow: --context wins and must match TF_DS_WINDOW; a follower takes TF_DS_WINDOW, else rank 0's" {
+     try std.testing.expectEqual(@as(?usize, 1048576), try Model.pickWindow(1048576, 2101248, null));
+     try std.testing.expectEqual(@as(?usize, 1048576), try Model.pickWindow(1048576, 2101248, "1048576"));
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5d7520e62 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -63,6 +63,9 @@ const prompt = @import("prompt.zig");
+ const core = @import("core");
+ const shard = @import("shard.zig");
+ const kv_lanes = @import("kv_lanes.zig");
++const api = @import("engine_api");
++const comm = @import("comm.zig");
++const rdma = @import("rdma.zig");
+ 
+ pub const model_type = "deepseek_v41";
+ pub const formats: []const []const u8 = &.{"exl3-mul1"};
+@@ -112,6 +115,10 @@ pub const Loaded = struct {
+     replay: u32 = 0,
+     /// TF_DS_KV_SHARD: the parts' counters and rows for /health and /metrics (null: the switch off).
+     kv_parts: ?lanes.kv_parts.Source = null,
++    /// The broken-pair policy's hooks (TF_DS_PAIR_BROKEN, exit by default; null: degrade). `ctx` is `ctx`.
++    pair: ?Pair = null,
++    /// Whether the model's stream is free of a CUDA graph capture (the lane host's service fence), with `ctx`.
++    quiet: ?*const fn (ctx: *anyopaque) bool = null,
+ };
+ 
+ pub const Snaps = struct {
+@@ -132,6 +139,9 @@ const State = struct {
+     vision: ?*vision_mod.Vision = null,
+     staging: ?cuda.HostBuffer = null, // the spill tier's pinned staging (allocated before the pool)
+     events: []cuda.Event = &.{}, // one a staging slot
++    pair_host: ?*anyopaque = null, // the broken-pair policy's report (pairWatch): the lane host and its call
++    pair_broken: ?*const fn (host: *anyopaque, why: []const u8, drain: bool) void = null,
++    watch: ?link.Watch = null, // the followers' links, watched for a close while the policy is on (pairWatch)
+ };
+ 
+ fn getenv(name: [:0]const u8) ?[]const u8 {
+@@ -167,11 +177,15 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
+     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
+     if (o.spill != null) try spillPreflight(getenvFn); // (before the staging, the weights and the pool)
++    const pair_mode = try pairMode(getenvFn); // (a bad value refused before anything loads)
+     const st = try gpa.create(State);
+     errdefer gpa.destroy(st);
+     st.gpa = gpa;
+     st.staging = null;
+     st.events = &.{};
++    st.pair_host = null;
++    st.pair_broken = null;
++    st.watch = null;
+     // the spill tier's staging comes out of memory before the pool is sized (PORT-SPILL-V2: budgeted first)
+     if (o.spill) |sp| st.staging = try spillStaging(ctx, sp);
+     errdefer if (st.staging) |*b| b.free();
+@@ -241,11 +255,130 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         tier = st.lanes.spill.?.tier();
+     }
+     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts };
++    const pair: ?Pair = if (pair_mode == .exit) .{ .watch = pairWatch, .abort = pairAbort } else null;
++    if (pair != null) std.log.info("dsv41: a broken rank pair ends this server with status {d} for a restart of both ranks (TF_DS_PAIR_BROKEN=degrade: requests fail one by one instead)", .{api.LaneHost.pair_exit_code});
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
++}
++
++// -- the broken-pair policy (robustness, docs/port/robustness.md) ------------------------------------------------
++
++/// TF_DS_PAIR_BROKEN: what rank 0 does once the pair cannot go on (a follower ended or stopped answering, a KV
++/// transfer failed across parts or timed out, the ranks' spill/KV-shard command streams diverged). `exit`, the
++/// default (unset or empty): the lane host admits nothing more, fails what waits, lets decoding streams finish within
++/// its bound (or fails them when the device stream is wedged), aborts the NCCL communicator and exits with
++/// LaneHost.pair_exit_code, so the service's supervisor (systemd) restarts both ranks; the communicator cannot be
++/// rebuilt in place, and the stock engine's rank 0 would wait on the dead peer forever. `degrade`: the old behaviour
++/// (requests fail one by one, the spill tier stops writing and restoring; the process stays up). Either way nothing
++/// acts before a failure: replies are unchanged. A server with one rank has no pair and no policy (dsv41 always runs
++/// two or four, TF_TP_WORLD).
++pub const PairMode = enum { degrade, exit };
++
++pub fn pairMode(env: *const fn ([:0]const u8) ?[]const u8) !PairMode {
++    const v = std.mem.trim(u8, nonEmpty(env("TF_DS_PAIR_BROKEN")) orelse return .exit, " ");
++    if (std.mem.eql(u8, v, "exit")) return .exit;
++    if (std.mem.eql(u8, v, "degrade")) return .degrade;
++    return error.BadPairBroken;
++}
++
++/// The errors from a prompt pass or a round that mean the pair broke (rank_wire's PairBroken; kv_lanes' transfers;
++/// a follower's StaleExtent/ShardDiverged reach rank 0 as its link going down; an aborted communicator; an RDMA ring
++/// that saw a dead peer or was aborted, RingFailed). None of them drains: the next round's collective would wait on
++/// the peer.
++pub const pair_fatal = [_]api.LaneHost.Fatal{
++    .{ .err = error.PairBroken, .drain = false },
++    .{ .err = error.TransferTimeout, .drain = false },
++    .{ .err = error.TransferFailed, .drain = false },
++    .{ .err = error.ShardDiverged, .drain = false },
++    .{ .err = error.PeerDown, .drain = false },
++    .{ .err = error.CommAborted, .drain = false },
++    .{ .err = error.RingFailed, .drain = false },
++};
++
++/// Loaded.pair: the hooks the server wires to its lane host (native/cuda.zig).
++pub const Pair = struct {
++    /// The family's own breaks reach `broken(host, ...)` from now on: the spill tier's on_broken and the KV
++    /// planner's on_end (call it once, after the lane host is set up and before it starts).
++    watch: *const fn (ctx: *anyopaque, host: *anyopaque, broken: *const fn (host: *anyopaque, why: []const u8, drain: bool) void) void,
++    /// Rank 0's NCCL communicator aborted (comm.zig, once): any stream wedged behind an unmatched call drains.
++    abort: *const fn (ctx: *anyopaque) void,
++    fatal: []const api.LaneHost.Fatal = &pair_fatal,
++};
++
++fn pairWatch(ctx: *anyopaque, host: *anyopaque, broken: *const fn (*anyopaque, []const u8, bool) void) void {
++    const st: *State = @ptrCast(@alignCast(ctx));
++    st.pair_host = host;
++    st.pair_broken = broken;
++    if (st.lanes.spill) |t| {
++        t.on_broken = spillBroken;
++        t.broken_ctx = st;
++    }
++    if (st.lanes.kv) |k| k.on_end = .{ .ctx = st, .call = kvEnded };
++    // a follower that died (killed, crashed) closes its link at once: the pair breaks now, not at the stall bound
++    st.watch = link.Watch.init(st.m.followers(), st, linkLost);
++    st.watch.?.start() catch |e| {
++        std.log.warn("dsv41: no watch over the followers' links ({s}): a dead follower is found by the stall monitor", .{@errorName(e)});
++        st.watch = null;
++    };
++}
++
++/// A follower's link closed (link.Watch, its thread): the process on the other end is gone, so every collective is
++/// stopped at once (a round blocked on the peer returns) and the pair is broken; nothing drains.
++fn linkLost(ctx: *anyopaque, follower: usize) void {
++    pairAbort(ctx);
++    const st: *State = @ptrCast(@alignCast(ctx));
++    var wbuf: [160]u8 = undefined;
++    report(st, linkLostWhy(&wbuf, follower), false);
++}
++
++/// The broken pair's cause when follower `i`'s link closed.
++pub fn linkLostWhy(buf: []u8, follower: usize) []const u8 {
++    return std.fmt.bufPrint(buf, "rank {d}'s link to rank 0 closed (its process ended or the connection reset)", .{follower + 1}) catch "a follower's link closed";
++}
++
++/// Every collective of this rank stopped (comm.abortAll): the RDMA rings' abort word (TP2's decode gathers run on
++/// the ring whenever TF_RDMA_DEVICES is set, and ncclCommAbort does not release a collect kernel spinning on a dead
++/// peer's flags), then NCCL. Any thread, once each.
++fn pairAbort(ctx: *anyopaque) void {
++    const st: *State = @ptrCast(@alignCast(ctx));
++    var buf: [3]*rdma.Ring = undefined;
++    _ = comm.abortAll(&st.m.comm, st.m.rdmaRings(&buf), "rank pair broken");
++}
++
++fn report(st: *State, why: []const u8, drain: bool) void {
++    if (st.pair_broken) |f| f(st.pair_host.?, why, drain);
++}
++
++/// The spill tier's agreement broke (it logged the rank and cause, and stops writing and restoring): rounds do not
++/// depend on it, so decoding streams may drain (the lane host's deadline bounds a round stuck on a dead peer).
++fn spillBroken(ctx: ?*anyopaque, err: anyerror) void {
++    const st: *State = @ptrCast(@alignCast(ctx.?));
++    var buf: [192]u8 = undefined;
++    var wbuf: [224]u8 = undefined;
++    const lead = if (st.lanes.spill) |t| t.lead else null;
++    const cause = if (lead) |l| (if (l.broken) |b| rank_wire.describeBroken(b, &buf) else @errorName(err)) else @errorName(err);
++    report(st, std.fmt.bufPrint(&wbuf, "the spill tier's agreement: {s}", .{cause}) catch cause, true);
++}
++
++/// Rank 0 ended the pair for a KV transfer of its own (kv_lanes.Kv.endPair): its stream may hold an unmatched NCCL
++/// half, so the communicator is aborted at once and nothing drains.
++fn kvEnded(ctx: *anyopaque, err: anyerror) void {
++    pairAbort(ctx);
++    const st: *State = @ptrCast(@alignCast(ctx));
++    var wbuf: [160]u8 = undefined;
++    report(st, std.fmt.bufPrint(&wbuf, "a KV transfer between the ranks: {s}", .{@errorName(err)}) catch @errorName(err), false);
++}
++
++/// Loaded.quiet: no CUDA graph capture in progress on the model's stream (a driver error reads as quiet: the
++/// fence then rests on the lane host's own round and chunk rules).
++fn quietFn(ctx: *anyopaque) bool {
++    const st: *State = @ptrCast(@alignCast(ctx));
++    const status = cuda.graph.captureStatus(st.m.stream) catch return true;
++    return status == .none;
+ }
+ 
+ fn deinitFn(ptr: *anyopaque) void {
+     const st: *State = @ptrCast(@alignCast(ptr));
++    if (st.watch) |*w| w.end(); // (before the links close: rank 1 ending after `done` is no break)
+     // the tier after the prompt cache's store (cuda.zig frees it first) and before the family: its store closes
+     if (st.lanes.spill) |t| t.destroy();
+     st.lanes.spill = null;
+@@ -512,6 +645,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
+         error.KvShardNotStarted, error.BadPlan => "TF_DS_KV_SHARD=1: the KV-part planner was not set up as the lanes need (an engine bug): restart with TF_DS_KV_SHARD=0",
+         error.FollowerScanStalled => "rank 1's spill store scan stopped making progress (its log names the store): check its spill disk (TF_DS_SPILL_DIR), or start it with a fresh directory",
++        error.BadPairBroken => "TF_DS_PAIR_BROKEN: exit (the default: a broken rank pair ends the server with status 75 for its supervisor to restart both ranks) or degrade (requests fail one by one, the server stays up)",
++        error.CommAborted => "the ranks' NCCL communicator was aborted after a broken pair (a transfer that never completed): the server restarts both ranks",
++        error.RingFailed => "the ranks' RDMA ring failed (the peer stopped answering, or the ring was aborted after a broken pair): the server restarts both ranks",
+         else => null,
+     };
+ }
+@@ -526,6 +662,30 @@ test "refusals name what to set" {
+     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
+ }
+ 
++test "TF_DS_PAIR_BROKEN: exit by default (spill and KV sharding off), degrade the opt-out, a bad value refused" {
++    const E = struct {
++        var v: ?[]const u8 = null;
++        fn get(name: [:0]const u8) ?[]const u8 {
++            if (std.mem.eql(u8, name, "TF_DS_PAIR_BROKEN")) return v;
++            if (std.mem.eql(u8, name, "TF_DS_KV_SHARD")) return "0";
++            return null; // (no TF_DS_SPILL_DIR; pairMode takes nothing of the spill tier either)
++        }
++    };
++    try std.testing.expectEqual(PairMode.exit, try pairMode(E.get)); // (unset)
++    E.v = "";
++    try std.testing.expectEqual(PairMode.exit, try pairMode(E.get)); // (empty: unset)
++    E.v = " exit ";
++    try std.testing.expectEqual(PairMode.exit, try pairMode(E.get));
++    E.v = "degrade";
++    try std.testing.expectEqual(PairMode.degrade, try pairMode(E.get));
++    for ([_][]const u8{ "restart", "Exit", "0", "1" }) |bad| {
++        E.v = bad;
++        try std.testing.expectError(error.BadPairBroken, pairMode(E.get));
++    }
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadPairBroken).?, "degrade") != null);
++    for (pair_fatal) |f| try std.testing.expect(!f.drain);
++}
++
+ test "the spill tier's refusals from the environment come before anything loads, and each says what to set" {
+     const E = struct {
+         var kv: ?[]const u8 = null;
+@@ -561,3 +721,152 @@ test "the spill tier's refusals from the environment come before anything loads,
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SpillNotStarted).?, "TF_DS_SPILL_DIR") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoWeightsId).?, "TF_DS_RANK_CACHE_SHA") != null);
+ }
++
++test "a follower killed mid-round: the link watch stops the collectives and the pair ends within a second" {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    // a backend whose next round waits on the peer until the collectives are stopped (an RDMA collect spinning on a
++    // dead rank's flag), then fails as an aborted communicator does
++    const Stuck = struct {
++        inner: lanes.backend.Backend,
++        stuck: std.atomic.Value(bool) = .init(false),
++        entered: std.atomic.Value(bool) = .init(false),
++        aborted: std.atomic.Value(bool) = .init(false),
++        exits: std.atomic.Value(u32) = .init(0),
++        code: std.atomic.Value(u8) = .init(0),
++
++        fn backend(f: *@This()) lanes.backend.Backend {
++            return .{ .ptr = f, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
++        }
++        fn of(ptr: *anyopaque) *@This() {
++            return @ptrCast(@alignCast(ptr));
++        }
++        fn round(f: *@This()) !void {
++            if (!f.stuck.load(.acquire)) return;
++            f.entered.store(true, .release);
++            while (!f.aborted.load(.acquire)) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            return error.CommAborted;
++        }
++        fn prefill(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
++            return of(ptr).inner.vtable.prefill(of(ptr).inner.ptr, s);
++        }
++        fn first(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
++            return of(ptr).inner.vtable.first(of(ptr).inner.ptr, s, position);
++        }
++        fn queue(ptr: *anyopaque, s: *lanes.Stream, feed: lanes.backend.Feed, position: u64) anyerror!u64 {
++            try of(ptr).round();
++            return of(ptr).inner.vtable.queue(of(ptr).inner.ptr, s, feed, position);
++        }
++        fn read(ptr: *anyopaque, handle: u64) anyerror!u32 {
++            return of(ptr).inner.vtable.read(of(ptr).inner.ptr, handle);
++        }
++        fn verify(ptr: *anyopaque, windows: []const lanes.backend.Window, out: []lanes.backend.Verified) anyerror!void {
++            try of(ptr).round();
++            return of(ptr).inner.vtable.verify(of(ptr).inner.ptr, windows, out);
++        }
++        fn keep(ptr: *anyopaque, windows: []const lanes.backend.Window, paths: []const []const u32) anyerror!void {
++            return of(ptr).inner.vtable.keep(of(ptr).inner.ptr, windows, paths);
++        }
++        fn draft(ptr: *anyopaque, requests: []const lanes.backend.DraftRequest) anyerror!void {
++            return of(ptr).inner.vtable.draft(of(ptr).inner.ptr, requests);
++        }
++        fn release(ptr: *anyopaque, s: *lanes.Stream) void {
++            of(ptr).inner.vtable.release(of(ptr).inner.ptr, s);
++        }
++        fn abort(ctx: *anyopaque) void {
++            of(ctx).aborted.store(true, .release);
++        }
++        fn exit(ctx: *anyopaque, code: u8) void {
++            of(ctx).code.store(code, .release);
++            _ = of(ctx).exits.fetchAdd(1, .acq_rel);
++        }
++    };
++    // what linkLost does with the State's hooks: stop the collectives, then break the pair with nothing to drain
++    const Glue = struct {
++        stuck: *Stuck,
++        host: *api.LaneHost,
++        fn lost(ctx: *anyopaque, follower: usize) void {
++            const g: *@This() = @ptrCast(@alignCast(ctx));
++            Stuck.abort(g.stuck);
++            var buf: [160]u8 = undefined;
++            g.host.pairBroken(linkLostWhy(&buf, follower), false);
++        }
++    };
++    const Reply = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: usize = 0,
++        done: ?api.Reason = null,
++        message: [256]u8 = undefined,
++        len: usize = 0,
++        fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens += t.len,
++                .finished => |f| {
++                    b.done = f.reason;
++                    b.len = @min(f.message.len, b.message.len);
++                    @memcpy(b.message[0..b.len], f.message[0..b.len]);
++                },
++                else => {},
++            }
++        }
++        fn state(b: *@This()) struct { tokens: usize, done: ?api.Reason } {
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            return .{ .tokens = b.tokens, .done = b.done };
++        }
++    };
++    const Follower = struct {
++        fn run(p: u16) void {
++            var l = link.Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
++            var buf: [8]u8 = undefined;
++            _ = l.recv(&buf) catch {}; // "die"
++            l.close(); // (kill -9: the kernel closes the process's sockets)
++        }
++    };
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var stuck: Stuck = .{ .inner = target.backend() };
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var clock: lanes.fake.FixedClock = .{};
++    var core_e = lanes.Engine.init(gpa, &cfg, stuck.backend(), clock.clock());
++    defer core_e.deinit();
++    var host = api.LaneHost.init(gpa, io, &core_e, .{ .lanes = 1 });
++    host.interleave_ns = 0;
++    // the deadline (30 s) and the stall monitor (off) cannot be what ends this
++    host.pair = .{ .ctx = &stuck, .abort = Stuck.abort, .exit = Stuck.exit, .deadline_ns = 30 * std.time.ns_per_s, .grace_ns = std.time.ns_per_ms, .stall_ns = 0, .fatal = &pair_fatal };
++    try host.start();
++    defer host.stop();
++    const port: u16 = 27100 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
++    const ft = try std.Thread.spawn(.{}, Follower.run, .{port});
++    var l = try link.Link.listen(.{ 127, 0, 0, 1 }, port);
++    defer l.close();
++    var glue: Glue = .{ .stuck = &stuck, .host = &host };
++    var w = link.Watch.init(&.{@as(?link.Link, l)}, &glue, Glue.lost);
++    try w.start();
++    defer w.end();
++    var a: Reply = .{};
++    const prompt_ids = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++    const long: api.Request = .{ .prompt = &prompt_ids, .max_tokens = 1 << 30 };
++    try host.engine().submit(1, &long, .{ .ctx = &a, .event = Reply.event });
++    while (a.state().tokens == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    stuck.stuck.store(true, .release); // the next round waits on rank 1
++    while (!stuck.entered.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    try l.send("die");
++    ft.join();
++    while (a.state().done == null or stuck.exits.load(.acquire) == 0) {
++        if (std.Io.Clock.awake.now(io).toNanoseconds() - t0 > 5 * std.time.ns_per_s) return error.Timeout;
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    const took = std.Io.Clock.awake.now(io).toNanoseconds() - t0;
++    try std.testing.expect(took < std.time.ns_per_s); // (the watch's 100 ms period and 500 ms grace, then the abort)
++    try std.testing.expectEqual(api.Reason.failed, a.state().done.?);
++    try std.testing.expect(host.isBroken());
++    try std.testing.expect(std.mem.startsWith(u8, host.pair_why[0..host.pair_why_len], "rank 1's link to rank 0 closed"));
++    try std.testing.expect(!host.pair_drain);
++    try std.testing.expectEqual(api.LaneHost.pair_exit_code, stuck.code.load(.acquire));
++}
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index 309fed77d926dd1e26ac9e92f07470a1558edb2d..5e4f564fb8ccba010156bdf5bb122569fedee033 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -30,7 +30,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
+ 
+ extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
+ 
+-pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
++pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+ 
+ /// The served ring has its own GID selection, independent of NCCL's.
+ pub fn parseGidIndex(text: ?[]const u8) error{InvalidRdmaGidIndex}!u8 {
+@@ -498,7 +498,7 @@ pub const Ring = struct {
+     }
+     /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`.
+     pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
+-        if (r.failure() != null) return error.Failed;
++        if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
+         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
+         const own: DevicePtr = if (r.s.own_early) recv + @as(u64, r.rank) * n4 * 16 else 0;
+         try r.stage(stream, send, n4, own, n4, n4);
+@@ -527,7 +527,7 @@ pub const Ring = struct {
+     /// Every rank's [rows, w_p] fp32 slice straight into dsts[p]; `send` is this rank's slice, contiguous. Every rank
+     /// names the same widths, so each peer's ring slot holds rows x w_p floats.
+     pub fn gatherInto(r: *Ring, stream: cuda.Stream, send: DevicePtr, rows: u32, own_row4: u32, dsts: []const Dst) Error!void {
+-        if (r.failure() != null) return error.Failed;
++        if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
+         if (dsts.len != r.world) return error.BadInfo;
+         const n4 = rows * own_row4;
+         if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
+diff --git a/zig/src/families/dsv41/spill_tier.zig b/zig/src/families/dsv41/spill_tier.zig
+index c0645a3d26a3faa90432c30a8e06cca83608bdd0..6b26dced9388c94ae17aabee1fe8d93407448cb0 100644
+--- a/zig/src/families/dsv41/spill_tier.zig
++++ b/zig/src/families/dsv41/spill_tier.zig
+@@ -865,6 +865,7 @@ pub fn Leader(comptime Dev: type) type {
+         const vt: pc.Tier.VTable = .{
+             .lookup = lookupFn,
+             .begin = beginFn,
++            .full = fullFn,
+             .poll = pollFn,
+             .cancel = cancelFn,
+             .keep = keepFn,
+@@ -1213,6 +1214,14 @@ pub fn Leader(comptime Dev: type) type {
+ 
+         // -- restores ---------------------------------------------------------------------------------------------
+ 
++        /// beginFn's capacity refusals asked before the prompt cache makes room (robustness): the restores in flight at
++        /// max_restores, or this rank's store out of reads or restore slots. A broken tier is not full: begin names it.
++        fn fullFn(ptr: *anyopaque) bool {
++            const self = of(ptr);
++            if (self.broken != null) return false;
++            return self.jobs.count() >= self.max_restores or self.side.store.readsFull();
++        }
++
+         fn beginFn(ptr: *anyopaque, point: *const pc.Point) anyerror!u64 {
+             const self = of(ptr);
+             if (self.broken) |e| return e;
+diff --git a/zig/src/families/dsv41/spill_tier_test.zig b/zig/src/families/dsv41/spill_tier_test.zig
+index 24f4ee0371d7a4f1f502cf7ec133d0e0e826efea..264220c987b0833c5dd23c911c758ef09fcdaf6f 100644
+--- a/zig/src/families/dsv41/spill_tier_test.zig
++++ b/zig/src/families/dsv41/spill_tier_test.zig
+@@ -1287,16 +1287,19 @@ test "one rank: a restore past the cap is refused before anything is placed or r
+     defer for (snaps) |s| gpa.destroy(s);
+     try pumpUntil(ld, 3);
+     r.sim.delay = 1000;
++    try testing.expect(!t.vtable.full.?(t.ptr)); // (the prompt cache asks before making room: robustness)
+     var jobs: [2]u64 = undefined;
+     for (0..2) |i| {
+         fam.next_base = (8 + 4 * i) * bt;
+         jobs[i] = try t.vtable.begin(t.ptr, &(t.vtable.lookup(t.ptr, &want(&ids[i])) orelse return error.NotFound));
+     }
+     const p3 = t.vtable.lookup(t.ptr, &want(&ids[2])) orelse return error.NotFound;
++    try testing.expect(t.vtable.full.?(t.ptr)); // full before begin is asked: no room made for a third
+     try testing.expectError(error.TooManyRestores, t.vtable.begin(t.ptr, &p3));
+     try testing.expectEqual(@as(u32, 2), fam.reserved); // no third destination placed
+     for (jobs) |j| t.vtable.cancel(t.ptr, j);
+     try stagingDrains(ld.side.store);
++    try testing.expect(!t.vtable.full.?(t.ptr));
+     try testing.expect(t.vtable.lookup(t.ptr, &want(&ids[2])) != null); // still there for later
+ }
+ 
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 65420772f7b4512b9465389072da54335130c589..279bfac5c00a8edc9ec374ee79999ac6e1ffcece 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -164,6 +164,10 @@ const Host = struct {
+     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
+     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+     spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
++    // robustness: the family's broken-pair policy and service fence, handed to the lane host before it starts
++    pair: ?api.LaneHost.PairPolicy = null,
++    pair_watch: ?*const fn (*anyopaque, *anyopaque, *const fn (*anyopaque, []const u8, bool) void) void = null,
++    quiet: ?api.LaneHost.Quiet = null,
+ 
+     fn close(p: *anyopaque) void {
+         const h: *Host = @ptrCast(@alignCast(p));
+@@ -204,6 +208,9 @@ const Host = struct {
+         if (h.cache) |*store| h.host.cache = store;
+         h.host.kv_parts = h.kv_parts;
+         if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
++        h.host.pair = h.pair;
++        h.host.quiet = h.quiet;
++        if (h.pair_watch) |w| w(h.family, &h.host, api.LaneHost.pairBrokenFn); // (the family's breaks reach the host)
+         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+         try h.host.start();
+     }
+@@ -402,6 +409,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     });
+     errdefer gpa.free(h.startup);
+     if (@hasField(@TypeOf(loaded), "kv_parts")) h.kv_parts = loaded.kv_parts;
++    // robustness: a family's broken-pair policy (dsv41: TF_DS_PAIR_BROKEN=exit) and its device's word for the
++    // lane host's service fence; both null keep the host exactly as before
++    if (@hasField(@TypeOf(loaded), "pair")) if (loaded.pair) |p| {
++        h.pair = .{ .ctx = loaded.ctx, .abort = p.abort, .exit = pairExit, .fatal = p.fatal };
++        h.pair_watch = p.watch;
++    };
++    if (@hasField(@TypeOf(loaded), "quiet")) if (loaded.quiet) |q| {
++        h.quiet = .{ .ctx = loaded.ctx, .check = q };
++    };
+     // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
+     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+@@ -432,6 +448,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+ }
+ 
++/// The broken-pair policy's exit (robustness): the lane host has failed every request and stopped the collectives;
++/// _exit skips the CUDA driver's exit handlers, which could wait on a stream a dead peer left wedged. The service's
++/// supervisor (systemd) restarts both ranks (rank 1 ends when its link to this rank goes).
++fn pairExit(_: *anyopaque, code: u8) void {
++    std.log.err("tensorfold: the rank pair broke; exiting with status {d} for a restart of both ranks", .{code});
++    std.c._exit(code);
++}
++
+ /// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.
+ fn familyEfforts(comptime F: type) []const api.Effort {
+     if (!@hasDecl(F, "efforts")) return &.{};
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index a406ec43ee06bc7c0ca9cc5097376fd307cc882e..1e5fc6c1bbecfbcc53443d2e84425ce4e0c57547 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -106,7 +106,7 @@ pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENS
+     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
+ 
+ /// The prompt cache tier's variables (api.Spill): its knobs beyond the flags.
+-pub const spill_env = [_][]const u8{ "TF_SPILL_TURNS", "TF_SPILL_LOAD_MS", "TF_SPILL_LOAD_WAIT_MS", "TF_SPILL_FLUSH_MS" };
++pub const spill_env = [_][]const u8{ "TF_SPILL_TURNS", "TF_SPILL_LOAD_MS", "TF_SPILL_LOAD_WAIT_MS", "TF_SPILL_DEFER_MS", "TF_SPILL_FLUSH_MS" };
+ 
+ pub const Args = struct {
+     model: []const u8 = "",
+@@ -290,6 +290,7 @@ pub fn spill(args: Args, env_: anytype) api.Spill {
+     if (env_.get("TF_SPILL_TURNS")) |v| s.turns = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.turns;
+     if (env_.get("TF_SPILL_LOAD_MS")) |v| s.load_ms = positive(v) orelse s.load_ms;
+     if (env_.get("TF_SPILL_LOAD_WAIT_MS")) |v| s.load_wait_ms = positive(v) orelse s.load_wait_ms;
++    if (env_.get("TF_SPILL_DEFER_MS")) |v| s.defer_ms = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.defer_ms;
+     if (env_.get("TF_SPILL_FLUSH_MS")) |v| s.flush_ms = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch s.flush_ms;
+     return s;
+ }
+@@ -435,7 +436,9 @@ test "spill flags and variables: off by default, checked, passed whole" {
+     try std.testing.expect(!off.enabled());
+     try std.testing.expectEqual(api.Spill{}, off);
+     const args = try parse(a, &.{ "m", "--spill-dir", "/nvme/spill", "--spill-gib", "64", "--spill-min-free-gib=20", "--spill-min-tokens", "4096", "--spill-quota", "0.25" }, &u);
+-    const on = spill(args, Env{ .pairs = &.{ .{ "TF_SPILL_TURNS", "2" }, .{ "TF_SPILL_LOAD_MS", "25" }, .{ "TF_SPILL_FLUSH_MS", "x" } } });
++    const on = spill(args, Env{ .pairs = &.{ .{ "TF_SPILL_TURNS", "2" }, .{ "TF_SPILL_LOAD_MS", "25" }, .{ "TF_SPILL_FLUSH_MS", "x" }, .{ "TF_SPILL_DEFER_MS", "0" } } });
++    try std.testing.expectEqual(@as(u32, 0), on.defer_ms); // (0: a capacity-refused restore is not deferred)
++    try std.testing.expectEqual(@as(u32, 5_000), spill(args, Env{ .pairs = &.{.{ "TF_SPILL_DEFER_MS", "-3" }} }).defer_ms);
+     try std.testing.expect(on.enabled());
+     try std.testing.expectEqualStrings("/nvme/spill", on.dir.?);
+     try std.testing.expectEqual(@as(f64, 64), on.gib);
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index f6fd0023758cff7c507f0d5f36d0b3ba85ce702a..8dcdc1cd5552eee0bc4d9bc3c199731808dffab7 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -143,9 +143,24 @@ pub const Metrics = struct {
+         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+         if (status.cache) |c| try cacheFamilies(w, c);
+         if (status.kv_parts) |k| try kvPartFamilies(w, k);
++        if (status.pair) |p| try pairFamilies(w, p);
+     }
+ };
+ 
++/// The rank pair's robustness counters and state (a backend with a broken-pair policy or a disk tier):
++/// tensorfold:service_refused and tensorfold:pair_failed (counters, /health's names), then the gauges
++/// tensorfold:pair_busy_ms, pair_stall_ms, pair_stalled and pair_broken (booleans as 0/1).
++pub fn pairFamilies(w: *std.Io.Writer, p: api.PairStatus) !void {
++    const H = api.PairStatus.help;
++    const info = @typeInfo(api.PairStatus).@"struct";
++    inline for (info.field_names, info.field_types) |name, T| {
++        const v: u64 = if (T == bool) @intFromBool(@field(p, name)) else @field(p, name);
++        const kind = comptime kindOf(&api.PairStatus.gauges, name);
++        const full = comptime if (std.mem.eql(u8, kind, "counter")) name else "pair_" ++ name;
++        try gauge(w, full, kind, @field(H, name), v);
++    }
++}
++
+ /// The prompt cache's counters (its tier or grouping on): the GLM engine's names for continuation, then
+ /// tensorfold:prompt_cache_* and the tier's tensorfold:spill_*{rank="N"}.
+ pub fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStats) !void {
+@@ -403,6 +418,33 @@ test "cache families: present only with the cache's counters, every field with i
+     }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+ }
+ 
++test "pair families: present only with the pair's status, the two counters and the stall state" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    var stub: RenderStub = .{};
++    var plain: std.Io.Writer.Allocating = .init(gpa);
++    defer plain.deinit();
++    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "service_refused") == null);
++    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "pair_") == null);
++    stub.status_value.pair = .{ .service_refused = 3, .pair_failed = 2, .busy_ms = 121000, .stall_ms = 120000, .stalled = true };
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    for ([_][]const u8{
++        "# TYPE tensorfold:service_refused counter\n",
++        "tensorfold:service_refused 3\n",
++        "# TYPE tensorfold:pair_failed counter\n",
++        "tensorfold:pair_failed 2\n",
++        "# TYPE tensorfold:pair_busy_ms gauge\n",
++        "tensorfold:pair_busy_ms 121000\n",
++        "tensorfold:pair_stall_ms 120000\n",
++        "tensorfold:pair_stalled 1\n",
++        "tensorfold:pair_broken 0\n",
++    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
++}
++
+ test "kv shard families: present only with a sharded backend's stats, its counters and every part's rows" {
+     const gpa = std.testing.allocator;
+     var m: Metrics = .{ .gpa = gpa };
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index 9f0fe94f2ecd29334272713e6f2ee491641b2838..19360c647da9dc0bdd7d6ab0485837ea018e60e3 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -9,18 +9,24 @@ const Conn = @import("http_conn.zig").Conn;
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+ 
+-/// With keys on, health names nothing about the model.
++/// With keys on, health names nothing about the model. A rank pair whose round is past its stall bound, or that
++/// broke, answers 503 with status "stalled" or "broken" (only a backend with a broken-pair policy reports one).
+ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+-    if (srv.keys) |k| if (k.enabled()) return conn.sendJson(200, "{\"status\": \"ok\"}");
++    var status: api.Status = .{};
++    srv.engine.status(&status, &.{});
++    const word = if (status.pair) |p| p.health() else "ok";
++    const code: u16 = if (std.mem.eql(u8, word, "ok")) 200 else 503;
++    if (srv.keys) |k| if (k.enabled()) {
++        if (code == 200) return conn.sendJson(200, "{\"status\": \"ok\"}");
++        return conn.sendJson(code, if (std.mem.eql(u8, word, "broken")) "{\"status\": \"broken\"}" else "{\"status\": \"stalled\"}");
++    };
+     const o = try json.newObject(a);
+-    try o.put(a, "status", .{ .string = "ok" });
++    try o.put(a, "status", .{ .string = word });
+     try o.put(a, "model", .{ .string = srv.config.served_name });
+     const ids = try a.alloc(Value, srv.config.model_ids.len);
+     for (srv.config.model_ids, ids) |id, *slot| slot.* = .{ .string = id };
+     try o.put(a, "model_ids", .{ .array = ids });
+     try o.put(a, "max_batch_size", try json.intValue(a, srv.info.lanes));
+-    var status: api.Status = .{};
+-    srv.engine.status(&status, &.{});
+     try o.put(a, "warming", .{ .bool = status.warming });
+     const memory = try json.newObject(a);
+     if (srv.engine.memory(std.mem.indexOf(u8, conn.path, "reset_peak=1") != null)) |mem| {
+@@ -32,7 +38,17 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     try o.put(a, "live", try live.snapshot(a, srv.engine));
+     if (status.cache) |c| try putCache(a, o, c);
+     if (status.kv_parts) |k| try putKvParts(a, o, k);
+-    routes.sendValue(conn, a, 200, .{ .object = o });
++    if (status.pair) |p| try putPair(a, o, p);
++    routes.sendValue(conn, a, code, .{ .object = o });
++}
++
++/// The rank pair's robustness counters and state, under "pair" (a backend with a broken-pair policy or a disk tier).
++pub fn putPair(a: Allocator, o: *json.Object, p: api.PairStatus) !void {
++    const po = try json.newObject(a);
++    inline for (@typeInfo(api.PairStatus).@"struct".field_names, @typeInfo(api.PairStatus).@"struct".field_types) |name, T| {
++        if (T == bool) try po.put(a, name, .{ .bool = @field(p, name) }) else try po.put(a, name, try json.intValue(a, @field(p, name)));
++    }
++    try o.put(a, "pair", .{ .object = po });
+ }
+ 
+ /// The prompt cache's counters, when its tier or grouping is on: the GLM engine's top-level names (chats_continued,
+@@ -227,3 +243,20 @@ test "health's kv shard counters: every counter under kv_shard, each part's rows
+     try std.testing.expectEqualStrings("1", pr[1].object.get("transfers_failed").?.int);
+     try std.testing.expectEqualStrings("11", pr[0].object.get("owner_rounds").?.int);
+ }
++
++test "health's pair status: every field under pair, the word is ok, stalled or broken" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const o = try json.newObject(a);
++    try putPair(a, o, .{ .service_refused = 2, .pair_failed = 1, .busy_ms = 7, .stall_ms = 120000, .stalled = true });
++    const po = o.get("pair").?.object;
++    try std.testing.expectEqualStrings("2", po.get("service_refused").?.int);
++    try std.testing.expectEqualStrings("1", po.get("pair_failed").?.int);
++    try std.testing.expectEqualStrings("120000", po.get("stall_ms").?.int);
++    try std.testing.expect(po.get("stalled").?.bool);
++    try std.testing.expect(!po.get("broken").?.bool);
++    try std.testing.expectEqualStrings("ok", (api.PairStatus{}).health());
++    try std.testing.expectEqualStrings("stalled", (api.PairStatus{ .stalled = true }).health());
++    try std.testing.expectEqualStrings("broken", (api.PairStatus{ .stalled = true, .broken = true }).health());
++}

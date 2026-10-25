@@ -12,9 +12,11 @@ use ds41_gateway::api::AppState;
 use ds41_gateway::engine::EngineClient;
 use ds41_gateway::health;
 use ds41_gateway::parity::GatewayConfig;
+use ds41_gateway::security::ApiKeys;
 use ds41_gateway::{Gateway, GatewaySettings};
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Parser)]
 #[command(name = "ds41-gateway", about = "DeepSeek API parity gateway")]
@@ -61,9 +63,15 @@ struct Cli {
     /// Maximum total image megabytes per request.
     #[arg(long)]
     max_image_mb: Option<usize>,
-    /// Require `Authorization`/`x-api-key` before rendering.
+    /// Require a valid `Authorization: Bearer` or `x-api-key` credential.
     #[arg(long)]
     require_key: bool,
+    /// API key file used with `--require-key` (or API_KEY_FILE).
+    #[arg(long, value_name = "PATH")]
+    api_key_file: Option<PathBuf>,
+    /// Maximum admitted requests; additional requests wait (default: 3).
+    #[arg(long, value_parser = parse_positive_usize)]
+    max_concurrent: Option<usize>,
     /// Log level.
     #[arg(long)]
     log: Option<String>,
@@ -73,6 +81,31 @@ struct Cli {
 }
 
 const DEFAULT_IMAGE_TOKEN: &str = "<｜deepseek_image｜>";
+// floor((512 MiB container limit - 235 MiB idle RSS) / 70 MiB per admitted request).
+const DEFAULT_MAX_CONCURRENT: usize = (512 - 235) / 70;
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("must be a positive integer, got {value:?}"))?;
+    if parsed == 0 {
+        return Err("must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
+fn load_api_keys(require_key: bool, path: Option<PathBuf>) -> Result<Option<ApiKeys>, String> {
+    if !require_key {
+        return Ok(None);
+    }
+    let path = path
+        .ok_or_else(|| "--require-key requires --api-key-file PATH or API_KEY_FILE".to_string())?;
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read API key file {}: {error}", path.display()))?;
+    ApiKeys::parse(&contents)
+        .map(Some)
+        .map_err(|error| format!("invalid API key file {}: {error}", path.display()))
+}
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -128,6 +161,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .or_else(|| env("GATEWAY_MAX_IMAGE_MB").and_then(|value| value.parse().ok()))
         .unwrap_or(64);
     let require_key = cli.require_key || env("API_KEY").is_some();
+    let api_key_file = cli
+        .api_key_file
+        .or_else(|| env("API_KEY_FILE").map(PathBuf::from));
+    let api_keys = load_api_keys(require_key, api_key_file)?;
+    let max_concurrent = match cli.max_concurrent {
+        Some(value) => value,
+        None => env("GATEWAY_MAX_CONCURRENT")
+            .map(|value| parse_positive_usize(&value))
+            .transpose()?
+            .unwrap_or(DEFAULT_MAX_CONCURRENT),
+    };
     let log_level = cli
         .log
         .or_else(|| env("GATEWAY_LOG"))
@@ -155,6 +199,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         default_effort,
         strict,
         require_key,
+        api_keys,
         block_private_urls,
         max_images,
         max_image_mb,
@@ -167,6 +212,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         gateway: Arc::new(gateway),
         engine: engine_client,
         config: Arc::new(config),
+        semaphore: Arc::new(Semaphore::new(max_concurrent)),
     };
     let listener = TcpListener::bind(&listen).await?;
     eprintln!(
@@ -242,11 +288,40 @@ async fn auto_max_model_len(engine: &EngineClient) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_IMAGE_TOKEN;
+    use super::{DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, load_api_keys, parse_positive_usize};
 
     #[test]
     fn the_default_image_token_is_the_served_spelling() {
         assert_eq!(DEFAULT_IMAGE_TOKEN, "<｜deepseek_image｜>");
         assert_ne!(DEFAULT_IMAGE_TOKEN, "<｜end_of_query｜>");
+    }
+
+    #[test]
+    fn require_key_needs_a_readable_nonempty_key_file() {
+        let error = load_api_keys(true, None).expect_err("missing path");
+        assert!(error.contains("requires --api-key-file"));
+
+        let missing =
+            std::env::temp_dir().join(format!("ds41-gateway-missing-key-{}", std::process::id()));
+        let error = load_api_keys(true, Some(missing)).expect_err("missing file");
+        assert!(error.contains("cannot read API key file"));
+
+        let empty =
+            std::env::temp_dir().join(format!("ds41-gateway-empty-key-{}", std::process::id()));
+        std::fs::write(&empty, "\n  \n").expect("empty key fixture");
+        let error = load_api_keys(true, Some(empty.clone())).expect_err("empty file");
+        let _ = std::fs::remove_file(empty);
+        assert!(error.contains("contains no API keys"));
+    }
+
+    #[test]
+    fn concurrency_default_and_parser_enforce_the_memory_budget() {
+        assert_eq!(DEFAULT_MAX_CONCURRENT, 3);
+        // The budget is a property of the constants, so it is checked at compile time.
+        const { assert!(235 + DEFAULT_MAX_CONCURRENT * 70 <= 512) };
+        const { assert!(235 + (DEFAULT_MAX_CONCURRENT + 1) * 70 > 512) };
+        assert_eq!(parse_positive_usize("4"), Ok(4));
+        assert!(parse_positive_usize("0").is_err());
+        assert!(parse_positive_usize("not-a-number").is_err());
     }
 }
