@@ -1,0 +1,50 @@
+From 807ae13de0ee2bf8e434e4e27bd981b485e3c979 Mon Sep 17 00:00:00 2001
+From: Maciej Kowalik <33423060+koniaik@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 15:59:44 +0100
+Subject: [PATCH] server: the Anthropic frontend accepts a system turn anywhere
+ in messages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A system message inside messages (not the top-level system field) was
+refused unless it directly followed a user or system turn and directly
+preceded an assistant turn or the end ("mid-conversation system messages
+must follow a user turn and precede an assistant or end"). A client that
+injects a system reminder before the newest user turn — which the cloud
+accepts — sends exactly that and every mid-conversation message failed
+with 400 invalid_request, ending the turn. The placement check is gone;
+the message translates as a system-role chat message, which the chat
+side takes anywhere. Turn-scoped clear_at and per-message output_config
+are still refused as before.
+---
+ zig/src/server/anthropic_translate.zig | 10 +---------
+ 1 file changed, 1 insertion(+), 9 deletions(-)
+
+diff --git a/zig/src/server/anthropic_translate.zig b/zig/src/server/anthropic_translate.zig
+index 96165b78..bea1c241 100644
+--- a/zig/src/server/anthropic_translate.zig
++++ b/zig/src/server/anthropic_translate.zig
+@@ -76,18 +76,10 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
+         try m.put(a, "content", .{ .string = joined.items });
+         try out.append(a, .{ .object = m });
+     };
+-    for (list.array, 0..) |message, index| {
++    for (list.array) |message| {
+         if (message != .object or !roleIs(message, &.{ "user", "assistant", "system" })) return cx.refuse("message role must be user, assistant or system");
+         const role = message.get("role").?.string;
+         if (std.mem.eql(u8, role, "system")) {
+-            const previous: Value = if (index > 0) list.array[index - 1] else .{ .object = try json.newObject(a) };
+-            const following: Value = if (index + 1 < list.array.len) list.array[index + 1] else blk: {
+-                const f = try json.newObject(a);
+-                try f.put(a, "role", .{ .string = "assistant" });
+-                break :blk .{ .object = f };
+-            };
+-            if (previous != .object or !roleIs(previous, &.{ "user", "system" }) or following != .object or !roleIs(following, &.{ "assistant", "system" }))
+-                return cx.refuse("mid-conversation system messages must follow a user turn and precede an assistant or end");
+             const clear = message.get("clear_at");
+             const clear_ok = clear == null or clear.? == .null or (clear.? == .string and std.mem.eql(u8, clear.?.string, "never"));
+             if (!clear_ok or json.truthyField(message, "output_config")) return cx.refuse("turn-scoped system messages and per-message output_config are unsupported");
+-- 
+2.43.0
+
