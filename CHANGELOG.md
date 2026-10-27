@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `zig/patches/0031-graph-cap.patch` (on, `GRAPH_CAP=128`): the CUDA graph cache keeps at most `GRAPH_CAP` captured
+  stretches a rank and destroys the least recently replayed one past it (issue #69). Before, every graph stayed until
+  the process ended, so both ranks' device and host memory grew for days with growing conversations until memguard
+  killed rank 0. Replies are unchanged (`tools/exact.py` 31/31 with an eviction almost every stretch) and decode at the
+  default equals uncapped graphs; `GRAPH_CAP=0` keeps the old behavior. `scripts/port_test.sh` checks that both ranks
+  get the setting.
 - `ABLIT=1` on a read-only Hugging Face blob cache: `prepare.sh` gives the overlay's work folder its own writable copy of
   the checkpoint index (the shards stay hard links), so the graft no longer fails with `PermissionError` when it rewrites
   the index (issue #42, reported by unitea1992). By **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,

@@ -154,6 +154,10 @@ RDMA="${RDMA:-1}"
 RDMA_IDLE_S="${RDMA_IDLE_S:-2}"       # 0 to 3600 seconds
 RDMA_NAP_US="${RDMA_NAP_US:-500}"    # 1 to 1000000 microseconds; bounds wake and shutdown delay
 GRAPHS="${GRAPHS:-1}"
+# zig/patches/0031: with GRAPHS=1, the captured CUDA graphs each rank keeps at most; past it the least recently replayed
+# one is destroyed and captured again when it comes up. 0 keeps every one, as before 0031: they add up over days of
+# growing conversations (rows x context buckets x stretches) and are never freed (issue #69).
+GRAPH_CAP="${GRAPH_CAP:-128}"
 SIDE="${SIDE:-1}"
 PREFETCH="${PREFETCH:-1}"
 ENGRAM_AIO="${ENGRAM_AIO:-1}"

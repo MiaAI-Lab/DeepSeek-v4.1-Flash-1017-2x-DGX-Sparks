@@ -1,0 +1,319 @@
+# dsv41 round: the CUDA graph cache keeps at most GRAPH_CAP stretches (issue #69). round.Graphs captured a stretch the
+# first time its (rows, context bucket, stretch, shard mode) came up and kept every graph until the process ended: the
+# keys add up over days as conversations grow past each power of two (16 rows x 12 buckets at POOL=2097152 x 3
+# stretches), each graph holding device memory and about 1.6 times as much host memory on both ranks, until memguard
+# killed rank 0 after two days of agent traffic.
+# - graph_cache.zig: a map with a cap on its entries; past the cap a put hands back the least recently used entry (a
+#   replay counts as a use) for its owner to free. Host tests: the eviction order, the cap held over 600 new keys,
+#   cap 0 keeps all.
+# - round.Graphs keeps its graphs there and destroys an evicted one with cuGraphExecDestroy (a graph still running is
+#   freed when it completes); the stretch is captured again when its key comes back. Both ranks see the same keys in
+#   the same order, so with the same cap they keep and drop the same graphs. A new graph is launched before it is
+#   kept: before, a failed first launch freed a graph the map still held. The log says when the cache reaches 64 and
+#   128 graphs and, past the cap, at each power of two of evictions.
+# - draft.PassGraphs is unchanged: its key (streams, steps) is bounded by --parallel and the draft block.
+# Switch: TF_DS_GRAPH_CAP (rank 0) and --graph-cap (rank 1), the same number on both; 0 or unset keeps every graph as
+# before. Recipe setting GRAPH_CAP, default 128 (start.sh sends --graph-cap only with GRAPHS=1).
+# Measured on the pair (engine 629c524 with this recipe's 0001-0008, 0010 and the EAQ v1.1 float linears; 4 streams,
+# drafts on, POOL=2097152): GRAPH_CAP=3 (a capture almost every stretch, 4096 evictions a rank) gives the same replies
+# as GRAPHS=0, tools/exact.py IDENTICAL 31/31, with one stream about 5% slower than uncapped graphs (34.5 against
+# 33.0 ms/chunk, median of 7). GRAPH_CAP=128 decodes as uncapped: one stream 33.0 / 33.0, four streams at ~60K 63.9 /
+# 64.0 ms/chunk (mean of 8). A repeated sweep of 8 fresh conversations (500 to 32K words) then grows rank 0's GPU
+# memory only by the prompt cache's kept states (+38 MiB a pass, as with GRAPHS=0), with rank 1's RSS flat (the sweeps
+# ran before the launch was moved ahead of the put, which changes no GPU work).
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 847b4b29..40c63fe2 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -95,6 +95,7 @@ test {
+     refAll(ring2d);
+     refAll(text);
+     refAll(round);
++    refAll(@import("graph_cache.zig"));
+     refAll(round2d);
+     refAll(draft2d);
+     refAll(markov_tokens);
+diff --git a/zig/src/families/dsv41/graph_cache.zig b/zig/src/families/dsv41/graph_cache.zig
+new file mode 100644
+index 00000000..cdbe0e29
+--- /dev/null
++++ b/zig/src/families/dsv41/graph_cache.zig
+@@ -0,0 +1,119 @@
++//! A map with a cap on its entries: past the cap, a put hands back the least recently used entry for its owner to
++//! free (round.Graphs: the captured stretches, each an instantiated CUDA graph on the device and the host).
++
++const std = @import("std");
++
++pub fn Lru(comptime K: type, comptime V: type) type {
++    return struct {
++        const Self = @This();
++        const Slot = struct { v: V, used: u64 };
++
++        map: std.AutoHashMapUnmanaged(K, Slot) = .empty,
++        cap: usize, // the entries kept at most (0: no cap)
++        tick: u64 = 0,
++        evicted: u64 = 0, // the entries put has handed back so far
++
++        pub fn init(cap: usize) Self {
++            return .{ .cap = cap };
++        }
++
++        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
++            self.map.deinit(gpa);
++            self.* = undefined;
++        }
++
++        pub fn count(self: *const Self) usize {
++            return self.map.count();
++        }
++
++        /// The entry of `k`, now the most recently used.
++        pub fn get(self: *Self, k: K) ?*V {
++            const s = self.map.getPtr(k) orelse return null;
++            self.tick += 1;
++            s.used = self.tick;
++            return &s.v;
++        }
++
++        /// Keeps `v` under `k` (not in the map yet); at the cap first takes out the least recently used entry and
++        /// returns its value, which the caller frees. A put that fails keeps every entry.
++        pub fn put(self: *Self, gpa: std.mem.Allocator, k: K, v: V) !?V {
++            try self.map.ensureUnusedCapacity(gpa, 1);
++            var out: ?V = null;
++            if (self.cap != 0 and self.map.count() >= self.cap) {
++                // a scan, on a miss only (each costs a capture anyway): the cap keeps it short
++                var it = self.map.iterator();
++                var lru = it.next().?;
++                while (it.next()) |en| if (en.value_ptr.used < lru.value_ptr.used) {
++                    lru = en;
++                };
++                out = lru.value_ptr.v;
++                self.map.removeByPtr(lru.key_ptr);
++                self.evicted += 1;
++            }
++            self.tick += 1;
++            self.map.putAssumeCapacityNoClobber(k, .{ .v = v, .used = self.tick });
++            return out;
++        }
++
++        /// Every value kept, for the owner to free before deinit.
++        pub fn valueIterator(self: *const Self) ValueIterator {
++            return .{ .it = self.map.valueIterator() };
++        }
++
++        pub const ValueIterator = struct {
++            it: std.AutoHashMapUnmanaged(K, Slot).ValueIterator,
++            pub fn next(i: *ValueIterator) ?*V {
++                const s = i.it.next() orelse return null;
++                return &s.v;
++            }
++        };
++    };
++}
++
++// A captured stretch's key as round.Graphs makes it; the values stand for the graphs' handles.
++const Key = struct { rows: u32, bucket: u64, stretch: u32, mode: u8 = 0 };
++
++fn key(rows: u32, bucket: u64, stretch: u32) Key {
++    return .{ .rows = rows, .bucket = bucket, .stretch = stretch };
++}
++
++test "at the cap a put hands back the least recently used entry, a get counting as a use" {
++    const gpa = std.testing.allocator;
++    var c = Lru(Key, u32).init(3);
++    defer c.deinit(gpa);
++    try std.testing.expectEqual(@as(?u32, null), try c.put(gpa, key(1, 1024, 0), 10));
++    try std.testing.expectEqual(@as(?u32, null), try c.put(gpa, key(1, 1024, 1), 11));
++    try std.testing.expectEqual(@as(?u32, null), try c.put(gpa, key(1, 1024, 2), 12));
++    // replaying the first stretch makes the second the least recently used
++    try std.testing.expectEqual(@as(u32, 10), c.get(key(1, 1024, 0)).?.*);
++    try std.testing.expectEqual(@as(?u32, 11), try c.put(gpa, key(2, 1024, 0), 20));
++    try std.testing.expectEqual(@as(?*u32, null), c.get(key(1, 1024, 1)));
++    try std.testing.expectEqual(@as(u32, 10), c.get(key(1, 1024, 0)).?.*);
++    try std.testing.expectEqual(@as(u32, 12), c.get(key(1, 1024, 2)).?.*);
++    try std.testing.expectEqual(@as(u32, 20), c.get(key(2, 1024, 0)).?.*);
++    try std.testing.expectEqual(@as(usize, 3), c.count());
++    try std.testing.expectEqual(@as(u64, 1), c.evicted);
++}
++
++test "cap 0 keeps every entry: the cache before GRAPH_CAP" {
++    const gpa = std.testing.allocator;
++    var c = Lru(Key, u32).init(0);
++    defer c.deinit(gpa);
++    for (0..600) |i| try std.testing.expectEqual(@as(?u32, null), try c.put(gpa, key(@intCast(i % 16 + 1), @as(u64, 1024) << @intCast(i / 48), @intCast(i % 3)), @intCast(i)));
++    try std.testing.expectEqual(@as(usize, 600), c.count());
++    try std.testing.expectEqual(@as(u64, 0), c.evicted);
++}
++
++test "over days of new shapes the cache stays at its cap and hands back each oldest graph once" {
++    const gpa = std.testing.allocator;
++    var c = Lru(Key, u32).init(128);
++    defer c.deinit(gpa);
++    // 600 distinct stretches, none replayed: the n-th put past the cap hands back the n-th one kept
++    for (0..600) |i| {
++        const out = try c.put(gpa, key(@intCast(i % 16 + 1), @as(u64, 1024) << @intCast(i / 48), @intCast(i % 3)), @intCast(i));
++        try std.testing.expectEqual(if (i < 128) null else @as(?u32, @intCast(i - 128)), out);
++        try std.testing.expect(c.count() <= 128);
++    }
++    try std.testing.expectEqual(@as(usize, 128), c.count());
++    try std.testing.expectEqual(@as(u64, 472), c.evicted);
++}
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index e61e4861..6f025c65 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -21,7 +21,7 @@ const cuda = @import("cuda");
+ const dsv41 = @import("dsv41");
+ const lanes = @import("lanes");
+ 
+-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S] [--spill-dir DIR --spill-gib G [--spill-min-free-gib F] [--spill-min-tokens T] [--spill-quota Q] [--spill-staging-mib M] [--prompt-cache-gib G]]\n";
++const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--graphs 0|1 [--graph-cap N]] [--fix-k K] [--round-rows R] [--streams S] [--spill-dir DIR --spill-gib G [--spill-min-free-gib F] [--spill-min-tokens T] [--spill-quota Q] [--spill-staging-mib M] [--prompt-cache-gib G]]\n";
+ 
+ const pcache = dsv41.spill_tier.prompt_cache;
+ 
+@@ -152,6 +152,8 @@ pub fn main(init: std.process.Init) !u8 {
+             o.side = !std.mem.eql(u8, val, "0");
+         } else if (std.mem.eql(u8, key, "--graphs")) {
+             o.graphs = !std.mem.eql(u8, val, "0");
++        } else if (std.mem.eql(u8, key, "--graph-cap")) {
++            o.graph_cap = try std.fmt.parseInt(usize, val, 10);
+         } else if (std.mem.eql(u8, key, "--serial")) {
+             serial = !std.mem.eql(u8, val, "0");
+         } else if (std.mem.eql(u8, key, "--fix-k")) {
+diff --git a/zig/src/families/dsv41/layer_main.zig b/zig/src/families/dsv41/layer_main.zig
+index d7328143..94b0b8fa 100644
+--- a/zig/src/families/dsv41/layer_main.zig
++++ b/zig/src/families/dsv41/layer_main.zig
+@@ -499,7 +499,7 @@ pub fn main(init: std.process.Init) !u8 {
+         return if (ok) 0 else 1;
+     }
+     if (light) {
+-        var gs = round_mod.Graphs.init(gpa);
++        var gs = round_mod.Graphs.init(gpa, 0);
+         defer gs.deinit();
+         const ok = try runLight(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, rounds, tokens, if (use_graphs) &gs else null);
+         if (use_graphs) {
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 49967f9b..f6d390c7 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -63,6 +63,7 @@ pub const Options = struct {
+     // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
+     rdma_kernels: ?[]const u8 = null, // world 4: the rings' kernels' image (rdma_gather.cu's fatbin; null: the embedded one)
+     graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
++    graph_cap: usize = 0, // the captured stretches kept at most, least recently replayed out first (TF_DS_GRAPH_CAP; 0: all)
+     side: bool = false, // the mixes' side work on a stream of its own (round.Round.useSide)
+     prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
+     engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
+@@ -343,7 +344,7 @@ pub const Model = struct {
+         m.rd = try round.Round.init(&m.eng, &m.arena, a, m.request_cap);
+         if (m.kvs != null) try m.rd.useShard(&m.eng, &m.arena, a);
+         m.amax = try m.arena.take(round.max_rows * 4);
+-        if (o.graphs) m.graphs = round.Graphs.init(gpa);
++        if (o.graphs) m.graphs = round.Graphs.init(gpa, o.graph_cap);
+         if (o.side) try m.rd.useSide(&m.eng);
+         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
+         if (o.drafts) {
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 1c57752f..e00a5e08 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -17,6 +17,9 @@
+ //!                                               count so a token's bits do not change with the round's shape (16; 0: off)
+ //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
+ //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
++//!   TF_DS_GRAPH_CAP=N                           (with TF_DS_GRAPHS) the captured stretches kept at most, the least
++//!                                               recently replayed destroyed first (0 or unset: all); rank 1's
++//!                                               --graph-cap, the same number on both ranks
+ //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
+ //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
+ //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
+@@ -205,6 +208,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .rdma_devices = nonEmpty(getenv("TF_RDMA_DEVICES")),
+         .rdma_kernels = getenv("TF_DS_RDMA_KERNELS"),
+         .graphs = if (getenv("TF_DS_GRAPHS")) |v| !std.mem.eql(u8, v, "0") else false,
++        .graph_cap = if (getenv("TF_DS_GRAPH_CAP")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadGraphCap else 0,
+         .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,
+         .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
+         .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
+@@ -620,6 +624,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
+         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
+         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
++        error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
+         error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
+         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index b7ba5cb9..b8e6c489 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -30,6 +30,7 @@ const ops_mod = @import("ops.zig");
+ const shard = @import("shard.zig");
+ const shard_ops = @import("shard_ops.zig");
+ const shard_ring = @import("shard_ring.zig");
++const graph_cache = @import("graph_cache.zig");
+ 
+ const Engine = prompt.Engine;
+ const Chunk = prompt.Chunk;
+@@ -1396,32 +1397,36 @@ const Carry = struct {
+ /// The rounds' stretches as CUDA graphs (the served graph.py: one capture a rows and context bucket, the round cut
+ /// before each Engram layer, whose rows the host reads between the stretches): a stretch is captured the first time
+ /// its (rows, bucket, stretch) comes up and replayed after, with what it leaves. The same launches with the same
+-/// arguments as the eager round, so the same bytes.
++/// arguments as the eager round, so the same bytes. At most `cap` stretches are kept (TF_DS_GRAPH_CAP, rank 1's
++/// --graph-cap; 0: all): past it the least recently replayed one is destroyed and captured again when it next comes
++/// up. Uncapped, the keys (rows x buckets x stretches x shard modes) add up over days of growing conversations, each
++/// graph holding device and host memory until the process ends. Both ranks see the same keys in the same order, so
++/// with the same cap they keep and drop the same stretches.
+ pub const Graphs = struct {
+     gpa: std.mem.Allocator,
+-    map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
++    lru: graph_cache.Lru(Key, Entry),
+ 
+     pub const Key = struct { rows: u32, bucket: u64, stretch: u32, mode: u8 = 0 }; // mode: the round's shard.Mode (auto's choice)
+     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
+ 
+-    pub fn init(gpa: std.mem.Allocator) Graphs {
+-        return .{ .gpa = gpa };
++    pub fn init(gpa: std.mem.Allocator, cap: usize) Graphs {
++        return .{ .gpa = gpa, .lru = .init(cap) };
+     }
+ 
+     pub fn deinit(g: *Graphs) void {
+-        var it = g.map.valueIterator();
++        var it = g.lru.valueIterator();
+         while (it.next()) |en| en.exec.deinit();
+-        g.map.deinit(g.gpa);
++        g.lru.deinit(g.gpa);
+         g.* = undefined;
+     }
+ 
+     /// The captured stretches.
+     pub fn count(g: *const Graphs) usize {
+-        return g.map.count();
++        return g.lru.count();
+     }
+ 
+     fn run(g: *Graphs, key: Key, e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, cy: *Carry, li: usize, end: usize) !void {
+-        if (g.map.getPtr(key)) |en| {
++        if (g.lru.get(key)) |en| {
+             if (!std.meta.eql(en.start, cy.*)) return error.GraphStateMismatch;
+             try en.exec.launchOn(e.s);
+             cy.* = en.end;
+@@ -1443,8 +1448,14 @@ pub const Graphs = struct {
+         defer graph.deinit();
+         var exec = try graph.instantiate();
+         errdefer exec.deinit();
+-        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* });
++        // launched before it is kept: a failed launch frees it here and leaves no handle in the cache; a graph still
++        // running when destroyed (this one if the put fails, or an evicted one) is freed when it completes
+         try exec.launchOn(e.s);
++        if (try g.lru.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* })) |old| {
++            var x = old.exec;
++            x.deinit();
++            if (std.math.isPowerOfTwo(g.lru.evicted)) std.log.info("dsv41: CUDA graphs: {d} kept (the cap), {d} destroyed for newer ones so far; a count that keeps rising means TF_DS_GRAPH_CAP is below the working set", .{ g.lru.count(), g.lru.evicted });
++        } else if (std.math.isPowerOfTwo(g.lru.count()) and g.lru.count() >= 64) std.log.info("dsv41: CUDA graphs: {d} kept", .{g.lru.count()});
+     }
+ };
+ 

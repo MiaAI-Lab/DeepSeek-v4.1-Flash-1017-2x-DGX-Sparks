@@ -23,7 +23,7 @@
 # Setup: WORKER (an ssh target, key-based) in scripts/local.sh.
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and their notes in scripts/config.sh):
 #   serving  CONTEXT, POOL, PARALLEL, ROUND_ROWS, MAX_TOKENS, THINKING, REASONING_EFFORT, THINKING_BUDGET, TEMPERATURE, TOP_P, TOP_K, DRAFTS,
-#            SERVED_NAME, HOST, PORT, RDMA, RDMA_IDLE_S, RDMA_NAP_US, GRAPHS, SIDE, PREFETCH, ENGRAM_AIO, REPLAY_FLOOR
+#            SERVED_NAME, HOST, PORT, RDMA, RDMA_IDLE_S, RDMA_NAP_US, GRAPHS, GRAPH_CAP, SIDE, PREFETCH, ENGRAM_AIO, REPLAY_FLOOR
 #   nodes    WORKER, FABRIC_PEER, MASTER_ADDR, MASTER_PORT, SOCKET_IFNAME, NCCL_RAILS, NCCL_DEBUG
 #   files    EAQ_V1_1 (0 | 1), ABLIT (0 | 1), ABLIT_REVISION, MODEL_ID, MODEL_REVISION, ENGRAM_ID, ENGRAM_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER, NFS_VOLUME,
 #            WORKER_ENGRAM_DIR, WORKER_CACHE_DIR, STATE_DIR, LOG_DIR, LOG_KEEP, LOG_MAX_SIZE, LOG_MAX_FILE
@@ -72,6 +72,7 @@ for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] ||
 [[ -z "$LOG_MAX_SIZE" || "$LOG_MAX_SIZE" =~ ^[1-9][0-9]*[kmg]$ ]] || die "LOG_MAX_SIZE is a size such as 100m (k, m or g), or empty for the docker daemon's own setting, not $LOG_MAX_SIZE"
 [[ "$LOG_MAX_FILE" =~ ^[1-9][0-9]*$ ]] || die "LOG_MAX_FILE is a number of files, 1 or more, not $LOG_MAX_FILE"
 for v in EAQ_V1_1 THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+[[ "$GRAPH_CAP" =~ ^[0-9]+$ ]] || die "GRAPH_CAP is a count of CUDA graphs a rank keeps, 0 for all, not $GRAPH_CAP"
 [[ "$RDMA_IDLE_S" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$RDMA_IDLE_S" 'BEGIN { exit !(value <= 3600) }' || die "RDMA_IDLE_S is 0 to 3600 seconds (0 turns the nap off), not $RDMA_IDLE_S"
 [[ "$RDMA_NAP_US" =~ ^[1-9][0-9]*$ ]] && awk -v value="$RDMA_NAP_US" 'BEGIN { exit !(value <= 1000000) }' || die "RDMA_NAP_US is 1 to 1000000 microseconds, not $RDMA_NAP_US"
 [[ "${RANK1_PROFILE:-}" =~ ^[012]?$ ]] || die "RANK1_PROFILE is empty, 0, 1 or 2, not '${RANK1_PROFILE:-}'"
@@ -253,7 +254,7 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
 ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 # each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response
@@ -264,6 +265,8 @@ KIT=/hf/$KIT_SUB/kit
 # every round ungraphed, with no side stream, prefetch or AIO, and rank 0 waits on it each round. Its pool is rank 0's
 # context (or POOL, which scripts/port.sh derives for KV_SHARD=1 when it is empty), and its streams rank 0's (TF_DS_STREAMS): with other values the two ranks wait on each other.
 FOLLOW="--pool ${POOL:-$CONTEXT} --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
+# zig/patches/0031: only with graphs on, so an image from before 0031 still starts with GRAPHS=0 (it refuses the flag)
+[[ "$GRAPHS" == 0 ]] || FOLLOW+=" --graph-cap $GRAPH_CAP"
 [[ -z "$ROUND_ROWS" ]] || FOLLOW+=" --round-rows $ROUND_ROWS"
 # RANK1_PROFILE=1|2: rank 1's own profile (--profile; 2 adds prefill_phases_ms), AGGREGATED over the run and printed to its
 # log only when rank 0 goes away first (docker stop rank 0, read rank 1's log, then ./stop.sh). It synchronizes the stream
@@ -288,7 +291,7 @@ else
 fi
 ENV0=(TF_TP_WORLD=2 "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA/rank-cache" "TF_DS_KIT=$KIT"
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container)" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json"
-      "TF_DS_GRAPHS=$GRAPHS" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
+      "TF_DS_GRAPHS=$GRAPHS" "TF_DS_GRAPH_CAP=$GRAPH_CAP" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
 if (( DRY )); then HEAD_HF=${HEAD_NFS_SERVER:+$HEAD_NFS_VOLUME}; HEAD_HF=${HEAD_HF:-$HF_CACHE}; else HEAD_HF=$(head_hf_mount); fi
 here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro")
 read -ra port0 <<<"$(port_spill_args 0)"; here+=(${port0[@]+"${port0[@]}"})   # rank 0's spill directory (scripts/port.sh)

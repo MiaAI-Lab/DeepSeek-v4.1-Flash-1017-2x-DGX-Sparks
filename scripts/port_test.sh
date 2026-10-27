@@ -472,7 +472,7 @@ check_ "POOL: the derived sharding pool goes through start.sh's 0008 mapping, on
   fol=$(grep "^FOLLOW=\"" "$here/../start.sh")
   die() { echo "DIE: $*"; exit 1; }; warn() { :; }; log() { :; }
   TP=2 CONTEXT=1048576 PARALLEL=4 ROUND_ROWS=16 HF_CACHE=/x/hf NFS_PATH=/x/hf POOL= KV_SHARD=1 SPILL_GIB=0
-  REPLAY_FLOOR=0 HF_HUB_OFFLINE=1 PREFILL_INTERLEAVE_MS=0 RDMA_IDLE_S=2 RDMA_NAP_US=500 DRAFTS=1 GRAPHS=1 SIDE=0 PREFETCH=0 ENGRAM_AIO=0
+  REPLAY_FLOOR=0 HF_HUB_OFFLINE=1 PREFILL_INTERLEAVE_MS=0 RDMA_IDLE_S=2 RDMA_NAP_US=500 DRAFTS=1 GRAPHS=1 GRAPH_CAP=128 SIDE=0 PREFETCH=0 ENGRAM_AIO=0
   source "$here/port.sh"; port_validate >/dev/null; port_map
   eval "$eng"; eval "$fol"
   all=$(printf "%s\n" "${ENGINE_ENV[@]}")
@@ -570,13 +570,16 @@ EOF
     awk 'p { print; p = 0 } /^\[dry-run\] rank [01] / { p = 1 }' "$G_T/$out.log" > "$G_T/$out"
     [[ "$(wc -l < "$G_T/$out" | tr -d ' ')" == 2 ]] || { echo "start.sh ($tree) printed no two docker commands:"; tail -5 "$G_T/$out.log"; return 1; }
   }
-  # gcmp <out> <pool or -> <token>...: <out> with every token (each must be there), the tf.recipe.port label and the
-  # container log's rotation (LOG_MAX_SIZE, issue #49; both ranks must carry it) removed,
+  # gcmp <out> <pool or -> <token>...: <out> with every token (each must be there), the tf.recipe.port label, the
+  # container log's rotation (LOG_MAX_SIZE, issue #49; both ranks must carry it) and the graph cap (0031: rank 1's
+  # --graph-cap, rank 0's TF_DS_GRAPH_CAP; both must carry it) removed,
   # and rank 1's --pool <pool> put back to --pool 1048576, equals the base's commands (GBASE: which base run, base.out)
+  gcap_sed='s/ (--graph-cap |-e TF_DS_GRAPH_CAP=)[0-9]+//'   # 0031's two tokens, which the base has not
   gcmp() {
     local out=$1 pool=$2 tok x b=${GBASE:-base.out}; shift 2
-    x=$(sed -E -e 's/ --label tf\.recipe\.port=[^ ]+//' -e 's/ --log-driver json-file --log-opt max-size=[^ ]+ --log-opt max-file=[^ ]+//' "$G_T/$out")
+    x=$(sed -E -e 's/ --label tf\.recipe\.port=[^ ]+//' -e 's/ --log-driver json-file --log-opt max-size=[^ ]+ --log-opt max-file=[^ ]+//' -e "$gcap_sed" "$G_T/$out")
     [[ "$(grep -c -- ' --label tf\.recipe\.port=' "$G_T/$out")" == 2 ]] || { echo "not both ranks carry tf.recipe.port"; return 1; }
+    [[ "$(sed -n 1p "$G_T/$out")" == *" --aio 1 --graph-cap 128 "* && "$(sed -n 2p "$G_T/$out")" == *" -e TF_DS_GRAPHS=1 -e TF_DS_GRAPH_CAP=128 "* ]] || { echo "not both ranks carry the graph cap (0031: --graph-cap, TF_DS_GRAPH_CAP)"; return 1; }
     [[ "$(grep -c -- ' --log-driver json-file --log-opt max-size=100m --log-opt max-file=3 ' "$G_T/$out")" == 2 ]] || { echo "not both ranks carry the container log's rotation (LOG_MAX_SIZE, #49)"; return 1; }
     for tok in "$@"; do
       [[ "$x" == *" $tok"* ]] || { echo "missing: $tok"; return 1; }
@@ -594,7 +597,15 @@ EOF
   check_ "golden: LOG_MAX_SIZE= (empty) leaves the daemon's log settings: no rotation flags (#49)" '
     grun port nolog.out SPILL_GIB=0 KV_SHARD=0 LOG_MAX_SIZE= || exit 1
     ! grep -q -- "--log-opt" "$G_T/nolog.out" || { echo "a rotation flag with LOG_MAX_SIZE empty"; exit 1; }
-    diff "$G_T/base.out" <(sed -E "s/ --label tf\.recipe\.port=[^ ]+//" "$G_T/nolog.out")'
+    diff "$G_T/base.out" <(sed -E -e "s/ --label tf\.recipe\.port=[^ ]+//" -e "$gcap_sed" "$G_T/nolog.out")'
+  check_ "golden: GRAPH_CAP=0 (keep every graph) reaches both ranks; a bad GRAPH_CAP refuses the start; a raw TF_DS_GRAPH_CAP export loses; GRAPHS=0 sends no --graph-cap (0031, #69)" '
+    grun port cap0.out SPILL_GIB=0 KV_SHARD=0 GRAPH_CAP=0 || exit 1
+    [[ "$(sed -n 1p "$G_T/cap0.out")" == *" --graph-cap 0 "* && "$(sed -n 2p "$G_T/cap0.out")" == *" -e TF_DS_GRAPH_CAP=0 "* ]] || { echo "GRAPH_CAP=0 is not on both ranks"; exit 1; }
+    ! grun port badcap.out GRAPH_CAP=-1 2>/dev/null && grep -q "GRAPH_CAP is a count" "$G_T/badcap.out.log" || { echo "GRAPH_CAP=-1 did not refuse the start"; exit 1; }
+    grun port rawcap.out SPILL_GIB=0 KV_SHARD=0 TF_DS_GRAPH_CAP=7 || exit 1
+    [[ "$(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")" == "TF_DS_GRAPH_CAP=128 " ]] || { echo "a raw TF_DS_GRAPH_CAP export reached a rank: $(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")"; exit 1; }
+    grun port nographs.out SPILL_GIB=0 KV_SHARD=0 GRAPHS=0 || exit 1
+    ! grep -q -- "--graph-cap" "$G_T/nographs.out" || { echo "rank 1 got --graph-cap with GRAPHS=0 (an image from before 0031 refuses it)"; exit 1; }'
   check_ "golden: a LOG_MAX_SIZE that is not a size refuses the start (#49)" '
     ! grun port badlog.out LOG_MAX_SIZE="100m;true" 2>/dev/null && grep -q "LOG_MAX_SIZE is a size" "$G_T/badlog.out.log"'
   check_ "golden: KV_SHARD=1 POOL=2101248 adds only its variables to $gbase's POOL=2101248 (0008: TF_DS_POOL, TF_DS_WINDOW, --pool)" '
