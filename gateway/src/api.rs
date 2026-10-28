@@ -123,8 +123,46 @@ struct Trace {
     prompt_tokens: usize,
 }
 
+/// The most JSON values a request body may hold. A parsed value takes 32 bytes or more whatever its text (a
+/// one-digit array element is 2 bytes on the wire), so a 64 MiB body of tiny values would parse into gigabytes.
+/// Real requests put their weight in strings (text, base64 images) and hold far fewer values: a conversation of ten
+/// thousand messages with tools is in the tens of thousands.
+pub const MAX_JSON_VALUES: usize = 1 << 20;
+
+/// An upper bound on the number of JSON values (object keys included) in `body`, from one pass over its bytes:
+/// every value but the first follows a `[`, `{`, `,` or `:` outside a string.
+pub fn json_values_upper_bound(body: &[u8]) -> usize {
+    let mut count = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'[' | b'{' | b',' | b':' => count += 1,
+                _ => {}
+            }
+        }
+    }
+    count
+}
+
 /// Read and validate the JSON body.
 fn parse_body(body: &Bytes) -> Result<Value, ApiError> {
+    let values = json_values_upper_bound(body);
+    if values > MAX_JSON_VALUES {
+        return Err(ApiError::bad_request(format!(
+            "the request body holds about {values} JSON values; this gateway takes at most {MAX_JSON_VALUES}"
+        )));
+    }
     let value: Value = serde_json::from_slice(body)
         .map_err(|error| ApiError::bad_request(format!("invalid JSON body: {error}")))?;
     if !value.is_object() {

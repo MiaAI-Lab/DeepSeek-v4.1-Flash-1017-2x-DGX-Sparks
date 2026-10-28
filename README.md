@@ -515,7 +515,9 @@ recipe's 1M-token context (three runs each, fresh process, the highest): 57 MiB 
 request with an 8 MiB prompt and 55 MiB of images 1,294 MiB; three of them at once 1,722 MiB (3,600 MiB before encodes
 took turns). An admitted request's body is read within `GATEWAY_BODY_TIMEOUT` (60 s; then 408, and the permit goes back)
 and up to 64 MiB: a larger `content-length` is a 413 before anything is read, a larger chunked body a 413 when it crosses
-the limit; it is copied frame by frame, so a body split into tiny chunks costs no more than its size. At most
+the limit; it is copied frame by frame into one buffer that never grows past 64 MiB, so a body split into tiny chunks
+costs no more than a whole one. A body of tiny JSON values is refused before it is parsed when it holds more than about
+a million of them (parsed, each takes 32 bytes or more). At most
 `GATEWAY_MAX_CONNECTIONS` (256) connections are open, `GATEWAY_MAX_CONNECTIONS_PER_PEER` (32) from one address (more
 are closed at once), and each has `GATEWAY_HEADER_TIMEOUT` (30 s) to send a request header, on a new connection and
 between keep-alive requests; the gateway speaks HTTP/1.1. Raising the concurrency adds about 200 MiB a request to the

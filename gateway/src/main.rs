@@ -133,6 +133,22 @@ fn load_api_keys(require_key: bool, path: Option<PathBuf>) -> Result<Option<ApiK
         .map_err(|error| format!("invalid API key file {}: {error}", path.display()))
 }
 
+/// `API_KEY` from the environment. Unset is off; any value that is not a clear on or off (empty, unknown, not text)
+/// is an error, since reading it as "off" would leave the API open.
+fn api_key_setting(value: Result<String, std::env::VarError>) -> Result<bool, String> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err("API_KEY is not valid text".to_string()),
+        Ok(value) => match value.as_str() {
+            "1" | "true" | "TRUE" | "yes" => Ok(true),
+            "0" | "false" | "FALSE" | "no" => Ok(false),
+            _ => Err(format!(
+                "API_KEY is 1 or 0 (true/false, yes/no), not {value:?}"
+            )),
+        },
+    }
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
@@ -186,13 +202,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .max_image_mb
         .or_else(|| env("GATEWAY_MAX_IMAGE_MB").and_then(|value| value.parse().ok()))
         .unwrap_or(64);
-    // An API_KEY that is neither on nor off is an error: read as "off", it would leave the API open.
-    let require_key = cli.require_key
-        || match env("API_KEY") {
-            None => false,
-            Some(value) => env_bool("API_KEY")
-                .ok_or_else(|| format!("API_KEY is 1 or 0 (true/false, yes/no), not {value:?}"))?,
-        };
+    let require_key = cli.require_key || api_key_setting(std::env::var("API_KEY"))?;
     let api_key_file = cli
         .api_key_file
         .or_else(|| env("API_KEY_FILE").map(PathBuf::from));
@@ -370,7 +380,24 @@ async fn auto_max_model_len(engine: &EngineClient) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, load_api_keys, parse_positive_usize};
+    use super::{
+        DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, api_key_setting, load_api_keys,
+        parse_positive_usize,
+    };
+
+    #[test]
+    fn api_key_is_on_off_or_an_error() {
+        use std::env::VarError;
+        assert_eq!(api_key_setting(Err(VarError::NotPresent)), Ok(false));
+        assert_eq!(api_key_setting(Ok("1".into())), Ok(true));
+        assert_eq!(api_key_setting(Ok("yes".into())), Ok(true));
+        assert_eq!(api_key_setting(Ok("0".into())), Ok(false));
+        for bad in ["", "enabled", "True", "2"] {
+            assert!(api_key_setting(Ok(bad.into())).is_err(), "{bad:?}");
+        }
+        let not_text = std::ffi::OsString::from("x");
+        assert!(api_key_setting(Err(VarError::NotUnicode(not_text))).is_err());
+    }
 
     #[test]
     fn the_default_image_token_is_the_served_spelling() {

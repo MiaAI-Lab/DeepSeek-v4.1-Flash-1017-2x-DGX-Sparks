@@ -798,6 +798,51 @@ async fn one_request_encodes_at_a_time() {
     assert_eq!(slot.available_permits(), 1, "the slot came back");
 }
 
+#[test]
+fn json_values_are_counted_outside_strings() {
+    use ds41_gateway::api::json_values_upper_bound;
+    // root object, key a, its value, key b, its array value, 1, 2, {}, key c, 3: ten values
+    assert_eq!(
+        json_values_upper_bound(br#"{"a":"x","b":[1,2,{"c":3}]}"#),
+        10
+    );
+    // structural characters and an escaped quote inside a string are not counted
+    assert_eq!(json_values_upper_bound(br#"{"a":"[,{:\",]"}"#), 3);
+    assert_eq!(json_values_upper_bound(b"[1,1,1,1]"), 5);
+}
+
+#[tokio::test]
+async fn a_body_of_too_many_json_values_is_refused_before_it_is_parsed() {
+    let (engine, mock) = spawn_mock(vec![usage(1, 0)], Duration::ZERO, true).await;
+    let url = spawn_gateway(&engine, gateway(), 1_000).await;
+    let many = format!(
+        r#"{{"model": "DeepSeek-V4.1-Flash-1017", "messages": [{{"role": "user", "content": "hi"}}], "x": [{}0]}}"#,
+        "0,".repeat(ds41_gateway::api::MAX_JSON_VALUES)
+    );
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(many)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("body");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("JSON values"), "{message}");
+    assert!(mock.body.lock().unwrap().is_none(), "engine was touched");
+    // Control: the same request without the array is parsed and reaches the engine.
+    let _ = post_json(
+        &format!("{url}/v1/chat/completions"),
+        json!({"model": "DeepSeek-V4.1-Flash-1017", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert!(
+        mock.body.lock().unwrap().is_some(),
+        "the control never reached the engine"
+    );
+}
+
 #[tokio::test]
 async fn length_finish_reason_is_preserved() {
     let gw = gateway();

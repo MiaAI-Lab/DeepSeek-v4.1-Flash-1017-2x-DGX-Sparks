@@ -163,6 +163,8 @@ enum BodyError {
 /// Copy the body's data frames into one buffer as they arrive, dropping each frame at
 /// once, so the memory is the buffer itself however finely the client splits the body
 /// (a collector that keeps every frame until the end would hold one allocation each).
+/// The buffer grows by doubling but never past `limit`; while it grows, the old and the
+/// new allocation can coexist for a moment, so the peak stays under twice the limit.
 async fn collect_within(body: Body, capacity: usize, limit: usize) -> Result<Bytes, BodyError> {
     use http_body_util::BodyExt;
     let mut body = body;
@@ -170,8 +172,13 @@ async fn collect_within(body: Body, capacity: usize, limit: usize) -> Result<Byt
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(BodyError::Read)?;
         if let Ok(data) = frame.into_data() {
-            if buffer.len() + data.len() > limit {
+            let needed = buffer.len() + data.len();
+            if needed > limit {
                 return Err(BodyError::TooLarge);
+            }
+            if needed > buffer.capacity() {
+                let target = needed.max(buffer.capacity().saturating_mul(2)).min(limit);
+                buffer.reserve_exact(target - buffer.len());
             }
             buffer.extend_from_slice(&data);
         }

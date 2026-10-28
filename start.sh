@@ -415,11 +415,12 @@ if (( DRY )); then
 fi
 log "Rank 0 here: ${SERVE[*]}"
 "${here[@]}" >/dev/null
-[[ "${FOREGROUND:-0}" != 1 ]] || foreground
+# FOREGROUND=1 attaches here, as on main; with the gateway it needs the engine up first, so it attaches after step 4
+[[ "${FOREGROUND:-0}" != 1 || "$API_GATEWAY" == 1 ]] || foreground
 
 # ---------------------------------------------------------------- 4. load
 API_URL=$URL
-if [[ "$API_GATEWAY" == 1 ]]; then URL="http://$API_HOST:$ENGINE_PORT"; fi
+if [[ "$API_GATEWAY" == 1 ]]; then URL="http://127.0.0.1:$ENGINE_PORT"; fi   # the engine is on loopback (SERVE_HOST)
 step 4 "Loading: ~98 GiB of weights on each Spark, then Engram and the caches (a few minutes)"
 docker logs -f "$CONTAINER_NAME" 2>&1 | sed -u "s/^/  ${D}│${R} /" &
 LOGS_PID=$!
@@ -451,6 +452,10 @@ if [[ "$API_GATEWAY" == 1 ]]; then
   done
   curl -sf --max-time 5 "$API_URL/health" >/dev/null 2>&1 || { gateway_dump_logs; fail "ds41-gateway did not become healthy"; }
   log "Gateway answered on $API_URL"
+  if [[ "${FOREGROUND:-0}" == 1 ]]; then
+    trap - EXIT                                        # foreground() removes the gateway itself when the ranks end
+    foreground
+  fi
 fi
 
 # ---------------------------------------------------------------- 5. smoke test

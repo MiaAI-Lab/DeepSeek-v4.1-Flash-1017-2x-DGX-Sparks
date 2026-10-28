@@ -54,10 +54,14 @@ only to be refused for its length. Each further admitted request adds about 200 
 
 The body of an admitted request is read by the same middleware, within `GATEWAY_BODY_TIMEOUT` (60 s): a client that has
 not sent its whole body by then gets a 408 and its permit goes back. A `content-length` over 64 MiB is a 413 before
-anything is read; a chunked body is a 413 when it crosses 64 MiB. Frames are copied into one buffer as they arrive, so a
-body split into tiny chunks costs no more than its size. Connections: `GATEWAY_MAX_CONNECTIONS` (256) open at most,
+anything is read; a chunked body is a 413 when it crosses 64 MiB. Frames are copied into one buffer as they arrive, and
+the buffer never grows past 64 MiB (while it grows, old and new allocations coexist for a moment, under 128 MiB), so a
+body split into tiny chunks costs no more than a whole one. A body holding more than 1,048,576 JSON values (counted in
+one pass over its bytes, object keys included) is a 400 before it is parsed: a parsed value takes 32 bytes or more, so a
+64 MiB body of one-digit array elements would otherwise parse into gigabytes. Real requests put their weight in strings
+and hold far fewer values. The parsed body is not cloned on the way to the encoder. Connections: `GATEWAY_MAX_CONNECTIONS` (256) open at most,
 `GATEWAY_MAX_CONNECTIONS_PER_PEER` (32) from one address (more are closed at once, so one client cannot take every
-slot), and `GATEWAY_HEADER_TIMEOUT` (30 s) for a request header, on a new connection and between keep-alive requests, so
+slot; behind a reverse proxy every client has the proxy's address, so raise it to `GATEWAY_MAX_CONNECTIONS` there), and `GATEWAY_HEADER_TIMEOUT` (30 s) for a request header, on a new connection and between keep-alive requests, so
 a silent, slow or idle connection gives its slot back. The gateway speaks HTTP/1.1.
 
 ## Fallback and strict mode

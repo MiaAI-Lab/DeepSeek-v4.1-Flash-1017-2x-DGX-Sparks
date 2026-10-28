@@ -180,7 +180,13 @@ pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
         object.insert("model".to_string(), json!(config.served_name));
     }
     inject_default_effort(&mut object, protocol, config.default_effort.as_deref());
-    let request: R = serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
+    // Deserialized from a reference, not a clone: the body's strings (images included) are not copied twice.
+    let value = Value::Object(object);
+    let parsed = R::deserialize(&value);
+    let Value::Object(object) = value else {
+        unreachable!("built as an object just above")
+    };
+    let request: R = parsed.map_err(|error| {
         let message = error.to_string();
         // The native chat route can infer a missing tool_call_id from the preceding
         // tool calls; preserve that engine behavior unless strict mode is enabled.
@@ -338,6 +344,15 @@ fn converted_model(object: &Map<String, Value>, served_name: &str) -> String {
 
 /// Chat fields that vLLM/DeepSeek clients send with today's meaning.  Returns a fallback
 /// reason for `chat_template_kwargs` keys the API cannot map.
+/// Every field `shim_chat` reads or writes.
+const SHIM_CHAT_FIELDS: [&str; 5] = [
+    "max_tokens",
+    "max_completion_tokens",
+    "chat_template_kwargs",
+    "thinking",
+    "reasoning_effort",
+];
+
 fn shim_chat(object: &mut Map<String, Value>) -> Option<String> {
     if object.get("max_tokens").is_none_or(Value::is_null)
         && let Some(max) = object.get("max_completion_tokens").cloned()
@@ -404,8 +419,16 @@ pub fn detect_fallback(
     };
     let mut reason = fallback_fields(object, protocol, engine_logprobs);
     if protocol == Protocol::Chat {
-        let mut object = object.clone();
-        reason = reason.or_else(|| shim_chat(&mut object));
+        // shim_chat reads and rewrites only these fields: copy them, not the whole body.
+        let mut fields: Map<String, Value> = SHIM_CHAT_FIELDS
+            .iter()
+            .filter_map(|key| {
+                object
+                    .get(*key)
+                    .map(|value| ((*key).to_string(), value.clone()))
+            })
+            .collect();
+        reason = reason.or_else(|| shim_chat(&mut fields));
     }
     reason
 }

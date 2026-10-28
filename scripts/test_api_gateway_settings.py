@@ -197,6 +197,22 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         result = self.run_start(API_GATEWAY=1, API_KEY=1)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_gateway_mode_waits_for_the_engine_on_loopback(self):
+        """The engine binds 127.0.0.1 in gateway mode, whatever HOST is: readiness and its smoke test go there."""
+        source = (ROOT / "start.sh").read_text()
+        self.assertIn('SERVE_HOST=127.0.0.1; SERVE_PORT=$ENGINE_PORT', source)
+        self.assertIn('if [[ "$API_GATEWAY" == 1 ]]; then URL="http://127.0.0.1:$ENGINE_PORT"; fi', source)
+        self.assertNotIn('URL="http://$API_HOST:$ENGINE_PORT"', source)
+
+    def test_foreground_with_the_gateway_attaches_after_the_gateway_is_up(self):
+        """FOREGROUND=1 used to attach right after the launch, so a gateway was never started."""
+        source = (ROOT / "start.sh").read_text()
+        early = source.index('[[ "${FOREGROUND:-0}" != 1 || "$API_GATEWAY" == 1 ]] || foreground')
+        answered = source.index('log "Gateway answered on $API_URL"')
+        late = source.index("    foreground\n", answered)
+        self.assertLess(early, answered)
+        self.assertLess(answered, late)
+
     def test_without_a_key_the_gateway_keeps_the_image_user(self):
         result = self.run_start(API_GATEWAY=1)
         self.assertEqual(result.returncode, 0, result.stderr)
