@@ -51,6 +51,7 @@ pass with `TF_DS_KV_SHARD=1` runs whole, the pair-broken monitor covers its piec
 `0030`-`0033` apply unchanged. Checked: every patch passes `git apply --check` in order on a clean `fbbc971` checkout;
 `zig build test` (engine host tests) and `zig/tests/server/zig_test.sh` (server) pass on x86_64 with Zig 0.17.0; the
 image of this series (with #59's token route, before `0030`-`0032` were added) built and served on a pair; the pull request has its measurements.
+| `0035-rendezvous-ports-early.patch` | `TF_DS_CONNECT_S` (both ranks; seconds, default 300) | **on** | rank 0 opens its follower's port before its weights load and takes the connection afterwards, so a worker that finishes loading first waits in the port's backlog instead of exiting with `ConnectFailed` once its 300 s retry window ends |
 
 With every switch unset, for requests without a `tool_choice` and for prompts shorter than 131,072 tokens, the engine behaves like the pinned one (the indexer split above that keeps the bits: a 399,516-token prompt's greedy reply has the same token hash) (`tools/exact.py` compares token hashes; bit-identity verified for 0001 and 0002 on the earlier pin; 0004 is checked by the same replay; the image of the current pin was not run on a pair). The mixed-pack loader is automatic: a rank cache without plain entries (every EXL3-only pack) takes the old path. Remove a patch from
 this folder to leave it out of the image; never run `scripts/prepare.sh` to rebuild with a partial cache.

@@ -538,7 +538,7 @@ check_ "start.sh: a container left over, running or exited, is stopped by stop.s
   rm "$t/here"; : > "$t/there"; exists_worker 1 || { echo "a container on the worker is not found"; exit 1; }
   launch=$(sed -n "/^if (( ! DRY )); then/,/^  memguard_start/p" "$here/../start.sh")
   [[ "$launch" == *"if exists_here || exists_worker 1; then ./stop.sh; fi"*"docker rm -f"* ]] || { echo "start.sh removes a container stop.sh has not seen"; exit 1; }
-  grep -q "^here=0; docker ps -a " "$here/../stop.sh" || { echo "stop.sh does not count an exited container here"; exit 1; }
+  grep -q "^if names=\$(docker ps -a --format" "$here/../stop.sh" || { echo "stop.sh does not count an exited container here"; exit 1; }
   for f in stop_here stop_worker; do
     body=$(sed -n "/^$f() {/,/^}/p" "$here/../stop.sh")
     [[ "$body" == *save_log*"docker rm -f"* ]] || { echo "stop.sh $f: no log saved before docker rm"; exit 1; }
@@ -652,6 +652,12 @@ EOF
     [[ "$(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")" == "TF_DS_GRAPH_CAP=128 " ]] || { echo "a raw TF_DS_GRAPH_CAP export reached a rank: $(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")"; exit 1; }
     grun port nographs.out SPILL_GIB=0 KV_SHARD=0 GRAPHS=0 || exit 1
     ! grep -q -- "--graph-cap" "$G_T/nographs.out" || { echo "rank 1 got --graph-cap with GRAPHS=0 (an image from before 0033 refuses it)"; exit 1; }'
+  check_ "golden: TF_DS_CONNECT_S reaches both ranks as given; a value that is not 1 to 86400 refuses the start (0035)" '
+    grun port conn.out SPILL_GIB=0 KV_SHARD=0 TF_DS_CONNECT_S=900 || exit 1
+    [[ "$(grep -c -- " -e TF_DS_CONNECT_S=900 " "$G_T/conn.out")" == 2 ]] || { echo "TF_DS_CONNECT_S is not on both ranks"; exit 1; }
+    for bad in 0 -1 abc 86401 "30;true"; do
+      ! grun port badconn.out TF_DS_CONNECT_S="$bad" 2>/dev/null && grep -q "TF_DS_CONNECT_S is a count of seconds" "$G_T/badconn.out.log" || { echo "TF_DS_CONNECT_S=$bad did not refuse the start"; exit 1; }
+    done'
   check_ "golden: a LOG_MAX_SIZE that is not a size refuses the start (#49)" '
     ! grun port badlog.out LOG_MAX_SIZE="100m;true" 2>/dev/null && grep -q "LOG_MAX_SIZE is a size" "$G_T/badlog.out.log"'
   check_ "golden: KV_SHARD=1 POOL=2101248 adds only its variables to $gbase's POOL=2101248 (0008: TF_DS_POOL, TF_DS_WINDOW, --pool)" '
