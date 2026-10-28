@@ -60,7 +60,9 @@ exact count.
 | three of those with 55 MiB of images each, at once | 882 MiB (856-908) |
 | a 64 MiB body of text, refused by the prompt limit before encoding | 441 MiB (441-441) |
 
-Three at once stay under the `3g` container default with room to spare. Without the token count, the 8 MiB prompt at
+These peaks are what the gateway holds to prepare a request: the measurement runs without an engine, so each request
+ends in a 400 or a 502 after its body, JSON, encode and images. Generation adds the reply as it streams, a few bytes a
+token. Three at once stay under the `3g` container default with room to spare. Without the token count, the 8 MiB prompt at
 one token a byte took 2,926 MiB (2,918-2,935) alone and 3,991 MiB (3,980-4,011) three at once with images, over the
 cap. Without the single encode slot the three ordinary prompts with images took 3,574 MiB (3,505-3,600), and before the
 prompt limit a 64 MiB body of text was encoded whole: 6,537 MiB and 26 s only to be refused for its length. Each
@@ -79,7 +81,9 @@ and hold far fewer values. The parsed body is not cloned on the way to the encod
 slot; behind a reverse proxy every client has the proxy's address, so raise it to `GATEWAY_MAX_CONNECTIONS` there), and `GATEWAY_HEADER_TIMEOUT` (30 s) for a request header, on a new connection and between keep-alive requests, so
 a silent, slow or idle connection gives its slot back. A reply that has not moved for `GATEWAY_WRITE_TIMEOUT` (60 s)
 because the client stopped reading it (the kernel's buffers are full) closes its connection, and the response's permit
-goes back with it. The gateway speaks HTTP/1.1.
+goes back with it. The time counts from the last write that went through, as nginx's `send_timeout` does: a client
+that keeps reading, however slowly, keeps its reply. Queued requests wait for admission without a deadline; each
+running one ends, or loses its client to these deadlines. The gateway speaks HTTP/1.1.
 
 ## Fallback and strict mode
 

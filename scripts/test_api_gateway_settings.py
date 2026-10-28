@@ -313,5 +313,62 @@ class ApiGatewaySettingsTest(unittest.TestCase):
                 self.assertIn(message, result.stderr)
 
 
+    def test_gateway_recover_starts_a_stopped_gateway_or_fails(self):
+        """gateway_recover (the already-running check and FOREGROUND's watcher): start a stopped gateway and wait for
+        its health; a removed gateway, one docker cannot start or one that never gets healthy is a failure."""
+        import tempfile
+
+        text = (ROOT / "start.sh").read_text()
+        function = re.search(r"^gateway_recover\(\) \{.*?^\}", text, re.S | re.M).group(0)
+        with tempfile.TemporaryDirectory(prefix="ds41-recover-") as tmp:
+            tmp = Path(tmp)
+            stubs = tmp / "bin"
+            stubs.mkdir()
+            calls = tmp / "calls"
+            bodies = {
+                "docker": f"""#!/usr/bin/env bash
+echo "docker $*" >> {calls}
+case "$1" in
+  inspect) [[ -e {tmp}/exists ]] ;;
+  start) [[ -e {tmp}/startable ]] ;;
+  *) exit 1 ;;
+esac
+""",
+                "curl": f"#!/usr/bin/env bash\necho curl >> {calls}\n[[ -e {tmp}/healthy ]]\n",
+                "sleep": "#!/usr/bin/env bash\nexit 0\n",
+            }
+            for name, body in bodies.items():
+                (stubs / name).write_text(body)
+                (stubs / name).chmod(0o755)
+
+            def recover(*flags):
+                for flag in ("exists", "startable", "healthy"):
+                    (tmp / flag).unlink(missing_ok=True)
+                for flag in flags:
+                    (tmp / flag).touch()
+                calls.write_text("")
+                result = subprocess.run(
+                    ["bash", "-c", function + "\ngateway_recover http://127.0.0.1:8888"],
+                    env={"PATH": f"{stubs}:/usr/bin:/bin"},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                return result.returncode, calls.read_text().splitlines()
+
+            code, seen = recover("exists", "startable", "healthy")
+            self.assertEqual(code, 0, seen)
+            self.assertIn("docker start ds41-gateway", seen)
+            code, seen = recover()
+            self.assertEqual(code, 1, seen)
+            self.assertNotIn("docker start ds41-gateway", seen)
+            code, seen = recover("exists")
+            self.assertEqual(code, 1, seen)
+            self.assertNotIn("curl", seen)
+            code, seen = recover("exists", "startable")
+            self.assertEqual(code, 1, seen)
+            self.assertEqual(seen.count("curl"), 30)
+
+
 if __name__ == "__main__":
     unittest.main()

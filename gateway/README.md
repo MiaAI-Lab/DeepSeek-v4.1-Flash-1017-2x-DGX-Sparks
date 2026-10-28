@@ -71,6 +71,10 @@ The defaults are in `scripts/config.sh`; the flags are in `src/main.rs`. The imp
 | `GATEWAY_MAX_PROMPT_MB` | `--max-prompt-mb` | 8 |
 | `API_KEY` | `--require-key` | 0 |
 
+A flag wins over its variable. An empty variable counts as unset; any other value a setting cannot take (a count that is
+not a positive integer, a boolean that is not 1/0, true/false or yes/no in any case) stops the gateway at startup
+instead of falling back to the default.
+
 With `API_KEY=1` the gateway loads the keys from `API_KEY_FILE` once at startup (one key, or `label: key`, a line;
 an empty or unreadable file stops it) and checks `Authorization: Bearer <key>` or `x-api-key: <key>` itself, in constant
 time, before reading the body, on every route except `GET /health`; a missing or wrong key is the API's 401. An

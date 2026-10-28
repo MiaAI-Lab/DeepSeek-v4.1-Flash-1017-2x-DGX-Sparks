@@ -62,18 +62,26 @@ struct MockState {
     body: Mutex<Option<Value>>,
     headers: Mutex<Option<HeaderMap>>,
     closed: AtomicBool,
-    events: Vec<Value>,
-    delay: Duration,
+    /// Each event after its own wait.
+    events: Vec<(Duration, Value)>,
     done: bool,
 }
 
 async fn spawn_mock(events: Vec<Value>, delay: Duration, done: bool) -> (String, Arc<MockState>) {
+    spawn_mock_timed(
+        events.into_iter().map(|event| (delay, event)).collect(),
+        done,
+    )
+    .await
+}
+
+/// [`spawn_mock`] with a wait of its own before each event.
+async fn spawn_mock_timed(events: Vec<(Duration, Value)>, done: bool) -> (String, Arc<MockState>) {
     let state = Arc::new(MockState {
         body: Mutex::new(None),
         headers: Mutex::new(None),
         closed: AtomicBool::new(false),
         events,
-        delay,
         done,
     });
     let handler = |State(state): State<Arc<MockState>>, headers: HeaderMap, body: Bytes| async move {
@@ -89,13 +97,13 @@ async fn spawn_mock(events: Vec<Value>, delay: Duration, done: bool) -> (String,
             watcher_state.closed.store(true, Ordering::SeqCst);
         });
         tokio::spawn(async move {
-            for event in &task_state.events {
+            for (wait, event) in &task_state.events {
                 tokio::select! {
                     _ = tx.closed() => {
                         task_state.closed.store(true, Ordering::SeqCst);
                         return;
                     }
-                    _ = tokio::time::sleep(task_state.delay) => {}
+                    _ = tokio::time::sleep(*wait) => {}
                 }
                 let line = format!("data: {event}\n\n");
                 if tx.send(Ok(Bytes::from(line))).await.is_err() {
@@ -1378,4 +1386,42 @@ async fn a_silent_engine_does_not_leave_the_stream_idle_for_more_than_15_seconds
             .iter()
             .any(|(name, _)| name.as_deref() == Some("message_stop"))
     );
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_mid_stream_closes_the_engine_stream() {
+    let gw = gateway();
+    let ids = text_ids(&gw, "Hola");
+    // Far more rounds than the gateway's channels hold, with no finish in sight.
+    let mut events = vec![(Duration::ZERO, usage(8, 0))];
+    for _ in 0..2_000 {
+        events.push((Duration::from_millis(5), tokens(&ids[..1], None)));
+    }
+    let (engine, mock) = spawn_mock_timed(events, true).await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+    let mut response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    // Control: the stream is flowing and the engine stream is open.
+    let _ = response.chunk().await.expect("a first chunk");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !mock.closed.load(Ordering::SeqCst),
+        "closed before the client left"
+    );
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !mock.closed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the gateway closed the engine stream after the client left");
 }

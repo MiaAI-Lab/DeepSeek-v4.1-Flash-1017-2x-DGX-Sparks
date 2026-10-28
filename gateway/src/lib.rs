@@ -324,7 +324,10 @@ impl Gateway {
 pub const COUNT_IN_PIECES_FROM: usize = 1024 * 1024;
 /// The largest piece [`Gateway::prompt_tokens_over`] encodes at once.
 pub const COUNT_PIECE_BYTES: usize = 256 * 1024;
-/// The tokens a cut anywhere else can add to or take from the count.
+/// The tokens a cut anywhere else is allowed to add to or take from the count. It is an allowance, not a proven bound
+/// (BPE on the two sides of a cut inside a word can differ from BPE on the whole by a few tokens), and it does not have
+/// to be one: the gateway refuses at twice the context, so a prompt that fits would be refused only by a count off by a
+/// whole context, and one admitted holds about twice the context at most, which the memory figures cover.
 pub const TOKENS_PER_CUT: usize = 64;
 
 /// How far back from a piece's largest end [`piece_end`] looks for an exact cut: a

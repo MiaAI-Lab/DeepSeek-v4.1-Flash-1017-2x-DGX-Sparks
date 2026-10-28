@@ -10,11 +10,14 @@
   constant-time and failures are API-shaped 401 responses. `GATEWAY_MAX_CONCURRENT` (default 3) queues excess requests
   instead of rejecting them, holding each permit through its response body/SSE. A rendered prompt over
   `GATEWAY_MAX_PROMPT_MB` (8) is a 400 before encoding, a prompt over 1 MiB is counted in pieces first and is a 400
-  when it holds more than twice the context, and one request encodes at a time, so three worst-case requests peak at
-  1.7 GiB under the `3g` container cap (measured; 3.6 GiB without the encode slot, 4.0 GiB at one token a byte without
-  the count). Bodies are read frame by frame within `GATEWAY_BODY_TIMEOUT` (60 s, then 408) and over 64 MiB are a 413;
+  when it holds more than twice the context, and one request encodes at a time, so preparing three of the largest
+  requests measured peaks at 1.7 GiB under the `3g` container cap (3.6 GiB without the encode slot, 4.0 GiB at one token
+  a byte without the count; generation itself was not part of the measurement). Bodies are read frame by frame within `GATEWAY_BODY_TIMEOUT` (60 s, then 408) and over 64 MiB are a 413;
   connections are capped (`GATEWAY_MAX_CONNECTIONS` 256, 32 a peer) and get `GATEWAY_HEADER_TIMEOUT` (30 s) for a
-  header, idle keep-alive included, and `GATEWAY_WRITE_TIMEOUT` (60 s) for a reply the client stopped reading.
+  header, idle keep-alive included, and `GATEWAY_WRITE_TIMEOUT` (60 s) for a reply the client stopped reading. A
+  stream whose first frame is slow keeps itself alive too, and a client that leaves mid-stream now closes the engine
+  stream instead of leaving two gateway tasks waiting on each other. Fallback reasons are logged escaped and cut to
+  200 characters.
   Invalid `GATEWAY_MAX_IMAGES`/`GATEWAY_MAX_IMAGE_MB` stop startup instead of falling back to the defaults, and
   `GATEWAY_MEMORY` must be over zero. The container drops all capabilities; with a key it runs as the key's owner and never as root. Image URLs
   are fetched by the gateway's own client: no proxies, every resolved address and every redirect target checked against

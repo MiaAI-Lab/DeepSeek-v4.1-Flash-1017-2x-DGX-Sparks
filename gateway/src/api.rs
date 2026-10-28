@@ -518,6 +518,11 @@ where
                 }
             }
         }
+        // Drop the protocol stream, and with it the receiver the engine task sends to: a
+        // task still sending (the client left mid-reply, or the processor stopped early)
+        // then sees the channel closed and ends, closing the engine stream, instead of
+        // waiting on a channel nobody reads while this task waits on it.
+        drop(protocol_stream);
         // Wait for the engine task to finish draining after the finish chunk, so a
         // late engine error is not masked by [DONE] or by a successful close.
         let _ = engine_task.await;
@@ -557,7 +562,8 @@ where
 
     // Wait for the first frame, but do not hold a long prefill: after two seconds the
     // headers go out and the stream continues.  A rejection before the first frame is
-    // still a normal HTTP error, not an error inside a 200 SSE stream.
+    // still a normal HTTP error, not an error inside a 200 SSE stream.  Every stream that
+    // goes out keeps itself alive with a comment every 15 s, the slow start included.
     let first = tokio::time::timeout(Duration::from_secs(2), frame_rx.recv()).await;
     let mut response = match first {
         Ok(Some(Ok(frame))) => {
@@ -573,9 +579,13 @@ where
             if let Some(error) = error_slot.lock().expect("error mutex poisoned").take() {
                 return Err(error);
             }
-            Sse::new(sse(frame_rx)).into_response()
+            Sse::new(sse(frame_rx))
+                .keep_alive(KeepAlive::default())
+                .into_response()
         }
-        Err(_) => Sse::new(sse(frame_rx)).into_response(),
+        Err(_) => Sse::new(sse(frame_rx))
+            .keep_alive(KeepAlive::default())
+            .into_response(),
     };
     response
         .headers_mut()
@@ -696,8 +706,9 @@ async fn fallback_response(
     started: Instant,
 ) -> Response {
     eprintln!(
-        "- {} camino=fallback motivo={reason} ms={}",
+        "- {} camino=fallback motivo={} ms={}",
         protocol.path(),
+        log_text(reason),
         started.elapsed().as_millis()
     );
     let path_and_query = uri
@@ -732,9 +743,27 @@ fn log_line(prepared: &Prepared, trace: &Trace, finish: Option<&str>, elapsed: D
 /// Log a render that falls back before conversion, without request content.
 fn log_render_fallback(protocol: Protocol, reason: &str) {
     eprintln!(
-        "- {} camino=fallback render motivo={reason}",
-        protocol.path()
+        "- {} camino=fallback render motivo={}",
+        protocol.path(),
+        log_text(reason)
     );
+}
+
+/// The longest piece of client text a log line carries.
+const LOG_TEXT_CHARS: usize = 200;
+
+/// Client-controlled text (a fallback reason can name a request field) as one bounded
+/// log line: control characters and quotes escaped, cut at [`LOG_TEXT_CHARS`].
+fn log_text(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .take(LOG_TEXT_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if text.chars().nth(LOG_TEXT_CHARS).is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 /// The render body when a request must go to the engine untouched.
@@ -799,7 +828,7 @@ pub async fn render_handler(
         prepared
             .max_tokens
             .map_or_else(|| "null".to_string(), |value| value.to_string()),
-        prepared.fallback_reason.as_deref().unwrap_or("none"),
+        log_text(prepared.fallback_reason.as_deref().unwrap_or("none")),
     );
     Ok(info)
 }
@@ -808,6 +837,20 @@ pub async fn render_handler(
 mod tests {
     use super::*;
     use crate::GatewaySettings;
+
+    #[test]
+    fn client_text_in_a_log_line_is_one_bounded_line() {
+        assert_eq!(
+            log_text("chat_template_kwargs field x"),
+            "chat_template_kwargs field x"
+        );
+        let forged = log_text("field a\n- /v1/messages camino=api forged=1\r");
+        assert!(!forged.contains('\n') && !forged.contains('\r'), "{forged}");
+        assert!(forged.contains("\\n"), "{forged}");
+        let long = log_text(&"k".repeat(10_000));
+        assert_eq!(long.len(), LOG_TEXT_CHARS + 3);
+        assert!(long.ends_with("..."));
+    }
     use deepseek_recipe::stream::InferenceTokenLogprob;
 
     fn test_gateway() -> Gateway {

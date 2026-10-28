@@ -166,8 +166,24 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    env(name).and_then(|value| parse_bool(&value))
+/// A boolean from the command line, else from `name` in the environment, else `default`. An empty variable is unset,
+/// as everywhere here; any other value that is not a clear on or off stops the gateway instead of being ignored.
+fn bool_setting(cli: Option<bool>, name: &str, default: bool) -> Result<bool, String> {
+    match cli {
+        Some(value) => Ok(value),
+        None => env_bool(name, std::env::var(name)).map(|value| value.unwrap_or(default)),
+    }
+}
+
+fn env_bool(name: &str, value: Result<String, std::env::VarError>) -> Result<Option<bool>, String> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid text")),
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) => parse_bool(&value).map(Some).ok_or_else(|| {
+            format!("{name} is 1 or 0 (true/false, yes/no, any case), not {value:?}")
+        }),
+    }
 }
 
 #[tokio::main]
@@ -189,20 +205,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .image_token
         .or_else(|| env("GATEWAY_IMAGE_TOKEN"))
         .unwrap_or_else(|| DEFAULT_IMAGE_TOKEN.to_string());
-    let default_thinking = cli
-        .default_thinking
-        .or_else(|| env_bool("THINKING"))
-        .unwrap_or(true);
+    let default_thinking = bool_setting(cli.default_thinking, "THINKING", true)?;
     let default_effort = cli.default_effort.or_else(|| env("REASONING_EFFORT"));
-    let strict = cli.strict || env_bool("GATEWAY_STRICT").unwrap_or(false);
-    let block_private_urls = cli
-        .block_private_urls
-        .or_else(|| env_bool("GATEWAY_BLOCK_PRIVATE_URLS"))
-        .unwrap_or(true);
-    let api_sampling = cli
-        .api_sampling
-        .or_else(|| env_bool("GATEWAY_API_SAMPLING"))
-        .unwrap_or(true);
+    let strict = cli.strict || bool_setting(None, "GATEWAY_STRICT", false)?;
+    let block_private_urls =
+        bool_setting(cli.block_private_urls, "GATEWAY_BLOCK_PRIVATE_URLS", true)?;
+    let api_sampling = bool_setting(cli.api_sampling, "GATEWAY_API_SAMPLING", true)?;
     let max_images = positive_setting(cli.max_images, "GATEWAY_MAX_IMAGES", DEFAULT_MAX_IMAGES)?;
     let max_image_mb = positive_setting(
         cli.max_image_mb,
@@ -318,8 +326,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// A positive count from the command line, else from `name` in the environment, else `default`.
+/// An empty variable is unset, as everywhere here; one that is not text is an error, not the default.
 fn positive_setting(cli: Option<usize>, name: &str, default: usize) -> Result<usize, String> {
-    count_setting(cli, name, env(name), default)
+    if cli.is_some() {
+        return count_setting(cli, name, None, default);
+    }
+    let value = match std::env::var(name) {
+        Ok(value) => Some(value).filter(|value| !value.is_empty()),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(format!("{name} is not valid text")),
+    };
+    count_setting(cli, name, value, default)
 }
 
 /// [`positive_setting`] with the variable's value given: an invalid one is an error, never the default.
@@ -404,8 +421,8 @@ async fn auto_max_model_len(engine: &EngineClient) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, api_key_setting, count_setting, load_api_keys,
-        parse_bool, parse_positive_usize,
+        DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, api_key_setting, count_setting, env_bool,
+        load_api_keys, parse_bool, parse_positive_usize,
     };
 
     #[test]
@@ -461,6 +478,22 @@ mod tests {
         assert_eq!(parse_positive_usize("4"), Ok(4));
         assert!(parse_positive_usize("0").is_err());
         assert!(parse_positive_usize("not-a-number").is_err());
+    }
+
+    #[test]
+    fn a_boolean_setting_that_is_not_on_or_off_stops_startup() {
+        use std::env::VarError;
+        let name = "GATEWAY_STRICT";
+        assert_eq!(env_bool(name, Err(VarError::NotPresent)), Ok(None));
+        assert_eq!(env_bool(name, Ok(String::new())), Ok(None));
+        assert_eq!(env_bool(name, Ok("YES".into())), Ok(Some(true)));
+        assert_eq!(env_bool(name, Ok("0".into())), Ok(Some(false)));
+        for bad in ["on", "typo", "2"] {
+            let error = env_bool(name, Ok(bad.into())).expect_err(bad);
+            assert!(error.starts_with("GATEWAY_STRICT is 1 or 0"), "{error}");
+        }
+        let not_text = std::ffi::OsString::from("x");
+        assert!(env_bool(name, Err(VarError::NotUnicode(not_text))).is_err());
     }
 
     #[test]

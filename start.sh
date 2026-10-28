@@ -149,6 +149,7 @@ flock -n 8 || die "another ./start.sh is already running; wait for it to finish"
 (( DRY )) && log "DRY_RUN=1: printing the docker commands; nothing is stopped, started or prepared"
 
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
+[[ "$API_HOST" != *:* ]] || API_HOST="[$API_HOST]"   # an IPv6 address goes in brackets in a URL
 URL="http://$API_HOST:$PORT"
 running_here()   { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
 running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
@@ -156,6 +157,23 @@ running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CO
 exists_here()    { docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
 exists_worker()  { worker "$1" docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
 running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>/dev/null)" == true ]]; }
+# Remove ds41-gateway after saving its log (FOREGROUND's stops: a gateway that exited keeps its last words).
+gateway_remove_keeping_log() {
+  save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP" >/dev/null 2>&1 || true
+  docker rm -f ds41-gateway >/dev/null 2>&1 || true
+}
+# Start a stopped ds41-gateway again (its on-failure restarts used up) and wait for $1/health; a removed one cannot be
+# rebuilt from here, and one that does not come up within 30 s is a failure.
+gateway_recover() {
+  local i
+  docker inspect ds41-gateway >/dev/null 2>&1 || return 1
+  docker start ds41-gateway >/dev/null 2>&1 || return 1
+  for i in $(seq 1 30); do
+    curl -sf --max-time 3 "$1/health" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
 if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; then
   # Preparation may have run separately while the old server stayed up: inspect the live ranks too.
   live_head=$(docker inspect -f '{{index .Config.Labels "tf.recipe.ablit"}}' "$CONTAINER_NAME")
@@ -175,6 +193,10 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; th
     die "the running ranks use other spill / KV-shard / pool settings ($live_head, asked: $(port_identity)); run ./start.sh restart"
   [[ "$(prepared_state 2>/dev/null)" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
     die "the requested configuration differs from the prepared server; run ./start.sh restart with the same settings (including ABLIT)"
+  if [[ "$API_GATEWAY" == 1 ]] && ! running_gateway; then
+    gateway_recover "$URL" || die "the ranks are running but ds41-gateway is not, and it could not be started again: run ./start.sh restart"
+    log "ds41-gateway was not running: started it again on $HOST:$PORT"
+  fi
   log "$CONTAINER_NAME is already running on both Sparks (port $PORT): nothing to do. ./start.sh restart restarts it, ./stop.sh stops it."
   exit 0
 fi
@@ -265,23 +287,31 @@ fi
 # SIGTERM run ./stop.sh. Note the supervisor restarts a start that was killed by memguard too; give it a RestartSec.
 # (From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's start.sh, for the one worker here.)
 foreground() {
-  local watch w code gw_warned=0
+  local watch w code
   trap './stop.sh; exit 130' INT TERM
   ( exec 8>&-                                        # not holding start.sh's lock once start.sh has exited
     while sleep 30; do
       if ! running_here; then
-        [[ "$API_GATEWAY" != 1 ]] || docker rm -f ds41-gateway >/dev/null 2>&1 || true
+        [[ "$API_GATEWAY" != 1 ]] || gateway_remove_keeping_log
         exit 0
       fi
+      # The gateway is the public API: one that exited is started again, and if that fails the server stops with a
+      # failure, so that the supervisor restarts the whole of it instead of leaving it up without its API.
       if [[ "$API_GATEWAY" == 1 ]] && ! running_gateway; then
-        (( gw_warned )) || warn "ds41-gateway exited: the engine's native API stays on 127.0.0.1:$ENGINE_PORT"
-        gw_warned=1
+        if gateway_recover "$API_URL"; then
+          warn "ds41-gateway had exited: started it again"
+        else
+          warn "ds41-gateway exited and could not be started again: stopping the server"
+          docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
+          gateway_remove_keeping_log
+          exit 1
+        fi
       fi
       worker 1 true 2>/dev/null || continue         # a worker out of reach for a moment says nothing about its rank
       running_worker 1 && continue
       warn "rank 1 on $(worker_host 1) exited: stopping rank 0"
       docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
-      [[ "$API_GATEWAY" != 1 ]] || docker rm -f ds41-gateway >/dev/null 2>&1 || true
+      [[ "$API_GATEWAY" != 1 ]] || gateway_remove_keeping_log
       exit 1
     done ) &
   watch=$!
@@ -291,7 +321,7 @@ foreground() {
   code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
   [[ "$w" != 1 || "$code" != 0 ]] || code=1         # the worker's rank failed, even if rank 0 then shut down cleanly
   worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
-  [[ "$API_GATEWAY" != 1 ]] || docker rm -f ds41-gateway >/dev/null 2>&1 || true
+  [[ "$API_GATEWAY" != 1 ]] || gateway_remove_keeping_log
   exit "$code"
 }
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)

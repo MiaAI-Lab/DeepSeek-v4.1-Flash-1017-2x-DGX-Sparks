@@ -26,10 +26,14 @@ request's thinking and effort instead of false/null. A streamed token reply
 gets the text routes' keep-alive: TokenSink has a ping, the SSE writer sends
 ": ping" after ping_after_ns of silence (a long cold prefill, when the route is
 used without the gateway), and the silence is counted from the submit.
+The route's refusals name the field instead of printing "{s}"; continuous
+usage carries the prompt's cached tokens once the engine reports them; a
+failed allocation is a 500 (or an error event in a stream) instead of a closed
+connection.
 zig fmt applied.
 
 Checked with Zig 0.17.0 on x86_64, CPU-only harness (zig/tests/server):
-build.sh builds fake_serve and tensorfold-native; zig_test.sh 117/117 and 90/90;
+build.sh builds fake_serve and tensorfold-native; zig_test.sh 119/119 and 90/90;
 token_route_smoke.py against fake_serve 34/35, the same as before the rebase
 (logprobs content fails on both with the fake engine).
 ---
@@ -43,13 +47,13 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  zig/src/core/lanes/stream.zig            |   27 +
  zig/src/core/prompt_cache_media_test.zig |    1 +
  zig/src/families/dsv41/lanes.zig         |   43 +-
- zig/src/families/dsv41/sampling.zig      |  150 ++++
+ zig/src/families/dsv41/sampling.zig      |  150 +++
  zig/src/families/dsv41/text.zig          |   27 +-
  zig/src/native/cuda.zig                  |   12 +-
  zig/src/server/auth.zig                  |    1 +
- zig/src/server/chat.zig                  |  658 ++++++++++++--
- zig/src/server/generate.zig              |  630 +++++++++++++
- zig/src/server/generate_test.zig         | 1045 ++++++++++++++++++++++
+ zig/src/server/chat.zig                  |  661 +++++++++++--
+ zig/src/server/generate.zig              |  654 +++++++++++++
+ zig/src/server/generate_test.zig         | 1098 ++++++++++++++++++++++
  zig/src/server/metrics.zig               |   29 +
  zig/src/server/prompt.zig                |   25 +-
  zig/src/server/prompt_test.zig           |  144 +++
@@ -64,8 +68,8 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  zig/tests/server/fake_engine.zig         |   32 +-
  zig/tests/server/fake_serve.zig          |    2 +-
  zig/tests/server/fixtures/scripts.json   |   92 +-
- zig/tests/server/token_route_smoke.py    |  207 +++++
- 32 files changed, 3290 insertions(+), 105 deletions(-)
+ zig/tests/server/token_route_smoke.py    |  207 ++++
+ 32 files changed, 3370 insertions(+), 105 deletions(-)
  create mode 100644 zig/src/server/generate.zig
  create mode 100644 zig/src/server/generate_test.zig
  create mode 100644 zig/src/server/prompt_test.zig
@@ -798,7 +802,7 @@ index 475ae2af..bd6fc2c6 100644
      if (std.mem.startsWith(u8, path, "/responses/")) return true;
      for ([_][]const u8{ "/chat/completions", "/completions", "/decisions", "/models" }) |end| if (std.mem.endsWith(u8, path, end)) return true;
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 69cd0ded..01816570 100644
+index 69cd0ded..4f685653 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
 @@ -11,6 +11,7 @@ const prompt_mod = @import("prompt.zig");
@@ -826,7 +830,7 @@ index 69cd0ded..01816570 100644
  };
  
  /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
-@@ -44,8 +55,37 @@ pub const Sink = struct {
+@@ -44,8 +55,39 @@ pub const Sink = struct {
      ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
  };
  
@@ -849,6 +853,8 @@ index 69cd0ded..01816570 100644
 +    scored: ?*const fn (ctx: *anyopaque, logprobs: []const api.Logprob) error{Closed}!void = null,
 +    /// A keep-alive while the reply is silent (a long cold prefill), as the text sinks have.
 +    ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
++    /// The prompt's cached tokens, given before each round once the engine has reported them.
++    cached: ?*const fn (ctx: *anyopaque, cached: u32) void = null,
 +};
 +
 +/// What ``generateTokens`` returns: the whole reply's ids and the stats the token route puts in its JSON.
@@ -866,7 +872,7 @@ index 69cd0ded..01816570 100644
  
  pub const Reply = struct {
      content: []const u8,
-@@ -63,6 +103,20 @@ pub const Reply = struct {
+@@ -63,6 +105,20 @@ pub const Reply = struct {
  
  pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
  
@@ -887,7 +893,7 @@ index 69cd0ded..01816570 100644
  /// Events the engine thread hands this request, read by the request's own thread.
  const Mailbox = struct {
      io: std.Io,
-@@ -71,8 +125,14 @@ const Mailbox = struct {
+@@ -71,8 +127,14 @@ const Mailbox = struct {
      cond: std.Io.Condition = .init,
      tokens: std.ArrayList(u32) = .empty,
      chunks: std.ArrayList(usize) = .empty, // where each round's tokens end
@@ -902,7 +908,7 @@ index 69cd0ded..01816570 100644
      finished: bool = false,
      reason: api.Reason = .stop,
      stats: api.Stats = .{},
-@@ -91,10 +151,56 @@ const Mailbox = struct {
+@@ -91,10 +153,56 @@ const Mailbox = struct {
                  m.prefilled_ns = std.Io.Clock.awake.now(m.io).toNanoseconds();
              },
              .tokens => |t| {
@@ -961,7 +967,7 @@ index 69cd0ded..01816570 100644
                  m.finished = true;
                  m.reason = f.reason;
                  m.stats = f.stats;
-@@ -110,6 +216,9 @@ const Mailbox = struct {
+@@ -110,6 +218,9 @@ const Mailbox = struct {
      fn deinit(m: *Mailbox) void {
          m.tokens.deinit(m.gpa);
          m.chunks.deinit(m.gpa);
@@ -971,7 +977,7 @@ index 69cd0ded..01816570 100644
          m.gpa.free(m.widths);
          m.gpa.free(m.raised);
          m.gpa.free(m.telemetry);
-@@ -138,6 +247,7 @@ pub const Prepared = struct {
+@@ -138,6 +249,7 @@ pub const Prepared = struct {
      sampled: bool, // a sampling config, which the reply labels "exact"; greedy otherwise
      drafts: bool,
      stops: fields_mod.Stops,
@@ -979,7 +985,7 @@ index 69cd0ded..01816570 100644
      preparing: bool,
  };
  
-@@ -156,14 +266,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -156,14 +268,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
      if (preparing) _ = srv.preparing.fetchAdd(1, .acq_rel);
      errdefer release(srv, preparing);
      if (gone.check()) return error.Cancelled;
@@ -997,7 +1003,7 @@ index 69cd0ded..01816570 100644
      if (gone.check()) return error.Cancelled;
      if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
      const window: i64 = srv.info.context_window;
-@@ -174,14 +284,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -174,14 +286,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
          if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
          limit = @min(limit, room);
      }
@@ -1017,7 +1023,7 @@ index 69cd0ded..01816570 100644
      var request: api.Request = .{
          .prompt = rendered.ids,
          .images = rendered.images,
-@@ -189,13 +299,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -189,13 +301,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
          .cache_media = rendered.media,
          .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
          .sampling = sampling,
@@ -1035,7 +1041,7 @@ index 69cd0ded..01816570 100644
          .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
      };
      try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
-@@ -209,7 +320,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -209,7 +322,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
              request.think_end = srv.think_close_end;
          }
      }
@@ -1044,7 +1050,7 @@ index 69cd0ded..01816570 100644
  }
  
  /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
-@@ -260,6 +371,63 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+@@ -260,6 +373,63 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
      return result;
  }
  
@@ -1108,7 +1114,7 @@ index 69cd0ded..01816570 100644
  /// The ``ended`` line of a submitted reply that ends without one: its client left, or it failed.
  fn logEnded(id: []const u8, e: Failure, message: []const u8, prompt: usize, tokens: usize, after: f64) void {
      const why: ?[]const u8 = switch (e) {
-@@ -323,6 +491,9 @@ const Shown = struct {
+@@ -323,6 +493,9 @@ const Shown = struct {
  };
  
  /// The token loop and the text it streams.
@@ -1118,7 +1124,7 @@ index 69cd0ded..01816570 100644
  const Generation = struct {
      last_out_ns: i96 = 0, // the last byte a streaming sink heard; a ping goes out after ping_after_ns of silence
      srv: *Server,
-@@ -331,6 +502,16 @@ const Generation = struct {
+@@ -331,6 +504,16 @@ const Generation = struct {
      id: api.Id,
      reply_id: []const u8, // the id the client gets, which the done line prints
      sink: ?Sink,
@@ -1135,7 +1141,7 @@ index 69cd0ded..01816570 100644
      thinking: bool,
      stops: reply_text.Stops,
      ignore_eos: bool,
-@@ -338,6 +519,8 @@ const Generation = struct {
+@@ -338,6 +521,8 @@ const Generation = struct {
      tools: []const Value,
      calls: ?tool_stream.Streamer = null,
      collected: std.ArrayList(u32) = .empty,
@@ -1144,7 +1150,7 @@ index 69cd0ded..01816570 100644
      token_ids: bool = false, // the request asked for its ids back (Input.token_ids)
      visible: reply_text.Incremental = .{},
      hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
-@@ -347,6 +530,7 @@ const Generation = struct {
+@@ -347,6 +532,7 @@ const Generation = struct {
      first_ns: ?i96 = null,
      last_ns: ?i96 = null,
      reason: ?[]const u8 = null, // the server ended the reply (a stop string, the length) before the engine said so
@@ -1152,7 +1158,7 @@ index 69cd0ded..01816570 100644
      engine_done: bool = false,
      consumed: usize = 0,
      chunk_index: usize = 0,
-@@ -355,6 +539,10 @@ const Generation = struct {
+@@ -355,6 +541,10 @@ const Generation = struct {
          return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
      }
  
@@ -1163,7 +1169,7 @@ index 69cd0ded..01816570 100644
      /// What closes a call the model's end token left open (``tool_parse.closeCall``); nothing when a stop string, the length or ``ignore_eos`` ended the reply instead.
      fn closeCall(g: *const Generation, text: []const u8) Allocator.Error![]const u8 {
          const t = g.collected.items;
-@@ -364,16 +552,22 @@ const Generation = struct {
+@@ -364,16 +554,22 @@ const Generation = struct {
  
      /// The engine's stop check, here: the newest tokens' text holds a stop string.
      fn stopHit(g: *Generation) Allocator.Error!bool {
@@ -1190,7 +1196,7 @@ index 69cd0ded..01816570 100644
          var landed: usize = 0;
          for (chunk) |t| {
              if (g.reason != null) break;
-@@ -428,6 +622,92 @@ const Generation = struct {
+@@ -428,6 +624,92 @@ const Generation = struct {
          }
      }
  
@@ -1283,7 +1289,7 @@ index 69cd0ded..01816570 100644
      fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
          sink.call(sink.ctx, delta) catch {
              g.cancel();
-@@ -457,20 +737,47 @@ const Generation = struct {
+@@ -457,20 +739,47 @@ const Generation = struct {
          while (true) {
              m.mutex.lockUncancelable(m.io);
              var chunk: ?[]u32 = null;
@@ -1334,7 +1340,7 @@ index 69cd0ded..01816570 100644
                  return;
              }
              if (gone.check()) {
-@@ -478,10 +785,12 @@ const Generation = struct {
+@@ -478,10 +787,12 @@ const Generation = struct {
                  return error.Cancelled;
              }
              const tokens = chunk orelse {
@@ -1349,11 +1355,12 @@ index 69cd0ded..01816570 100644
                              g.cancel();
                              return error.Cancelled;
                          };
-@@ -490,54 +799,16 @@ const Generation = struct {
+@@ -490,54 +801,17 @@ const Generation = struct {
                  };
                  continue;
              };
 -            if (g.reason == null) try g.commit(tokens);
++            if (g.token_sink) |ts| if (ts.cached) |set| if (cached) |c| set(ts.ctx, c);
 +            if (g.reason == null) try g.commit(tokens, scored);
              g.last_out_ns = nowNs(g.srv.io);
          }
@@ -1407,7 +1414,7 @@ index 69cd0ded..01816570 100644
          const prefilled = m.prefilled_ns;
          const total = seconds(finished_ns - submitted);
          const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
-@@ -571,6 +842,13 @@ const Generation = struct {
+@@ -571,6 +845,13 @@ const Generation = struct {
              try loop_field.put(a, "period", try json.intValue(a, period));
              try runtime.put(a, "loop", .{ .object = loop_field });
          }
@@ -1421,7 +1428,7 @@ index 69cd0ded..01816570 100644
          const s = m.stats;
          const spec = try json.newObject(a);
          try spec.put(a, "rounds", try json.intValue(a, s.rounds));
-@@ -579,6 +857,53 @@ const Generation = struct {
+@@ -579,6 +860,53 @@ const Generation = struct {
          try spec.put(a, "acceptance_rate", .{ .float = if (s.drafted > 0) @as(f64, @floatFromInt(s.accepted)) / @as(f64, @floatFromInt(s.drafted)) else 0 });
          try spec.put(a, "tokens_per_round", .{ .float = if (s.rounds > 0) @as(f64, @floatFromInt(g.collected.items.len)) / @as(f64, @floatFromInt(s.rounds)) else 0 });
          if (m.telemetry.len > 0) if ((try json.parse(a, m.telemetry)) == .ok) try spec.put(a, "proposer", (try json.parse(a, m.telemetry)).ok);
@@ -1475,7 +1482,7 @@ index 69cd0ded..01816570 100644
          const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
          const reply: Reply = .{
              .content = content,
-@@ -590,16 +915,49 @@ const Generation = struct {
+@@ -590,16 +918,49 @@ const Generation = struct {
              .cached_tokens = m.cached orelse 0,
              .completion_tokens = g.collected.items.len,
              .reasoning_tokens = reply_text.reasoningCount(g.collected.items, think_end),
@@ -1529,7 +1536,7 @@ index 69cd0ded..01816570 100644
  };
  
  /// The request's stop strings as the engine checks them after each token: the newest tokens' text holds one.
-@@ -644,3 +1002,163 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
+@@ -644,3 +1005,163 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
      @memcpy(&out, &hex);
      return out;
  }
@@ -1695,10 +1702,10 @@ index 69cd0ded..01816570 100644
 +}
 diff --git a/zig/src/server/generate.zig b/zig/src/server/generate.zig
 new file mode 100644
-index 00000000..463761cb
+index 00000000..da8a6f17
 --- /dev/null
 +++ b/zig/src/server/generate.zig
-@@ -0,0 +1,630 @@
+@@ -0,0 +1,654 @@
 +//! POST /inference/v1/generate: vLLM's token-in/token-out route, behind TENSORFOLD_TOKEN_ROUTE.
 +const std = @import("std");
 +const api = @import("engine_api");
@@ -1728,6 +1735,12 @@ index 00000000..463761cb
 +    return error.Reject;
 +}
 +
++/// ``fail`` for one field: its name goes into the message (``{s}``) and is the param.
++fn failField(cx: *Reject, comptime message: []const u8, name: []const u8) error{Reject} {
++    const text = std.fmt.allocPrint(cx.a, message, .{name}) catch "invalid request field";
++    return fail(cx, text, name, null);
++}
++
 +fn isInt(v: Value) ?i64 {
 +    return v.int64();
 +}
@@ -1738,13 +1751,13 @@ index 00000000..463761cb
 +
 +fn flag(cx: *Reject, body: Value, name: []const u8) !bool {
 +    const v = body.get(name) orelse return false;
-+    if (v != .bool) return fail(cx, "{s} must be a boolean", name, null);
++    if (v != .bool) return failField(cx, "{s} must be a boolean", name);
 +    return v.bool;
 +}
 +
 +fn intField(cx: *Reject, body: Value, name: []const u8, required: bool) !?i64 {
-+    const v = body.get(name) orelse return if (required) fail(cx, "{s} is required", name, null) else null;
-+    const n = isInt(v) orelse return fail(cx, "{s} must be an integer", name, null);
++    const v = body.get(name) orelse return if (required) failField(cx, "{s} is required", name) else null;
++    const n = isInt(v) orelse return failField(cx, "{s} must be an integer", name);
 +    return n;
 +}
 +
@@ -1825,7 +1838,7 @@ index 00000000..463761cb
 +        if (v != .string or !std.mem.eql(u8, v.string, "tokens")) return fail(reject, "output_mode must be \"tokens\"", "output_mode", null);
 +    }
 +    for ([_][]const u8{ "features", "parse_context", "kv_transfer_params", "ec_transfer_params", "cache_salt" }) |name| {
-+        if (body.get(name)) |v| if (v != .null) return fail(reject, "{s} is not supported by this endpoint", name, null);
++        if (body.get(name)) |v| if (v != .null) return failField(reject, "{s} is not supported by this endpoint", name);
 +    }
 +    for ([_][]const u8{ "repetition_penalty", "presence_penalty", "frequency_penalty", "min_tokens", "logit_bias", "bad_words", "allowed_token_ids", "prompt_logprobs" }) |name| {
 +        if (sampling.get(name)) |v| {
@@ -1836,7 +1849,7 @@ index 00000000..463761cb
 +                const f = v.float;
 +                break :blk if (std.mem.eql(u8, name, "repetition_penalty")) f == 1 else f == 0;
 +            } else if (v == .array) v.array.len == 0 else if (v == .object) v.object.count() == 0 else false;
-+            if (!neutral) return fail(reject, "{s} is not supported by this model", name, null);
++            if (!neutral) return failField(reject, "{s} is not supported by this model", name);
 +        }
 +    }
 +    const logprobs: ?i64 = if (sampling.get("logprobs")) |v| blk: {
@@ -2007,6 +2020,13 @@ index 00000000..463761cb
 +    }
 +};
 +
++/// A failed allocation before any reply went out: the client gets a 500 (best effort, it allocates too), not a closed
++/// connection.
++fn outOfMemory(conn: *Conn, a: Allocator) []const u8 {
++    sendError(conn, a, .{ .a = a, .status = 500, .typ = "server_error", .message = "out of memory" });
++    return "failed";
++}
++
 +fn sendValue(conn: *Conn, a: Allocator, code: u16, payload: Value) void {
 +    const body = json.stringify(a, payload, .{}) catch return;
 +    conn.sendJson(code, body);
@@ -2092,13 +2112,13 @@ index 00000000..463761cb
 +        .images = req.images,
 +    };
 +    const prepared = chat.prepare(srv, &cx, input, gone) catch |e| {
-+        if (e == error.OutOfMemory) return "failed";
++        if (e == error.OutOfMemory) return outOfMemory(conn, a);
 +        if (e == error.Cancelled) return "cancelled";
 +        sendError(conn, a, .{ .a = a, .status = cx.status(), .message = cx.message, .param = if (cx.kind == .context_length) "token_ids" else null, .code = if (cx.kind == .context_length) "context_length_exceeded" else null });
 +        return "refused";
 +    };
 +    const reply = chat.generateTokens(srv, &cx, prepared, null, gone) catch |e| {
-+        if (e == error.OutOfMemory) return "failed";
++        if (e == error.OutOfMemory) return outOfMemory(conn, a);
 +        sendError(conn, a, .{ .a = a, .status = cx.status(), .message = cx.message, .param = null, .code = null });
 +        return if (e == error.Cancelled) "cancelled" else "failed";
 +    };
@@ -2152,9 +2172,16 @@ index 00000000..463761cb
 +    pending_stop: ?chat.TokenStop = null,
 +    tokens_sent: bool = false,
 +    failed: bool = false,
++    cached: u32 = 0,
 +
 +    fn sink(s: *Stream) chat.TokenSink {
-+        return .{ .ctx = s, .call = call, .ready = ready, .scored = scored, .ping = ping };
++        return .{ .ctx = s, .call = call, .ready = ready, .scored = scored, .ping = ping, .cached = setCached };
++    }
++
++    /// The prompt's cached tokens, once the engine has reported them: the rounds' continuous usage carries them.
++    fn setCached(ctx: *anyopaque, cached: u32) void {
++        const s: *Stream = @ptrCast(@alignCast(ctx));
++        s.cached = cached;
 +    }
 +
 +    /// An SSE comment, as the text routes send: a client or proxy sees bytes during a long cold prefill.
@@ -2218,7 +2245,7 @@ index 00000000..463761cb
 +            s.tokens_sent = true;
 +        }
 +        s.sent += tokens.len;
-+        if (s.continuous) o.put(s.a, "usage", usageObject(s.a, s.prompt_tokens, s.sent, 0) catch return error.Closed) catch return error.Closed;
++        if (s.continuous) o.put(s.a, "usage", usageObject(s.a, s.prompt_tokens, s.sent, s.cached) catch return error.Closed) catch return error.Closed;
 +        return sse.data(s.conn, s.a, .{ .object = o });
 +    }
 +
@@ -2267,7 +2294,7 @@ index 00000000..463761cb
 +        .images = req.images,
 +    };
 +    const prepared = chat.prepare(srv, &cx, input, gone) catch |e| {
-+        if (e == error.OutOfMemory) return "failed";
++        if (e == error.OutOfMemory) return outOfMemory(conn, a);
 +        if (e == error.Cancelled) return "cancelled";
 +        sendError(conn, a, .{ .a = a, .status = cx.status(), .message = cx.message, .param = if (cx.kind == .context_length) "token_ids" else null, .code = if (cx.kind == .context_length) "context_length_exceeded" else null });
 +        return "refused";
@@ -2285,7 +2312,11 @@ index 00000000..463761cb
 +        .prompt_token_ids = prepared.request.prompt,
 +    };
 +    const reply = chat.generateTokens(srv, &cx, prepared, stream.sink(), gone) catch |e| {
-+        if (e == error.OutOfMemory) return "failed";
++        if (e == error.OutOfMemory) {
++            // the stream is open: an error event and [DONE], as for any other failure
++            if (!stream.failed) stream.errorLine("out of memory") catch {};
++            return "failed";
++        }
 +        if (e == error.Cancelled) return "cancelled";
 +        if (!stream.failed) stream.errorLine(cx.message) catch {};
 +        return "failed";
@@ -2331,10 +2362,10 @@ index 00000000..463761cb
 +}
 diff --git a/zig/src/server/generate_test.zig b/zig/src/server/generate_test.zig
 new file mode 100644
-index 00000000..c295474f
+index 00000000..6e3521f6
 --- /dev/null
 +++ b/zig/src/server/generate_test.zig
-@@ -0,0 +1,1045 @@
+@@ -0,0 +1,1098 @@
 +//! T007: the token route's validation table and one valid request.
 +const std = @import("std");
 +const api = @import("engine_api");
@@ -2540,6 +2571,59 @@ index 00000000..c295474f
 +    };
 +    _ = got;
 +    return error.NotRejected;
++}
++
++fn rejectMessage(srv: *Server, a: std.mem.Allocator, body: []const u8) ![]const u8 {
++    const raw = try parseBody(a, body);
++    var reject: generate.Reject = .{ .a = a, .message = "" };
++    var cx: @import("errors.zig").Cx = .{ .a = a };
++    _ = generate.parse(srv, &cx, &reject, raw) catch |e| switch (e) {
++        error.OutOfMemory => return error.OutOfMemory,
++        error.Refused, error.Reject => return reject.message,
++    };
++    return error.NotRejected;
++}
++
++test "token route refusals name the field in the message, not a {s} placeholder" {
++    var text: TestText = .{};
++    var engine: FakeEngine = .{};
++    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    try std.testing.expectEqualStrings("stream must be a boolean", try rejectMessage(srv, a, "{\"token_ids\":[1],\"stream\":\"yes\"}"));
++    try std.testing.expectEqualStrings("cache_salt is not supported by this endpoint", try rejectMessage(srv, a, "{\"token_ids\":[1],\"cache_salt\":\"x\"}"));
++    try std.testing.expectEqualStrings("repetition_penalty is not supported by this model", try rejectMessage(srv, a, "{\"token_ids\":[1],\"sampling_params\":{\"repetition_penalty\":2}}"));
++}
++
++test "streaming token reply: continuous usage carries the prompt's cached tokens" {
++    var text: TestText = .{};
++    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 }, &.{ 20, 1 } }, .cached = 7 };
++    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const gone: NoGone = .{};
++    const out = try callStream(srv, arena.allocator(), "{\"token_ids\":[1],\"sampling_params\":{\"max_tokens\":100},\"stream\":true,\"stream_options\":{\"include_usage\":true,\"continuous_usage_stats\":true}}", gone);
++    var rounds: usize = 0;
++    var lines = std.mem.splitScalar(u8, out, '\n');
++    while (lines.next()) |line| {
++        if (std.mem.indexOf(u8, line, "\"token_ids\"") == null) continue;
++        rounds += 1;
++        try std.testing.expect(std.mem.indexOf(u8, line, "\"cached_tokens\": 7") != null);
++    }
++    try std.testing.expect(rounds >= 1);
 +}
 +
 +test "token route validation refuses every field in the contract table" {
