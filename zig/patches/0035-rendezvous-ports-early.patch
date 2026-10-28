@@ -1,8 +1,8 @@
-From bc35abc89503c7c8fc1f66f0fe2d7e0017ade44d Mon Sep 17 00:00:00 2001
+From b39546ea41a797a41fd12c765002389ac7e8c8eb Mon Sep 17 00:00:00 2001
 From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 18:35:50 +0200
-Subject: [PATCH] dsv41: rank 0 opens its followers' ports before its weights
- load
+Subject: [PATCH] dsv41: rank 0 opens its followers' ports before its
+ weights load
 
 Rank 0 listened for its follower only after its own weights had loaded (Fan.open after weights.load), and the
 follower retried its connect for a fixed 300 s. A worker that finished loading more than 300 s before the head
@@ -25,7 +25,7 @@ After the 4x recipe's 0035 (Mia's AI Lab; diagnosed by shanedertrain in its issu
  3 files changed, 153 insertions(+), 20 deletions(-)
 
 diff --git a/zig/src/families/dsv41/link.zig b/zig/src/families/dsv41/link.zig
-index fc38893..eeeffe8 100644
+index fc38893..0a135b7 100644
 --- a/zig/src/families/dsv41/link.zig
 +++ b/zig/src/families/dsv41/link.zig
 @@ -34,18 +34,9 @@ pub const Link = struct {
@@ -95,7 +95,7 @@ index fc38893..eeeffe8 100644
  
 +test "a peer that connects before rank 0 takes its port waits in the backlog, and the port closes once taken" {
 +    const io = std.testing.io;
-+    const port: u16 = 29900 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
++    const port: u16 = 27700 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
 +    var bound = try Link.Listener.bind(.{ 127, 0, 0, 1 }, port);
 +    defer bound.close();
 +    // the peer connects now, while nothing accepts: before this change rank 0 listened only after its weights had
@@ -144,7 +144,7 @@ index f6d390c..0c428d4 100644
          m.comm = try m.fan.comm(o.rank, o.world);
          errdefer m.comm.deinit();
 diff --git a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
-index d792bd6..191fd7d 100644
+index d792bd6..ee4f949 100644
 --- a/zig/src/families/dsv41/prompt2d.zig
 +++ b/zig/src/families/dsv41/prompt2d.zig
 @@ -36,25 +36,74 @@ pub fn split(g: u32, world: u32) !plan.Split {
@@ -235,7 +235,7 @@ index d792bd6..191fd7d 100644
 +
 +test "a follower that connects before rank 0 takes its port is linked once rank 0 does, and NCCL's id can cross" {
 +    const io = std.testing.io;
-+    const port: u16 = 29800 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
++    const port: u16 = 27600 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
 +    const ip: [4]u8 = .{ 127, 0, 0, 1 };
 +    var ports = try Fan.bind(ip, port, 0, 2); // rank 0 opens its port first (before its weights load)
 +    defer ports.close();

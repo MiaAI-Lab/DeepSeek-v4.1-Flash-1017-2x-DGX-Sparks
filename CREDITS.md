@@ -144,6 +144,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 - **`zig/patches/0033-graph-cap.patch`** (the CUDA graph cache keeps at most `GRAPH_CAP` graphs, issue #69) was authored by
   **E-Zou Shen ([ezoushen](https://github.com/ezoushen))** in [pull request #70](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70)
   (commit [`a1ceaf0`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70/commits/a1ceaf0fd88892712f748e3080e187d2b6526396), sent as `0031`); carried as sent, renumbered.
+- **`zig/patches/0036-metrics-cached-prompt-tokens.patch`** (cached prompt tokens in `/metrics`, `/health` and `max_model_len` in `/v1/models`, issue #58): the
+  cached-token counter, its vLLM-named repeats and the engine flag that turns them on were authored by
+  **[manuel1618](https://github.com/manuel1618)** in [pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4-Spark recipe
+  (commit [`03f489f`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/03f489f)), a backport of BertholomusAI's `ce0d9053`; adapted here by Mia's AI Lab,
+  which added the `/health` totals and `max_model_len`. **`0035-rendezvous-ports-early.patch`** was written by Mia's AI Lab after the 4-Spark recipe's `0035`.
 - **`zig/patches/0004-call-gate.patch`** (`tool_choice` enforcement) was written by Mia's AI Lab (Apache-2.0). Its new file,
   `zig/src/core/lanes/call_gate.zig`, is Mia's AI Lab's Zig call gate for the Flash Next CUDA engine (commits `49350ed6` and
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's
