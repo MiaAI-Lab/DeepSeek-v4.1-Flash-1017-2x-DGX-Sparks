@@ -28,8 +28,8 @@ gets the text routes' keep-alive: TokenSink has a ping, the SSE writer sends
 used without the gateway), and the silence is counted from the submit.
 The route's refusals name the field instead of printing "{s}"; continuous
 usage carries the prompt's cached tokens once the engine reports them; a
-failed allocation is a 500 (or an error event in a stream) instead of a closed
-connection.
+failed allocation (parsing, preparing, generating or building the reply) is a
+500, or an error event in a stream, instead of a closed connection.
 zig fmt applied.
 
 Checked with Zig 0.17.0 on x86_64, CPU-only harness (zig/tests/server):
@@ -52,7 +52,7 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  zig/src/native/cuda.zig                  |   12 +-
  zig/src/server/auth.zig                  |    1 +
  zig/src/server/chat.zig                  |  661 +++++++++++--
- zig/src/server/generate.zig              |  654 +++++++++++++
+ zig/src/server/generate.zig              |  655 +++++++++++++
  zig/src/server/generate_test.zig         | 1098 ++++++++++++++++++++++
  zig/src/server/metrics.zig               |   29 +
  zig/src/server/prompt.zig                |   25 +-
@@ -69,7 +69,7 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  zig/tests/server/fake_serve.zig          |    2 +-
  zig/tests/server/fixtures/scripts.json   |   92 +-
  zig/tests/server/token_route_smoke.py    |  207 ++++
- 32 files changed, 3370 insertions(+), 105 deletions(-)
+ 32 files changed, 3371 insertions(+), 105 deletions(-)
  create mode 100644 zig/src/server/generate.zig
  create mode 100644 zig/src/server/generate_test.zig
  create mode 100644 zig/src/server/prompt_test.zig
@@ -1702,10 +1702,10 @@ index 69cd0ded..4f685653 100644
 +}
 diff --git a/zig/src/server/generate.zig b/zig/src/server/generate.zig
 new file mode 100644
-index 00000000..da8a6f17
+index 00000000..3247c4c9
 --- /dev/null
 +++ b/zig/src/server/generate.zig
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,655 @@
 +//! POST /inference/v1/generate: vLLM's token-in/token-out route, behind TENSORFOLD_TOKEN_ROUTE.
 +const std = @import("std");
 +const api = @import("engine_api");
@@ -2344,7 +2344,7 @@ index 00000000..da8a6f17
 +        return sendError(conn, a, .{ .a = a, .message = cx.message, .param = null });
 +    };
 +    const req = parse(srv, &cx, &reject, body) catch |e| switch (e) {
-+        error.OutOfMemory => return,
++        error.OutOfMemory => return srv.metrics.noteRoute(srv.io, outOfMemory(conn, a)),
 +        error.Refused => {
 +            srv.metrics.noteRoute(srv.io, "refused");
 +            return sendError(conn, a, .{ .a = a, .message = cx.message, .param = null });
@@ -2357,7 +2357,8 @@ index 00000000..da8a6f17
 +    const result = if (req.stream)
 +        streamReply(srv, conn, a, req, gone) catch "failed"
 +    else
-+        wholeReply(srv, conn, a, req, gone) catch "failed";
++        // its errors are allocation failures building the reply, before anything was sent
++        wholeReply(srv, conn, a, req, gone) catch outOfMemory(conn, a);
 +    srv.metrics.noteRoute(srv.io, result);
 +}
 diff --git a/zig/src/server/generate_test.zig b/zig/src/server/generate_test.zig

@@ -191,7 +191,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let host = env("HOST").unwrap_or_else(|| "0.0.0.0".to_string());
     let port = env("PORT").unwrap_or_else(|| "8888".to_string());
-    let listen = cli.listen.unwrap_or_else(|| format!("{host}:{port}"));
+    // An IPv6 HOST goes in brackets in HOST:PORT.
+    let listen = cli.listen.unwrap_or_else(|| {
+        if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
+    });
     let engine = cli.engine.unwrap_or_else(|| {
         env("ENGINE_PORT")
             .map(|port| format!("http://127.0.0.1:{port}"))
@@ -222,13 +229,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .api_key_file
         .or_else(|| env("API_KEY_FILE").map(PathBuf::from));
     let api_keys = load_api_keys(require_key, api_key_file)?;
-    let max_concurrent = match cli.max_concurrent {
-        Some(value) => value,
-        None => env("GATEWAY_MAX_CONCURRENT")
-            .map(|value| parse_positive_usize(&value))
-            .transpose()?
-            .unwrap_or(DEFAULT_MAX_CONCURRENT),
-    };
+    let max_concurrent = positive_setting(
+        cli.max_concurrent,
+        "GATEWAY_MAX_CONCURRENT",
+        DEFAULT_MAX_CONCURRENT,
+    )?;
     let max_connections = positive_setting(
         cli.max_connections,
         "GATEWAY_MAX_CONNECTIONS",

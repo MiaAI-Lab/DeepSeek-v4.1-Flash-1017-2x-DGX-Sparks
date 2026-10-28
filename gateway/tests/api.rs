@@ -1425,3 +1425,54 @@ async fn a_client_that_leaves_mid_stream_closes_the_engine_stream() {
     .await
     .expect("the gateway closed the engine stream after the client left");
 }
+
+#[tokio::test]
+async fn a_client_that_leaves_while_the_final_usage_is_late_closes_the_engine_stream() {
+    let gw = gateway();
+    let ids = text_ids(&gw, "Hola");
+    // The reply finishes at once, but the engine's final usage comes 30 s later: the
+    // gateway drains for it, and a client that leaves meanwhile must end that drain.
+    let (engine, mock) = spawn_mock_timed(
+        vec![
+            (Duration::ZERO, usage(8, 0)),
+            (Duration::ZERO, tokens(&ids, Some("stop"))),
+            (Duration::from_secs(30), final_usage(8, 0, ids.len() as u64)),
+        ],
+        true,
+    )
+    .await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+    let mut response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "Hola"}],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let mut text = String::new();
+    while !text.contains("\"finish_reason\":\"stop\"") {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+            .await
+            .expect("the finish chunk in time")
+            .expect("chunk")
+            .expect("the stream goes on");
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    // Control: the gateway is still draining for the final usage, the engine stream open.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !mock.closed.load(Ordering::SeqCst),
+        "closed before the client left"
+    );
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !mock.closed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the gateway closed the engine stream after the client left");
+}

@@ -16,7 +16,9 @@
   connections are capped (`GATEWAY_MAX_CONNECTIONS` 256, 32 a peer) and get `GATEWAY_HEADER_TIMEOUT` (30 s) for a
   header, idle keep-alive included, and `GATEWAY_WRITE_TIMEOUT` (60 s) for a reply the client stopped reading. A
   stream whose first frame is slow keeps itself alive too, and a client that leaves mid-stream now closes the engine
-  stream instead of leaving two gateway tasks waiting on each other. Fallback reasons are logged escaped and cut to
+  stream instead of leaving two gateway tasks waiting on each other. `start.sh` starts a stopped gateway again (with the
+  ranks up, or under `FOREGROUND=1`, where a failure to do so stops the server with a failure) and refuses to reuse one
+  started with other settings. Fallback reasons are logged escaped and cut to
   200 characters.
   Invalid `GATEWAY_MAX_IMAGES`/`GATEWAY_MAX_IMAGE_MB` stop startup instead of falling back to the defaults, and
   `GATEWAY_MEMORY` must be over zero. The container drops all capabilities; with a key it runs as the key's owner and never as root. Image URLs

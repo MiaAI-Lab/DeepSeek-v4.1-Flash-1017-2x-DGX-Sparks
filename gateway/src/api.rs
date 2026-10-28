@@ -524,8 +524,17 @@ where
         // waiting on a channel nobody reads while this task waits on it.
         drop(protocol_stream);
         // Wait for the engine task to finish draining after the finish chunk, so a
-        // late engine error is not masked by [DONE] or by a successful close.
-        let _ = engine_task.await;
+        // late engine error is not masked by [DONE] or by a successful close; but a
+        // client that leaves meanwhile ends that drain too (aborting the task closes the
+        // engine stream), since nobody is left to tell.
+        let mut engine_task = engine_task;
+        tokio::select! {
+            _ = &mut engine_task => {}
+            _ = frame_tx.closed() => {
+                engine_task.abort();
+                let _ = engine_task.await;
+            }
+        }
         let error = error_task.lock().expect("error mutex poisoned").take();
         if let Some(error) = error {
             let _ = if sent {

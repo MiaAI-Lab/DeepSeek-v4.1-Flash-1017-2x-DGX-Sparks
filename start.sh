@@ -157,6 +157,18 @@ running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CO
 exists_here()    { docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
 exists_worker()  { worker "$1" docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
 running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>/dev/null)" == true ]]; }
+# A digest of the gateway's settings: the GATEWAY_* variables and what else goes into its container. Its label tells a
+# gateway started with other settings, which must not be reused.
+gateway_identity() {
+  local name
+  { for name in $(compgen -v GATEWAY_); do
+      case "$name" in GATEWAY_RUN | GATEWAY_ARGS | GATEWAY_LISTEN | GATEWAY_MODEL_DIR) continue ;; esac
+      printf '%s=%s\n' "$name" "${!name}"
+    done
+    printf '%s\n' "$HOST" "$PORT" "$ENGINE_PORT" "$SERVED_NAME" "$CONTEXT" "$THINKING" "$REASONING_EFFORT" "$API_KEY" \
+      "$API_KEY_FILE" "$DATA_DIR"
+  } | sha256sum | cut -c1-16
+}
 # Remove ds41-gateway after saving its log (FOREGROUND's stops: a gateway that exited keeps its last words).
 gateway_remove_keeping_log() {
   save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP" >/dev/null 2>&1 || true
@@ -193,9 +205,14 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; th
     die "the running ranks use other spill / KV-shard / pool settings ($live_head, asked: $(port_identity)); run ./start.sh restart"
   [[ "$(prepared_state 2>/dev/null)" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
     die "the requested configuration differs from the prepared server; run ./start.sh restart with the same settings (including ABLIT)"
-  if [[ "$API_GATEWAY" == 1 ]] && ! running_gateway; then
-    gateway_recover "$URL" || die "the ranks are running but ds41-gateway is not, and it could not be started again: run ./start.sh restart"
-    log "ds41-gateway was not running: started it again on $HOST:$PORT"
+  if [[ "$API_GATEWAY" == 1 ]]; then
+    live_gateway=$(docker inspect -f '{{index .Config.Labels "tf.recipe.gateway"}}' ds41-gateway 2>/dev/null || true)
+    [[ -z "$live_gateway" || "$live_gateway" == "$(gateway_identity)" ]] || \
+      die "ds41-gateway was started with other settings than these: run ./start.sh restart"
+    if ! running_gateway; then
+      gateway_recover "$URL" || die "the ranks are running but ds41-gateway is not, and it could not be started again: run ./start.sh restart"
+      log "ds41-gateway was not running: started it again on $HOST:$PORT"
+    fi
   fi
   log "$CONTAINER_NAME is already running on both Sparks (port $PORT): nothing to do. ./start.sh restart restarts it, ./stop.sh stops it."
   exit 0
@@ -287,8 +304,11 @@ fi
 # SIGTERM run ./stop.sh. Note the supervisor restarts a start that was killed by memguard too; give it a RestartSec.
 # (From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's start.sh, for the one worker here.)
 foreground() {
-  local watch w code
+  local watch w code failed="$STATE_DIR/foreground.failed"
   trap './stop.sh; exit 130' INT TERM
+  # The watcher marks a failure BEFORE it stops rank 0: stopping rank 0 ends `docker logs -f` below, and this shell then
+  # kills the watcher, which may not live to exit 1. The mark survives it.
+  rm -f "$failed"
   ( exec 8>&-                                        # not holding start.sh's lock once start.sh has exited
     while sleep 30; do
       if ! running_here; then
@@ -302,6 +322,7 @@ foreground() {
           warn "ds41-gateway had exited: started it again"
         else
           warn "ds41-gateway exited and could not be started again: stopping the server"
+          : > "$failed"
           docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
           gateway_remove_keeping_log
           exit 1
@@ -310,6 +331,7 @@ foreground() {
       worker 1 true 2>/dev/null || continue         # a worker out of reach for a moment says nothing about its rank
       running_worker 1 && continue
       warn "rank 1 on $(worker_host 1) exited: stopping rank 0"
+      : > "$failed"
       docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
       [[ "$API_GATEWAY" != 1 ]] || gateway_remove_keeping_log
       exit 1
@@ -320,6 +342,7 @@ foreground() {
   w=0; wait "$watch" || w=$?
   code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
   [[ "$w" != 1 || "$code" != 0 ]] || code=1         # the worker's rank failed, even if rank 0 then shut down cleanly
+  if [[ -e "$failed" ]]; then [[ "$code" != 0 ]] || code=1; rm -f "$failed"; fi   # the same, when the watcher was killed first
   worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
   [[ "$API_GATEWAY" != 1 ]] || gateway_remove_keeping_log
   exit "$code"
@@ -383,7 +406,8 @@ if [[ "$DRY" != 1 ]]; then
   [[ -n "$GATEWAY_MODEL_DIR" ]] || GATEWAY_MODEL_DIR=$DATA_DIR/model
   [[ -d "$GATEWAY_MODEL_DIR" ]] || die "the served folder $GATEWAY_MODEL_DIR does not exist: prepare.sh downloads the model there"
 fi
-GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
+GATEWAY_RUN=(docker run -d --name ds41-gateway --label "tf.recipe.gateway=$(gateway_identity)" --network host
+             --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
              --restart on-failure:3 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges
              -v "$GATEWAY_MODEL_DIR:/served:ro")
 # The key file is mode 600 and belongs to the user running this script (api_key_ensure, and the smoke test reads it), so
@@ -525,6 +549,7 @@ fi
 trap 'kill $LOGS_PID 2>/dev/null || true; save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP" >/dev/null 2>&1 || true' EXIT
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
+[[ "$IP" != *:* ]] || IP="[$IP]"   # an IPv6 address goes in brackets in a URL
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   $( [[ "$API_GATEWAY" == 1 ]] && echo "(gateway: DeepSeek API parity on; engine on 127.0.0.1:$ENGINE_PORT)" || echo "(model: $SERVED_NAME)" )

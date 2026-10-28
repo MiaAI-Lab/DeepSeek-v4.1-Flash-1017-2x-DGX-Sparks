@@ -163,10 +163,11 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         self.assertIn("TF_DS_API_EFFORTS=1", out)
         self.assertIn("[dry-run] gateway:", out)
         self.assertIn(
-            "docker run -d --name ds41-gateway --network host --memory 768m --cpus 1.5 "
-            "--restart on-failure:3 --read-only --tmpfs /tmp",
+            "--network host --memory 768m --cpus 1.5 --restart on-failure:3 --read-only --tmpfs /tmp",
             out,
         )
+        # The gateway carries the digest of its settings, which a later start compares.
+        self.assertRegex(out, r"docker run -d --name ds41-gateway --label tf\.recipe\.gateway=[0-9a-f]{16} --network host")
         self.assertIn("-v /tmp/ds41-home/.cache/huggingface/tensorfold-dsv41/45ee5d0f/model:/served:ro", out)
         self.assertIn("-v /tmp/ds41-home/.local/state/dsv41-tensorfold/api-key:/run/secrets/key:ro", out)
         self.assertIn("-e API_KEY_FILE=/run/secrets/key", out)
@@ -368,6 +369,103 @@ esac
             code, seen = recover("exists", "startable")
             self.assertEqual(code, 1, seen)
             self.assertEqual(seen.count("curl"), 30)
+
+
+    def test_foreground_exits_with_a_failure_when_the_watcher_stops_the_server(self):
+        """FOREGROUND's watcher stops rank 0 when the gateway cannot be started again or rank 1 is gone; the exit code
+        must say so even though stopping rank 0 ends `docker logs -f` and the watcher is killed before it exits."""
+        import tempfile
+
+        text = (ROOT / "start.sh").read_text()
+        functions = "\n".join(
+            re.search(rf"^{name}\(\) \{{.*?^\}}", text, re.S | re.M).group(0)
+            for name in ("gateway_remove_keeping_log", "gateway_recover", "foreground")
+        )
+        functions += "\n" + "\n".join(
+            line for line in text.splitlines() if re.match(r"^(running_here|running_worker|running_gateway)\(\)", line)
+        )
+        with tempfile.TemporaryDirectory(prefix="ds41-foreground-") as tmp:
+            tmp = Path(tmp)
+            stubs = tmp / "bin"
+            stubs.mkdir()
+            bodies = {
+                "docker": f"""#!/usr/bin/env bash
+t={tmp}
+rank=rank0; [[ -n "${{WORKER_SIDE:-}}" ]] && rank=rank1
+case "$1" in
+  inspect)
+    if [[ "$2" == -f ]]; then
+      case "$3" in
+        *Running*) if [[ "$4" == ds41-gateway ]]; then [[ -e $t/gw_running ]] && echo true || echo false
+                   else [[ -e $t/$rank ]] && echo true || echo false; fi ;;
+        *ExitCode*) echo 0 ;;
+      esac
+    else [[ -e $t/gw_exists ]]; fi ;;
+  start) [[ -e $t/gw_startable ]] && touch $t/gw_running ;;
+  stop) rm -f $t/$rank ;;
+  rm) rm -f $t/gw_exists $t/gw_running ;;
+  logs) while [[ -e $t/rank0 ]]; do /bin/sleep 0.05; done ;;
+esac
+""",
+                "curl": f"#!/usr/bin/env bash\n[[ -e {tmp}/gw_running ]]\n",
+                "sleep": "#!/usr/bin/env bash\nexec /bin/sleep 0.05\n",
+            }
+            for name, body in bodies.items():
+                (stubs / name).write_text(body)
+                (stubs / name).chmod(0o755)
+            harness = f"""
+warn() {{ :; }}
+worker_host() {{ echo worker; }}
+worker() {{ shift; WORKER_SIDE=1 bash -c "$*"; }}
+save_log() {{ /bin/sleep 0.5; }}   # saving the gateway's log takes a while, as docker logs does
+API_GATEWAY=1 API_URL=http://127.0.0.1:8888 CONTAINER_NAME=rank STATE_DIR={tmp} LOG_DIR={tmp} LOG_KEEP=1
+{functions}
+"""
+
+            def run(state, extra=""):
+                for flag in ("rank0", "rank1", "gw_exists", "gw_running", "gw_startable"):
+                    (tmp / flag).unlink(missing_ok=True)
+                for flag in state:
+                    (tmp / flag).touch()
+                result = subprocess.run(
+                    ["bash", "-c", harness + extra + "\nforeground"],
+                    env={"PATH": f"{stubs}:/usr/bin:/bin"},
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                return result.returncode
+
+            # The gateway exited and cannot be started again: the server stops with a failure.
+            self.assertEqual(run(["rank0", "rank1", "gw_exists"]), 1)
+            self.assertFalse((tmp / "foreground.failed").exists())
+            # Rank 1 is gone: the same.
+            self.assertEqual(run(["rank0", "gw_exists", "gw_running"]), 1)
+            # The gateway exited and is started again: the server goes on until rank 0 ends cleanly, then 0.
+            self.assertEqual(run(["rank0", "rank1", "gw_exists", "gw_startable"], f"( /bin/sleep 1; rm -f {tmp}/rank0 ) &"), 0)
+            # Control: all up, rank 0 ends cleanly by itself: 0.
+            self.assertEqual(run(["rank0", "rank1", "gw_exists", "gw_running"], f"( /bin/sleep 0.5; rm -f {tmp}/rank0 ) &"), 0)
+
+
+    def test_gateway_identity_changes_with_the_gateway_settings(self):
+        """The gateway's label: the same settings give the same digest; another setting or another key file, another."""
+        text = (ROOT / "start.sh").read_text()
+        function = re.search(r"^gateway_identity\(\) \{.*?^\}", text, re.S | re.M).group(0)
+
+        def identity(**extra):
+            env = {"PATH": "/usr/bin:/bin", "GATEWAY_STRICT": "0", "GATEWAY_MAX_CONCURRENT": "3", "HOST": "0.0.0.0",
+                   "PORT": "8888", "API_KEY": "0", "GATEWAY_RUN": "ignored"}
+            env.update(extra)
+            script = "".join(f"{k}={v!r}; " for k, v in env.items()) + "\n" + function + "\ngateway_identity"
+            return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout.strip()
+
+        base = identity()
+        self.assertRegex(base, r"^[0-9a-f]{16}$")
+        self.assertEqual(base, identity())
+        self.assertEqual(base, identity(GATEWAY_RUN="other"))  # the command arrays are left out
+        self.assertNotEqual(base, identity(GATEWAY_STRICT="1"))
+        self.assertNotEqual(base, identity(GATEWAY_MAX_CONCURRENT="4"))
+        self.assertNotEqual(base, identity(API_KEY="1"))
 
 
 if __name__ == "__main__":

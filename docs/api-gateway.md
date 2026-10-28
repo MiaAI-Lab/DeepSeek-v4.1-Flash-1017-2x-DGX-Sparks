@@ -136,7 +136,10 @@ The served tokenizer's image-token spelling is given by `GATEWAY_IMAGE_TOKEN`; t
 
 With the recipe: `API_GATEWAY=1` in `scripts/local.sh`, then `./start.sh` (or `./start.sh restart`). `scripts/prepare.sh`
 builds `GATEWAY_IMAGE` from `gateway/Dockerfile`; `start.sh` starts it after the engine answers, waits for `/health` and
-runs both smoke tests. `./stop.sh` removes the gateway first and saves its log.
+runs both smoke tests. `./stop.sh` removes the gateway first and saves its log. The gateway's container carries a
+digest of its settings (`tf.recipe.gateway`): with the ranks already up, `./start.sh` starts a stopped gateway again,
+and asks for `./start.sh restart` when the gateway is gone or was started with other settings. With `FOREGROUND=1` a
+gateway that exits is started again; if that fails the server stops with a failure, so the supervisor restarts it.
 
 By hand, from `gateway/`:
 
