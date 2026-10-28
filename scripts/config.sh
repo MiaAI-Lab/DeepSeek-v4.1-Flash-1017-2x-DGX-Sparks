@@ -168,6 +168,12 @@ REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
 # rounds for the streams already live (and to their cancels): TF_DS_PREFILL_INTERLEAVE_MS, read by rank 0 only. 0: the pass runs to
 # its end first, as before. 250 is what PR #5 and this recipe measured. Each such stop costs the long prompt about the time given.
 PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
+# zig/patches/0037: 1 reads every prompt a chunk at a time, in turn, with PREFILL_INTERLEAVE_MS of decode rounds between two
+# chunks, so a request that arrives while a long prompt is being read gets its own pass after one chunk (about a second)
+# instead of after the whole prompt (a 250K-token cold prompt: two minutes). Off (0, the default): a prompt is read whole,
+# as before; prompts with pictures are read whole either way. TF_DS_PREFILL_YIELD, read by rank 0; both ranks must run an
+# image that has the patch (rank 0 sends rank 1 a frame the earlier image does not know). Not measured on a pair yet.
+PREFILL_YIELD="${PREFILL_YIELD:-0}"
 
 # ---------------------------------------------------------------- files
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"

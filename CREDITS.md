@@ -150,6 +150,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   (commit [`03f489f`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/03f489f)), a backport of BertholomusAI's `ce0d9053`; adapted here by Mia's AI Lab,
   which added the `/health` totals and `max_model_len`. **`0034-rendezvous-ports-early.patch`** and
   **`0035-aligned-index-views.patch`** were written by Mia's AI Lab after the 4-Spark recipe's `0035`, `0005` and `0007`.
+- **`zig/patches/0037-prompt-steps.patch`** (a prompt read a chunk at a time, with other requests admitted between its chunks) follows the design of
+  the 4-Spark recipe's `0031`, authored by **Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus))** in
+  [pull request #15](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/15) (commit [`b2bf975`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/b2bf975)): the loop that advances admitted prompts a chunk a turn, `Engine.fillStream`,
+  the fake chunked backend and the late-request host tests. It was re-written here against this tree's spill tier, parked requests, KV parts and
+  pair-broken handling, with the follower's `fill_resume` frame, by Mia's AI Lab.
 - **`zig/patches/0004-call-gate.patch`** (`tool_choice` enforcement) was written by Mia's AI Lab (Apache-2.0). Its new file,
   `zig/src/core/lanes/call_gate.zig`, is Mia's AI Lab's Zig call gate for the Flash Next CUDA engine (commits `49350ed6` and
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's

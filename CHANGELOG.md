@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `zig/patches/0037-prompt-steps.patch` (`PREFILL_YIELD=1`; off by default): a prompt can be read a chunk at a time. Until
+  now a prompt's whole pass ran inside its admission, so a request that arrived while a long prompt was being read waited
+  for all of it (a 250K-token cold prompt: two minutes; the live streams already got decode rounds between its chunks,
+  `PREFILL_INTERLEAVE_MS`, but admission waited). With the switch on, rank 0 reads its admitted prompts a chunk a turn, in
+  turn, with the live streams' rounds between two chunks: a short request that arrives meanwhile is read after one chunk
+  and decodes beside the long one, which finishes about as soon as it would have. Replies are the same bits (each chunk is
+  the unchanged 2,048-row chunk, from the same positions; the slot's rows and rings live in the slot between chunks);
+  rank 0 sends rank 1 a new frame to return to a prompt another prompt's chunk interrupted, so both ranks need the image.
+  Prompts with pictures are read whole either way. Off, the code that runs is the code that ran before. Host tests with
+  the fake backend (a late short request completes first, with the same tokens as solo; cancels, a refused request, a full
+  pool), and the existing host suites also run with prompts read a chunk a turn (`TF_TEST_PREFILL_STEPS=1`: parked and
+  deferred restores, pair break, stall monitor, prompt-cache resume and eviction). **The dsv41 step functions need a GPU
+  and have not been run on a pair**: compare replies with `tools/exact.py` and the long-prompt/short-request timing
+  before turning it on. Design after the 4x recipe's `0031` by **Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus))**
+  ([pull request #15](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/15)); re-written for this recipe's spill tier, parked requests, KV parts and pair handling.
 - `zig/patches/0036-metrics-cached-prompt-tokens.patch` (always on, issue #58): `/metrics` publishes
   `prompt_tokens_cached_total`, the prompt tokens of finished requests restored from kept prompt states (they are in
   `prompt_tokens_total` too), repeated under vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`; `/health`
