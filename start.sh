@@ -209,13 +209,11 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; th
   [[ "$(prepared_state 2>/dev/null)" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
     die "the requested configuration differs from the prepared server; run ./start.sh restart with the same settings (including ABLIT)"
   if [[ "$API_GATEWAY" == 1 ]]; then
-    # a gateway that exists is reused only with exactly these settings (and this key); one without the label, or whose
-    # label cannot be read, is not
-    if docker inspect ds41-gateway >/dev/null 2>&1; then
-      live_gateway=$(docker inspect -f '{{index .Config.Labels "tf.recipe.gateway"}}' ds41-gateway 2>/dev/null || true)
-      [[ "$live_gateway" == "$(gateway_identity)" ]] || \
-        die "ds41-gateway was started with other settings or another key than these: run ./start.sh restart"
-    fi
+    # The gateway is reused (or started again) only when its label reads back equal to these settings' digest, key
+    # included. Missing, unreadable, unlabelled or different: no reuse.
+    live_gateway=$(docker inspect -f '{{index .Config.Labels "tf.recipe.gateway"}}' ds41-gateway 2>/dev/null || true)
+    [[ "$live_gateway" == "$(gateway_identity)" ]] || \
+      die "ds41-gateway is missing, or was started with other settings or another key than these: run ./start.sh restart"
     if ! running_gateway; then
       gateway_recover "$URL" || die "the ranks are running but ds41-gateway is not, and it could not be started again: run ./start.sh restart"
       log "ds41-gateway was not running: started it again on $HOST:$PORT"
