@@ -280,10 +280,26 @@ served_in_container() { echo "/hf/$DATA_SUB/model"; }
 # What scripts/prepare.sh last left ready (start.sh runs it again when this line changes). "+stock-dtypes": an overlay
 # checkpoint prepared before scripts/ablit_stock_dtypes.py gets that step on the next start.
 PREPARED_MARKER="$STATE_DIR/prepared"
+# Every field is quoted (printf %q), so a value holding another field's text cannot shift into it, and the template's
+# sha256 is part of it (a changed model/chat_template.jinja is served only after prepare.sh linked it again). It fails
+# (status 1, a message) when the template cannot be hashed: a state that cannot be computed never reads as ready.
 prepared_state() {
-  echo "model=$MODEL_ID@$(snapshot_rev) engram=$ENGRAM_ID@$(engram_rev) image=$(image_ident "$IMAGE") kit=$KIT_REF" \
-       "w=$(worker_host 1) wengram=$WORKER_ENGRAM_DIR wcache=$WORKER_CACHE_DIR ablit=$ABLIT" \
-       "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
+  local i tpl f
+  tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" | cut -c1-64) && [[ -n "$tpl" ]] ||
+    die "cannot hash model/chat_template.jinja (sha256sum)"
+  f=("model=$MODEL_ID@$(snapshot_rev)" "engram=$ENGRAM_ID@$(engram_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF"
+     "w=$(worker_host 1)" "wengram=$WORKER_ENGRAM_DIR" "wcache=$WORKER_CACHE_DIR" "ablit=$ABLIT"
+     "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
+     "hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
+  for i in 2 3; do [[ -z "$(worker_host "$i")" ]] || f+=("w$i=$(worker_host "$i")"); done
+  for i in 1 2 3; do f+=("nfs$i=$(wval NFS_SERVER "$i")"); done
+  (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
+}
+# prepare.sh's last step: computed first and swapped in whole, so a failure leaves the previous marker as it was
+write_prepared_marker() {
+  local state
+  state=$(prepared_state) || return 1
+  printf '%s\n' "$state" > "$PREPARED_MARKER.new" && mv -f "$PREPARED_MARKER.new" "$PREPARED_MARKER"
 }
 
 # ---------------------------------------------------------------- API key
