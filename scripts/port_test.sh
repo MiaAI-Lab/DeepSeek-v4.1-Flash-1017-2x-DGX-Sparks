@@ -518,7 +518,7 @@ check_ "POOL: the derived sharding pool goes through start.sh's 0008 mapping, on
   fol=$(grep "^FOLLOW=\"" "$here/../start.sh")
   die() { echo "DIE: $*"; exit 1; }; warn() { :; }; log() { :; }
   TP=2 CONTEXT=1048576 PARALLEL=4 ROUND_ROWS=16 HF_CACHE=/x/hf NFS_PATH=/x/hf POOL= KV_SHARD=1 SPILL_GIB=0
-  REPLAY_FLOOR=0 HF_HUB_OFFLINE=1 PREFILL_INTERLEAVE_MS=0 RDMA_IDLE_S=2 RDMA_NAP_US=500 DRAFTS=1 GRAPHS=1 GRAPH_CAP=128 SIDE=0 PREFETCH=0 ENGRAM_AIO=0
+  REPLAY_FLOOR=0 HF_HUB_OFFLINE=1 PREFILL_INTERLEAVE_MS=0 PREFILL_YIELD=0 STEP_AHEAD=0 RDMA_IDLE_S=2 RDMA_NAP_US=500 DRAFTS=1 GRAPHS=1 GRAPH_CAP=128 SIDE=0 PREFETCH=0 ENGRAM_AIO=0
   source "$here/port.sh"; port_validate >/dev/null; port_map
   eval "$eng"; eval "$fol"
   all=$(printf "%s\n" "${ENGINE_ENV[@]}")

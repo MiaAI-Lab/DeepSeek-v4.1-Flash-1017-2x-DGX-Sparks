@@ -32,7 +32,7 @@ class StepAheadSettingsTest(unittest.TestCase):
         source = (ROOT / "start.sh").read_text()
         engine = source[source.index("ENGINE_ENV=("):source.index("envs() {")]
         base = dict(PATH=os.environ["PATH"], CONTEXT="65536", POOL="", REPLAY_FLOOR="1", PARALLEL="4", HF_HUB_OFFLINE="1",
-                    ROUND_ROWS="", PREFILL_INTERLEAVE_MS="250", RDMA_IDLE_S="2", RDMA_NAP_US="500")
+                    ROUND_ROWS="", PREFILL_INTERLEAVE_MS="250", PREFILL_YIELD="0", RDMA_IDLE_S="2", RDMA_NAP_US="500")
         for value, raw, want in (("0", None, []), ("1", None, ["TF_DS_STEP_AHEAD=1"]), ("0", "1", []), ("1", "0", ["TF_DS_STEP_AHEAD=1"])):
             with self.subTest(step_ahead=value, raw=raw):
                 env = base | {"STEP_AHEAD": value} | ({"TF_DS_STEP_AHEAD": raw} if raw is not None else {})
