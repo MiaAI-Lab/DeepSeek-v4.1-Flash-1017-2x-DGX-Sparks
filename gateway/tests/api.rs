@@ -717,39 +717,85 @@ async fn context_limit_is_the_exact_api_400_before_the_engine() {
 }
 
 #[tokio::test]
-async fn a_prompt_far_over_the_context_is_refused_without_tokenizing_all_of_it() {
-    let gw = gateway();
-    // 24 MiB of words against a 1,000-token context: refused after the first piece.
-    let text = "word ".repeat(24 * 1024 * 1024 / 5);
-    let request = json!({
-        "model": "DeepSeek-V4.1-Flash-1017",
-        "messages": [{"role": "user", "content": text}]
-    });
+async fn a_prompt_over_the_byte_limit_is_refused_before_it_is_encoded() {
+    let config = |limit: usize| GatewayConfig {
+        max_model_len: 1_000,
+        strict: true,
+        max_prompt_bytes: limit,
+        ..GatewayConfig::default()
+    };
+    let request = |bytes: usize| {
+        json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": "word ".repeat(bytes / 5)}]
+        })
+    };
+    // Over the limit: the gateway's 400, and neither the encoder's count nor the engine.
     let (engine, mock) = spawn_mock(vec![usage(1, 0)], Duration::ZERO, true).await;
-    let url = spawn_gateway(&engine, gw, 1_000).await;
-    let response = post_json(&format!("{url}/v1/chat/completions"), request).await;
+    let url = spawn_gateway_config(&engine, gateway(), config(1024 * 1024)).await;
+    let response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        request(2 * 1024 * 1024),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("body");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.starts_with("The rendered prompt is "), "{message}");
+    assert!(
+        message.contains("at most 1048576 bytes (GATEWAY_MAX_PROMPT_MB)"),
+        "{message}"
+    );
+    assert!(mock.body.lock().unwrap().is_none(), "engine was touched");
+    // Control: under the limit the prompt is encoded and gets the API's exact context 400.
+    let response = post_json(&format!("{url}/v1/chat/completions"), request(512 * 1024)).await;
     assert_eq!(response.status(), 400);
     let body: Value = response.json().await.expect("body");
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
         message.starts_with(
-            "This model's maximum context length is 1000 tokens. However, the messages have at least "
+            "This model's maximum context length is 1000 tokens. However, you requested "
         ),
         "{message}"
     );
     assert!(mock.body.lock().unwrap().is_none(), "engine was touched");
-    // The bound shows where the count stopped: within the first piece or two (about 52k
-    // tokens each), not after the whole text (about five million tokens).
-    let lower: usize = message
-        .split("at least ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|count| count.parse().ok())
-        .expect("a count in the message");
+}
+
+#[tokio::test]
+async fn one_request_encodes_at_a_time() {
+    // The test holds the gateway's only encode slot: a request waits for it, then goes on.
+    let slot = Arc::new(tokio::sync::Semaphore::new(1));
+    let held = Arc::clone(&slot).acquire_owned().await.expect("slot");
+    let config = GatewayConfig {
+        max_model_len: 1_000,
+        strict: true,
+        encode_slot: Arc::clone(&slot),
+        ..GatewayConfig::default()
+    };
+    let (engine, mock) = spawn_mock(vec![usage(1, 0)], Duration::ZERO, true).await;
+    let url = spawn_gateway_config(&engine, gateway(), config).await;
+    let request = json!({
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [{"role": "user", "content": "word ".repeat(2_000)}]
+    });
+    let pending = tokio::spawn({
+        let url = url.clone();
+        async move {
+            post_json(&format!("{url}/v1/chat/completions"), request)
+                .await
+                .status()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
-        (1_000..200_000).contains(&lower),
-        "stopped at {lower} tokens"
+        !pending.is_finished(),
+        "the request encoded while another held the slot"
     );
+    assert!(mock.body.lock().unwrap().is_none(), "engine was touched");
+    drop(held);
+    // Over the 1,000-token context: the API's 400, reached only after the encode.
+    assert_eq!(pending.await.expect("join"), 400);
+    assert_eq!(slot.available_permits(), 1, "the slot came back");
 }
 
 #[tokio::test]

@@ -384,7 +384,9 @@ fn allowed_v6(address: Ipv6Addr) -> bool {
     if segments[0] == 0x3fff && segments[1] & 0xf000 == 0 {
         return false;
     }
-    true
+    // Outside the cases above, only global unicast (2000::/3) is a public destination:
+    // the rest is unassigned or reserved (::2, 4000::1, ...).
+    segments[0] & 0xe000 == 0x2000
 }
 
 /// A preprocessor that reads the header dimensions and keeps the original bytes.

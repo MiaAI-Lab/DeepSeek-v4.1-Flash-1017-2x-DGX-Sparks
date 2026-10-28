@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,7 @@ use deepseek_recipe::request::{ConversationRequest, ProtocolRequest};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use crate::engine::{GenerateRequest, SamplingParams, StreamOptions};
 use crate::images::{self, ImageSettings, ResolvedImages};
@@ -77,6 +79,11 @@ pub struct GatewayConfig {
     pub dns_overrides: HashMap<String, IpAddr>,
     /// How long an admitted request may take to send its body (`None`: no limit).
     pub body_timeout: Option<Duration>,
+    /// The largest rendered prompt the gateway encodes, in bytes; a larger one is a 400
+    /// before encoding, which costs memory in proportion to the prompt's bytes.
+    pub max_prompt_bytes: usize,
+    /// One encode at a time (see `prepare`), shared by every request of this gateway.
+    pub encode_slot: Arc<Semaphore>,
 }
 
 impl Default for GatewayConfig {
@@ -96,9 +103,15 @@ impl Default for GatewayConfig {
             engine_logprobs: None,
             dns_overrides: HashMap::new(),
             body_timeout: None,
+            max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
+            encode_slot: Arc::new(Semaphore::new(1)),
         }
     }
 }
+
+/// The default of `GatewayConfig::max_prompt_bytes` (`GATEWAY_MAX_PROMPT_MB=8`): a million
+/// tokens of ordinary text renders to about 4 MiB.
+pub const DEFAULT_MAX_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 
 /// One prepared request.
 #[derive(Debug)]
@@ -188,16 +201,25 @@ pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
         Err(error) => return Err(ApiError::fallback(error.to_string())),
     };
     let model = converted_model(&object, &config.served_name);
-    if let Some(lower) =
-        gateway.prompt_surely_exceeds(&converted.conversation, config.max_model_len as usize)
-    {
-        return Err(ApiError::bad_request(format!(
-            "This model's maximum context length is {} tokens. However, the messages have at \
-             least {lower} tokens. Please reduce the length of the messages.",
-            config.max_model_len
-        )));
-    }
-    let encoded = gateway.prepare_conversation(&converted.conversation)?;
+    // Encoding takes memory in proportion to the prompt's bytes (about 120 bytes a byte), so one request encodes
+    // at a time: three admitted requests each with a prompt at the byte limit would otherwise encode at once. The
+    // slot covers only the size check, the render and the encode (seconds, no network); image fetches run outside it.
+    let encoded = {
+        let _slot = config
+            .encode_slot
+            .acquire()
+            .await
+            .map_err(|_| ApiError::internal("the encode slot is closed"))?;
+        let prompt_bytes = gateway.rendered_prompt_bytes(&converted.conversation);
+        if prompt_bytes > config.max_prompt_bytes {
+            return Err(ApiError::bad_request(format!(
+                "The rendered prompt is {prompt_bytes} bytes; this gateway encodes prompts of at most {} bytes \
+                 (GATEWAY_MAX_PROMPT_MB). Please reduce the length of the messages.",
+                config.max_prompt_bytes
+            )));
+        }
+        gateway.prepare_conversation(&converted.conversation)?
+    };
     let images = images::resolve(
         &encoded.image_sources,
         &ImageSettings {

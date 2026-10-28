@@ -154,11 +154,6 @@ pub struct GatewaySettings {
     pub aliases: Vec<String>,
 }
 
-/// The piece size of [`Gateway::prompt_surely_exceeds`].
-pub const PRECOUNT_PIECE: usize = 256 * 1024;
-/// The prompt size from which [`Gateway::prompt_surely_exceeds`] counts in pieces.
-pub const PRECOUNT_MIN_BYTES: usize = 4 * 1024 * 1024;
-
 /// The tokenizer and the deepseek-recipe options shared by every request.
 pub struct Gateway {
     pub options: ConversionOptions,
@@ -253,57 +248,13 @@ impl Gateway {
         Ok((rendered, ids, offsets))
     }
 
-    /// A lower bound on the prompt's token count when the prompt cannot fit in
-    /// `limit` tokens, found without tokenizing all of it; `None` when it may fit.
+    /// The size in bytes of the prompt the conversation renders to.
     ///
-    /// Encoding a prompt keeps several hundred bytes per token, so a 64 MiB body of
-    /// text would take gigabytes only to be refused for its length. A prompt of at
-    /// most [`PRECOUNT_MIN_BYTES`], or of at most four bytes per token of the limit,
-    /// is left to the normal path and its exact count (about 100 bytes of memory per
-    /// byte of prompt: 4 MiB is about 400 MiB). A longer one
-    /// is counted in pieces of [`PRECOUNT_PIECE`] bytes, each cut just before a space
-    /// so that no word is split, and the count stops as soon as it is over the limit.
-    /// The plain tokenizer reads an added-vocabulary spelling as one token, never
-    /// more than the prompt encoding does, and a cut can add at most a couple of
-    /// tokens (a run of spaces split in two), so two tokens per cut are taken off.
-    pub fn prompt_surely_exceeds(
-        &self,
-        conversation: &Conversation,
-        limit: usize,
-    ) -> Option<usize> {
-        let rendered = self.encoding.render_conversation(conversation);
-        let prompt = rendered.prompt.as_str();
-        if prompt.len() <= limit.saturating_mul(4).max(PRECOUNT_MIN_BYTES) {
-            return None;
-        }
-        let mut counted = 0usize;
-        let mut cuts = 0usize;
-        let mut start = 0;
-        while start < prompt.len() {
-            let mut end = (start + PRECOUNT_PIECE).min(prompt.len());
-            if end < prompt.len() {
-                while !prompt.is_char_boundary(end) {
-                    end -= 1;
-                }
-                if let Some(space) = prompt[start..end].rfind(' ')
-                    && space > 0
-                {
-                    end = start + space;
-                }
-                cuts += 1;
-            }
-            counted += self
-                .tokenizer
-                .encode(&prompt[start..end], false)
-                .ok()?
-                .len();
-            let lower = counted.saturating_sub(2 * cuts);
-            if lower > limit {
-                return Some(lower);
-            }
-            start = end;
-        }
-        None
+    /// Encoding keeps tens of bytes of memory per byte of prompt (offsets, alignments
+    /// and token strings), whatever the token count, so the gateway refuses a prompt
+    /// over its byte limit before encoding it (`GatewayConfig::max_prompt_bytes`).
+    pub fn rendered_prompt_bytes(&self, conversation: &Conversation) -> usize {
+        self.encoding.render_conversation(conversation).prompt.len()
     }
 
     /// Render and encode a conversation, deriving `history_len` and `shared_prefixes`.

@@ -507,18 +507,19 @@ counted by the gateway, with private destinations rejected by default. The gatew
 health and is 200 only while the engine is 200.
 
 **Ports, memory and queueing.** The gateway is the only listener on `HOST:PORT`; the engine is on loopback. The container
-is capped at `GATEWAY_MEMORY` (3g) and `GATEWAY_CPUS` (2), runs read-only with a `tmpfs` at `/tmp`, and has no GPU, Python
-or OpenCV. `GATEWAY_MAX_CONCURRENT=3` admits three requests at a time; excess requests wait rather than receiving a
-429/503, and a permit remains held until the response body or SSE stream finishes (or the client disconnects). The cap
-comes from measured peaks of the release binary (three runs each, fresh process): 57 MiB idle; one admitted request adds
-159 MiB for a 188,000-token prompt, up to 522 MiB for a 64 MiB body of images, and up to 784 MiB for a prompt that fits
-the context but is made of 128-byte tokens. With 800 MiB a request, `floor((3072-64)/800)=3`; three 64 MiB image requests
-at once peaked at 1.5 GiB. A body of text that cannot fit the context is refused after counting at most a few pieces of
-it (64 MiB: 0.7 s and 447 MiB, where tokenizing all of it took 26 s and 6.4 GiB). Bodies are read within
-`GATEWAY_BODY_TIMEOUT` (60 s; 408 after it, giving the permit back) and a declared or actual body over 64 MiB is a 413
-before it is read. At most `GATEWAY_MAX_CONNECTIONS` (64) client connections are open at once, so requests queued for a
-permit and idle keep-alive connections cannot pile up; the next client waits in the kernel's accept queue. Raising the
-concurrency needs the cap raised by 800 MiB a request.
+is capped at `GATEWAY_MEMORY` (3g) and `GATEWAY_CPUS` (2), runs read-only with a `tmpfs` at `/tmp`, with no capabilities
+(`--cap-drop ALL`, `no-new-privileges`), and has no GPU, Python or OpenCV. `GATEWAY_MAX_CONCURRENT=3` admits three
+requests at a time; excess requests wait rather than receiving a 429/503, and a permit remains held until the response
+body or SSE stream finishes (or the client disconnects). Encoding a prompt takes up to about 120 bytes of memory per byte of prompt, whatever its token count, so a rendered prompt over `GATEWAY_MAX_PROMPT_MB` (8 MiB; a million tokens of ordinary text is about 4 MiB) is a 400 before it is encoded, and one request encodes at a time; image fetches run outside that slot. Measured peaks of the release binary at the
+recipe's 1M-token context (three runs each, fresh process, the highest): 57 MiB idle; a 188,000-token prompt 206 MiB; one
+request with an 8 MiB prompt and 55 MiB of images 1,294 MiB; three of them at once 1,722 MiB (3,600 MiB before encodes
+took turns). An admitted request's body is read within `GATEWAY_BODY_TIMEOUT` (60 s; then 408, and the permit goes back)
+and up to 64 MiB: a larger `content-length` is a 413 before anything is read, a larger chunked body a 413 when it crosses
+the limit; it is copied frame by frame, so a body split into tiny chunks costs no more than its size. At most
+`GATEWAY_MAX_CONNECTIONS` (256) connections are open, `GATEWAY_MAX_CONNECTIONS_PER_PEER` (32) from one address (more
+are closed at once), and each has `GATEWAY_HEADER_TIMEOUT` (30 s) to send a request header, on a new connection and
+between keep-alive requests; the gateway speaks HTTP/1.1. Raising the concurrency adds about 200 MiB a request to the
+peak.
 
 **Settings** (defaults and notes in `scripts/config.sh`):
 
@@ -530,8 +531,11 @@ concurrency needs the cap raised by 800 MiB a request.
 | `GATEWAY_IMAGE` | `ds41-gateway:<hash of gateway/>` | the gateway image `prepare.sh` builds; set it to use a prebuilt one |
 | `GATEWAY_MEMORY`, `GATEWAY_CPUS` | 3g, 2 | the container's `--memory` and `--cpus` |
 | `GATEWAY_MAX_CONCURRENT` | 3 | simultaneous request permits; excess requests queue, including through streaming responses |
-| `GATEWAY_MAX_CONNECTIONS` | 64 | open client connections; further clients wait to be accepted |
+| `GATEWAY_MAX_CONNECTIONS` | 256 | open client connections; further clients wait to be accepted |
+| `GATEWAY_MAX_CONNECTIONS_PER_PEER` | 32 | open connections from one address; more are closed at once |
+| `GATEWAY_HEADER_TIMEOUT` | 30 | seconds to send a request header, also between keep-alive requests |
 | `GATEWAY_BODY_TIMEOUT` | 60 | seconds an admitted request may take to send its body; 408 after it |
+| `GATEWAY_MAX_PROMPT_MB` | 8 | largest rendered prompt the gateway encodes; a larger one is a 400 before encoding |
 | `GATEWAY_STRICT` | 0 | `1`: the API's 400 instead of the fallback |
 | `GATEWAY_BLOCK_PRIVATE_URLS` | 1 | `1`: reject loopback, private, link-local and reserved image destinations |
 | `GATEWAY_API_SAMPLING` | 1 | `1`: use the API's sampling policy; `0`: the client's temperature/top_p/seed |

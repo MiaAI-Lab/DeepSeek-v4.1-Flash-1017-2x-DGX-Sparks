@@ -86,6 +86,8 @@ fn config(served_name: &str) -> GatewayConfig {
         engine_logprobs: None,
         dns_overrides: HashMap::new(),
         body_timeout: None,
+        max_prompt_bytes: crate::parity::DEFAULT_MAX_PROMPT_BYTES,
+        encode_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
     }
 }
 

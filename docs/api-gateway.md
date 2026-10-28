@@ -34,23 +34,31 @@ API open, as the native recipe does by default.
 
 `GATEWAY_MAX_CONCURRENT` (default 3) admits that many requests and queues the rest instead of rejecting them at the cap.
 A permit covers the whole response body, including an SSE stream, and is released on completion or client cancellation.
-The default derives from measured peaks of the release binary (three runs each, fresh process, median and range):
+The default comes from measured peaks of the release binary at the recipe's 1M-token context (three runs each, fresh
+process; median and range). Encoding a prompt takes up to about 120 bytes of memory per byte of prompt, whatever its token count, so a rendered prompt over `GATEWAY_MAX_PROMPT_MB` (8 MiB; a million tokens of ordinary text is about 4 MiB) is a 400 before it is encoded, and one request encodes at a time; image fetches run outside that slot.
 
-| request | peak over idle (57 MiB) |
+| admitted requests | peak (idle: 57 MiB) |
 | --- | --- |
-| 188,000-token prompt (0.7 MiB) | 159 MiB (159-160) |
-| 64 MiB body of images | 484 MiB (482-522) |
-| prompt that fits the context, made of 128-byte tokens (12 MiB) | 763 MiB (748-784) |
-| 64 MiB body of text that cannot fit, refused after the piecewise count | 447 MiB (447-448) |
+| one 188,000-token prompt (0.7 MiB) | 206 MiB (206-206) |
+| one 8 MiB prompt of ordinary text | 1,025 MiB (986-1,026) |
+| one 64 MiB body of images | 529 MiB (529-536) |
+| one 8 MiB prompt and 55 MiB of images | 1,294 MiB (1,232-1,294) |
+| three 8 MiB prompts at once | 1,079 MiB (1,063-1,127) |
+| three 64 MiB image bodies at once | 949 MiB (939-977) |
+| three 8 MiB prompts with 55 MiB of images each, at once | 1,692 MiB (1,685-1,722) |
+| a 64 MiB body of text, refused by the prompt limit before encoding | 441 MiB (441-441) |
 
-With 800 MiB a request and 64 MiB idle, `floor((3072-64)/800)=3` under the `3g` container default; three 64 MiB image
-requests at once peaked at 1,469 MiB (1,424-1,515). Before the piecewise count, the 64 MiB text body was tokenized whole
-and took 6,537 MiB and 26 s only to be refused. Raising the permit count needs the cap raised by 800 MiB a request.
+Three at once stay under the `3g` container default with room to spare. Without the single encode slot the last case
+took 3,574 MiB (3,505-3,600), and before the prompt limit a 64 MiB body of text was encoded whole: 6,537 MiB and 26 s
+only to be refused for its length. Each further admitted request adds about 200 MiB (its body, JSON and images).
 
 The body of an admitted request is read by the same middleware, within `GATEWAY_BODY_TIMEOUT` (60 s): a client that has
-not sent its whole body by then gets a 408 and its permit goes back. A body over 64 MiB, declared in `content-length` or
-found while reading, is a 413. `GATEWAY_MAX_CONNECTIONS` (64) caps the open client connections, so connections waiting
-for a permit and idle keep-alive connections are bounded too; the next client waits in the kernel's accept queue.
+not sent its whole body by then gets a 408 and its permit goes back. A `content-length` over 64 MiB is a 413 before
+anything is read; a chunked body is a 413 when it crosses 64 MiB. Frames are copied into one buffer as they arrive, so a
+body split into tiny chunks costs no more than its size. Connections: `GATEWAY_MAX_CONNECTIONS` (256) open at most,
+`GATEWAY_MAX_CONNECTIONS_PER_PEER` (32) from one address (more are closed at once, so one client cannot take every
+slot), and `GATEWAY_HEADER_TIMEOUT` (30 s) for a request header, on a new connection and between keep-alive requests, so
+a silent, slow or idle connection gives its slot back. The gateway speaks HTTP/1.1.
 
 ## Fallback and strict mode
 
@@ -75,9 +83,9 @@ pixels) and counted with DeepSeek's `ImageTokenSpec::v41`. The destination filte
 rejects, for IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`,
 `192.0.0.0/24`, `192.0.2.0/24`, `192.31.196.0/24`, `192.52.193.0/24`, `192.88.99.0/24`, `192.168.0.0/16`,
 `192.175.48.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4` and the
-broadcast address; for IPv6: `::/128`, `::1/128`, `::ffff:0:0/96`, `64:ff9b::/96`, `64:ff9b:1::/48`, `100::/64`,
-`2001::/23`, `2001:db8::/32`, `2002::/16`, `3fff::/20`, `fc00::/7`, `fe80::/10`, `fec0::/10` and `ff00::/8`.
-IPv4-mapped and 6to4 addresses are checked through their embedded IPv4 address. These are the loopback, private,
+broadcast address; for IPv6: everything outside global unicast `2000::/3`, and within it `2001::/23`,
+`2001:db8::/32`, `3fff::/20`; IPv4-mapped (`::ffff:0:0/96`), 6to4 (`2002::/16`) and NAT64 (`64:ff9b::/96`) addresses
+are checked through their embedded IPv4 address, and `64:ff9b:1::/48` is rejected. These are the loopback, private,
 carrier-grade NAT, link-local, multicast, broadcast, reserved, documentation, benchmarking, discard, translation and
 tunnelling ranges, and every redirect and resolved address is checked, so an image URL cannot make the gateway fetch a
 private or non-routable destination. The API's limits apply: `GATEWAY_MAX_IMAGES` (600), `GATEWAY_MAX_IMAGE_MB` (64) and
@@ -114,9 +122,11 @@ cargo build --release --locked --bin ds41-gateway
 ```
 
 The flags and their defaults are in `gateway/src/main.rs` and `gateway/README.md`. The container runs as an unprivileged
-user, read-only, with `--memory` and `--cpus` from `GATEWAY_MEMORY` / `GATEWAY_CPUS`, and no GPU. With `API_KEY=1` it runs
-as the uid and gid of the user who runs `start.sh`, who owns the mode-600 key file it mounts; otherwise as the image's
-unprivileged `ds41` user (uid 10001). The memory default is `3g`, sized for three admitted requests as described above.
+user, read-only, with no capabilities (`--cap-drop ALL`, `--security-opt no-new-privileges`), `--memory` and `--cpus`
+from `GATEWAY_MEMORY` / `GATEWAY_CPUS`, and no GPU. With `API_KEY=1` it runs as the uid and gid of the user who runs
+`start.sh`, who owns the mode-600 key file it mounts, and `start.sh` refuses to do that as root; otherwise it runs as the
+image's unprivileged `ds41` user (uid 10001). Docker's `userns-remap` is not supported with a key: the uid inside is not
+the host's, and the key stays unreadable. The memory default is `3g`, sized for three admitted requests as above.
 
 ## Parity battery without a GPU
 

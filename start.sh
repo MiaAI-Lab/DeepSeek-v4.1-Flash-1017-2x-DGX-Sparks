@@ -87,6 +87,13 @@ done
 [[ "$GATEWAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONCURRENT is a positive count, not $GATEWAY_MAX_CONCURRENT"
 [[ "$GATEWAY_MAX_CONNECTIONS" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONNECTIONS is a positive count, not $GATEWAY_MAX_CONNECTIONS"
 [[ "$GATEWAY_BODY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_BODY_TIMEOUT is a positive number of seconds, not $GATEWAY_BODY_TIMEOUT"
+[[ "$GATEWAY_MAX_CONNECTIONS_PER_PEER" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONNECTIONS_PER_PEER is a positive count, not $GATEWAY_MAX_CONNECTIONS_PER_PEER"
+[[ "$GATEWAY_HEADER_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_HEADER_TIMEOUT is a positive number of seconds, not $GATEWAY_HEADER_TIMEOUT"
+[[ "$GATEWAY_MAX_PROMPT_MB" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_PROMPT_MB is a positive count, not $GATEWAY_MAX_PROMPT_MB"
+# With a key the gateway runs as the key's owner (below), so that owner may not be root: the network-facing process
+# would then run as root. Run start.sh as the non-root user who owns API_KEY_FILE.
+[[ "$API_GATEWAY" != 1 || "$API_KEY" != 1 || "$(id -u)" != 0 ]] ||
+  die "API_GATEWAY=1 with API_KEY=1 runs the gateway as the user running start.sh, and that is root: run it as the key's non-root owner"
 [[ "$GATEWAY_LOG" =~ ^(debug|info|warn|error)$ ]] || die "GATEWAY_LOG is debug, info, warn or error, not $GATEWAY_LOG"
 [[ -n "$GATEWAY_IMAGE_TOKEN" ]] || die "GATEWAY_IMAGE_TOKEN is empty: give the served tokenizer's image-token spelling"
 for v in GATEWAY_MAX_IMAGES GATEWAY_MAX_IMAGE_MB; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
@@ -297,7 +304,7 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
 ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|API_EFFORTS)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|API_EFFORTS)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" | grep -v '^TENSORFOLD_TOKEN_ROUTE=' || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 # each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response
@@ -327,7 +334,8 @@ GATEWAY_ARGS=(--listen "$GATEWAY_LISTEN" --engine "http://127.0.0.1:$ENGINE_PORT
               --served-name "$SERVED_NAME" --image-token "$GATEWAY_IMAGE_TOKEN" --max-model-len "$CONTEXT"
               --max-images "$GATEWAY_MAX_IMAGES" --max-image-mb "$GATEWAY_MAX_IMAGE_MB"
               --max-concurrent "$GATEWAY_MAX_CONCURRENT" --max-connections "$GATEWAY_MAX_CONNECTIONS"
-              --body-timeout "$GATEWAY_BODY_TIMEOUT" --log "$GATEWAY_LOG")
+              --max-connections-per-peer "$GATEWAY_MAX_CONNECTIONS_PER_PEER" --header-timeout "$GATEWAY_HEADER_TIMEOUT"
+              --body-timeout "$GATEWAY_BODY_TIMEOUT" --max-prompt-mb "$GATEWAY_MAX_PROMPT_MB" --log "$GATEWAY_LOG")
 if [[ "$THINKING" == 1 ]]; then GATEWAY_ARGS+=(--default-thinking); else GATEWAY_ARGS+=(--default-thinking=false); fi
 [[ -z "$REASONING_EFFORT" ]] || GATEWAY_ARGS+=(--default-effort "$REASONING_EFFORT")
 [[ "$GATEWAY_STRICT" != 1 ]] || GATEWAY_ARGS+=(--strict)
@@ -344,9 +352,11 @@ if [[ "$DRY" != 1 ]]; then
   [[ -d "$GATEWAY_MODEL_DIR" ]] || die "the served folder $GATEWAY_MODEL_DIR does not exist: prepare.sh downloads the model there"
 fi
 GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
-             --restart on-failure:3 --read-only --tmpfs /tmp -v "$GATEWAY_MODEL_DIR:/served:ro")
+             --restart on-failure:3 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges
+             -v "$GATEWAY_MODEL_DIR:/served:ro")
 # The key file is mode 600 and belongs to the user running this script (api_key_ensure, and the smoke test reads it), so
-# with a key the gateway runs as that uid:gid instead of the image's ds41 (10001), which could not read it.
+# with a key the gateway runs as that uid:gid instead of the image's ds41 (10001), which could not read it; never as root
+# (refused above). With Docker's userns-remap the uid inside is not the host's and the key stays unreadable: not supported.
 if [[ "$API_KEY" == 1 ]]; then
   GATEWAY_RUN+=(--user "$(id -u):$(id -g)" -v "$API_KEY_FILE:/run/secrets/key:ro" -e API_KEY_FILE=/run/secrets/key)
 fi

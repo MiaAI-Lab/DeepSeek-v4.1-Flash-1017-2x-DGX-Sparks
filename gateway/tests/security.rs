@@ -587,22 +587,45 @@ async fn a_body_over_the_limit_is_413_before_it_is_read() {
     assert!(status.contains(" 413 "), "{status}");
 }
 
-#[tokio::test]
-async fn the_listener_keeps_at_most_max_connections_open() {
-    use ds41_gateway::listener::LimitedListener;
-    let router = Router::new().route("/", any(|| async { "ok" }));
+/// Serve `router` with the gateway's own listener and server, as main.rs does.
+async fn spawn_limited(
+    router: Router,
+    max: usize,
+    per_peer: usize,
+    header_timeout: Duration,
+) -> std::net::SocketAddr {
+    use ds41_gateway::listener::{LimitedListener, serve};
     let listener = LimitedListener::new(
         tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind"),
-        1,
+        max,
+        per_peer,
     );
-    let address = axum::serve::Listener::local_addr(&listener).expect("address");
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("serve");
-    });
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(serve(listener, router, header_timeout));
+    address
+}
+
+/// Whether the server closes `stream` within `wait` (a read that returns 0 or fails).
+async fn closed_within(stream: &mut tokio::net::TcpStream, wait: Duration) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buffer = [0; 512];
+    loop {
+        match tokio::time::timeout(wait, stream.read(&mut buffer)).await {
+            Err(_) => return false,
+            Ok(Ok(0)) | Ok(Err(_)) => return true,
+            Ok(Ok(_)) => continue,
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_listener_keeps_at_most_max_connections_open() {
+    let router = Router::new().route("/", any(|| async { "ok" }));
+    let address = spawn_limited(router, 1, 8, Duration::from_secs(30)).await;
     let url = format!("http://{address}");
-    let head = "GET / HTTP/1.1\r\nhost: x\r\n\r\n";
+    let head = "GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
     // Control: with the slot free, a request is answered.
     let status = raw_request(&url, head, b"", Duration::ZERO, Duration::from_secs(2)).await;
     assert!(status.is_some_and(|line| line.contains(" 200 ")));
@@ -622,6 +645,122 @@ async fn the_listener_keeps_at_most_max_connections_open() {
     drop(idle);
     let status = waiting.await.expect("join");
     assert!(status.is_some_and(|line| line.contains(" 200 ")));
+}
+
+#[tokio::test]
+async fn one_address_cannot_take_more_than_its_share() {
+    let router = Router::new().route("/", any(|| async { "ok" }));
+    let address = spawn_limited(router, 8, 2, Duration::from_secs(30)).await;
+    let head = "GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
+    let url = format!("http://{address}");
+    // Two idle connections from 127.0.0.1 fill its share of 2 (the global cap is 8).
+    let _first = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("first");
+    let _second = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("second");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A third from the same address is closed at once instead of waiting.
+    let mut third = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("third");
+    assert!(closed_within(&mut third, Duration::from_secs(2)).await);
+    // Control: once one of the two goes, the address is served again.
+    drop(_first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let status = raw_request(&url, head, b"", Duration::ZERO, Duration::from_secs(2)).await;
+    assert!(status.is_some_and(|line| line.contains(" 200 ")));
+}
+
+#[tokio::test]
+async fn a_connection_that_sends_no_header_in_time_is_closed_and_frees_its_slot() {
+    use tokio::io::AsyncWriteExt;
+    let router = Router::new().route("/", any(|| async { "ok" }));
+    let address = spawn_limited(router, 1, 8, Duration::from_millis(500)).await;
+    let url = format!("http://{address}");
+    // Silent from the start: closed after the deadline.
+    let mut silent = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("silent");
+    assert!(closed_within(&mut silent, Duration::from_secs(3)).await);
+    // A header sent a byte at a time, slower than the deadline: closed too.
+    let mut slow = tokio::net::TcpStream::connect(address).await.expect("slow");
+    let slow_closed = tokio::spawn(async move {
+        for byte in b"GET / HTTP/1.1\r\nhost: x\r\n" {
+            if slow.write_all(&[*byte]).await.is_err() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        closed_within(&mut slow, Duration::from_secs(3)).await
+    });
+    assert!(slow_closed.await.expect("join"));
+    // A kept-alive connection idle after its response: closed after the deadline.
+    let mut kept = tokio::net::TcpStream::connect(address).await.expect("kept");
+    kept.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        .await
+        .expect("request");
+    let mut reply = [0; 256];
+    let read = tokio::io::AsyncReadExt::read(&mut kept, &mut reply)
+        .await
+        .expect("reply");
+    assert!(String::from_utf8_lossy(&reply[..read]).starts_with("HTTP/1.1 200"));
+    assert!(closed_within(&mut kept, Duration::from_secs(3)).await);
+    // The one slot came back each time: a request is still answered.
+    let status = raw_request(
+        &url,
+        "GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+        b"",
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(status.is_some_and(|line| line.contains(" 200 ")));
+}
+
+#[tokio::test]
+async fn a_body_in_tiny_chunks_is_read_whole() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (engine, _) = spawn_basic_engine().await;
+    let url = spawn_gateway(
+        &engine,
+        timed_config(Duration::from_secs(20)),
+        Arc::new(Semaphore::new(1)),
+    )
+    .await;
+    // A JSON body sent as 20,000 one-byte chunks: it arrives whole (and is refused only
+    // as a request, 400), so the per-frame copy keeps every byte in order.
+    let body = format!("{{\"padding\": \"{}\"}}", "x".repeat(19_985));
+    assert_eq!(body.len(), 20_000);
+    let mut wire = Vec::new();
+    for byte in body.bytes() {
+        wire.extend_from_slice(b"1\r\n");
+        wire.push(byte);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    let address = url.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    stream
+        .write_all(
+            b"POST /v1/messages HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+              transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .expect("head");
+    stream.write_all(&wire).await.expect("body");
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).await.expect("reply");
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(
+        reply.starts_with("HTTP/1.1 400"),
+        "{}",
+        &reply[..reply.len().min(300)]
+    );
+    assert!(!reply.contains("cannot read the request body"), "{reply}");
 }
 
 #[tokio::test]

@@ -112,6 +112,9 @@ fn destination_filter_rejects_the_api_table() {
         "fec0::1",
         "3fff::1",
         "::ffff:127.0.0.1",
+        "::2",
+        "4000::1",
+        "e000::1",
     ];
     for address in rejected {
         assert!(

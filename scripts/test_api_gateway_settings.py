@@ -24,6 +24,10 @@ HOME = "/tmp/ds41-home"
 IMAGE_TAG = re.compile(r"tensorfold-dsv41:exl3-tp2-[0-9a-f]{12}")
 
 STUBS = {
+    # FAKE_UID makes `id -u` answer it (the refusal to run a keyed gateway as root); otherwise the real id.
+    "id": """#!/usr/bin/env bash
+if [[ -n "${FAKE_UID:-}" && "$1" == "-u" ]]; then echo "$FAKE_UID"; else exec /usr/bin/id "$@"; fi
+""",
     "docker": """#!/usr/bin/env bash
 exit 1
 """,
@@ -166,6 +170,7 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         self.assertIn("-v /tmp/ds41-home/.cache/huggingface/tensorfold-dsv41/45ee5d0f/model:/served:ro", out)
         self.assertIn("-v /tmp/ds41-home/.local/state/dsv41-tensorfold/api-key:/run/secrets/key:ro", out)
         self.assertIn("-e API_KEY_FILE=/run/secrets/key", out)
+        self.assertIn("--cap-drop ALL --security-opt no-new-privileges", out)
         # The key file is the invoking user's, mode 600: the gateway must run as that user to read it.
         self.assertIn(f"--user {os.getuid()}:{os.getgid()} -v /tmp/ds41-home/.local/state/dsv41-tensorfold/api-key", out)
         self.assertIn(
@@ -176,13 +181,21 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         gateway_tokens = self._gateway_tokens(out)
         self.assertEqual(gateway_tokens[gateway_tokens.index("--image-token") + 1], "<\uff5cdeepseek_image\uff5c>")
         self.assertIn(
-            "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --max-concurrent 3 --max-connections 64 "
-            "--body-timeout 60 --log debug "
+            "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --max-concurrent 3 --max-connections 256 "
+            "--max-connections-per-peer 32 --header-timeout 30 --body-timeout 60 --max-prompt-mb 8 --log debug "
             "--default-thinking --strict --block-private-urls=false --api-sampling=false --require-key",
             out,
         )
         self.assertNotIn("-e API_KEY=0", out)
         self.assertNotIn("--host 0.0.0.0 --port 8888", out)
+
+    def test_a_keyed_gateway_refuses_to_run_as_root(self):
+        result = self.run_start(API_GATEWAY=1, API_KEY=1, FAKE_UID=0)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("run it as the key's non-root owner", result.stderr)
+        # Control: the same settings as a non-root user start.
+        result = self.run_start(API_GATEWAY=1, API_KEY=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_without_a_key_the_gateway_keeps_the_image_user(self):
         result = self.run_start(API_GATEWAY=1)
@@ -268,6 +281,9 @@ class ApiGatewaySettingsTest(unittest.TestCase):
             ({"GATEWAY_MAX_IMAGE_MB": 0}, "GATEWAY_MAX_IMAGE_MB is a positive count"),
             ({"GATEWAY_MAX_CONNECTIONS": 0}, "GATEWAY_MAX_CONNECTIONS is a positive count"),
             ({"GATEWAY_BODY_TIMEOUT": "1.5"}, "GATEWAY_BODY_TIMEOUT is a positive number of seconds"),
+            ({"GATEWAY_MAX_CONNECTIONS_PER_PEER": 0}, "GATEWAY_MAX_CONNECTIONS_PER_PEER is a positive count"),
+            ({"GATEWAY_HEADER_TIMEOUT": "x"}, "GATEWAY_HEADER_TIMEOUT is a positive number of seconds"),
+            ({"GATEWAY_MAX_PROMPT_MB": 0}, "GATEWAY_MAX_PROMPT_MB is a positive count"),
         ]
         for extra, message in cases:
             with self.subTest(extra=extra):

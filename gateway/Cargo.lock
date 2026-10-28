@@ -683,6 +683,8 @@ dependencies = [
  "deepseek-recipe-image",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "image",
  "pin-project-lite",
  "quick-xml",

@@ -29,6 +29,8 @@ clap = { version = "4", features = ["derive"] }
 subtle = "2.6"
 http-body = "1"
 http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 pin-project-lite = "0.2"
 
 [dev-dependencies]

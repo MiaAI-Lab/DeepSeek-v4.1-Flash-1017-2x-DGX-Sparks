@@ -63,13 +63,19 @@ The defaults are in `scripts/config.sh`; the flags are in `src/main.rs`. The imp
 | `GATEWAY_MAX_IMAGES`, `GATEWAY_MAX_IMAGE_MB` | `--max-images`, `--max-image-mb` | 600, 64 |
 | `GATEWAY_LOG` | `--log` | info |
 | `GATEWAY_MAX_CONCURRENT` | `--max-concurrent` | 3 |
-| `GATEWAY_MAX_CONNECTIONS` | `--max-connections` | 64 |
+| `GATEWAY_MAX_CONNECTIONS` | `--max-connections` | 256 |
+| `GATEWAY_MAX_CONNECTIONS_PER_PEER` | `--max-connections-per-peer` | 32 |
+| `GATEWAY_HEADER_TIMEOUT` | `--header-timeout` (seconds) | 30 |
 | `GATEWAY_BODY_TIMEOUT` | `--body-timeout` (seconds) | 60 |
+| `GATEWAY_MAX_PROMPT_MB` | `--max-prompt-mb` | 8 |
 | `API_KEY` | `--require-key` | 0 |
 
-With `API_KEY=1` the recipe mounts the key at `/run/secrets/key`, passes `--require-key` and runs the container as the
-uid:gid of the user who runs `start.sh`, the owner of the mode-600 key file; the gateway forwards `Authorization` /
-`x-api-key` to the engine and lets it decide.
+With `API_KEY=1` the gateway loads the keys from `API_KEY_FILE` once at startup (one key, or `label: key`, a line;
+an empty or unreadable file stops it) and checks `Authorization: Bearer <key>` or `x-api-key: <key>` itself, in constant
+time, before reading the body, on every route except `GET /health`; a missing or wrong key is the API's 401. An
+`API_KEY` that is neither 1/0, true/false nor yes/no stops it, rather than leaving the API open. The recipe mounts the
+key at `/run/secrets/key`, passes `--require-key` and runs the container as the uid:gid of the user who runs `start.sh`,
+the owner of the mode-600 key file (never root: `start.sh` refuses). A key change needs a restart.
 
 ## Images
 
@@ -78,17 +84,17 @@ uid:gid of the user who runs `start.sh`, the owner of the mode-600 key file; the
 default) the destination filter rejects, for IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`,
 `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.31.196.0/24`, `192.52.193.0/24`,
 `192.88.99.0/24`, `192.168.0.0/16`, `192.175.48.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`,
-`224.0.0.0/4`, `240.0.0.0/4` and the broadcast address; for IPv6: `::/128`, `::1/128`, `::ffff:0:0/96`,
-`64:ff9b::/96`, `64:ff9b:1::/48`, `100::/64`, `2001::/23`, `2001:db8::/32`, `2002::/16`, `3fff::/20`, `fc00::/7`,
-`fe80::/10`, `fec0::/10` and `ff00::/8`. IPv4-mapped and 6to4 addresses are checked through their embedded IPv4
-address. These are the loopback, private, carrier-grade NAT, link-local, multicast, broadcast, reserved, documentation,
+`224.0.0.0/4`, `240.0.0.0/4` and the broadcast address; for IPv6: everything outside global unicast
+`2000::/3`, and within it `2001::/23`, `2001:db8::/32`, `3fff::/20`; IPv4-mapped (`::ffff:0:0/96`), 6to4 (`2002::/16`)
+and NAT64 (`64:ff9b::/96`) addresses are checked through their embedded IPv4 address, and `64:ff9b:1::/48` is
+rejected. These are the loopback, private, carrier-grade NAT, link-local, multicast, broadcast, reserved, documentation,
 benchmarking, discard, translation and tunnelling ranges. The fetch uses the gateway's own HTTP client (the image crate
 only streams the body under the size limits): environment proxies are ignored, the resolver hands the client only the
 addresses the filter allows, so a second DNS answer cannot swap in another one, an address spelled in the URL (decimal,
 hexadecimal, IPv4-mapped) is checked as the address it parses to, and every redirect goes through the same checks, at
 most five times. So an image URL cannot make the gateway fetch a private or non-routable destination; the tests in
-`src/images.rs` run that production client against a loopback server, with a positive control. `GATEWAY_MAX_IMAGES` (600), `GATEWAY_MAX_IMAGE_MB`
-(64) and 8192-character URLs still apply.
+`src/images.rs` run that production client against a loopback server, with a positive control. `GATEWAY_MAX_IMAGES`
+(600), `GATEWAY_MAX_IMAGE_MB` (64) and 8192-character URLs still apply.
 
 ## Parity battery
 

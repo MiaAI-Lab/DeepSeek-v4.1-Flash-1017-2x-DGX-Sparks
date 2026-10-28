@@ -130,7 +130,9 @@ async fn read_body(request: Request, timeout: Option<Duration>) -> Result<Reques
         return Err(too_large());
     }
     let (parts, body) = request.into_parts();
-    let read = axum::body::to_bytes(body, MAX_BODY_BYTES);
+    // At most the declared length up front (a lie only costs a regrow), never the limit.
+    let capacity = declared.map_or(0, |length| length as usize);
+    let read = collect_within(body, capacity, MAX_BODY_BYTES);
     let bytes = match timeout {
         Some(limit) => tokio::time::timeout(limit, read).await.map_err(|_| {
             ApiError::new(
@@ -144,16 +146,37 @@ async fn read_body(request: Request, timeout: Option<Duration>) -> Result<Reques
         })?,
         None => read.await,
     };
-    let bytes = bytes.map_err(|error| {
-        let over_limit = std::error::Error::source(&error)
-            .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
-        if over_limit {
-            too_large()
-        } else {
+    let bytes = bytes.map_err(|error| match error {
+        BodyError::TooLarge => too_large(),
+        BodyError::Read(error) => {
             ApiError::bad_request(format!("cannot read the request body: {error}"))
         }
     })?;
     Ok(Request::from_parts(parts, Body::from(bytes)))
+}
+
+enum BodyError {
+    TooLarge,
+    Read(axum::Error),
+}
+
+/// Copy the body's data frames into one buffer as they arrive, dropping each frame at
+/// once, so the memory is the buffer itself however finely the client splits the body
+/// (a collector that keeps every frame until the end would hold one allocation each).
+async fn collect_within(body: Body, capacity: usize, limit: usize) -> Result<Bytes, BodyError> {
+    use http_body_util::BodyExt;
+    let mut body = body;
+    let mut buffer: Vec<u8> = Vec::with_capacity(capacity.min(limit));
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(BodyError::Read)?;
+        if let Ok(data) = frame.into_data() {
+            if buffer.len() + data.len() > limit {
+                return Err(BodyError::TooLarge);
+            }
+            buffer.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(buffer))
 }
 
 fn authorized(headers: &HeaderMap, keys: Option<&ApiKeys>) -> bool {

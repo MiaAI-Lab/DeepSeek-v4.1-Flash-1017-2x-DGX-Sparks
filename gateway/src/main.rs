@@ -11,8 +11,8 @@ use clap::Parser;
 use ds41_gateway::api::AppState;
 use ds41_gateway::engine::EngineClient;
 use ds41_gateway::health;
-use ds41_gateway::listener::LimitedListener;
-use ds41_gateway::parity::GatewayConfig;
+use ds41_gateway::listener::{self, LimitedListener};
+use ds41_gateway::parity::{DEFAULT_MAX_PROMPT_BYTES, GatewayConfig};
 use ds41_gateway::security::ApiKeys;
 use ds41_gateway::{Gateway, GatewaySettings};
 use serde_json::Value;
@@ -73,12 +73,21 @@ struct Cli {
     /// Maximum admitted requests; additional requests wait (default: 3).
     #[arg(long, value_parser = parse_positive_usize)]
     max_concurrent: Option<usize>,
-    /// Maximum open client connections; further clients wait to be accepted (default: 64).
+    /// Maximum open client connections; further clients wait to be accepted (default: 256).
     #[arg(long, value_parser = parse_positive_usize)]
     max_connections: Option<usize>,
+    /// Maximum open connections from one IP address; more are closed at once (default: 32).
+    #[arg(long, value_parser = parse_positive_usize)]
+    max_connections_per_peer: Option<usize>,
+    /// Seconds a connection has to send a request header, new or kept alive (default: 30).
+    #[arg(long, value_parser = parse_positive_usize)]
+    header_timeout: Option<usize>,
     /// Seconds an admitted request may take to send its body (default: 60).
     #[arg(long, value_parser = parse_positive_usize)]
     body_timeout: Option<usize>,
+    /// Largest rendered prompt the gateway encodes, in MiB; a larger one is a 400 (default: 8).
+    #[arg(long, value_parser = parse_positive_usize)]
+    max_prompt_mb: Option<usize>,
     /// Log level.
     #[arg(long)]
     log: Option<String>,
@@ -88,16 +97,18 @@ struct Cli {
 }
 
 const DEFAULT_IMAGE_TOKEN: &str = "<｜deepseek_image｜>";
-// Open connections: admitted requests, the ones queued behind them and idle keep-alives.
-const DEFAULT_MAX_CONNECTIONS: usize = 64;
+// Open connections: admitted requests, the ones queued behind them and idle keep-alives; and from one address.
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+const DEFAULT_MAX_CONNECTIONS_PER_PEER: usize = 32;
+// hyper's own default for the request header; it also closes keep-alive connections idle that long.
+const DEFAULT_HEADER_TIMEOUT_SECS: usize = 30;
 // A 64 MiB body at about 1 MiB/s; a slower client gives its admission slot back.
 const DEFAULT_BODY_TIMEOUT_SECS: usize = 60;
-// Measured peaks of the release binary: 57 MiB idle (64 here), up to 784 MiB an admitted request (800 here), against
-// the recipe's 3 GiB container default (GATEWAY_MEMORY=3g in scripts/config.sh).
-const BUDGET_MIB: usize = 3072;
-const IDLE_MIB: usize = 64;
-const REQUEST_MIB: usize = 800;
-const DEFAULT_MAX_CONCURRENT: usize = (BUDGET_MIB - IDLE_MIB) / REQUEST_MIB;
+// Admitted requests. Measured peaks of the release binary at a 1M-token context, one encode at a time (three runs
+// each, the highest): 57 MiB idle; one request with an 8 MiB prompt and 55 MiB of images 1,294 MiB; three of them at
+// once 1,722 MiB, under the recipe's 3 GiB container cap (GATEWAY_MEMORY=3g in scripts/config.sh). Each further
+// admitted request adds about 200 MiB (its body, JSON and images); the encode itself is not repeated.
+const DEFAULT_MAX_CONCURRENT: usize = 3;
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
@@ -175,7 +186,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .max_image_mb
         .or_else(|| env("GATEWAY_MAX_IMAGE_MB").and_then(|value| value.parse().ok()))
         .unwrap_or(64);
-    let require_key = cli.require_key || env_bool("API_KEY").unwrap_or(false);
+    // An API_KEY that is neither on nor off is an error: read as "off", it would leave the API open.
+    let require_key = cli.require_key
+        || match env("API_KEY") {
+            None => false,
+            Some(value) => env_bool("API_KEY")
+                .ok_or_else(|| format!("API_KEY is 1 or 0 (true/false, yes/no), not {value:?}"))?,
+        };
     let api_key_file = cli
         .api_key_file
         .or_else(|| env("API_KEY_FILE").map(PathBuf::from));
@@ -187,20 +204,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .transpose()?
             .unwrap_or(DEFAULT_MAX_CONCURRENT),
     };
-    let max_connections = match cli.max_connections {
-        Some(value) => value,
-        None => env("GATEWAY_MAX_CONNECTIONS")
-            .map(|value| parse_positive_usize(&value))
-            .transpose()?
-            .unwrap_or(DEFAULT_MAX_CONNECTIONS),
-    };
-    let body_timeout = match cli.body_timeout {
-        Some(value) => value,
-        None => env("GATEWAY_BODY_TIMEOUT")
-            .map(|value| parse_positive_usize(&value))
-            .transpose()?
-            .unwrap_or(DEFAULT_BODY_TIMEOUT_SECS),
-    };
+    let max_connections = positive_setting(
+        cli.max_connections,
+        "GATEWAY_MAX_CONNECTIONS",
+        DEFAULT_MAX_CONNECTIONS,
+    )?;
+    let max_connections_per_peer = positive_setting(
+        cli.max_connections_per_peer,
+        "GATEWAY_MAX_CONNECTIONS_PER_PEER",
+        DEFAULT_MAX_CONNECTIONS_PER_PEER,
+    )?;
+    let header_timeout = positive_setting(
+        cli.header_timeout,
+        "GATEWAY_HEADER_TIMEOUT",
+        DEFAULT_HEADER_TIMEOUT_SECS,
+    )?;
+    let body_timeout = positive_setting(
+        cli.body_timeout,
+        "GATEWAY_BODY_TIMEOUT",
+        DEFAULT_BODY_TIMEOUT_SECS,
+    )?;
+    let max_prompt_mb = positive_setting(
+        cli.max_prompt_mb,
+        "GATEWAY_MAX_PROMPT_MB",
+        DEFAULT_MAX_PROMPT_BYTES / (1024 * 1024),
+    )?;
     let log_level = cli
         .log
         .or_else(|| env("GATEWAY_LOG"))
@@ -237,6 +265,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         engine_logprobs,
         dns_overrides,
         body_timeout: Some(Duration::from_secs(body_timeout as u64)),
+        max_prompt_bytes: max_prompt_mb.saturating_mul(1024 * 1024),
+        encode_slot: Arc::new(Semaphore::new(1)),
     };
     let state = AppState {
         gateway: Arc::new(gateway),
@@ -244,14 +274,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config: Arc::new(config),
         semaphore: Arc::new(Semaphore::new(max_concurrent)),
     };
-    let listener = LimitedListener::new(TcpListener::bind(&listen).await?, max_connections);
+    let listener = LimitedListener::new(
+        TcpListener::bind(&listen).await?,
+        max_connections,
+        max_connections_per_peer,
+    );
     eprintln!(
         "ds41-gateway listening on {listen} (engine {}, model {served_name}, max_model_len {max_model_len}, \
-         {max_concurrent} admitted requests, {max_connections} connections, body timeout {body_timeout} s)",
+         {max_concurrent} admitted requests, {max_connections} connections ({max_connections_per_peer} a peer), \
+         header timeout {header_timeout} s, body timeout {body_timeout} s, prompts up to {max_prompt_mb} MiB)",
         state.engine.base()
     );
-    axum::serve(listener, health::router(state)).await?;
+    listener::serve(
+        listener,
+        health::router(state),
+        Duration::from_secs(header_timeout as u64),
+    )
+    .await?;
     Ok(())
+}
+
+/// A positive count from the command line, else from `name` in the environment, else `default`.
+fn positive_setting(cli: Option<usize>, name: &str, default: usize) -> Result<usize, String> {
+    match cli {
+        Some(value) => Ok(value),
+        None => env(name)
+            .map(|value| parse_positive_usize(&value).map_err(|error| format!("{name}: {error}")))
+            .transpose()
+            .map(|value| value.unwrap_or(default)),
+    }
 }
 
 fn parse_dns_overrides(values: &[String]) -> Result<HashMap<String, IpAddr>, String> {
@@ -319,10 +370,7 @@ async fn auto_max_model_len(engine: &EngineClient) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BUDGET_MIB, DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, IDLE_MIB, REQUEST_MIB,
-        load_api_keys, parse_positive_usize,
-    };
+    use super::{DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, load_api_keys, parse_positive_usize};
 
     #[test]
     fn the_default_image_token_is_the_served_spelling() {
@@ -351,9 +399,6 @@ mod tests {
     #[test]
     fn concurrency_default_and_parser_enforce_the_memory_budget() {
         assert_eq!(DEFAULT_MAX_CONCURRENT, 3);
-        // The budget is a property of the constants, so it is checked at compile time.
-        const { assert!(IDLE_MIB + DEFAULT_MAX_CONCURRENT * REQUEST_MIB <= BUDGET_MIB) };
-        const { assert!(IDLE_MIB + (DEFAULT_MAX_CONCURRENT + 1) * REQUEST_MIB > BUDGET_MIB) };
         assert_eq!(parse_positive_usize("4"), Ok(4));
         assert!(parse_positive_usize("0").is_err());
         assert!(parse_positive_usize("not-a-number").is_err());
