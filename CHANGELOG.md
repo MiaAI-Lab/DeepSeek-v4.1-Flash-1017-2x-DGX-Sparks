@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- `zig/patches/0036-metrics-cached-prompt-tokens.patch` (always on, issue #58): `/metrics` publishes
+  `prompt_tokens_cached_total`, the prompt tokens of finished requests restored from kept prompt states (they are in
+  `prompt_tokens_total` too), repeated under vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`; `/health`
+  carries `prompt_tokens_total`, `cached_tokens_total` (the name sparkDash reads) and `generation_tokens_total`, read
+  together with the `/metrics` counters so a scraper never subtracts a cached count from another moment's prompt count;
+  `/v1/models` names `max_model_len` (the context window; sparkDash's Context tile reads it). Computed prompt tokens
+  are `prompt_tokens_total - cached_tokens_total`. Counters are left out for an engine that keeps no prompt states. The
+  counter and its vLLM names are by **manuel1618 ([manuel1618](https://github.com/manuel1618))**
+  ([pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4x recipe, a backport of BertholomusAI's `ce0d9053`), adapted here with
+  `/health` and `/v1/models` added; host tests in `zig/src/server/status_totals_test.zig` and `metrics.zig`.
+- `zig/patches/0035-aligned-index-views.patch` (always on): the prompt pass's indexer scores rows in blocks, and a block
+  size that was not a multiple of 16 (137,612 compressed keys gave 121-row blocks) put a later block's views off the
+  16-byte boundary the kit's kernels were captured for: no matching variant, `MissingTritonVariant`. Blocks are now a
+  multiple of 16 rows (a row's scores are its own: no bits change), and a replay cut with an odd first row copies the
+  positions to an aligned buffer. From the 4x recipe's `0005` and `0007` (Mia's AI Lab); a host test for the block
+  size. Not run on a pair: it may be related to #65 and #36 but that is not shown, so compare replies with
+  `tools/exact.py` before relying on it.
 - `zig/patches/0034-rendezvous-ports-early.patch` (on): rank 0 opens its follower's port before its weights load and takes
   the connection afterwards. It used to listen only after its own weights had loaded, while the worker retried its
   connect for a fixed 300 s, so a worker that finished loading more than 300 s before the head (the head reading its
