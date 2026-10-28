@@ -49,6 +49,7 @@ How `scripts/config.sh` reaches the two commands (the flags and variables are th
 | `DRAFTS` | `--no-drafts` when 0 | `--drafts` |
 | `GRAPHS`, `SIDE`, `PREFETCH`, `ENGRAM_AIO` | `TF_DS_GRAPHS`, `TF_DS_HC_SIDE`, `TF_DS_L2_PREFETCH`, `TF_DS_ENGRAM_AIO` | `--graphs`, `--side`, `--prefetch`, `--aio` |
 | `GRAPH_CAP` | `TF_DS_GRAPH_CAP` | `--graph-cap` (`zig/patches/0033`) |
+| none: export `TF_DS_CONNECT_S` (seconds, 1 to 86400, default 300) | `TF_DS_CONNECT_S` (rank 0 only validates it) | `TF_DS_CONNECT_S`: how long rank 1 retries its connect (`zig/patches/0034`) |
 | `RDMA` | `TF_RDMA_DEVICES`, `TF_RDMA_GID_INDEX` | `--rdma`, `TF_RDMA_GID_INDEX` |
 | `RDMA_IDLE_S`, `RDMA_NAP_US` | `TF_RDMA_IDLE_S`, `TF_RDMA_NAP_US` | the same, through `ENGINE_ENV` (`zig/patches/0010`; recipe default 2 s / 500 µs) |
 | `REPLAY_FLOOR` | `TF_DS_REPLAY_FLOOR` | `TF_DS_REPLAY_FLOOR` |

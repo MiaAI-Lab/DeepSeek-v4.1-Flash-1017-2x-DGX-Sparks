@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- `zig/patches/0034-rendezvous-ports-early.patch` (on): rank 0 opens its follower's port before its weights load and takes
+  the connection afterwards. It used to listen only after its own weights had loaded, while the worker retried its
+  connect for a fixed 300 s, so a worker that finished loading more than 300 s before the head (the head reading its
+  weights cold, say) exited with `ConnectFailed`; now it waits in the port's backlog. `TF_DS_CONNECT_S` (default 300)
+  sets that retry window on both ranks; `start.sh` refuses a value that is not 1 to 86400. Host tests: a peer that
+  connects before the accept (also through `Fan`) is linked once rank 0 takes its port, and the setting's parsing; a
+  `scripts/port_test.sh` check that it reaches both ranks. After the 4x recipe's `0035` (Mia's AI Lab), which found it
+  there (its issue #3, diagnosed by shanedertrain).
+- `./stop.sh` exits 1 when a rank could not be stopped or a Spark's containers could not be listed (ssh or `docker ps`
+  failed), and says which Spark it left alone. Before, such a Spark counted as having no container, stop.sh exited 0,
+  and `./start.sh restart` went on to launch a rank while the old one might still hold the GPU's memory. The prepared
+  marker (`scripts/config.sh`, `prepared_state`) now covers the chat template's sha256, `HF_CACHE`, `NFS_PATH`,
+  `NFS_VOLUME` and each `NFS_SERVER`, quotes every field, is swapped in whole, and a state that cannot be computed
+  (the template cannot be hashed) stops `start.sh` instead of comparing equal to a missing marker, which read as "ready".
+  The marker's text changes: the next `./start.sh` on a running pair asks for one `./start.sh restart`. By **[SvangenStudios](https://github.com/SvangenStudios)**
+  ([pull request #4](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/4) of the 4x recipe), adapted to two ranks; offline tests `scripts/test_scripts.py`
+  (fake `ssh` and `docker`, no Spark): 22 of 26 fail on the previous scripts.
+- `tools/validate.py` passes a check only on a real completion: an HTTP error, an `error` object, a reply that is not
+  the assistant's, a tool call without an id, a function name or JSON-object arguments, and a short, empty or non-list
+  `--compare` reference now fail with a message instead of passing or crashing, and an option without a value stops with
+  one. By **[SvangenStudios](https://github.com/SvangenStudios)** ([pull request #5](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/5) of the 4x recipe, without its `TF_DEBUG_PROMPT_FILE` option);
+  offline tests `tools/test_validate.py` (a mock server, 28 tests; 31 checks fail on the previous script).
 - `zig/patches/0030-anthropic-context-management-lenient.patch` (always on): the Anthropic frontend accepts any
   `clear_thinking_<date>` edit in `context_management` with any `keep`. It accepted only `clear_thinking_20251015` with
   `keep: "all"`, so a client that clears earlier thinking when the user sends a message mid-conversation (the original

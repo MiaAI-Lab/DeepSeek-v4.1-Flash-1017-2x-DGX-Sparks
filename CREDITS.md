@@ -186,6 +186,13 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   ranks' Engram folders are compared before anything is stopped, issue #61) was authored by
   **Qingchen Yu ([markyu0401](https://github.com/markyu0401))** in [pull request #64](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/64)
   (commit [`a004d7e`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/64/commits/a004d7e753fbd4a4b1176cc4291abd6806b01151)); carried as sent.
+- `stop.sh`'s exit status, the prepared marker (`prepared_state`, `write_prepared_marker` in `scripts/config.sh`, their use in `start.sh` and
+  `scripts/prepare.sh`) and the offline tests `scripts/test_scripts.py` were authored by **[SvangenStudios](https://github.com/SvangenStudios)** in
+  [pull request #4](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/4) of the 4-Spark recipe (commits
+  [`f90b78a`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/f90b78a), [`5a2b988`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/5a2b988), [`5dcfe83`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/5dcfe83) and
+  [`adfef6e`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/adfef6e)), adapted here to two ranks; `tools/validate.py` and its tests `tools/test_validate.py` were authored by
+  the same contributor in [pull request #5](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/5) of that recipe (commits [`1a75f9e`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/1a75f9e) and
+  [`47f831f`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/47f831f)).
 
 ## Tools and platform
 
