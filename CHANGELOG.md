@@ -26,9 +26,7 @@
   Prompts with pictures are read whole either way. Off, the code that runs is the code that ran before. Host tests with
   the fake backend (a late short request completes first, with the same tokens as solo; cancels, a refused request, a full
   pool), and the existing host suites also run with prompts read a chunk a turn (`TF_TEST_PREFILL_STEPS=1`: parked and
-  deferred restores, pair break, stall monitor, prompt-cache resume and eviction). **The dsv41 step functions need a GPU
-  and have not been run on a pair**: compare replies with `tools/exact.py` and the long-prompt/short-request timing
-  before turning it on. Design after the 4x recipe's `0031` by **Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus))**
+  deferred restores, pair break, stall monitor, prompt-cache resume and eviction). **Run on the pair:** Measured on the pair (engine `629c524` + 0001-0038, 70K-token cold prompt, a short request sent 8 s in): the short request took 26.7 s with the switch off and 0.98 s on, the long prompt 34.5 s and 34.2 s with the same reply hash; `tools/exact.py` gave IDENTICAL on all 31 cases and `tools/validate.py` passed; two 33K-token cold prompts read at the same time with short requests during both answered the shorts in 0.4-1.6 s and equalled their cached reruns; a client that left mid-prompt freed its slot (the next request took 1.4 s). `tools/prefill_yield_check.py` repeats the first measurement. Design after the 4x recipe's `0031` by **Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus))**
   ([pull request #15](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/15)); re-written for this recipe's spill tier, parked requests, KV parts and pair handling.
 - `zig/patches/0036-metrics-cached-prompt-tokens.patch` (always on, issue #58): `/metrics` publishes
   `prompt_tokens_cached_total`, the prompt tokens of finished requests restored from kept prompt states (they are in
