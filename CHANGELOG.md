@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `zig/patches/0035-engram-lead-failure-paths.patch` (always on): Engram prompt reads fail safely with
+  `TF_DS_ENGRAM_LEAD` and without it. A read that fails on one rank only (a disk or memory fault) left that rank out of
+  the layer's collective while the other waited in it; it now ends the pair (`EngramRankFault`, status 75 for the
+  supervisor to restart both ranks). A table shorter than the hasher's row range is refused at start, the follower
+  joins its Engram readers on every exit, an AIO allocation failure records no batch, and `Model.open`, `Pool.init` and
+  `Tables.open` release what they made on failure. A read failure on both ranks now restarts the pair too, instead of
+  failing one request. By **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
 - The engine pin moves to `fbbc971` (BertholomusAI's `deepseek-v41-zig` tip of 2026-10-23, was `629c524`), with the
   series rebased onto it: `0002` and `0006` are gone (the engine's `TF_DS_ENGRAM_LEAD` and `3de79d8` do their jobs),
   twelve patches are adapted to the engine's prompt pass in pieces (`TF_FILL_CHUNKS`, `TF_FILL_CUT_IN`; `start.sh` passes

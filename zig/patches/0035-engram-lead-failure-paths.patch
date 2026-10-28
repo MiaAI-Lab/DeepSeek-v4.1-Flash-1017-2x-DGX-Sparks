@@ -1,0 +1,539 @@
+diff --git a/zig/src/families/dsv41/engram.zig b/zig/src/families/dsv41/engram.zig
+index 5409324..589b665 100644
+--- a/zig/src/families/dsv41/engram.zig
++++ b/zig/src/families/dsv41/engram.zig
+@@ -92,6 +92,12 @@ pub const Hasher = struct {
+         return (h.ngram - 1) * h.heads;
+     }
+ 
++    /// The rows layer slot l's table needs: every column's ids, on every rank (the last column's offset + prime).
++    pub fn rowsNeeded(h: Hasher, l: usize) u64 {
++        const c = h.cols() - 1;
++        return @intCast(h.offsets[l][c] + h.primes[l][c]);
++    }
++
+     /// `ids`: the whole sequence so far (negative at image positions, which no n-gram reaches across); `out`:
+     /// [n][layers][cols] row ids, each offset into its layer's table.
+     pub fn hashes(h: Hasher, ids: []const i32, start: usize, n: usize, out: []i64) void {
+diff --git a/zig/src/families/dsv41/engram_aio.zig b/zig/src/families/dsv41/engram_aio.zig
+index 65dc549..e3e1997 100644
+--- a/zig/src/families/dsv41/engram_aio.zig
++++ b/zig/src/families/dsv41/engram_aio.zig
+@@ -156,21 +156,22 @@ pub const Aio = struct {
+             if (!busy) break;
+             a.reap();
+         }
+-        const id = a.next_id;
+-        a.next_id += 1;
+-        var b: Batch = .{
+-            .first = a.head,
+-            .n = reads,
+-            .left = reads,
+-            .touch = out_w == null,
+-            .dst = try a.gpa.alloc(?[*]u8, reads),
+-            .skew = try a.gpa.alloc(usize, reads),
+-            .bytes = try a.gpa.alloc(usize, reads),
+-        };
++        // everything that can fail comes before anything is committed: a failure here leaves `head`, the map and the
++        // list as they were, so no batch is recorded that was never submitted (deinit would wait on it forever)
++        try a.batches.ensureUnusedCapacity(a.gpa, 1);
++        try a.live.ensureUnusedCapacity(a.gpa, 1);
++        const dst = try a.gpa.alloc(?[*]u8, reads);
++        errdefer a.gpa.free(dst);
++        const skew = try a.gpa.alloc(usize, reads);
++        errdefer a.gpa.free(skew);
++        const bytes = try a.gpa.alloc(usize, reads);
++        errdefer a.gpa.free(bytes);
+         const cbs = try a.gpa.alloc(Iocb, reads);
+         defer a.gpa.free(cbs);
+         const ptrs = try a.gpa.alloc(*Iocb, reads);
+         defer a.gpa.free(ptrs);
++        const id = a.next_id;
++        var b: Batch = .{ .first = a.head, .n = reads, .left = reads, .touch = out_w == null, .dst = dst, .skew = skew, .bytes = bytes };
+         for (0..reads) |j| {
+             const i = j >> 1;
+             const sc = j & 1 == 1;
+@@ -191,9 +192,10 @@ pub const Aio = struct {
+             };
+             ptrs[j] = &cbs[j];
+         }
++        a.next_id += 1;
+         a.head += reads;
+-        try a.batches.put(a.gpa, id, b);
+-        try a.live.append(a.gpa, .{ id, b.first });
++        a.batches.putAssumeCapacity(id, b);
++        a.live.appendAssumeCapacity(.{ id, b.first });
+         var sent: usize = 0;
+         while (sent < reads) {
+             const r = ioSubmit(a.ctx, reads - sent, ptrs[sent..].ptr);
+@@ -349,3 +351,72 @@ test "a refused row id leaves the ring and its allocations as they were" {
+     try std.testing.expectEqualSlices(u8, &want_w, &w);
+     try std.testing.expectEqualSlices(u8, &want_s, &sc);
+ }
++
++test "an allocation failure while submitting commits nothing and leaks nothing" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    const rows = 40;
++    var json_buf: [256]u8 = undefined;
++    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"U8\",\"shape\":[{d},100],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"U8\",\"shape\":[{d},3],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 100, rows, rows * 100, rows * 103 });
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    for (0..rows * 103) |i| try file.append(a, @intCast((i * 7 + 3) % 251));
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var t = try engram_io.Tables.open(a, io, dir);
++    defer t.close();
++    const tab = t.layers.get(1).?;
++    const pool = try engram_io.Pool.init(a, io, 2);
++    defer pool.deinit(a);
++    var want_w: [3 * 100]u8 = undefined;
++    var want_s: [3 * 3]u8 = undefined;
++    const ids = [_]i64{ 5, 17, rows - 1 };
++    try pool.gather(tab, &ids, &want_w, &want_s);
++
++    // fail the k-th allocation of one submission, for every k until the submission goes through
++    inline for (.{ false, true }) |touch| {
++        var k: usize = 0;
++        while (true) : (k += 1) {
++            var failing = std.testing.FailingAllocator.init(a, .{});
++            const aio = Aio.init(failing.allocator(), io, 16) catch |e| switch (e) {
++                error.AioUnavailable => return error.SkipZigTest,
++                else => return e,
++            };
++            failing.fail_index = failing.alloc_index + k;
++            var got_w: [3 * 100]u8 = @splat(0);
++            var got_s: [3 * 3]u8 = @splat(0);
++            const sub = if (touch) aio.touch(tab, &ids) else aio.start(tab, &ids, &got_w, &got_s);
++            if (sub) |id| {
++                if (!touch) {
++                    try aio.wait(id);
++                    try std.testing.expectEqualSlices(u8, &want_w, &got_w);
++                    try std.testing.expectEqualSlices(u8, &want_s, &got_s);
++                }
++                aio.deinit();
++                try std.testing.expect(k >= 5); // every allocation of the submission was tried
++                break;
++            } else |err| {
++                try std.testing.expectEqual(error.OutOfMemory, err);
++                // nothing was recorded or issued: no read to wait for, and the ring starts where it did
++                try std.testing.expect(!aio.inFlight());
++                try std.testing.expectEqual(@as(usize, 0), aio.batches.count());
++                try std.testing.expectEqual(@as(u64, 0), aio.head);
++                // the next submission works
++                failing.fail_index = std.math.maxInt(usize);
++                const id = try aio.start(tab, &ids, &got_w, &got_s);
++                try aio.wait(id);
++                try std.testing.expectEqualSlices(u8, &want_w, &got_w);
++                try std.testing.expectEqualSlices(u8, &want_s, &got_s);
++                aio.deinit();
++            }
++        }
++    }
++}
+diff --git a/zig/src/families/dsv41/engram_io.zig b/zig/src/families/dsv41/engram_io.zig
+index 5d8bd84..4041ede 100644
+--- a/zig/src/families/dsv41/engram_io.zig
++++ b/zig/src/families/dsv41/engram_io.zig
+@@ -49,15 +49,16 @@ pub const Tables = struct {
+                 const layer = try layerOf(name);
+                 const en = try entry(kv.value_ptr.*);
+                 if (opened == null) {
++                    try t.fds.ensureUnusedCapacity(gpa, 2); // (an fd opened below always has its slot: none leaks)
+                     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+                     if (fd < 0) return error.FileNotFound;
+-                    try t.fds.append(gpa, fd);
++                    t.fds.appendAssumeCapacity(fd);
+                     opened = fd;
+                     // and through O_DIRECT where the file system allows it
+                     var df = dio.File.open(path) catch null;
+                     if (df) |*f| {
+                         if (f.direct) {
+-                            try t.fds.append(gpa, f.fd);
++                            t.fds.appendAssumeCapacity(f.fd);
+                             direct = f.fd;
+                         } else f.close();
+                     }
+@@ -162,14 +163,13 @@ pub const Pool = struct {
+     };
+ 
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, n: usize) !*Pool {
++        const threads = try gpa.alloc(std.Thread, n);
++        errdefer gpa.free(threads);
+         const p = try gpa.create(Pool);
+-        p.* = .{ .io = io, .threads = try gpa.alloc(std.Thread, n) };
++        errdefer gpa.destroy(p);
++        p.* = .{ .io = io, .threads = threads };
+         var started: usize = 0;
+-        errdefer {
+-            p.shutdown(started);
+-            gpa.free(p.threads);
+-            gpa.destroy(p);
+-        }
++        errdefer p.shutdown(started);
+         for (p.threads) |*th| {
+             th.* = try std.Thread.spawn(.{}, loop, .{p});
+             started += 1;
+diff --git a/zig/src/families/dsv41/engram_lead.zig b/zig/src/families/dsv41/engram_lead.zig
+index c8cf000..eda2697 100644
+--- a/zig/src/families/dsv41/engram_lead.zig
++++ b/zig/src/families/dsv41/engram_lead.zig
+@@ -83,7 +83,7 @@ pub const Lead = struct {
+ /// Lead's reader of layer j: the chunk's rows into ahead_rows[j] as engramRows reads them; errors land in lead_err[j].
+ fn read(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize) void {
+     read1(eh, c, seq, start, n, j) catch |err| {
+-        eh.lead_err[j] = err;
++        eh.lead_err[j] = prompt.rankFault(err);
+     };
+ }
+ 
+@@ -245,3 +245,142 @@ test "TF_DS_ENGRAM_LEAD: each layer's rows of the next chunk are read while this
+     try std.testing.expectEqual(@as(usize, 6), try Pass.run(a, &ld, &eh, &c, tabs, &p2, 2, 5, null));
+     try std.testing.expectEqual(@as(u64, 8), eh.lead_late);
+ }
++
++test "an Engram read this rank could not make ends the pair at the layer, on every path" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var why: @import("config.zig").Why = .{};
++    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
++    c.engram_vocab = 10;
++    c.engram_heads = 1;
++    c.engram_pad = 0;
++    var map: [40]i32 = undefined;
++    for (&map, 0..) |*x, i| x.* = @intCast((i * 7 + 3) % 31);
++    const hasher = engram.Hasher.init(c, &map, .{ .{ 3, 5, 7, 9 }, .{ 11, 13, 15, 17 } });
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    // the header of the toy tables, and a single byte of their data: every row read runs past the end of the file
++    const whole = try leadToyFile(a, .{ 41, 71 });
++    const header = 8 + std.mem.readInt(u64, whole[0..8], .little);
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = whole[0 .. header + 1] });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    var tables = try engram_io.Tables.open(gpa, io, dir);
++    defer tables.close();
++    const pool = try engram_io.Pool.init(gpa, io, 2);
++    defer pool.deinit(gpa);
++    const cap = 8;
++    var eh = try EngramHost.init(a, &c, hasher, &tables, pool, 1, 2, cap);
++    var rings: [2]*engram_aio.Aio = undefined;
++    for (&rings, 0..) |*r, i| r.* = engram_aio.Aio.init(gpa, io, 64) catch |err| {
++        for (rings[0..i]) |x| x.deinit();
++        return if (err == error.AioUnavailable) error.SkipZigTest else err;
++    };
++    defer for (rings) |r| r.deinit();
++    const tabs = [2]engram_io.Table{ tables.layers.get(1).?, tables.layers.get(14).? };
++    var seq: [cap]i32 = undefined;
++    for (&seq, 0..) |*x, i| x.* = @intCast((i * 13 + 5) % 40);
++    const round_mod = @import("round.zig");
++    const fault: anyerror = error.EngramRankFault;
++
++    // read at the layer, by the pool's preads and by the prompt's ring
++    try std.testing.expectError(error.EngramRankFault, prompt.engramRows(&eh, 0, tabs[0], &seq, 0, cap));
++    eh.paio = rings[0];
++    try std.testing.expectError(error.EngramRankFault, prompt.engramRows(&eh, 0, tabs[0], &seq, 0, cap));
++    // the read-ahead
++    eh.ahead_err = null;
++    prompt.engramReadAhead(&eh, &c, &seq, 0, cap, 0);
++    try std.testing.expectEqual(fault, eh.ahead_err.?);
++    eh.ahead_err = null;
++    prompt.engramReadAheadAll(&eh, &c, &seq, 0, cap);
++    try std.testing.expectEqual(fault, eh.ahead_err.?);
++    // TF_DS_ENGRAM_LEAD's readers: the layer's wait returns the fault, for each layer
++    try eh.useLead(a, cap, rings);
++    var ld: Lead = .{};
++    defer ld.joinAll();
++    ld.reset(&eh);
++    ld.begin(&eh, &c, &seq, 0, cap);
++    for (0..2) |j| {
++        const err = ld.before(&eh, j, 0, cap);
++        try std.testing.expectError(error.EngramRankFault, err);
++        if (j == 0) ld.after(&eh, &c, &seq, 0, cap, 0, null, 0); // (layer 1's reader starts after layer 0)
++    }
++    // and all of them end the pair
++    try std.testing.expect(round_mod.endsPair(fault));
++}
++
++test "a table short of any column's ids is refused at start on both ranks, before a read can part them" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var why: @import("config.zig").Why = .{};
++    var c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
++    c.engram_vocab = 10;
++    c.engram_heads = 1;
++    c.engram_pad = 0;
++    var map: [40]i32 = undefined;
++    for (&map, 0..) |*x, i| x.* = @intCast((i * 7 + 3) % 31);
++    const hasher = engram.Hasher.init(c, &map, .{ .{ 3, 5, 7, 9 }, .{ 11, 13, 15, 17 } });
++    try std.testing.expectEqual(@as(u64, 41), hasher.rowsNeeded(0));
++    try std.testing.expectEqual(@as(u64, 71), hasher.rowsNeeded(1));
++    const pool = try engram_io.Pool.init(gpa, io, 2);
++    defer pool.deinit(gpa);
++    // rank 0 reads column 0 (rows < 11), rank 1 columns 1 and 2 (up to 41): 40 rows serve rank 0 and fail rank 1
++    for ([_][2]usize{ .{ 40, 71 }, .{ 41, 70 } }) |rows| {
++        var tmp = std.testing.tmpDir(.{ .iterate = true });
++        defer tmp.cleanup();
++        try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = try leadToyFile(a, rows) });
++        const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++        var tables = try engram_io.Tables.open(gpa, io, dir);
++        defer tables.close();
++        for (0..2) |rank| try std.testing.expectError(error.BadEngramTable, EngramHost.init(a, &c, hasher, &tables, pool, rank, 2, 8));
++    }
++    // whole tables open on both
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = try leadToyFile(a, .{ 41, 71 }) });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    var tables = try engram_io.Tables.open(gpa, io, dir);
++    defer tables.close();
++    for (0..2) |rank| _ = try EngramHost.init(a, &c, hasher, &tables, pool, rank, 2, 8);
++}
++
++fn openFds() !usize {
++    var d = try std.Io.Dir.cwd().openDir(std.testing.io, "/proc/self/fd", .{ .iterate = true });
++    defer d.close(std.testing.io);
++    var n: usize = 0;
++    var it = d.iterate();
++    while (try it.next(std.testing.io)) |_| n += 1;
++    return n;
++}
++
++fn openTables(gpa: std.mem.Allocator, dir: []const u8) !void {
++    var t = try engram_io.Tables.open(gpa, std.testing.io, dir);
++    t.close();
++}
++
++fn openPool(gpa: std.mem.Allocator) !void {
++    const p = try engram_io.Pool.init(gpa, std.testing.io, 2);
++    p.deinit(gpa);
++}
++
++test "the Engram tables and the read pool, failing at any allocation, leave no memory and no descriptor behind" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "engram.safetensors", .data = try leadToyFile(a, .{ 41, 71 }) });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    const before = try openFds();
++    try std.testing.checkAllAllocationFailures(std.testing.allocator, openTables, .{dir});
++    try std.testing.expectEqual(before, try openFds());
++    try std.testing.checkAllAllocationFailures(std.testing.allocator, openPool, .{});
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 43325a4..eaab37f 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -1544,7 +1544,7 @@ fn refused(err: anyerror) void {
+     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
+ }
+ 
+-/// A round this rank could not finish: refused as above, unless the error means the ranks cannot go on together
++/// A round or a prompt chunk this rank could not finish: refused as above, unless the error means the ranks cannot go on together
+ /// (round.pair_ending: the ring's order or rows broken, a sized send or the peer's collect pending, the ring or the
+ /// communicator dead). Then the follower ends with it (rank 0 ends the pair for the same error, native.pair_fatal, or
+ /// sees this rank's link go down) instead of taking the next frame.
+@@ -1553,6 +1553,13 @@ fn roundRefused(err: anyerror) !void {
+     if (round.endsPair(err)) return err;
+ }
+ 
++test "a follower ends on an error that parts the ranks, and refuses the rest" {
++    try roundRefused(error.NoFreeSlot);
++    try roundRefused(error.ReadFailed); // (a raw read error is made EngramRankFault where it is raised)
++    try std.testing.expectError(error.EngramRankFault, roundRefused(error.EngramRankFault));
++    try std.testing.expectError(error.CommAborted, roundRefused(error.CommAborted));
++}
++
+ /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
+ pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
+ 
+@@ -1780,6 +1787,12 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+     defer for (&seqs) |*q| q.deinit(gpa);
+     var win_ids: [max_streams]std.ArrayList(i32) = @splat(.empty);
+     defer for (&win_ids) |*q| q.deinit(gpa);
++    // on every exit, before `seqs` goes: the Engram readers (the read-ahead, TF_DS_ENGRAM_LEAD's) may still be reading
++    // a prompt's ids, and an exit from a bad frame comes before the join the loop does for the next frame
++    defer {
++        m.joinAhead();
++        m.fill_seq = &.{};
++    }
+     var built: Built = .{};
+     var step: u64 = 0;
+     var slot: usize = 0;
+@@ -1871,7 +1884,8 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+                 if (start + n > seqs[slot].items.len) return error.BadChunk;
+                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
+                 if (spill) |sd| sd.bump(fill_base + start, fill_base + start + n);
+-                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
++                // an error that parts the ranks (an Engram read this rank could not make) ends the follower; rank 0 ends the pair
++                if (m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay)) |_| {} else |err| try roundRefused(err);
+             },
+             .verify => {
+                 const nw = try r.int(u32);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index c4c125f..1918fe0 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -365,6 +365,13 @@ pub const Model = struct {
+         try m.stream.synchronize();
+         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
+ 
++        // whatever the Engram setup below has made goes if the open fails after it (close() only runs for an open model);
++        // registered here, not inside the block, so a later failure runs them too
++        errdefer if (m.tables) |*t| t.close();
++        errdefer if (m.epool) |p| p.deinit(gpa);
++        errdefer if (m.aio) |x| x.deinit();
++        errdefer if (m.paio) |x| x.deinit();
++        errdefer if (m.paio2) |x| x.deinit();
+         // Engram on the host: the compressed token map, the multipliers, the tables and 64 readers
+         if (o.engram_dir) |edir| {
+             const map_text = try std.Io.Dir.cwd().readFileAlloc(io, o.token_map orelse return error.NoTokenMap, a, .limited(1 << 26));
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index c2ae5f6..a03bbf6 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -307,6 +307,7 @@ pub const pair_fatal = [_]api.LaneHost.Fatal{
+     .{ .err = error.RingOrder, .drain = false },
+     .{ .err = error.ShardRingOrder, .drain = false },
+     .{ .err = error.BadRingRows, .drain = false },
++    .{ .err = error.EngramRankFault, .drain = false },
+ };
+ 
+ /// Loaded.pair: the hooks the server wires to its lane host (native/cuda.zig).
+@@ -673,6 +674,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.BadPairBroken => "TF_DS_PAIR_BROKEN: exit (the default: a broken rank pair ends the server with status 75 for its supervisor to restart both ranks) or degrade (requests fail one by one, the server stays up)",
+         error.CommAborted => "the ranks' NCCL communicator was aborted after a broken pair (a transfer that never completed): the server restarts both ranks",
+         error.RingFailed => "the ranks' RDMA ring failed (the peer stopped answering, or the ring was aborted after a broken pair): the server restarts both ranks",
++        error.EngramRankFault => "a prompt chunk's Engram rows could not be read on one rank (its disk or memory failed; the other rank waits for it in the layer's collective, so the pair ends): the server restarts both ranks; if it recurs, check the Engram tables' disk",
+         else => null,
+     };
+ }
+@@ -730,6 +732,11 @@ test "a round's pair-ending errors end the pair on rank 0 (none drains) and are
+         try std.testing.expect(explain(null, err) != null);
+     }
+     for ([_]anyerror{ error.RingOrder, error.ShardRingOrder, error.BadRingRows, error.RingFailed }) |err| try std.testing.expect(round.endsPair(err));
++    // a prompt chunk's Engram rows that one rank could not read: the peer waits in the layer's allGather
++    try std.testing.expect(round.endsPair(error.EngramRankFault));
++    try std.testing.expect(!round.endsPair(error.ReadFailed));
++    try std.testing.expect(!round.endsPair(error.OutOfMemory));
++    try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.ReadFailed));
+     try std.testing.expect(!round.endsPair(error.NoFreeSlot));
+     try std.testing.expect(!round.endsPair(error.ContextFull));
+ }
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 6806b8b..cb82681 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -1447,6 +1447,15 @@ pub const EngramHost = struct {
+         const hi = (rank + 1) * cols / world;
+         const k = hi - lo;
+         const t = tables.layers.get(@intCast(c.engram_layers.slice()[0])) orelse return error.MissingEngramTable;
++        // a table short of any column's ids would fail one rank's reads and not the other's (the ranks split the
++        // columns): both refuse it here, before any collective, from the same tables and the same hasher
++        for (c.engram_layers.slice(), 0..) |id, l| {
++            const tl = tables.layers.get(@intCast(id)) orelse return error.MissingEngramTable;
++            if (tl.rows < hasher.rowsNeeded(l)) {
++                std.log.warn("dsv41: Engram layer {d}'s table has {d} rows; its hashes reach {d}", .{ id, tl.rows, hasher.rowsNeeded(l) });
++                return error.BadEngramTable;
++            }
++        }
+         var aw: [2][]u8 = .{ &.{}, &.{} };
+         var as: [2][]u8 = .{ &.{}, &.{} };
+         var ar: [2][]u16 = .{ &.{}, &.{} };
+@@ -1489,7 +1498,7 @@ pub const EngramHost = struct {
+ /// as engramApply would at the layer. Errors land in ahead_err.
+ pub fn engramReadAhead(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize) void {
+     engramAhead1(eh, c, seq, start, n, j) catch |err| {
+-        eh.ahead_err = err;
++        eh.ahead_err = rankFault(err);
+     };
+ }
+ 
+@@ -1497,7 +1506,7 @@ pub fn engramReadAhead(eh: *EngramHost, c: *const Config, seq: []const i32, star
+ pub fn engramReadAheadAll(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize) void {
+     for (0..@min(2, c.engram_layers.slice().len)) |j| {
+         engramAhead1(eh, c, seq, start, n, j) catch |err| {
+-            eh.ahead_err = err;
++            eh.ahead_err = rankFault(err);
+             return;
+         };
+     }
+@@ -1519,6 +1528,21 @@ fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usiz
+     eh.ahead_ready[j] = true;
+ }
+ 
++/// An Engram row read that failed on this rank alone (a disk or memory fault; the peer's own read went through) leaves
++/// this rank without its part of the layer's allGather while the peer waits in it, so the ranks cannot go on together:
++/// the error becomes EngramRankFault, which ends the pair (round.pair_ending) instead of failing one request. It is
++/// applied where a read's error is made or stored (engramRows, the read-ahead, TF_DS_ENGRAM_LEAD's reader). Any other
++/// error passes through unchanged.
++pub fn rankFault(err: anyerror) anyerror {
++    switch (err) {
++        error.ReadFailed, error.EndOfFile, error.OutOfMemory, error.RowOutOfRange => {
++            std.log.warn("dsv41: an Engram row read failed on this rank ({s}); the ranks end", .{@errorName(err)});
++            return error.EngramRankFault;
++        },
++        else => return err,
++    }
++}
++
+ /// Layer slot l's decoded rows of chunk [start, start + n) (engramApply's host part): read ahead if ready, else here.
+ pub fn engramRows(eh: *EngramHost, l: usize, t: engram_io.Table, seq: []const i32, start: usize, n: usize) ![]u16 {
+     const cols = eh.hasher.cols();
+@@ -1540,7 +1564,8 @@ pub fn engramRows(eh: *EngramHost, l: usize, t: engram_io.Table, seq: []const i3
+     }
+     // (TF_DS_ENGRAM_LEAD: on this layer's ring, its reader joined; the other layer's may be reading on its own)
+     const ring = if (lead) eh.lead_ring[l] else eh.paio;
+-    if (ring) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
++    const read = if (ring) |aio| aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
++    read catch |err| return rankFault(err);
+     engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
+     return eh.rows[0 .. m * t.row_w];
+ }
+@@ -1722,3 +1747,10 @@ fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
+     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
+     return error.NotPortedYet;
+ }
++
++test "rankFault: a read this rank could not make ends the pair; other errors pass through" {
++    for ([_]anyerror{ error.ReadFailed, error.EndOfFile, error.OutOfMemory, error.RowOutOfRange }) |err|
++        try std.testing.expectEqual(@as(anyerror, error.EngramRankFault), rankFault(err));
++    for ([_]anyerror{ error.EngramRankFault, error.TooManyRows, error.MissingEngramTable, error.BadSize, error.CommAborted, error.PairBroken, error.RingFailed }) |err|
++        try std.testing.expectEqual(err, rankFault(err));
++}
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index b8e6c48..95c72d1 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -1461,10 +1461,11 @@ pub const Graphs = struct {
+ 
+ /// A round's errors after which the ranks cannot go on together: the ring or the communicator dead (RingFailed,
+ /// CommAborted), a decode round's ring transfers out of their fixed order or row lists (RingOrder, ShardRingOrder,
+-/// BadRingRows: a sized send may be in flight with no receive, or the peer waits in a collect). Rank 0 ends the pair
++/// BadRingRows: a sized send may be in flight with no receive, or the peer waits in a collect), a prompt chunk's Engram
++/// rows that one rank could not read (EngramRankFault: the peer waits in the layer's allGather). Rank 0 ends the pair
+ /// on each (native.pair_fatal: TF_DS_PAIR_BROKEN=exit exits 75, both ranks restart); a follower stops following
+ /// (lanes.followPair) instead of taking the next frame.
+-pub const pair_ending = [_]anyerror{ error.RingFailed, error.CommAborted, error.RingOrder, error.ShardRingOrder, error.BadRingRows };
++pub const pair_ending = [_]anyerror{ error.RingFailed, error.CommAborted, error.RingOrder, error.ShardRingOrder, error.BadRingRows, error.EngramRankFault };
+ 
+ pub fn endsPair(err: anyerror) bool {
+     for (pair_ending) |x| if (x == err) return true;
