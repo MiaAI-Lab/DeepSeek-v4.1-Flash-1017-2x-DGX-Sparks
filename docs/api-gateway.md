@@ -2,7 +2,7 @@
 
 `gateway/` builds `ds41-gateway`, a Rust front end that gives TensorFold's token-in/token-out route the DeepSeek API's
 surface. It is off by default (`API_GATEWAY=0`); `API_GATEWAY=1` starts it on `HOST:PORT` and moves the engine to
-`127.0.0.1:ENGINE_PORT`. The engine image is unchanged apart from `zig/patches/0031-token-route.patch`.
+`127.0.0.1:ENGINE_PORT`. The engine image is unchanged apart from `zig/patches/0035-token-route.patch`.
 
 ## Routes
 
@@ -91,7 +91,7 @@ The served tokenizer's image-token spelling is given by `GATEWAY_IMAGE_TOKEN`; t
   thinking prompt faithfully.
 - Grammar-constrained decoding (`guided_json`, `guided_regex`, `guided_choice`, `grammar`, `structured_outputs`) falls
   back; `json_object`/`json_schema`/`regex` are written into the prompt without a grammar.
-- Patch 0031 serves `logprobs` / `top_logprobs` on the token route. They fall back only if the running engine's health
+- Patch 0035 serves `logprobs` / `top_logprobs` on the token route. They fall back only if the running engine's health
   reports `logprobs: false` (for example, an engine without that patch).
 - The image token count is the API's own estimate; the engine's prompt length can differ by the tokenizer's special
   tokens. The comparator reports both.

@@ -1,0 +1,181 @@
+From 5a6fb99c1c77bc311606e6e8d8f7c7ce875306f1 Mon Sep 17 00:00:00 2001
+From: Maciej Kowalik <33423060+koniaik@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 11:11:54 +0100
+Subject: [PATCH] server: a streaming reply pings while the engine reads a long
+ prompt
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A stream opens at once (the head and message_start go out before the
+prompt is read), but a cold prompt then produces nothing for the whole
+prefill: at 2,100 tok/s a 250k-token prompt is two minutes of silence,
+and a proxy in front (Cloudflare's free tier) closes an idle stream at
+about 126 s, so the client lost every long cold prompt that went
+through one. The cloud API sends ping events for exactly this; this
+adds the same: while the generation loop waits for a round and nothing
+has been sent for 25 s, a streaming sink that has a ping gets one —
+the Messages frontend an event: ping with {"type": "ping"}, the
+OpenAI frontends a ": ping" comment no client parses. Replies are
+unchanged: a sink without a ping and non-streaming requests take the
+same path as before.
+---
+ zig/src/server/anthropic.zig |  9 ++++++++-
+ zig/src/server/chat.zig      | 22 ++++++++++++++++++++--
+ zig/src/server/openai.zig    | 16 ++++++++++++++--
+ zig/src/server/sse.zig       |  7 +++++++
+ 4 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
+index e0946e24..6fc62239 100644
+--- a/zig/src/server/anthropic.zig
++++ b/zig/src/server/anthropic.zig
+@@ -106,7 +106,14 @@ const Wire = struct {
+     payload: Value = .null,
+ 
+     fn out(w: *Wire) openai.Out {
+-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
++        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .ping = ping } };
++    }
++
++    fn ping(ctx: *anyopaque) error{Closed}!void {
++        const w: *Wire = @ptrCast(@alignCast(ctx));
++        const o = json.newObject(w.reply.a) catch return error.Closed;
++        o.put(w.reply.a, "type", .{ .string = "ping" }) catch return error.Closed;
++        return sse.event(w.reply.conn, w.reply.a, "ping", .{ .object = o });
+     }
+ 
+     fn open(ctx: *anyopaque) error{Closed}!void {
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 924fce3c..69cd0ded 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -41,8 +41,12 @@ pub const Input = struct {
+ pub const Sink = struct {
+     ctx: *anyopaque,
+     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
++    ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+ };
+ 
++/// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill).
++const ping_after_ns: i96 = 25 * std.time.ns_per_s;
++
+ pub const Reply = struct {
+     content: []const u8,
+     stop_sequence: ?[]const u8,
+@@ -244,7 +248,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     release(srv, preparing); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids };
++    var gen: Generation = .{ .last_out_ns = submitted, .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids };
+     defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+@@ -320,6 +324,7 @@ const Shown = struct {
+ 
+ /// The token loop and the text it streams.
+ const Generation = struct {
++    last_out_ns: i96 = 0, // the last byte a streaming sink heard; a ping goes out after ping_after_ns of silence
+     srv: *Server,
+     a: Allocator,
+     box: *Mailbox,
+@@ -472,8 +477,21 @@ const Generation = struct {
+                 g.cancel();
+                 return error.Cancelled;
+             }
+-            const tokens = chunk orelse continue;
++            const tokens = chunk orelse {
++                if (g.sink) |sink| if (sink.ping) |ping| {
++                    const now = nowNs(g.srv.io);
++                    if (now - g.last_out_ns > ping_after_ns) {
++                        ping(sink.ctx) catch {
++                            g.cancel();
++                            return error.Cancelled;
++                        };
++                        g.last_out_ns = now;
++                    }
++                };
++                continue;
++            };
+             if (g.reason == null) try g.commit(tokens);
++            g.last_out_ns = nowNs(g.srv.io);
+         }
+     }
+ 
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 516f69da..fac413f3 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -34,6 +34,8 @@ pub const Out = struct {
+         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
+         /// A whole JSON reply.
+         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
++        /// A keep-alive the stream sends while nothing else is; optional.
++        ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+     };
+ };
+ 
+@@ -54,7 +56,7 @@ const ClientOut = struct {
+     a: Allocator,
+ 
+     fn out(c: *ClientOut) Out {
+-        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
++        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .ping = ping } };
+     }
+ 
+     fn open(ctx: *anyopaque) error{Closed}!void {
+@@ -62,6 +64,11 @@ const ClientOut = struct {
+         return sse.open(c.conn);
+     }
+ 
++    fn ping(ctx: *anyopaque) error{Closed}!void {
++        const c: *ClientOut = @ptrCast(@alignCast(ctx));
++        return sse.comment(c.conn, "ping");
++    }
++
+     fn event(ctx: *anyopaque, payload: ?Value) error{Closed}!void {
+         const c: *ClientOut = @ptrCast(@alignCast(ctx));
+         return if (payload) |p| sse.data(c.conn, c.a, p) else sse.done(c.conn);
+@@ -388,6 +395,11 @@ const Run = struct {
+         run: *Run,
+         tools: bool,
+ 
++        fn ping(ctx: *anyopaque) error{Closed}!void {
++            const s: *StreamSink = @ptrCast(@alignCast(ctx));
++            if (s.run.out.vt.ping) |p| return p(s.run.out.ctx);
++        }
++
+         fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
+             const s: *StreamSink = @ptrCast(@alignCast(ctx));
+             const r = s.run;
+@@ -458,7 +470,7 @@ const Run = struct {
+         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+         var sink_state: StreamSink = .{ .run = r, .tools = tools };
+         handed = true;
+-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call }, gone) catch |e| {
++        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping }, gone) catch |e| {
+             switch (e) {
+                 error.Cancelled => return,
+                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
+diff --git a/zig/src/server/sse.zig b/zig/src/server/sse.zig
+index de30ac12..b6befa54 100644
+--- a/zig/src/server/sse.zig
++++ b/zig/src/server/sse.zig
+@@ -23,6 +23,13 @@ pub fn done(conn: *Conn) error{Closed}!void {
+     return conn.writeAll("data: [DONE]\n\n");
+ }
+ 
++/// ``: text`` and a blank line: a keep-alive comment no client parses.
++pub fn comment(conn: *Conn, text: []const u8) error{Closed}!void {
++    conn.writeAll(": ") catch return error.Closed;
++    conn.writeAll(text) catch return error.Closed;
++    return conn.writeAll("\n\n");
++}
++
+ /// ``event: KIND`` then its data line (Responses and Messages events).
+ pub fn event(conn: *Conn, a: Allocator, kind: []const u8, payload: json.Value) error{Closed}!void {
+     const text = json.stringify(a, payload, .{}) catch return error.Closed;
+-- 
+2.43.0
+

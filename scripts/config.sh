@@ -146,7 +146,7 @@ GATEWAY_IMAGE_TOKEN="${GATEWAY_IMAGE_TOKEN-<｜deepseek_image｜>}"  # the serve
 GATEWAY_MAX_IMAGES="${GATEWAY_MAX_IMAGES:-600}"       # the API's per-request image limit
 GATEWAY_MAX_IMAGE_MB="${GATEWAY_MAX_IMAGE_MB:-64}"    # the API's total image megabytes per request
 GATEWAY_LOG="${GATEWAY_LOG:-info}"       # debug, info, warn or error; one line per request
-# TF_DS_API_EFFORTS=1 is engine patch 0031's switch: the API's effort table instead of the lane's. Empty: the engine's.
+# TF_DS_API_EFFORTS=1 is engine patch 0035's switch: the API's effort table instead of the lane's. Empty: the engine's.
 TF_DS_API_EFFORTS="${TF_DS_API_EFFORTS:-}"
 
 # ---------------------------------------------------------------- serving
@@ -189,6 +189,10 @@ RDMA="${RDMA:-1}"
 RDMA_IDLE_S="${RDMA_IDLE_S:-2}"       # 0 to 3600 seconds
 RDMA_NAP_US="${RDMA_NAP_US:-500}"    # 1 to 1000000 microseconds; bounds wake and shutdown delay
 GRAPHS="${GRAPHS:-1}"
+# zig/patches/0033: with GRAPHS=1, the captured CUDA graphs each rank keeps at most; past it the least recently replayed
+# one is destroyed and captured again when it comes up. 0 keeps every one, as before 0033: they add up over days of
+# growing conversations (rows x context buckets x stretches) and are never freed (issue #69).
+GRAPH_CAP="${GRAPH_CAP:-128}"
 SIDE="${SIDE:-1}"
 PREFETCH="${PREFETCH:-1}"
 ENGRAM_AIO="${ENGRAM_AIO:-1}"
@@ -241,6 +245,9 @@ HEAD_NFS_SERVER="${HEAD_NFS_SERVER:-}"
 # Engram's tables on this Spark's own disk (a folder with the base model's shards 47 and 48, as WORKER_ENGRAM_DIR is on the worker),
 # mounted into rank 0 at /engram. Without it rank 0 reads them from HF_CACHE: over NFS a random 4 KiB read took 942 us here
 # against 90 us from the worker's local copy, and a decode round or a prefill chunk makes many of them. Empty: HF_CACHE.
+# With the spill tier on, the engine's rank fingerprint compares this folder's regular files with the worker's (name and
+# size; symlinks are skipped), so leaving it empty makes rank 0 list nothing against WORKER_ENGRAM_DIR's files and the
+# pair refuses to load with FingerprintMismatch in engram (start.sh's port_engram_check; issue #61).
 HEAD_ENGRAM_DIR="${HEAD_ENGRAM_DIR:-}"
 HEAD_NFS_VOLUME="${HEAD_NFS_VOLUME:-dsv41-hf-head}"
 

@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-- Feature 004 is additive on Mia main at `27741e1`: the optional DeepSeek API gateway and comparator in `gateway/`, the
-  `API_GATEWAY=1` wiring, and `zig/patches/0031-token-route.patch` (renumbered from 0011 after Mia's 0011-0029 series).
+- Feature 004 is additive on Mia main at `d8e5b28`: the optional DeepSeek API gateway and comparator in `gateway/`, the
+  `API_GATEWAY=1` wiring, and `zig/patches/0035-token-route.patch`, which applies after Mia's 0001-0033 (0034 is left
+  to the open #77).
   With `API_KEY=1`, gateway middleware loads `API_KEY_FILE` once, rejects a missing or empty key at startup, and requires
   the actual Bearer or `x-api-key` value on every route except public `/health`, before reading a body; comparisons are
   constant-time and failures are API-shaped 401 responses. `GATEWAY_MAX_CONCURRENT` (default 3) queues excess requests
@@ -16,6 +17,38 @@
   `gateway/NOTICE`, which the image carries at `/usr/share/doc/ds41-gateway/NOTICE`. The duplicate `zig/patches/0009-disk-cache.patch` bundle and `tools/disk_cache_check.py` are removed;
   Mia's current spill-v2/cache implementation and all other main-branch changes are preserved.
 
+- `zig/patches/0030-anthropic-context-management-lenient.patch` (always on): the Anthropic frontend accepts any
+  `clear_thinking_<date>` edit in `context_management` with any `keep`. It accepted only `clear_thinking_20251015` with
+  `keep: "all"`, so a client that clears earlier thinking when the user sends a message mid-conversation (the original
+  `clear_thinking_20250929` with `keep: "none"`, which the cloud API takes) got a non-retryable 400. Other edit types are
+  still refused. By **Maciej Kowalik ([koniaik](https://github.com/koniaik))**, [pull request #71](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/71); a host test in `late_system_test.zig`.
+- `zig/patches/0031-anthropic-system-anywhere.patch` (always on): a `system` turn inside `messages` is accepted anywhere,
+  as on the cloud API. It had to follow a user or system turn and precede an assistant turn or the end, so a client that
+  injects a reminder before the newest user turn got a 400; turn-scoped `clear_at` and per-message `output_config` are
+  still refused. By **Maciej Kowalik ([koniaik](https://github.com/koniaik))**, [pull request #72](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/72); the placement assertion in `late_system_test.zig` now
+  expects the new behaviour.
+- `zig/patches/0032-stream-keepalive-ping.patch` (always on): while a streaming reply waits for the engine and nothing has
+  been sent for 25 s, it sends a keep-alive (`event: ping` on Messages, a `: ping` comment on the OpenAI frontends), so a
+  proxy that closes an idle stream at about 126 s no longer cuts a long cold prefill. Replies are unchanged; a warm
+  prompt sends no ping. By **Maciej Kowalik ([koniaik](https://github.com/koniaik))**, [pull request #76](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/76), measured on a pair behind such a proxy.
+- `zig/patches/0033-graph-cap.patch` (on, `GRAPH_CAP=128`): the CUDA graph cache keeps at most `GRAPH_CAP` captured
+  stretches a rank and destroys the least recently replayed one past it (issue #69). Before, every graph stayed until
+  the process ended, so both ranks' device and host memory grew for days with growing conversations until memguard
+  killed rank 0. Replies are unchanged (`tools/exact.py` 31/31 with an eviction almost every stretch) and decode at the
+  default equals uncapped graphs; `GRAPH_CAP=0` keeps the old behavior. `scripts/port_test.sh` checks that both ranks
+  get the setting. By **E-Zou Shen ([ezoushen](https://github.com/ezoushen))**, [pull request #70](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70);
+  renumbered 0031 to 0033.
+- `start.sh` compares the two ranks' Engram folders before anything is stopped when the spill tier is on
+  (`port_engram_check`, `scripts/port.sh`). The engine's rank fingerprint covers the folder's regular files by name and
+  size (`zig/patches/0016`, `fingerprint.zig`'s `listing()`), and a Hugging Face snapshot holds symlinks into `blobs/`:
+  with the default empty `HEAD_ENGRAM_DIR` rank 0 listed nothing against the worker's four files, so the pair refused
+  to load with `FingerprintMismatch` in `engram` — after the running server had already been stopped (issue #61). The
+  check refuses before the stop, naming both listings and the fix (`HEAD_ENGRAM_DIR` on a local folder holding the same
+  files, hardlinked: no extra disk, and rank 0 then reads Engram locally); it stays silent while a folder is not there
+  yet, warns when the worker cannot be reached, and does nothing with the tier off (KV sharding alone marks `engram`
+  `shard-only`, `0018`). `scripts/port_test.sh` covers the listing, the refusal and its message, both silent paths and
+  the warning. By **Qingchen Yu ([markyu0401](https://github.com/markyu0401))**,
+  [pull request #64](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/64).
 - `ABLIT=1` on a read-only Hugging Face blob cache: `prepare.sh` gives the overlay's work folder its own writable copy of
   the checkpoint index (the shards stay hard links), so the graft no longer fails with `PermissionError` when it rewrites
   the index (issue #42, reported by unitea1992). By **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,

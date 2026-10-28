@@ -1,0 +1,91 @@
+From 82be53e0156064cfb8e3088a75620f50b63aa701 Mon Sep 17 00:00:00 2001
+From: Maciej Kowalik <33423060+koniaik@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 15:59:44 +0100
+Subject: [PATCH] server: the Anthropic frontend accepts any clear_thinking
+ context edit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A request that carries context_management.edits was refused unless the
+one edit was clear_thinking_20251015 with keep "all" ("context_management
+supports clear_thinking with keep: all only"). A client that clears the
+earlier thinking when the user sends a message mid-conversation sends
+the original clear_thinking_20250929 with keep "none" — the cloud API
+accepts both dates and both keep values — and every such request here
+failed with 400 invalid_request, ending the turn. The check now accepts
+any edit whose type starts with clear_thinking_, with any keep; other
+edits are refused as before. Replay already handles thinking blocks on
+its own, so nothing else changes.
+---
+ zig/src/server/anthropic_translate.zig |  9 ++++---
+ zig/src/server/late_system_test.zig    | 33 ++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/server/anthropic_translate.zig b/zig/src/server/anthropic_translate.zig
+index e7f01b8..8a155f5 100644
+--- a/zig/src/server/anthropic_translate.zig
++++ b/zig/src/server/anthropic_translate.zig
+@@ -199,12 +199,15 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
+         try chat.put(a, "stop", stops);
+     }
+     if (body.field("context_management")) |context| {
+-        const allowed = (try json.parse(a, "{\"type\": \"clear_thinking_20251015\", \"keep\": \"all\"}")).ok;
++        // Cloud tolerance: clients send any clear_thinking_<date> with keep all or none
++        // (issue: only 20251015+all was accepted, 400ing ZCode's mid-conversation messages).
+         const edits = context.get("edits") orelse Value{ .array = &.{} };
+         const ok = context == .object and edits == .array and for (edits.array) |e| {
+-            if (!json.equal(e, allowed)) break false;
++            if (e != .object) break false;
++            const et = e.get("type") orelse Value.null;
++            if (et != .string or !std.mem.startsWith(u8, et.string, "clear_thinking_")) break false;
+         } else true;
+-        if (!ok) return cx.refuse("context_management supports clear_thinking with keep: all only");
++        if (!ok) return cx.refuse("context_management supports clear_thinking edits only");
+     }
+     for ([_][]const u8{ "container", "mcp_servers", "service_tier" }) |name| if (body.field(name)) |v| {
+         const fine = (v == .array and v.array.len == 0) or (v == .string and std.mem.eql(u8, v.string, "auto"));
+diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
+index a5ef71b..4a061f8 100644
+--- a/zig/src/server/late_system_test.zig
++++ b/zig/src/server/late_system_test.zig
+@@ -208,3 +208,36 @@ test "a mid-conversation system message renders the same prompt on Messages and
+     try std.testing.expectEqual(@as(u16, 400), misplaced.status);
+     try std.testing.expect(std.mem.indexOf(u8, misplaced.body, "mid-conversation system messages must follow a user turn and precede an assistant or end") != null);
+ }
++
++const clear_old_body =
++    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}],"context_management":{"edits":[{"type":"clear_thinking_20250929","keep":"none"}]}}
++;
++const clear_new_body =
++    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}],"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}}
++;
++const clear_bogus_body =
++    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}],"context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]}}
++;
++
++test "context_management takes any clear_thinking edit and still refuses other edits" {
++    var text: DropLate = .{};
++    var backend: Capture = .{};
++    defer std.testing.allocator.free(backend.prompt);
++    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
++        .served_name = "m",
++        .model_ids = &.{"m"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++
++    for ([_][]const u8{ clear_old_body, clear_new_body }) |body| {
++        const ok = try exchange(srv, "/v1/messages", body);
++        defer std.testing.allocator.free(ok.body);
++        try std.testing.expectEqual(@as(u16, 200), ok.status);
++    }
++    const bogus = try exchange(srv, "/v1/messages", clear_bogus_body);
++    defer std.testing.allocator.free(bogus.body);
++    try std.testing.expectEqual(@as(u16, 400), bogus.status);
++    try std.testing.expect(std.mem.indexOf(u8, bogus.body, "context_management supports clear_thinking edits only") != null);
++}
+-- 
+2.43.0
+

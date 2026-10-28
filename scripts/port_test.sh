@@ -318,6 +318,52 @@ case_ "spill args name the checked path" 0 "SPILL_GIB=8" "$expect
   port_spill_judge 1 there '$ok_line'
   expect \"\$(port_spill_args 1)\" '--label tf.recipe.spill=/home/u/.cache/dsv41-tensorfold-spill -v /home/u/.cache/dsv41-tensorfold-spill:/spill'"
 
+# ---- port_engram_check: with the spill tier on, both ranks must list the same regular files of their Engram folder,
+# because the engine's rank fingerprint compares exactly that (name and size; symlinks are skipped, so a HF snapshot
+# lists nothing against the worker's copied files) — issue #61. Checked before anything is stopped.
+et=$(mktemp -d "${TMPDIR:-/tmp}/port-engram.XXXXXX")
+mkdir -p "$et/real" "$et/snap"
+printf 'abcde' > "$et/real/config.json"
+printf 'abcdefg' > "$et/real/model.safetensors.index.json"
+ln -s "$et/real/config.json" "$et/snap/config.json"
+ln -s "$et/real/model.safetensors.index.json" "$et/snap/model.safetensors.index.json"
+et_list='config.json:5; model.safetensors.index.json:7; '
+et_stubs="engram_rev() { echo 1bae0e1088993b9b82de08f59de5be5a34e42170; }; worker_host() { echo w; }; ENGRAM_ID=deepseek-ai/DeepSeek-V4.1-Flash-1017; ENGRAM_SHARDS='model-00047-of-00048.safetensors model-00048-of-00048.safetensors'"
+case_ "engram listing: name:size of the regular files, sorted; symlinks skipped" 0 "" "$expect
+  expect \"\$(engram_listing '$et/real' | tr '\n' ' ')\" '$et_list'
+  expect \"[\$(engram_listing '$et/snap' | tr '\n' ' ')]\" '[]'"
+case_ "engram dir: HEAD_ENGRAM_DIR when set" 0 "HEAD_ENGRAM_DIR=$et/real" "$expect
+  expect \"\$(head_engram_dir)\" '$et/real'"
+case_ "engram dir: no HEAD_ENGRAM_DIR -> the HF snapshot path on this Spark" 0 "" "$expect
+  HF_CACHE=/hf/cache; engram_in_container() { echo /hf/hub/models--x--y/snapshots/abc; }
+  expect \"\$(head_engram_dir)\" '/hf/cache/hub/models--x--y/snapshots/abc'"
+case_ "engram check: the spill tier off compares nothing" 0 "SPILL_GIB=0 KV_SHARD=0" "$expect
+  worker() { echo CALLED; }
+  expect \"[\$(port_engram_check 2>&1)]\" '[]'"
+case_ "engram check: KV sharding alone compares nothing (its agreement marks engram shard-only)" 0 "SPILL_GIB=0 KV_SHARD=1" "$expect
+  worker() { echo CALLED; }
+  expect \"[\$(port_engram_check 2>&1)]\" '[]'"
+case_ "engram check: spill on, both folders list the same files -> ok" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/real WORKER_ENGRAM_DIR=/y" "$expect; $et_stubs
+  worker() { printf 'config.json:5;\nmodel.safetensors.index.json:7;\n'; }
+  expect \"[\$(port_engram_check 2>&1)]\" '[]'"
+case_ "engram check: spill on, rank 0's folder is a HF snapshot (symlinks only) -> refused before anything stops" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/snap WORKER_ENGRAM_DIR=/y" "$expect; $et_stubs
+  worker() { printf 'config.json:5;\nmodel.safetensors.index.json:7;\n'; }
+  out=\$(port_engram_check 2>&1); rc=\$?
+  expect \"\$rc\" 1
+  grep -q 'list different files' <<<\"\$out\" || { echo \"\$out\"; exit 1; }
+  grep -q 'HEAD_ENGRAM_DIR' <<<\"\$out\" || { echo \"\$out\"; exit 1; }
+  grep -q 'issue #61' <<<\"\$out\" || { echo \"\$out\"; exit 1; }"
+case_ "engram check: rank 0's folder not there yet (prepare has not run) -> silent" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/none WORKER_ENGRAM_DIR=/y" "$expect
+  worker() { echo CALLED; }
+  expect \"[\$(port_engram_check 2>&1)]\" '[]'"
+case_ "engram check: the worker's folder not there yet -> silent" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/real WORKER_ENGRAM_DIR=/y" "$expect
+  worker() { echo __NO_DIR__; }
+  expect \"[\$(port_engram_check 2>&1)]\" '[]'"
+case_ "engram check: the worker cannot be reached -> a warning, not a refusal" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/real WORKER_ENGRAM_DIR=/y" "$expect; $et_stubs
+  worker() { return 255; }
+  expect \"[\$(port_engram_check 2>&1)]\" \"[WARN: could not compare /y on w with rank 0's Engram folder ($et/real)]\""
+rm -rf "$et"
+
 # ---- spill_dir_probe itself (GNU coreutils and util-linux: Linux only)
 if [[ "$(uname -s)" == Linux ]]; then
   tmp=$(mktemp -d)
@@ -472,7 +518,7 @@ check_ "POOL: the derived sharding pool goes through start.sh's 0008 mapping, on
   fol=$(grep "^FOLLOW=\"" "$here/../start.sh")
   die() { echo "DIE: $*"; exit 1; }; warn() { :; }; log() { :; }
   TP=2 CONTEXT=1048576 PARALLEL=4 ROUND_ROWS=16 HF_CACHE=/x/hf NFS_PATH=/x/hf POOL= KV_SHARD=1 SPILL_GIB=0
-  REPLAY_FLOOR=0 HF_HUB_OFFLINE=1 PREFILL_INTERLEAVE_MS=0 RDMA_IDLE_S=2 RDMA_NAP_US=500 DRAFTS=1 GRAPHS=1 SIDE=0 PREFETCH=0 ENGRAM_AIO=0
+  REPLAY_FLOOR=0 HF_HUB_OFFLINE=1 PREFILL_INTERLEAVE_MS=0 RDMA_IDLE_S=2 RDMA_NAP_US=500 DRAFTS=1 GRAPHS=1 GRAPH_CAP=128 SIDE=0 PREFETCH=0 ENGRAM_AIO=0
   source "$here/port.sh"; port_validate >/dev/null; port_map
   eval "$eng"; eval "$fol"
   all=$(printf "%s\n" "${ENGINE_ENV[@]}")
@@ -570,13 +616,16 @@ EOF
     awk 'p { print; p = 0 } /^\[dry-run\] rank [01] / { p = 1 }' "$G_T/$out.log" > "$G_T/$out"
     [[ "$(wc -l < "$G_T/$out" | tr -d ' ')" == 2 ]] || { echo "start.sh ($tree) printed no two docker commands:"; tail -5 "$G_T/$out.log"; return 1; }
   }
-  # gcmp <out> <pool or -> <token>...: <out> with every token (each must be there), the tf.recipe.port label and the
-  # container log's rotation (LOG_MAX_SIZE, issue #49; both ranks must carry it) removed,
+  # gcmp <out> <pool or -> <token>...: <out> with every token (each must be there), the tf.recipe.port label, the
+  # container log's rotation (LOG_MAX_SIZE, issue #49; both ranks must carry it) and the graph cap (0033: rank 1's
+  # --graph-cap, rank 0's TF_DS_GRAPH_CAP; both must carry it) removed,
   # and rank 1's --pool <pool> put back to --pool 1048576, equals the base's commands (GBASE: which base run, base.out)
+  gcap_sed='s/ (--graph-cap |-e TF_DS_GRAPH_CAP=)[0-9]+//'   # 0033's two tokens, which the base has not
   gcmp() {
     local out=$1 pool=$2 tok x b=${GBASE:-base.out}; shift 2
-    x=$(sed -E -e 's/ --label tf\.recipe\.port=[^ ]+//' -e 's/ --log-driver json-file --log-opt max-size=[^ ]+ --log-opt max-file=[^ ]+//' "$G_T/$out")
+    x=$(sed -E -e 's/ --label tf\.recipe\.port=[^ ]+//' -e 's/ --log-driver json-file --log-opt max-size=[^ ]+ --log-opt max-file=[^ ]+//' -e "$gcap_sed" "$G_T/$out")
     [[ "$(grep -c -- ' --label tf\.recipe\.port=' "$G_T/$out")" == 2 ]] || { echo "not both ranks carry tf.recipe.port"; return 1; }
+    [[ "$(sed -n 1p "$G_T/$out")" == *" --aio 1 --graph-cap 128 "* && "$(sed -n 2p "$G_T/$out")" == *" -e TF_DS_GRAPHS=1 -e TF_DS_GRAPH_CAP=128 "* ]] || { echo "not both ranks carry the graph cap (0033: --graph-cap, TF_DS_GRAPH_CAP)"; return 1; }
     [[ "$(grep -c -- ' --log-driver json-file --log-opt max-size=100m --log-opt max-file=3 ' "$G_T/$out")" == 2 ]] || { echo "not both ranks carry the container log's rotation (LOG_MAX_SIZE, #49)"; return 1; }
     for tok in "$@"; do
       [[ "$x" == *" $tok"* ]] || { echo "missing: $tok"; return 1; }
@@ -594,7 +643,15 @@ EOF
   check_ "golden: LOG_MAX_SIZE= (empty) leaves the daemon's log settings: no rotation flags (#49)" '
     grun port nolog.out SPILL_GIB=0 KV_SHARD=0 LOG_MAX_SIZE= || exit 1
     ! grep -q -- "--log-opt" "$G_T/nolog.out" || { echo "a rotation flag with LOG_MAX_SIZE empty"; exit 1; }
-    diff "$G_T/base.out" <(sed -E "s/ --label tf\.recipe\.port=[^ ]+//" "$G_T/nolog.out")'
+    diff "$G_T/base.out" <(sed -E -e "s/ --label tf\.recipe\.port=[^ ]+//" -e "$gcap_sed" "$G_T/nolog.out")'
+  check_ "golden: GRAPH_CAP=0 (keep every graph) reaches both ranks; a bad GRAPH_CAP refuses the start; a raw TF_DS_GRAPH_CAP export loses; GRAPHS=0 sends no --graph-cap (0033, #69)" '
+    grun port cap0.out SPILL_GIB=0 KV_SHARD=0 GRAPH_CAP=0 || exit 1
+    [[ "$(sed -n 1p "$G_T/cap0.out")" == *" --graph-cap 0 "* && "$(sed -n 2p "$G_T/cap0.out")" == *" -e TF_DS_GRAPH_CAP=0 "* ]] || { echo "GRAPH_CAP=0 is not on both ranks"; exit 1; }
+    ! grun port badcap.out GRAPH_CAP=-1 2>/dev/null && grep -q "GRAPH_CAP is a count" "$G_T/badcap.out.log" || { echo "GRAPH_CAP=-1 did not refuse the start"; exit 1; }
+    grun port rawcap.out SPILL_GIB=0 KV_SHARD=0 TF_DS_GRAPH_CAP=7 || exit 1
+    [[ "$(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")" == "TF_DS_GRAPH_CAP=128 " ]] || { echo "a raw TF_DS_GRAPH_CAP export reached a rank: $(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")"; exit 1; }
+    grun port nographs.out SPILL_GIB=0 KV_SHARD=0 GRAPHS=0 || exit 1
+    ! grep -q -- "--graph-cap" "$G_T/nographs.out" || { echo "rank 1 got --graph-cap with GRAPHS=0 (an image from before 0033 refuses it)"; exit 1; }'
   check_ "golden: a LOG_MAX_SIZE that is not a size refuses the start (#49)" '
     ! grun port badlog.out LOG_MAX_SIZE="100m;true" 2>/dev/null && grep -q "LOG_MAX_SIZE is a size" "$G_T/badlog.out.log"'
   check_ "golden: KV_SHARD=1 POOL=2101248 adds only its variables to $gbase's POOL=2101248 (0008: TF_DS_POOL, TF_DS_WINDOW, --pool)" '

@@ -147,6 +147,16 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   authored by **Maciej Kowalik ([koniaik](https://github.com/koniaik))** in [pull request #53](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/53)
   (commit `ba7b21e`, sent as `0014`); renumbered, and changed by Mia's AI Lab so that a `budget_tokens` that is sent but
   invalid is still refused.
+- **`zig/patches/0030-anthropic-context-management-lenient.patch`**, **`0031-anthropic-system-anywhere.patch`** and
+  **`0032-stream-keepalive-ping.patch`** (the Anthropic frontend's `clear_thinking` and mid-conversation `system` tolerance, and the
+  streaming keep-alive ping) were authored by **Maciej Kowalik ([koniaik](https://github.com/koniaik))** in pull requests
+  [#71](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/71) (commit [`ed9b692`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/71/commits/ed9b692424ea9cb88f901b18765ed43a411927c3)),
+  [#72](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/72) (commit [`63f9a16`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/72/commits/63f9a16c2895d0f7e69187949455ef78bc834588)) and
+  [#76](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/76) (commit [`449467c`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/76/commits/449467c33ba46f74afbb8d6c573716b5c690ee79)); carried as sent, with host
+  tests added by Mia's AI Lab.
+- **`zig/patches/0033-graph-cap.patch`** (the CUDA graph cache keeps at most `GRAPH_CAP` graphs, issue #69) was authored by
+  **E-Zou Shen ([ezoushen](https://github.com/ezoushen))** in [pull request #70](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70)
+  (commit [`a1ceaf0`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70/commits/a1ceaf0fd88892712f748e3080e187d2b6526396), sent as `0031`); carried as sent, renumbered.
 - **`zig/patches/0004-call-gate.patch`** (`tool_choice` enforcement) was written by Mia's AI Lab (Apache-2.0). Its new file,
   `zig/src/core/lanes/call_gate.zig`, is Mia's AI Lab's Zig call gate for the Flash Next CUDA engine (commits `49350ed6` and
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's
@@ -185,6 +195,10 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   written for this recipe; their measurements follow that recipe's `tools/needle.py`, `tools/toolcheck.py`,
   `tools/hermes_benchmark.py` (Mia's AI Lab; `hermes_benchmark.py` with Steve Darlow, @kerpopule) and the shared prose
   generator of `tools/client.py`.
+- `port_engram_check` in `scripts/port.sh` (with the `start.sh` call, its `port_test.sh` cases and the README note: with the spill tier on, the two
+  ranks' Engram folders are compared before anything is stopped, issue #61) was authored by
+  **Qingchen Yu ([markyu0401](https://github.com/markyu0401))** in [pull request #64](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/64)
+  (commit [`a004d7e`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/64/commits/a004d7e753fbd4a4b1176cc4291abd6806b01151)); carried as sent.
 
 ## Tools and platform
 

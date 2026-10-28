@@ -1,0 +1,91 @@
+From 39a1da297950c8ba5ea80520a89f980b90f8efb0 Mon Sep 17 00:00:00 2001
+From: Maciej Kowalik <33423060+koniaik@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 15:59:44 +0100
+Subject: [PATCH] server: the Anthropic frontend accepts a system turn
+ anywhere in messages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A system message inside messages (not the top-level system field) was
+refused unless it directly followed a user or system turn and directly
+preceded an assistant turn or the end ("mid-conversation system messages
+must follow a user turn and precede an assistant or end"). A client that
+injects a system reminder before the newest user turn — which the cloud
+accepts — sends exactly that and every mid-conversation message failed
+with 400 invalid_request, ending the turn. The placement check is gone;
+the message translates as a system-role chat message, which the chat
+side takes anywhere. Turn-scoped clear_at and per-message output_config
+are still refused as before.
+---
+ zig/src/server/anthropic_translate.zig | 10 +---------
+ zig/src/server/late_system_test.zig    | 22 ++++++++++++++++++----
+ 2 files changed, 19 insertions(+), 13 deletions(-)
+
+diff --git a/zig/src/server/anthropic_translate.zig b/zig/src/server/anthropic_translate.zig
+index 8a155f5..c3912d5 100644
+--- a/zig/src/server/anthropic_translate.zig
++++ b/zig/src/server/anthropic_translate.zig
+@@ -76,18 +76,10 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
+         try m.put(a, "content", .{ .string = joined.items });
+         try out.append(a, .{ .object = m });
+     };
+-    for (list.array, 0..) |message, index| {
++    for (list.array) |message| {
+         if (message != .object or !roleIs(message, &.{ "user", "assistant", "system" })) return cx.refuse("message role must be user, assistant or system");
+         const role = message.get("role").?.string;
+         if (std.mem.eql(u8, role, "system")) {
+-            const previous: Value = if (index > 0) list.array[index - 1] else .{ .object = try json.newObject(a) };
+-            const following: Value = if (index + 1 < list.array.len) list.array[index + 1] else blk: {
+-                const f = try json.newObject(a);
+-                try f.put(a, "role", .{ .string = "assistant" });
+-                break :blk .{ .object = f };
+-            };
+-            if (previous != .object or !roleIs(previous, &.{ "user", "system" }) or following != .object or !roleIs(following, &.{ "assistant", "system" }))
+-                return cx.refuse("mid-conversation system messages must follow a user turn and precede an assistant or end");
+             const clear = message.get("clear_at");
+             const clear_ok = clear == null or clear.? == .null or (clear.? == .string and std.mem.eql(u8, clear.?.string, "never"));
+             if (!clear_ok or json.truthyField(message, "output_config")) return cx.refuse("turn-scoped system messages and per-message output_config are unsupported");
+diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
+index 4a061f8..6a2da11 100644
+--- a/zig/src/server/late_system_test.zig
++++ b/zig/src/server/late_system_test.zig
+@@ -20,6 +20,13 @@ const misplaced_body =
+     \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"system","content":"be brief"}]}
+ ;
+ 
++const before_user_body =
++    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"be brief"},{"role":"user","content":"go"}]}
++;
++const scoped_body =
++    \\{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"be brief","clear_at":"next_turn"},{"role":"assistant","content":"ok"}]}
++;
++
+ /// Drops a system message after the first, so the late-system probe comes back as user.
+ const DropLate = struct {
+     fn text(t: *@This()) model_text.Text {
+@@ -203,10 +210,17 @@ test "a mid-conversation system message renders the same prompt on Messages and
+     defer std.testing.allocator.free(want);
+     try std.testing.expect(std.mem.indexOf(u8, counted.body, want) != null);
+ 
+-    const misplaced = try exchange(srv, "/v1/messages", misplaced_body);
+-    defer std.testing.allocator.free(misplaced.body);
+-    try std.testing.expectEqual(@as(u16, 400), misplaced.status);
+-    try std.testing.expect(std.mem.indexOf(u8, misplaced.body, "mid-conversation system messages must follow a user turn and precede an assistant or end") != null);
++    // A system turn may sit anywhere: after an assistant turn, last, or before the newest user turn.
++    for ([_][]const u8{ misplaced_body, before_user_body }) |body| {
++        const placed = try exchange(srv, "/v1/messages", body);
++        defer std.testing.allocator.free(placed.body);
++        try std.testing.expectEqual(@as(u16, 200), placed.status);
++    }
++    // A turn-scoped system message is still refused.
++    const scoped = try exchange(srv, "/v1/messages", scoped_body);
++    defer std.testing.allocator.free(scoped.body);
++    try std.testing.expectEqual(@as(u16, 400), scoped.status);
++    try std.testing.expect(std.mem.indexOf(u8, scoped.body, "turn-scoped system messages and per-message output_config are unsupported") != null);
+ }
+ 
+ const clear_old_body =
+-- 
+2.43.0
+
