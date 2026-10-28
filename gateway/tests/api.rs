@@ -1047,3 +1047,161 @@ async fn chat_template_kwargs_disable_thinking_even_with_a_top_level_effort() {
     let sent = mock.body.lock().unwrap().clone().expect("engine body");
     assert_eq!(sent["thinking"], false);
 }
+
+/// A plain Messages request with the given messages and extra top-level fields.
+fn messages_body(messages: Value, extra: Value) -> Value {
+    let mut body = json!({
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "max_tokens": 64,
+        "messages": messages,
+        "thinking": {"type": "disabled"}
+    });
+    if let (Value::Object(body), Value::Object(extra)) = (&mut body, extra) {
+        body.extend(extra);
+    }
+    body
+}
+
+async fn messages_engine() -> String {
+    let gw = gateway();
+    let ids = text_ids(&gw, "Hola");
+    let (engine, _) = spawn_mock(
+        vec![
+            usage(8, 0),
+            tokens(&ids, Some("stop")),
+            final_usage(8, 0, ids.len() as u64),
+        ],
+        Duration::ZERO,
+        true,
+    )
+    .await;
+    engine
+}
+
+/// PR #71's shapes: a clear_thinking edit of either date and any keep is accepted;
+/// any other edit is refused with a 400.
+#[tokio::test]
+async fn context_management_accepts_clear_thinking_and_refuses_other_edits() {
+    let engine = messages_engine().await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+    let user = json!([{"role": "user", "content": "Hola"}]);
+    for (kind, keep) in [
+        ("clear_thinking_20250929", json!("none")),
+        ("clear_thinking_20251015", json!("all")),
+        (
+            "clear_thinking_20251015",
+            json!({"type": "thinking_turns", "value": 1}),
+        ),
+    ] {
+        let body = messages_body(
+            user.clone(),
+            json!({"context_management": {"edits": [{"type": kind, "keep": keep}]}}),
+        );
+        let response = post_json(&format!("{url}/v1/messages"), body).await;
+        assert_eq!(response.status(), 200, "{kind} keep {keep}");
+    }
+    for extra in [
+        json!({"context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]}}),
+        json!({"context_management": {"edits": [{"type": "bogus_edit", "keep": "all"}]}}),
+        json!({"context_management": {"edits": "clear"}}),
+        json!({"context_management": "clear"}),
+    ] {
+        let response = post_json(
+            &format!("{url}/v1/messages"),
+            messages_body(user.clone(), extra.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), 400, "{extra}");
+        let body: Value = response.json().await.expect("body");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("context_management")),
+            "{extra}: {body}"
+        );
+    }
+}
+
+/// PR #72's shapes: a system turn anywhere in `messages` is accepted.
+#[tokio::test]
+async fn a_system_turn_is_accepted_anywhere_in_messages() {
+    let engine = messages_engine().await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+    for messages in [
+        json!([
+            {"role": "user", "content": "Hola"},
+            {"role": "system", "content": "Responde breve."},
+            {"role": "user", "content": "Hola otra vez"}
+        ]),
+        json!([
+            {"role": "user", "content": "Hola"},
+            {"role": "assistant", "content": "Hola."},
+            {"role": "system", "content": "Responde breve."},
+            {"role": "user", "content": "Hola otra vez"}
+        ]),
+        json!([
+            {"role": "user", "content": "Hola"},
+            {"role": "system", "content": "Responde breve."}
+        ]),
+    ] {
+        let response = post_json(
+            &format!("{url}/v1/messages"),
+            messages_body(messages.clone(), json!({})),
+        )
+        .await;
+        let status = response.status();
+        let body: Value = response.json().await.expect("body");
+        assert_eq!(status, 200, "{messages}: {body}");
+        assert_eq!(body["content"][0]["text"], "Hola", "{messages}: {body}");
+    }
+}
+
+/// PR #76's case: while the engine is silent (a long cold prefill), the Messages
+/// stream still sends bytes at least every 15 s, so an idle-cutting proxy keeps it.
+#[tokio::test]
+async fn a_silent_engine_does_not_leave_the_stream_idle_for_more_than_15_seconds() {
+    let gw = gateway();
+    let ids = text_ids(&gw, "Hola");
+    let (engine, _) = spawn_mock(
+        vec![
+            usage(8, 0),
+            tokens(&ids, Some("stop")),
+            final_usage(8, 0, ids.len() as u64),
+        ],
+        Duration::from_secs(17),
+        true,
+    )
+    .await;
+    let url = spawn_gateway(&engine, gateway(), 65536).await;
+    let mut body = messages_body(json!([{"role": "user", "content": "Hola"}]), json!({}));
+    body["stream"] = json!(true);
+    let mut response = post_json(&format!("{url}/v1/messages"), body).await;
+    assert_eq!(response.status(), 200);
+    let start = std::time::Instant::now();
+    let mut last = start;
+    let mut longest = Duration::ZERO;
+    let mut text = String::new();
+    while let Some(chunk) = response.chunk().await.expect("chunk") {
+        let now = std::time::Instant::now();
+        longest = longest.max(now - last);
+        last = now;
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(
+        start.elapsed() > Duration::from_secs(30),
+        "the engine was silent for 2 x 17 s"
+    );
+    assert!(
+        longest < Duration::from_secs(16),
+        "longest silence {longest:?}"
+    );
+    assert!(
+        text.lines().any(|line| line.starts_with(':')),
+        "no keep-alive comment: {text}"
+    );
+    assert!(
+        parse_sse(&text)
+            .iter()
+            .any(|(name, _)| name.as_deref() == Some("message_stop"))
+    );
+}

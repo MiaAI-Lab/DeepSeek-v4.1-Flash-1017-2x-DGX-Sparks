@@ -1,0 +1,37 @@
+{
+ "id": "messages-system-user-assistant-system-user",
+ "protocol": "messages",
+ "tags": [
+  "sistema"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   },
+   {
+    "role": "assistant",
+    "content": "Hola."
+   },
+   {
+    "role": "system",
+    "content": "Responde breve."
+   },
+   {
+    "role": "user",
+    "content": "Hola otra vez"
+   }
+  ],
+  "thinking": {
+   "type": "disabled"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true,
+ "nota": "MiaAI-Lab PR #72: a system reminder injected inside messages, a placement the cloud accepts."
+}

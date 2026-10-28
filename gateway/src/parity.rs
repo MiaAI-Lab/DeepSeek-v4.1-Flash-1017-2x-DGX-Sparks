@@ -157,6 +157,9 @@ pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
     if fallback_reason.is_some() && config.strict {
         return Err(ApiError::bad_request(fallback_reason.clone().unwrap()));
     }
+    if protocol == Protocol::Messages {
+        check_context_management(&object)?;
+    }
     if object.get("model").is_none_or(Value::is_null) {
         object.insert("model".to_string(), json!(config.served_name));
     }
@@ -438,6 +441,41 @@ fn fallback_fields(
         }
     }
     None
+}
+
+/// `context_management` on `/v1/messages`.  Any `clear_thinking_*` edit (either API
+/// date, any `keep`) is accepted, as the cloud accepts it, and the conversion renders
+/// the history it is given unchanged; any other edit is refused with a 400.
+fn check_context_management(object: &Map<String, Value>) -> Result<(), ApiError> {
+    let Some(value) = object
+        .get("context_management")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(());
+    };
+    let Value::Object(value) = value else {
+        return Err(ApiError::bad_request(
+            "context_management must be an object",
+        ));
+    };
+    let edits = match value.get("edits") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Array(edits)) => edits,
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "context_management.edits must be a list",
+            ));
+        }
+    };
+    for edit in edits {
+        let kind = edit.get("type").and_then(Value::as_str).unwrap_or("");
+        if !kind.starts_with("clear_thinking_") {
+            return Err(ApiError::bad_request(
+                "context_management supports clear_thinking edits only",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Inject the operator's default effort before conversion, per protocol.
