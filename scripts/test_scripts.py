@@ -82,7 +82,8 @@ for a in "$@"; do case "$a" in -*) ;; *) exec /usr/bin/paste "$@" ;; esac; done
 exec /usr/bin/paste "$@" -
 """
 
-NAME = "dsv41-1017-exl3-tf"
+# (not the recipe's own container name: a sandboxed start.sh must never name a real one, whatever it leaves behind)
+NAME = "tf-scripts-test-container"
 WORKERS = {"WORKER": "w1"}
 
 
@@ -119,6 +120,8 @@ class ScriptTest(unittest.TestCase):
             "HOME": str(self.home),
             "SIM": str(self.sim),
             "LANG": "C",
+            "CONTAINER_NAME": NAME,
+            "MEMGUARD_GIB": "0",   # no background watchdog in a sandbox: start.sh would leave it running when the test ends
             **WORKERS,
         }
 
