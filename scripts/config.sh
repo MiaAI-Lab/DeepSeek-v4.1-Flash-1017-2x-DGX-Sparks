@@ -75,7 +75,7 @@ declare -A ENGRAM_SHARD_SIZE=([model-00047-of-00048.safetensors]=101535150936 [m
 # The engine: BertholomusAI's TensorFold fork, branch deepseek-v41-zig (the DeepSeek-V4.1-Flash family on TensorFold's
 # native Zig engine, two nodes), at the head of that branch; it serves both ranks.
 TF_REPO="${TF_REPO:-https://github.com/bertholomus/TensorFold.git}"
-TF_REF="${TF_REF:-629c524a0ea57512a5342abb498d1b7c25353343}"   # the branch tip of 2026-10-19 (was 3ff3b2ac; docs/zig-engine.md, "The pin")
+TF_REF="${TF_REF:-fbbc97132cd004237d9887b8d3185896efaedc5c}"   # the branch tip of 2026-10-23 (was 629c524a; docs/zig-engine.md, "The pin")
 # The inputs' tools: the same fork's branch deepseek-v41-zig-tp4, at the commit of the four-node recipe v0.1.1. It adds
 # what the two-node branch lacks: tf-dsv41-rank-cache (a rank's weight file from the checkpoint alone, no GPU, no
 # Python) and the standalone token-map and RoPE-table scripts. Only those are taken; it does not serve here.

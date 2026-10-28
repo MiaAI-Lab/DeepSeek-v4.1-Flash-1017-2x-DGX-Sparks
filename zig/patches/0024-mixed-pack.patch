@@ -1,5 +1,5 @@
 diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
-index 959ad65..df44fa5 100644
+index bded4924f3c9bafe0cd809041a0e54eb8a511fdf..65492a529ea4983bc64b50836ed6676e42aea9bc 100644
 --- a/zig/src/families/dsv41/prompt.zig
 +++ b/zig/src/families/dsv41/prompt.zig
 @@ -254,6 +254,7 @@ pub const Chunk = struct {
@@ -136,7 +136,7 @@ index 959ad65..df44fa5 100644
      const dt: exl3_linear.DType = switch (out_type) {
          .bf16 => .bf16,
 diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
-index 196fc67..b7ba5cb 100644
+index 196fc673d5846225acd1dcc5de2b656dc40a51b4..b7ba5cb9677afd66c808adc0f6c9a88d14baf02b 100644
 --- a/zig/src/families/dsv41/round.zig
 +++ b/zig/src/families/dsv41/round.zig
 @@ -657,9 +657,9 @@ pub const Round = struct {
@@ -195,7 +195,7 @@ index 196fc67..b7ba5cb 100644
  }
  
 diff --git a/zig/src/families/dsv41/weights.zig b/zig/src/families/dsv41/weights.zig
-index df613e4..2eef209 100644
+index df613e42abbfcb9a8bfdd1132ae29e4071054e9c..2eef20996fd28d45ea48b63027d93f3663afc953 100644
 --- a/zig/src/families/dsv41/weights.zig
 +++ b/zig/src/families/dsv41/weights.zig
 @@ -17,7 +17,10 @@ const span_piece = 64 << 20;

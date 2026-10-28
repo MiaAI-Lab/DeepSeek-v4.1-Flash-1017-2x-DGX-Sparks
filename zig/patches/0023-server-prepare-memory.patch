@@ -438,7 +438,7 @@ index 176d9958e33eb9395b31868b3cc100e47092547c..0ff7e24639571473939a04165c961f13
 +    try std.testing.expect(deep.peak < 40 * text.len);
 +}
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index dfd151b6271a8f775b28238daab6beef7aec4e57..924fce3c64b9658a9e3cb49f21124d8c1c0a59b1 100644
+index 13179f7a3144ff5254ca045298d571d1f7290830..b57261f6b9a462dc76423fb94cc83a5d9775a745 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
 @@ -13,6 +13,7 @@ const ids = @import("ids.zig");

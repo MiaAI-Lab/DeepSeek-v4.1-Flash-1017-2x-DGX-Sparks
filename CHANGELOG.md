@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The engine pin moves to `fbbc971` (BertholomusAI's `deepseek-v41-zig` tip of 2026-10-23, was `629c524`), with the
+  series rebased onto it: `0002` and `0006` are gone (the engine's `TF_DS_ENGRAM_LEAD` and `3de79d8` do their jobs),
+  twelve patches are adapted to the engine's prompt pass in pieces (`TF_FILL_CHUNKS`, `TF_FILL_CUT_IN`; `start.sh` passes
+  `TF_FILL_*`), and `0034` holds two follow-ups. Details in `zig/patches/README.md`. By **eleata**.
 - `zig/patches/0030-anthropic-context-management-lenient.patch` (always on): the Anthropic frontend accepts any
   `clear_thinking_<date>` edit in `context_management` with any `keep`. It accepted only `clear_thinking_20251015` with
   `keep: "all"`, so a client that clears earlier thinking when the user sends a message mid-conversation (the original

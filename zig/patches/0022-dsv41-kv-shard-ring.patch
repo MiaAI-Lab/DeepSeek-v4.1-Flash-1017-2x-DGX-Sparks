@@ -345,10 +345,10 @@ index 8f5b165a6b6d780cd3e00cbf054f1489329321a4..a591e49f0221c1d5ed6b8dca48e795cf
  
  /// The gate every collective's NCCL calls hold against `Comm.abort` (process-wide: one engine thread enqueues, the
 diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
-index 33b4122f67475d9af99f789c64eb8bd89a3c912e..847b4b29b902379dccf1290bc8b4097d488fb800 100644
+index 5c95889537c12a6713b1ccd88f243c30b4faad3b..bef75043f9809c876c5da567a22a0aa70e17b0e7 100644
 --- a/zig/src/families/dsv41/dsv41.zig
 +++ b/zig/src/families/dsv41/dsv41.zig
-@@ -55,6 +55,7 @@ pub const kv_lanes = @import("kv_lanes.zig");
+@@ -57,6 +57,7 @@ pub const kv_lanes = @import("kv_lanes.zig");
  pub const rank_wire = @import("rank_wire.zig");
  pub const fingerprint = @import("fingerprint.zig");
  pub const rank_identity = @import("rank_identity.zig");
@@ -356,7 +356,7 @@ index 33b4122f67475d9af99f789c64eb8bd89a3c912e..847b4b29b902379dccf1290bc8b4097d
  
  test {
      // every declaration of every file, so functions no test calls are still compiled
-@@ -107,6 +108,7 @@ test {
+@@ -111,6 +112,7 @@ test {
      refAll(rank_wire);
      refAll(fingerprint);
      refAll(rank_identity);
@@ -365,11 +365,11 @@ index 33b4122f67475d9af99f789c64eb8bd89a3c912e..847b4b29b902379dccf1290bc8b4097d
      _ = &struct {
          fn f(gpa: @import("std").mem.Allocator, io: @import("std").Io, o: model.Options, m: *model.Model, x: rank_identity.Extra) !rank_identity.Gathered {
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index a18a7f92bd6bec8fd9d93eb6f4679d74359b7191..e2e341e8a64b444df5518703f99ac7ca5bb75bce 100644
+index c68c9ef83a10508dbcc4800227a69c4b6b16b649..43325a4c39f5b882a22197ae7d6269dbf9912154 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
-@@ -454,6 +454,8 @@ pub const Lanes = struct {
-     next_snap: u64 = 1,
+@@ -462,6 +462,8 @@ pub const Lanes = struct {
+     paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
      spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
      kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
 +    kv_stats: lanes.kv_parts.Stats = .{}, // the last parts' stats kvPartsFn built (the engine loop reads them every
@@ -377,7 +377,7 @@ index a18a7f92bd6bec8fd9d93eb6f4679d74359b7191..e2e341e8a64b444df5518703f99ac7ca
      /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
      /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
      rw: ?*rank_wire.Leader = null,
-@@ -714,10 +716,18 @@ pub const Lanes = struct {
+@@ -725,10 +727,18 @@ pub const Lanes = struct {
          try k.round(vs[0..windows.len]);
      }
  
@@ -397,7 +397,7 @@ index a18a7f92bd6bec8fd9d93eb6f4679d74359b7191..e2e341e8a64b444df5518703f99ac7ca
          k.stats(out);
          k.wantStats(); // (the followers' rows are asked for again at the next round, at most each stats_ms)
          if (self.m.kvs) |x| {
-@@ -733,8 +743,12 @@ pub const Lanes = struct {
+@@ -744,8 +754,12 @@ pub const Lanes = struct {
              out.copy_bytes = st.carry_bytes;
              shardRank(self.m, &out.rank[0]); // (rank 0's own row; the followers' ride their stats replies)
          }
@@ -410,7 +410,7 @@ index a18a7f92bd6bec8fd9d93eb6f4679d74359b7191..e2e341e8a64b444df5518703f99ac7ca
      // -- the vtable ---------------------------------------------------------------------------------------------
  
      /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
-@@ -1461,6 +1475,15 @@ fn refused(err: anyerror) void {
+@@ -1530,6 +1544,15 @@ fn refused(err: anyerror) void {
      std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
  }
  
@@ -426,7 +426,7 @@ index a18a7f92bd6bec8fd9d93eb6f4679d74359b7191..e2e341e8a64b444df5518703f99ac7ca
  /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
  pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
  
-@@ -1783,7 +1806,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+@@ -1861,7 +1884,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
                  }
                  const rows = try built.build(gpa, &seqs, wins[0..nw]);
                  if (spill) |sd| for (wins[0..nw]) |w| sd.bump(w.base + w.start, w.base + w.start + w.ids.len);
@@ -435,7 +435,7 @@ index a18a7f92bd6bec8fd9d93eb6f4679d74359b7191..e2e341e8a64b444df5518703f99ac7ca
                  if (m.prof) {
                      follow_prof.rounds += 1;
                      follow_prof.enqueue += m.t_enqueue;
-@@ -1802,7 +1825,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+@@ -1880,7 +1903,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
                      q0[i] = try r.int(i64);
                      slots[i] = try r.int(i64);
                  }
@@ -492,10 +492,10 @@ index 4a790c2a7afed51672ca062ea6d3d7aa179265ec..e61e4861e9f5b1b9421a9ea1a7922069
  fn printClock(w: *std.Io.Writer, rank: u32, m: *const dsv41.model.Model) !void {
      if (m.clk_rounds == 0) return;
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index 2027b3bfb2d6a207eac184de0cf9b16dd2365a04..62b939ae6141ec318e423f419cef37b6d1d86b4b 100644
+index 1541dbfd763e7eccef5f6d8c71443cb02b559a16..9b5efeb8a36b1e19880ae79bd4ceaf539ae0b954 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -510,6 +510,7 @@ pub const Model = struct {
+@@ -513,6 +513,7 @@ pub const Model = struct {
          }
          m.rd.dropSide(&m.eng);
          m.rd.dropPrefetch();
@@ -503,7 +503,7 @@ index 2027b3bfb2d6a207eac184de0cf9b16dd2365a04..62b939ae6141ec318e423f419cef37b6
          if (m.aio) |x| x.deinit();
          if (m.paio) |x| x.deinit();
          if (m.paio2) |x| x.deinit();
-@@ -1265,6 +1266,7 @@ pub const Model = struct {
+@@ -1282,6 +1283,7 @@ pub const Model = struct {
      /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
      pub fn useClock(m: *Model, marks: u8) !void {
          m.rd.clk_marks = marks == 1 or marks == 3;
@@ -512,10 +512,10 @@ index 2027b3bfb2d6a207eac184de0cf9b16dd2365a04..62b939ae6141ec318e423f419cef37b6
          m.rd.clk_layers = marks == 2 or marks == 3;
          if (m.rd.clk == 0) m.rd.clk = try m.arena.take((1 + 2 * round.Round.max_clocks) * 8);
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index c63efef4a7a49f7e96f41108eae2bead66312055..a0516fcaadb4cb86e53c6741e518d634c79d3804 100644
+index 2f30738633884ca02d14ad27189cf505911721ed..37fa2d9393a64b9a529d0bfbb121f049ed363573 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
-@@ -282,8 +282,9 @@ pub fn pairMode(env: *const fn ([:0]const u8) ?[]const u8) !PairMode {
+@@ -286,8 +286,9 @@ pub fn pairMode(env: *const fn ([:0]const u8) ?[]const u8) !PairMode {
  
  /// The errors from a prompt pass or a round that mean the pair broke (rank_wire's PairBroken; kv_lanes' transfers;
  /// a follower's StaleExtent/ShardDiverged reach rank 0 as its link going down; an aborted communicator; an RDMA ring
@@ -527,7 +527,7 @@ index c63efef4a7a49f7e96f41108eae2bead66312055..a0516fcaadb4cb86e53c6741e518d634
  pub const pair_fatal = [_]api.LaneHost.Fatal{
      .{ .err = error.PairBroken, .drain = false },
      .{ .err = error.TransferTimeout, .drain = false },
-@@ -292,6 +293,9 @@ pub const pair_fatal = [_]api.LaneHost.Fatal{
+@@ -296,6 +297,9 @@ pub const pair_fatal = [_]api.LaneHost.Fatal{
      .{ .err = error.PeerDown, .drain = false },
      .{ .err = error.CommAborted, .drain = false },
      .{ .err = error.RingFailed, .drain = false },
@@ -537,7 +537,7 @@ index c63efef4a7a49f7e96f41108eae2bead66312055..a0516fcaadb4cb86e53c6741e518d634
  };
  
  /// Loaded.pair: the hooks the server wires to its lane host (native/cuda.zig).
-@@ -620,7 +624,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -624,7 +628,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.BadPool => "TF_DS_POOL (rank 1: --pool): the pool's positions, a whole number of at least the context (unset: the context)",
          error.BadWindow => "TF_DS_WINDOW: the positions one request may use, a whole number; on rank 0 it must be --context (start.sh sets both from CONTEXT)",
          error.BadKvShard => "TF_DS_KV_SHARD: 1 (on) or 0 (off)",
@@ -546,7 +546,7 @@ index c63efef4a7a49f7e96f41108eae2bead66312055..a0516fcaadb4cb86e53c6741e518d634
          error.KvShardNeedsTwoRanks => "TF_DS_KV_SHARD=1 shards the compressed latents over the two TP2 ranks: TF_TP_WORLD=2",
          error.KvShardMismatch => "the ranks disagree on TF_DS_KV_SHARD, the pool (TF_DS_POOL, else rank 1's --pool), TF_DS_ROUND_ROWS or the window, or the other rank could not read one of them: give every rank the same TF_DS_* environment (start.sh's ENGINE_ENV) and settings",
          error.BadPart => "TF_DS_KV_SHARD=1: a round row whose part is not its extent's (a placement bug): restart with TF_DS_KV_SHARD=0",
-@@ -644,6 +648,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -648,6 +652,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.StagingTooSmall => "the spill staging cap (TF_DS_SPILL_STAGING_MIB) holds too few slots for this model's blocks and small state: raise it",
          error.BadKvShardSetting => "TF_DS_KV_SHARD_CARRY and TF_DS_KV_SHARD_TWINS: 1 (on, the default) or 0; TF_DS_KV_SHARD_CHECK: decode rounds between the ranks' planner checks (0: at start only); TF_DS_KV_SHARD_STATS_MS: 0 (the default, rank 0's own kv_shard row only) up to 3600000 ms between asks for the followers' rows (only while /health or /metrics read them)",
          error.ShardLayoutMismatch => "TF_DS_KV_SHARD=1: the ranks cut the pool into different parts or plan with other switches (another TF_DS_POOL, --pool, TF_DS_KV_SHARD_CARRY, TF_DS_KV_SHARD_TWINS or build on rank 1): give every rank the same TF_DS_* environment and build",
@@ -557,7 +557,7 @@ index c63efef4a7a49f7e96f41108eae2bead66312055..a0516fcaadb4cb86e53c6741e518d634
          error.ShardDiverged, error.StaleExtent => "TF_DS_KV_SHARD=1: the ranks' KV-part planners disagree (an engine bug; the pair stops rather than read the wrong rows): restart with TF_DS_KV_SHARD=0",
          error.TransferFailed => "TF_DS_KV_SHARD=1: a KV transfer between the ranks failed on one rank only: restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
          error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
-@@ -660,8 +668,14 @@ test "refusals name what to set" {
+@@ -664,8 +672,14 @@ test "refusals name what to set" {
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
@@ -573,7 +573,7 @@ index c63efef4a7a49f7e96f41108eae2bead66312055..a0516fcaadb4cb86e53c6741e518d634
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
      try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
  }
-@@ -690,6 +704,23 @@ test "TF_DS_PAIR_BROKEN: exit by default (spill and KV sharding off), degrade th
+@@ -694,6 +708,23 @@ test "TF_DS_PAIR_BROKEN: exit by default (spill and KV sharding off), degrade th
      for (pair_fatal) |f| try std.testing.expect(!f.drain);
  }
  
@@ -598,19 +598,19 @@ index c63efef4a7a49f7e96f41108eae2bead66312055..a0516fcaadb4cb86e53c6741e518d634
      const E = struct {
          var kv: ?[]const u8 = null;
 diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
-index 5e4f564fb8ccba010156bdf5bb122569fedee033..8ee634a65999c05bf47ff35b3ea507a9024ad1ea 100644
+index b43b69b355216eee8414610ef732383e4c2db534..a12d9b348a29be1c47d3c99064fcb02f18a639fd 100644
 --- a/zig/src/families/dsv41/rdma.zig
 +++ b/zig/src/families/dsv41/rdma.zig
-@@ -30,7 +30,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
+@@ -31,7 +31,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
  
  extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
  
 -pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
 +pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, RingOrder, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
  
- /// The served ring has its own GID selection, independent of NCCL's.
- pub fn parseGidIndex(text: ?[]const u8) error{InvalidRdmaGidIndex}!u8 {
-@@ -195,6 +195,29 @@ const Peer = struct {
+ /// TF_RDMA_IDLE_S: seconds with nothing posted or reaped before the proxy naps (0: never nap; default 2).
+ fn parseIdleNs(text: []const u8) Error!u64 {
+@@ -181,6 +181,29 @@ const Peer = struct {
      recv: u64 = 0,
  };
  
@@ -640,7 +640,7 @@ index 5e4f564fb8ccba010156bdf5bb122569fedee033..8ee634a65999c05bf47ff35b3ea507a9
  pub const Ring = struct {
      d: *const cuda.Driver,
      verbs: Verbs,
-@@ -218,6 +241,9 @@ pub const Ring = struct {
+@@ -204,6 +227,9 @@ pub const Ring = struct {
      /// The proxy's idle back-off: quiet for `idle_ns` (0: never nap), then sleep `nap_ns` between looks.
      idle_ns: u64 = default_idle_ns,
      nap_ns: u64 = default_nap_ns,
@@ -650,7 +650,7 @@ index 5e4f564fb8ccba010156bdf5bb122569fedee033..8ee634a65999c05bf47ff35b3ea507a9
  
      // the metadata block: flags [slots][world], doorbell, sizes [slots], sent [slots], abort word
      fn flags(r: *const Ring) [*]u64 {
-@@ -499,6 +525,7 @@ pub const Ring = struct {
+@@ -485,6 +511,7 @@ pub const Ring = struct {
      /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`.
      pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
          if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
@@ -658,7 +658,7 @@ index 5e4f564fb8ccba010156bdf5bb122569fedee033..8ee634a65999c05bf47ff35b3ea507a9
          if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
          const own: DevicePtr = if (r.s.own_early) recv + @as(u64, r.rank) * n4 * 16 else 0;
          try r.stage(stream, send, n4, own, n4, n4);
-@@ -528,6 +555,7 @@ pub const Ring = struct {
+@@ -514,6 +541,7 @@ pub const Ring = struct {
      /// names the same widths, so each peer's ring slot holds rows x w_p floats.
      pub fn gatherInto(r: *Ring, stream: cuda.Stream, send: DevicePtr, rows: u32, own_row4: u32, dsts: []const Dst) Error!void {
          if (r.failure() != null) return error.RingFailed; // (a dead peer, or an abort: rank pair broken)
@@ -666,7 +666,7 @@ index 5e4f564fb8ccba010156bdf5bb122569fedee033..8ee634a65999c05bf47ff35b3ea507a9
          if (dsts.len != r.world) return error.BadInfo;
          const n4 = rows * own_row4;
          if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
-@@ -561,6 +589,102 @@ pub const Ring = struct {
+@@ -547,6 +575,102 @@ pub const Ring = struct {
          const blocks = std.math.clamp((copy4 + per - 1) / per, 1, r.s.collect_blocks);
          try cuda.launch.launch(r.k.collect_into, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
      }
@@ -769,7 +769,7 @@ index 5e4f564fb8ccba010156bdf5bb122569fedee033..8ee634a65999c05bf47ff35b3ea507a9
      fn probe(r: *const Ring) DevicePtr {
          return if (r.s.probing) r.scalar(16) else 0;
      }
-@@ -693,3 +817,34 @@ test "RDMA idle nap bounds keep requests and shutdown responsive" {
+@@ -683,3 +807,34 @@ test "RDMA idle nap bounds keep requests and shutdown responsive" {
      try std.testing.expectEqual(@as(u64, 3600 * std.time.ns_per_s), try parseIdleNs("3600"));
      try std.testing.expectError(error.BadRdmaIdle, parseIdleNs("3600.1"));
  }

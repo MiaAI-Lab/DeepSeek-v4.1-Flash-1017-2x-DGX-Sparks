@@ -1,8 +1,14 @@
+
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): imports beside upstream's rdma_env.zig.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): imports beside upstream's rdma_env.zig.
+
 diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
-index 7d2e266..e883286 100644
+index 908b3c1cba167536c308937d558e8caf08a32679..4677d23807e53dc5707b460e197d5b2ece647bb2 100644
 --- a/zig/src/families/dsv41/dsv41.zig
 +++ b/zig/src/families/dsv41/dsv41.zig
-@@ -48,6 +48,7 @@ pub const draft = @import("draft.zig");
+@@ -50,6 +50,7 @@ pub const draft = @import("draft.zig");
  pub const sampling = @import("sampling.zig");
  pub const model = @import("model.zig");
  pub const lanes = @import("lanes.zig");
@@ -10,25 +16,25 @@ index 7d2e266..e883286 100644
  
  test {
      // every declaration of every file, so functions no test calls are still compiled
-@@ -94,4 +95,5 @@ test {
+@@ -98,4 +99,5 @@ test {
      refAll(sampling);
      refAll(model);
      refAll(lanes);
 +    refAll(pool);
  }
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index ee13c9f..6d601a9 100644
+index 0a29d578b9c8cfcfa299a17ce2a6c2ea54d5fe39..68deb3b8a60bf8f79641064bf3152501fd2aac21 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -27,6 +27,7 @@ const comm_mod = @import("comm.zig");
- const link = @import("link.zig");
+@@ -29,6 +29,7 @@ const link = @import("link.zig");
  const ring2d = @import("ring2d.zig");
  const rdma = @import("rdma.zig");
+ const rdma_env = @import("rdma_env.zig");
 +const pool_mod = @import("pool.zig");
  
  /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
  pub const chunk_rows = 2048;
-@@ -238,9 +239,10 @@ pub const Model = struct {
+@@ -247,9 +248,10 @@ pub const Model = struct {
          m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
          errdefer m.ex.unload();
  
@@ -41,7 +47,7 @@ index ee13c9f..6d601a9 100644
          m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
          errdefer m.rope_buf.free();
          {
-@@ -249,7 +251,7 @@ pub const Model = struct {
+@@ -258,7 +260,7 @@ pub const Model = struct {
              for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
                  var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
                  defer f.close(io);
@@ -51,10 +57,10 @@ index ee13c9f..6d601a9 100644
              }
          }
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index 55a532f..49e02c7 100644
+index 27a4f90b88badb6e36140b2311f59eeaf68cb487..2c933f6745a5d83df0b8f9f66d265dc4bd985bbc 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
-@@ -28,6 +28,7 @@ const std = @import("std");
+@@ -30,6 +30,7 @@ const std = @import("std");
  const cuda = @import("cuda");
  const lanes = @import("lanes");
  const model = @import("model.zig");
@@ -62,7 +68,7 @@ index 55a532f..49e02c7 100644
  const lanes_mod = @import("lanes.zig");
  const round = @import("round.zig");
  const link = @import("link.zig");
-@@ -133,7 +134,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+@@ -137,7 +138,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
          .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,
          .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
          .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
@@ -73,7 +79,7 @@ index 55a532f..49e02c7 100644
          .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
 diff --git a/zig/src/families/dsv41/pool.zig b/zig/src/families/dsv41/pool.zig
 new file mode 100644
-index 0000000..3c3926b
+index 0000000000000000000000000000000000000000..3c3926b569428672bda0b9ecbb2ac5129bd7fe49
 --- /dev/null
 +++ b/zig/src/families/dsv41/pool.zig
 @@ -0,0 +1,52 @@

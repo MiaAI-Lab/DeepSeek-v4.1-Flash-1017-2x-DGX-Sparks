@@ -29,7 +29,7 @@ with the next token or at the end; a block opened without them; a third newline 
  2 files changed, 34 insertions(+), 2 deletions(-)
 
 diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
-index de52b3a..9d1e473 100644
+index de52b3a46cb68f589e13daa7aff6281fc7c69880..9d1e47350520bbe416dff3da524f2542a98dbb6b 100644
 --- a/zig/src/server/openai.zig
 +++ b/zig/src/server/openai.zig
 @@ -365,7 +365,8 @@ const Run = struct {
@@ -43,7 +43,7 @@ index de52b3a..9d1e473 100644
              if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
              try choice.put(a, "message", .{ .object = message });
 diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
-index 8b132bc..4e2cca7 100644
+index 8b132bc45ead1d1db2c0d2342dba7712920768a9..4e2cca768edcf26bcbdf672fbea691f7b482b915 100644
 --- a/zig/src/server/reply_text.zig
 +++ b/zig/src/server/reply_text.zig
 @@ -8,11 +8,16 @@ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
@@ -94,5 +94,3 @@ index 8b132bc..4e2cca7 100644
 +    const t = try splitThinking(a, "plan\n\n" ++ block, true, think_markers);
 +    try std.testing.expectEqualStrings("plan", t.reasoning);
 +}
--- 
-2.43.0

@@ -18,11 +18,16 @@
 # 13.9 GB -> 0.42 GB). Decode at this stage runs NCCL collectives each compressed layer: -10.6 % at one stream, -12.3 %
 # at eight; 0022 moves the exchange onto the RDMA ring. Builds on 0015 and 0016. By Robert Wojciechowski (GitHub @wojo, X @rwojo).
 # Apache-2.0.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): with TF_DS_KV_SHARD a pass runs whole (no pieces, no cut-ins); Fill keeps the part id for setPartial.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): with TF_DS_KV_SHARD a pass runs whole (no pieces, no cut-ins); Fill keeps the part id for setPartial.
+
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index 65d8a2bd0be5c00ae1a277ed8da433ddfaef2c1f..08a0078f49c22cb2aea20e9b030c23b1df1c6e21 100644
+index a0e7bfe64f7c31fad429a6174979ec12d60acd5f..79bcd3ed163443ee34a439014d4319f7456b0c82 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
-@@ -332,8 +332,13 @@ pub const Status = struct {
+@@ -336,8 +336,13 @@ pub const Status = struct {
      generation_tokens: u64 = 0,
      /// The prompt cache's counters, when its tier or grouping is on.
      cache: ?CacheStats = null,
@@ -37,10 +42,10 @@ index 65d8a2bd0be5c00ae1a277ed8da433ddfaef2c1f..08a0078f49c22cb2aea20e9b030c23b1
  
  pub const Engine = struct {
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 485783dd14dd004e3f972af4079bee2c172351cd..b67e7e2bd778e47587481587df3e994d4aa93a2e 100644
+index 0faacd4175cc42a56c3e897890fec3f2b74996dd..cd46c84ab87d8e9687f087eed927479cda6f5b90 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -73,6 +73,9 @@ pub const LaneHost = struct {
+@@ -75,6 +75,9 @@ pub const LaneHost = struct {
      host_counts: HostCounts = .{},
      /// What status reports under `cache` (published on the engine thread at each noteLive; null until configured).
      tele: ?api.CacheStats = null,
@@ -50,7 +55,7 @@ index 485783dd14dd004e3f972af4079bee2c172351cd..b67e7e2bd778e47587481587df3e994d
  
      const Mark = struct { at: i96, tokens: u64 };
      const full_retry_ns: i96 = std.time.ns_per_s;
-@@ -279,6 +282,7 @@ pub const LaneHost = struct {
+@@ -269,6 +272,7 @@ pub const LaneHost = struct {
              .streams = n,
              .generation_tokens = h.live_generated,
              .cache = h.tele,
@@ -58,7 +63,7 @@ index 485783dd14dd004e3f972af4079bee2c172351cd..b67e7e2bd778e47587481587df3e994d
          };
      }
  
-@@ -713,6 +717,11 @@ pub const LaneHost = struct {
+@@ -724,6 +728,11 @@ pub const LaneHost = struct {
  
      fn noteLive(h: *LaneHost) void {
          const tele = h.telemetry();
@@ -70,14 +75,14 @@ index 485783dd14dd004e3f972af4079bee2c172351cd..b67e7e2bd778e47587481587df3e994d
          h.lock();
          defer h.unlock();
          h.live_tokens.clearRetainingCapacity();
-@@ -722,6 +731,7 @@ pub const LaneHost = struct {
+@@ -733,6 +742,7 @@ pub const LaneHost = struct {
              h.live_generated += @intCast(job.stream.emitted().len);
          };
          if (tele) |t| h.tele = t;
 +        if (parts) |p| h.kv_tele = p;
      }
  
-     fn run(h: *LaneHost) void {
+     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
 diff --git a/zig/src/core/lanes/kv_parts.zig b/zig/src/core/lanes/kv_parts.zig
 new file mode 100644
 index 0000000000000000000000000000000000000000..a32daa4196c0933e29c9fa78771964be5d2d93bc
@@ -213,10 +218,10 @@ index 74ca8e1b52e44ecc21cc378202d42c0436205cbf..b7c8e13091c20a81ece4f88c83345326
  pub const Engine = engine.Engine;
  pub const Config = config.Config;
 diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
-index b614bbe0baa625969bd8c7a2a72408cc72536d55..33b4122f67475d9af99f789c64eb8bd89a3c912e 100644
+index 1d14b2f75cfe6f3c62c9e0247126729c9047a3cb..5c95889537c12a6713b1ccd88f243c30b4faad3b 100644
 --- a/zig/src/families/dsv41/dsv41.zig
 +++ b/zig/src/families/dsv41/dsv41.zig
-@@ -51,6 +51,7 @@ pub const lanes = @import("lanes.zig");
+@@ -53,6 +53,7 @@ pub const lanes = @import("lanes.zig");
  pub const pool = @import("pool.zig");
  pub const spill_state = @import("spill_state.zig");
  pub const spill_tier = @import("spill_tier.zig");
@@ -224,7 +229,7 @@ index b614bbe0baa625969bd8c7a2a72408cc72536d55..33b4122f67475d9af99f789c64eb8bd8
  pub const rank_wire = @import("rank_wire.zig");
  pub const fingerprint = @import("fingerprint.zig");
  pub const rank_identity = @import("rank_identity.zig");
-@@ -102,6 +103,7 @@ test {
+@@ -106,6 +107,7 @@ test {
      refAll(lanes);
      refAll(pool);
      refAll(spill_state);
@@ -1700,7 +1705,7 @@ index 0000000000000000000000000000000000000000..1edd4d7f348ebea45b3ede36a89608b1
 +    try testing.expectEqual(@as(?anyerror, error.FingerprintMismatch), peer.err);
 +}
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c22f42ad08 100644
+index 9e90edacfdd2532aaaca70785d218483cc6faeaf..40f27adf27525dc80ba1ab3080ccf6fec183d0c8 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -22,6 +22,9 @@ const sampling = @import("sampling.zig");
@@ -1725,20 +1730,20 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
  /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
  pub const window_rows = 6;
  
-@@ -42,8 +50,10 @@ pub const image_piece = 32 << 10;
- pub var logits_sha = false;
+@@ -43,8 +51,10 @@ pub var logits_sha = false;
  
  /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+ /// fill_resume (TF_FILL_CHUNKS' pieces) is 12, after spill's two (both ranks run one build).
 -/// With the spill tier on (only then): rank_wire's frames (spill_tier: restores' agreement, guards) and the spill notes
 -/// (rank 0's write-at-keep and metadata).
 +/// With the spill tier on: rank_wire's frames (spill_tier: restores' agreement, guards) and the spill notes (rank 0's
 +/// write-at-keep and metadata). TF_DS_KV_SHARD adds rank_wire too (rank_wire.zig's frames: the parts' agreement, each
 +/// plan's ops, each transfer's shard_xfer/shard_finish, the digest checks). The two are never on together
 +/// (SpillWithKvShard), so one rank_wire Leader/Follower a rank serves either.
- pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, spill = 11 };
+ pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, spill = 11, fill_resume = 12 };
  
  comptime {
-@@ -78,6 +88,38 @@ pub const Wire = struct {
+@@ -79,6 +89,38 @@ pub const Wire = struct {
      }
  };
  
@@ -1777,7 +1782,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
  /// A frame being read.
  pub const Reader = struct {
      b: []const u8,
-@@ -108,8 +150,9 @@ pub const Reader = struct {
+@@ -109,8 +151,9 @@ pub const Reader = struct {
  
  /// A window of a round as both ranks build it: its stream's slot and extent, its first position, whether its rows'
  /// taps go into the drafter, its rows' ids; TF_DS_KV_SHARD: its extent's part (the rank holding its compressed rows;
@@ -1789,7 +1794,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
  
  /// The rows of a round (round.Rows' slices point here).
  pub const Built = struct {
-@@ -276,11 +319,16 @@ pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
+@@ -277,11 +320,16 @@ pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
      return out.items;
  }
  
@@ -1807,7 +1812,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
      first: u64 = 0, // the prompt's draw (a handle)
      held: [draft.max_block]u32 = undefined,
      confs: [draft.max_block]f32 = undefined,
-@@ -304,6 +352,7 @@ pub const Snap = struct {
+@@ -305,6 +353,7 @@ pub const Snap = struct {
      slot: u32 = 0, // the slot it was kept from (the spill tier's keep note: a follower reads the prompt's ids there)
      loading: bool = false, // a restore's destination: its rows held back, not usable until every rank installed it
      restored: bool = false, // read back from the spill tier
@@ -1815,15 +1820,24 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
  };
  
  /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
-@@ -340,6 +389,7 @@ pub const Lanes = struct {
-     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
-     next_snap: u64 = 1,
+@@ -315,7 +364,7 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
+ }
+ 
+ /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
+-const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false, base: usize = 0, restored: bool = false };
++const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false, base: usize = 0, restored: bool = false, part: ?u64 = null };
+ 
+ /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
+ /// in place and every kept state stays) before other kept states give their room for a copy of it.
+@@ -348,6 +397,7 @@ pub const Lanes = struct {
+     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
+     paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
      spill: ?*SpillTier = null, // --spill-dir/--spill-gib: the spill tier (native.zig opens it; null: off, nothing changes)
 +    kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
  
      pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
          var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
-@@ -352,6 +402,7 @@ pub const Lanes = struct {
+@@ -360,6 +410,7 @@ pub const Lanes = struct {
  
      /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
      pub fn deinit(self: *Lanes) void {
@@ -1831,7 +1845,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          for (self.snaps.items) |sn| {
              sn.buf.free();
              self.gpa.destroy(sn);
-@@ -435,6 +486,136 @@ pub const Lanes = struct {
+@@ -446,6 +497,136 @@ pub const Lanes = struct {
          if (try self.begin(kind)) try self.flush();
      }
  
@@ -1968,7 +1982,33 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
      // -- the vtable ---------------------------------------------------------------------------------------------
  
      /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
-@@ -453,10 +634,14 @@ pub const Lanes = struct {
+@@ -459,8 +640,10 @@ pub const Lanes = struct {
+         return of(ptr).prefillPart(s, chunks);
+     }
+ 
+-    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
++    fn prefillPart(self: *Lanes, s: *lanes.Stream, pieces: usize) !bool {
+         const m = self.m;
++        // TF_DS_KV_SHARD binds a pass's parts and twins for the whole pass: it runs whole (no pieces, no cut-ins)
++        const chunks = if (self.kv != null) std.math.maxInt(usize) else pieces;
+         const t0 = m.now();
+         defer if (self.prof) |*p| {
+             p.prefill += m.now() - t0;
+@@ -496,7 +679,12 @@ pub const Lanes = struct {
+                 try self.flush();
+             }
+             if (self.spill) |t| t.bump(f.base + start, f.base + start + n);
+-            f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
++            f.head = blk: {
++                // TF_DS_KV_SHARD: the stream's twins pinned while its chunk runs (parts.zig setPartial), not between
++                if (f.part) |id| self.kv.?.planner.setPartial(id, true);
++                defer if (f.part) |id| self.kv.?.planner.setPartial(id, false);
++                break :blk try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
++            };
+             f.start += n;
+             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+             // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
+@@ -550,10 +738,14 @@ pub const Lanes = struct {
          if (len == 0) return error.EmptyPrompt;
          const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
          if (size > m.request_cap) return error.PromptTooLong; // (the pool's, unless TF_DS_POOL or TF_DS_KV_SHARD part it)
@@ -1987,7 +2027,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
          if (self.spill) |t| t.bumpSlot(slot);
          var taken: [max_streams][2]usize = undefined;
-@@ -469,9 +654,11 @@ pub const Lanes = struct {
+@@ -566,9 +758,11 @@ pub const Lanes = struct {
          // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent, or in one of its own
          // with the kept rows copied there when a live stream holds that extent (a burst's second request on a prompt)
          s.cached = 0;
@@ -2000,9 +2040,9 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
 +        var moved = if (parted) |pp| pp.moved else false;
 +        if (parted == null) if (s.reuse.saved) |p| {
              const sn: *Snap = @ptrCast(@alignCast(p));
-             // (a prompt with images resumes a kept state too: the cache keys the image positions by the picture's content, so the
-             // state's rows are this prompt's own; the pictures before the cut need no rows again, below)
-@@ -482,8 +669,8 @@ pub const Lanes = struct {
+             // (the cache matched the images before its rows by their digests: its image rows are this prompt's)
+             if (self.usable(sn, len)) {
+@@ -578,8 +772,8 @@ pub const Lanes = struct {
                  // the Python lane's _place resumes "here" only in a free extent)
                  moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn);
              } else s.reuse_failed = true;
@@ -2013,7 +2053,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          if (kept) |sn| {
              sn.wanted = 0;
              if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
-@@ -494,8 +681,8 @@ pub const Lanes = struct {
+@@ -590,8 +784,8 @@ pub const Lanes = struct {
              s.reuse_failed = true;
          };
          // the rows this stream writes are no other kept state's
@@ -2024,7 +2064,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          self.used[slot] = true;
          errdefer {
              _ = self.streams.remove(s);
-@@ -543,6 +730,9 @@ pub const Lanes = struct {
+@@ -635,6 +829,9 @@ pub const Lanes = struct {
              try self.flush();
          }
          try m.fillBegin(slot, base);
@@ -2034,7 +2074,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          if (spans.items.len > 0) {
              // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
              // the ids of a full pool)
-@@ -569,12 +759,12 @@ pub const Lanes = struct {
+@@ -661,12 +858,12 @@ pub const Lanes = struct {
              if (try self.begin(.snap_restore)) {
                  try self.wire.int(gpa, u64, sn.id);
                  try self.wire.int(gpa, u32, @intCast(slot));
@@ -2049,21 +2089,16 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
                  if (self.spill) |t| t.bump(base, base + sn.at);
                  try m.copyExtent(sn.base, base, sn.at);
              }
-@@ -601,7 +791,12 @@ pub const Lanes = struct {
-                 try self.flush();
-             }
-             if (self.spill) |t| t.bump(base + start, base + start + n);
--            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
-+            head = blk: {
-+                // TF_DS_KV_SHARD: the stream's twins pinned while its chunk runs (parts.zig setPartial), not between
-+                if (parted) |pp| kv.?.planner.setPartial(pp.id, true);
-+                defer if (parted) |pp| kv.?.planner.setPartial(pp.id, false);
-+                break :blk try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
-+            };
-             start += n;
-             if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
-             // prefill interleave: the other streams' rounds between this pass's chunks (verify frames go to rank 1 in
-@@ -652,30 +847,11 @@ pub const Lanes = struct {
+@@ -677,7 +874,7 @@ pub const Lanes = struct {
+         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
+         // kept prompt), each at the chunk end at or before it
+         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
+-        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false };
++        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start, .base = base, .restored = if (kept) |sn| sn.restored else false, .part = if (parted) |pp| pp.id else null };
+     }
+ 
+     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+@@ -707,30 +904,11 @@ pub const Lanes = struct {
          if (windows.len > max_streams) return error.WindowTooWide;
          var ids: [max_streams][max_rows]i32 = undefined;
          var wins: [max_streams]Win = undefined;
@@ -2096,7 +2131,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
              try self.flush();
          }
          const t1 = m.now();
-@@ -714,6 +890,25 @@ pub const Lanes = struct {
+@@ -769,6 +947,25 @@ pub const Lanes = struct {
          }
      }
  
@@ -2122,7 +2157,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
      /// The caches are positional: the next window starts at the stream's new length and writes over the rows past it.
      fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
          _ = ptr;
-@@ -800,6 +995,7 @@ pub const Lanes = struct {
+@@ -855,6 +1052,7 @@ pub const Lanes = struct {
      /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
      fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
          if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
@@ -2130,7 +2165,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          return !sn.stale and !sn.loading and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
      }
  
-@@ -886,7 +1082,7 @@ pub const Lanes = struct {
+@@ -941,7 +1139,7 @@ pub const Lanes = struct {
          if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
          const sn = try self.gpa.create(Snap);
          errdefer self.gpa.destroy(sn);
@@ -2139,7 +2174,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          errdefer sn.buf.free();
          try self.snaps.append(self.gpa, sn);
          self.next_snap += 1;
-@@ -896,6 +1092,11 @@ pub const Lanes = struct {
+@@ -951,6 +1149,11 @@ pub const Lanes = struct {
              try self.flush();
          }
          try self.m.snapCopy(l.slot, sn.buf.ptr, true);
@@ -2151,7 +2186,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          return sn;
      }
  
-@@ -913,6 +1114,8 @@ pub const Lanes = struct {
+@@ -968,6 +1171,8 @@ pub const Lanes = struct {
              self.wire.int(self.gpa, u64, sn.id) catch {};
              self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
          }
@@ -2160,10 +2195,10 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
          sn.buf.free();
          self.gpa.destroy(sn);
      }
-@@ -998,8 +1201,12 @@ pub const Lanes = struct {
- 
-     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
-         const self = of(ptr);
+@@ -1061,8 +1266,12 @@ pub const Lanes = struct {
+         if (self.paused) |f| if (f.s == s) {
+             self.paused = null;
+         };
 -        const kv = self.streams.fetchRemove(s) orelse return;
 +        const kv = self.streams.fetchRemove(s) orelse {
 +            if (self.kv) |k| k.forgetKey(@intFromPtr(s)); // (a request that never placed: its refusal record goes)
@@ -2174,7 +2209,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
      }
  };
  
-@@ -1012,6 +1219,66 @@ pub fn survivals(conf: []const f32, out: []f64) void {
+@@ -1075,6 +1284,66 @@ pub fn survivals(conf: []const f32, out: []f64) void {
      }
  }
  
@@ -2241,7 +2276,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
  /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
  /// request ends with the error), so the follower reports it and takes the next frame instead of ending.
  fn refused(err: anyerror) void {
-@@ -1114,6 +1381,10 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
+@@ -1177,6 +1446,10 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
          sd.quiesce();
      };
      var fill_base: usize = 0;
@@ -2252,7 +2287,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
      while (true) {
          // with spill writes or restores pending, they progress while rank 0 sends nothing (2 ms polls)
          if (spill) |sd| while (sd.busy() and !try peer.readable(2 * std.time.ns_per_ms)) sd.service(std.time.ns_per_ms);
-@@ -1151,7 +1422,9 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
+@@ -1215,7 +1488,9 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
                  try r.ids(gpa, &seqs[slot]);
                  fill_base = @intCast(base);
                  if (spill) |sd| sd.bumpSlot(slot);
@@ -2262,8 +2297,8 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
 +                } else |err| refused(err);
                  m.fill_seq = seqs[slot].items;
              },
-             .fill_chunk => {
-@@ -1168,13 +1441,9 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
+             .fill_resume => {
+@@ -1240,13 +1515,9 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
                  if (nw == 0 or nw > max_streams) return error.BadFrame;
                  var wins: [max_streams]Win = undefined;
                  for (0..nw) |k| {
@@ -2280,7 +2315,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
                  }
                  const rows = try built.build(gpa, &seqs, wins[0..nw]);
                  if (spill) |sd| for (wins[0..nw]) |w| sd.bump(w.base + w.start, w.base + w.start + w.ids.len);
-@@ -1254,7 +1523,8 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
+@@ -1326,7 +1597,8 @@ pub fn followWith(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower) !vo
                      b.free();
                  }
              },
@@ -2290,7 +2325,7 @@ index f5f39dd76de9446cc2aaefd2f182939735c1ee64..00a127a6dac946fc3e67588ba468f4c2
              .spill => try (spill orelse return error.SpillNotStarted).note(r.rest()),
              .done => {
                  if (spill) |sd| {
-@@ -1423,3 +1693,282 @@ test "a restore's destination holds the waiting prompt's room past its rows whil
+@@ -1509,3 +1781,282 @@ test "a restore's destination holds the waiting prompt's room past its rows whil
      try std.testing.expectEqual(@as(?usize, null), try ln.placeFree(&.{.{ 4 * c, 64 * c }}, 8 * c));
      try std.testing.expect(!kept.stale);
  }
@@ -2586,10 +2621,10 @@ index de3a867f86f6e749c2bc142e98a10c701a1e3de5..2f1f4c1615e7c4954ce81444fc87333c
      // the spill tier and the prompt cache over it (the server's wiring: native/cuda.zig openWith)
      var events: []cuda.Event = &.{};
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index 54f9e300ae80706861e5ca0fe0c4c67f87a101ed..dc34d86743ed270d605a482931e39a9e0267a6a7 100644
+index 4ee3c37f6b0e9b9ae129ff8d4d7eb2e2a5eb870f..b7ac18172ea9f7f1f480870103f8f5c1d5eb9c93 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -470,23 +470,30 @@ pub const Model = struct {
+@@ -473,23 +473,30 @@ pub const Model = struct {
      /// the single-conversation limit (below the window asked: said so, with the numbers), the compressed planes'
      /// bytes a rank (calculated: rows by the formula; the arena's figure is the measured one).
      fn notePlan(m: *const Model, mode: shard.Mode, pl: shard.Plan) void {
@@ -2630,7 +2665,7 @@ index 54f9e300ae80706861e5ca0fe0c4c67f87a101ed..dc34d86743ed270d605a482931e39a9e
      pub fn close(m: *Model) void {
          m.joinAhead();
          m.stream.synchronize() catch {};
-@@ -625,6 +632,8 @@ pub const Model = struct {
+@@ -629,6 +636,8 @@ pub const Model = struct {
      /// destination's owner receives them into its own, both ranks in this same order (lanes.zig runs copyExtent on
      /// every rank in its frame order). The source's rows stay; nothing is freed.
      pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
@@ -2639,7 +2674,7 @@ index 54f9e300ae80706861e5ca0fe0c4c67f87a101ed..dc34d86743ed270d605a482931e39a9e
          const c = m.eng.c;
          const cs = &m.caches;
          const mv: ?shard.Move = if (cs.shard) |sh| try sh.extentMove(from, to, at) else null;
-@@ -662,8 +671,8 @@ pub const Model = struct {
+@@ -666,8 +675,8 @@ pub const Model = struct {
                  try m.copySpan(cs.idx_scales[i], from / r, to / r, n, c.index_head_dim / 32);
              }
          }
@@ -2650,7 +2685,7 @@ index 54f9e300ae80706861e5ca0fe0c4c67f87a101ed..dc34d86743ed270d605a482931e39a9e
          const x = mv orelse return;
          var bytes: usize = 0;
          for (spans[0..ns]) |sp| bytes += sp.bytes;
-@@ -678,6 +687,18 @@ pub const Model = struct {
+@@ -682,6 +691,18 @@ pub const Model = struct {
          }
      }
  
@@ -2669,7 +2704,7 @@ index 54f9e300ae80706861e5ca0fe0c4c67f87a101ed..dc34d86743ed270d605a482931e39a9e
      /// Rows [from, from + n) of `plane` (rows of `row` bytes; a sharded plane's rows of this rank's part) to rows
      /// [to, to + n), in the stream's order.
      fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
-@@ -994,6 +1015,14 @@ pub const Model = struct {
+@@ -1000,6 +1021,14 @@ pub const Model = struct {
          m.fill_slot = slot;
      }
  
@@ -2685,7 +2720,7 @@ index 54f9e300ae80706861e5ca0fe0c4c67f87a101ed..dc34d86743ed270d605a482931e39a9e
      /// layer with the served bounded replay (replay = the prompt's length - the window: an encoder-only chunk stops at
      /// the decoder's first layer). A chunk that reaches the head leaves the logits of its last row in ch.head_g and,
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index 05391bfc3cd1c5fc8f612eeb97cd2cf3450ebb12..d94a9702eebde57695970a6f949e65911afe9639 100644
+index f7f5ae759132f892214e79ace336cf408ee3c7c1..7d8f3c1e4265367e402835ff373ed9611cfece2a 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
 @@ -109,6 +109,8 @@ pub const Loaded = struct {
@@ -2697,7 +2732,7 @@ index 05391bfc3cd1c5fc8f612eeb97cd2cf3450ebb12..d94a9702eebde57695970a6f949e6591
  };
  
  pub const Snaps = struct {
-@@ -203,6 +205,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+@@ -205,6 +207,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
      // a start refused past here (a fingerprint mismatch at openPair, a store that does not open) frees the frames the
      // agreement wrote through the lanes (the hello: leaked on the mismatch path before); rank 1 ends on its own
      errdefer st.lanes.wire.deinit(gpa);
@@ -2705,9 +2740,9 @@ index 05391bfc3cd1c5fc8f612eeb97cd2cf3450ebb12..d94a9702eebde57695970a6f949e6591
 +    try st.lanes.startKv();
 +    errdefer st.lanes.stopKv();
      if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
-     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
-     st.vision = null;
-@@ -219,7 +224,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
+     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
+@@ -223,7 +228,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
          snaps.usable = L.usableFn;
          tier = st.lanes.spill.?.tier();
      }
@@ -2717,7 +2752,7 @@ index 05391bfc3cd1c5fc8f612eeb97cd2cf3450ebb12..d94a9702eebde57695970a6f949e6591
  }
  
  fn deinitFn(ptr: *anyopaque) void {
-@@ -400,7 +406,7 @@ pub fn followerSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, mo: mo
+@@ -404,7 +410,7 @@ pub fn followerSpill(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, mo: mo
  
  /// A request or a start this engine refuses, in words; null: none of its own.
  pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
@@ -2726,7 +2761,7 @@ index 05391bfc3cd1c5fc8f612eeb97cd2cf3450ebb12..d94a9702eebde57695970a6f949e6591
      return switch (err) {
          error.NotPortedYet => "the native DeepSeek-V4.1 engine runs tensor parallel over two GPUs or the four nodes of the 2D split: set TF_TP_WORLD=2 or 4",
          error.NoMaster, error.BadMaster => "set TF_TP_MASTER to rank 0's fabric address (rank 1: tf-dsv41-lanes MODEL CACHE 1 2 MASTER PORT KIT; ranks 1-3 of four: ... G 4 ...)",
-@@ -434,6 +440,12 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -438,6 +444,12 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.SpillNotStarted => "rank 0 runs the spill tier (--spill-dir/--spill-gib): start this rank with it too (TF_DS_SPILL_DIR and TF_DS_SPILL_GIB, or tf-dsv41-lanes --spill-dir/--spill-gib)",
          error.BadSpillSetting => "TF_DS_SPILL_STAGING_MIB: the spill staging cap in MiB, at least 16 (default 128)",
          error.StagingTooSmall => "the spill staging cap (TF_DS_SPILL_STAGING_MIB) holds too few slots for this model's blocks and small state: raise it",
@@ -2739,7 +2774,7 @@ index 05391bfc3cd1c5fc8f612eeb97cd2cf3450ebb12..d94a9702eebde57695970a6f949e6591
          else => null,
      };
  }
-@@ -442,7 +454,7 @@ test "refusals name what to set" {
+@@ -446,7 +458,7 @@ test "refusals name what to set" {
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
@@ -2749,7 +2784,7 @@ index 05391bfc3cd1c5fc8f612eeb97cd2cf3450ebb12..d94a9702eebde57695970a6f949e6591
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
      try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
-index c801dfe7cd3184ee4dc136e98374dbd0167bbc63..959ad6592b340c632504d8405285063308da5084 100644
+index a2b907f38dd89fd46a2d3cef903cd46b5cb624f7..bded4924f3c9bafe0cd809041a0e54eb8a511fdf 100644
 --- a/zig/src/families/dsv41/prompt.zig
 +++ b/zig/src/families/dsv41/prompt.zig
 @@ -724,6 +724,30 @@ pub const Caches = struct {
@@ -2818,7 +2853,7 @@ index 5238df5c5e82aa9e829641b626db4825d5216f03..77c515d3de5b5dbcc22c2e21c6e5092d
      pub const Stats = struct {
          prompt_fetches: u64 = 0,
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index b26486ee918b23beac02f7d2bab0e6bb15e1ac7e..ff2aa584008baa014b794b9b72f0e70a6481c19c 100644
+index c0cd34eddec3c3f5b66ead36b5fb867fa5945571..91af65a0837a940a5eb50e3908131abafd1e7485 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
 @@ -161,6 +161,7 @@ const Host = struct {
@@ -2829,7 +2864,7 @@ index b26486ee918b23beac02f7d2bab0e6bb15e1ac7e..ff2aa584008baa014b794b9b72f0e70a
      snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
      spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
  
-@@ -201,6 +202,7 @@ const Host = struct {
+@@ -208,6 +209,7 @@ const Host = struct {
          h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
          h.host.explain = explain;
          if (h.cache) |*store| h.host.cache = store;
@@ -2837,7 +2872,7 @@ index b26486ee918b23beac02f7d2bab0e6bb15e1ac7e..ff2aa584008baa014b794b9b72f0e70a
          if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
          if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
          try h.host.start();
-@@ -366,6 +368,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -384,6 +386,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
          return null;
      };
      defer if (!opened) loaded.deinit(loaded.ctx);
@@ -2850,7 +2885,7 @@ index b26486ee918b23beac02f7d2bab0e6bb15e1ac7e..ff2aa584008baa014b794b9b72f0e70a
      const model = cuda.usage(false).device - held0;
      const after = try pool(a, io, &g.ctx, problem) orelse return null;
      for ([_]Pool{ before, after }, [_][]const u8{ "the weights' check", "the streams' admission" }) |p, what| if (p.parked >= 1 << 28) {
-@@ -389,6 +397,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -407,6 +415,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
          capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), served, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
      });
      errdefer gpa.free(h.startup);

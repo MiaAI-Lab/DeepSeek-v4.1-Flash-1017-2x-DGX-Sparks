@@ -14,13 +14,18 @@
 # restores from disk on both ranks; exact.py 39/39 identical with the code in (engine 9983b2f, before the rebase onto
 # 0008). Builds on recipe 0006, 0016 and 0019.
 # By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): the server spells picture keys with prompt_cache.pictureId of the payload's SHA-256 (what mediaKeys checks) under upstream's cache_key and history_len; LaneHost.cacheable keeps the guard 0006 had (pictures without a content key never touch the cache: upstream falls back to the prompt's placeholder ids), so TF_DS_IMAGE_CACHE=0 still works; dsv41 marks every picture as upstream does.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): the server spells picture keys with prompt_cache.pictureId of the payload's SHA-256 (what mediaKeys checks) under upstream's cache_key and history_len; LaneHost.cacheable keeps the guard 0006 had (pictures without a content key never touch the cache: upstream falls back to the prompt's placeholder ids), so TF_DS_IMAGE_CACHE=0 still works; dsv41 marks every picture as upstream does.
+
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index 047ff037fc40c093afa4c60fcf4186d454e3316d..2a50f6f9d1367492557c39cba77ce38160a290d1 100644
+index d8f585a46dee89c74fd5e6522bc5ef51fb245a63..2dcfb3402c08006b02a5c752c5ab731bb4d5dc29 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
-@@ -64,6 +64,9 @@ pub const Request = struct {
-     /// The prompt as the prompt cache keys it, one id for each of its tokens: an image position's id made from the picture's
-     /// content (two pictures never share a kept state, one picture always does); empty: the prompt itself.
+@@ -63,6 +63,9 @@ pub const Request = struct {
+     images: []const Image = &.{},
+     /// The tokens the prompt cache matches, each image span spelled by its image's digest; empty: the prompt itself.
      cache_key: []const u32 = &.{},
 +    /// With `cache_key`: each image's identity for the durable tier (its span and the full SHA-256 its cache ids derive
 +    /// from, prompt_cache.pictureId), in prompt order; empty: none known (the tier then keeps and finds nothing with them).
@@ -28,7 +33,7 @@ index 047ff037fc40c093afa4c60fcf4186d454e3316d..2a50f6f9d1367492557c39cba77ce381
      max_tokens: u32,
      sampling: ?Sampling = null,
      /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
-@@ -462,6 +465,7 @@ test {
+@@ -466,6 +469,7 @@ test {
      _ = @import("lane_host_reuse_test.zig");
      _ = @import("prompt_cache.zig");
      _ = @import("lane_host_tier_test.zig");
@@ -37,24 +42,33 @@ index 047ff037fc40c093afa4c60fcf4186d454e3316d..2a50f6f9d1367492557c39cba77ce381
      _ = @import("keepalive.zig");
  }
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 69be46e248372b3bef16c4c781f2fbd72456123b..3367d54f1467dfd93c0f40518e6a39ec6dae5ca5 100644
+index 211e08691a9c34321885ff8a5445ebf1604a561a..81703c69e5bcd627c7033e347cb0de2400832c7d 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -226,7 +226,9 @@ pub const LaneHost = struct {
-             if (!cacheable(job.request)) return;
+@@ -227,8 +227,11 @@ pub const LaneHost = struct {
+             job.reported(); // before a keep can evict the entry the pass restored
              const h = job.host;
              const store = h.cache orelse return;
--            _ = store.keepWith(keyOf(job.request), at, s, job.request.chunks, .{ .group = job.join.group, .images = job.request.images.len > 0, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
 +            const r = job.request;
++            if (!cacheable(r)) return;
 +            const pics = r.images.len > 0; // (the tier records each picture's identity and the prompt's model ids)
-+            _ = store.keepWith(keyOf(r), at, s, r.chunks, .{ .group = job.join.group, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{}, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
+             // an image span keyed by its digest (Request.cacheKey)
+-            _ = store.keepWith(job.request.cacheKey(), at, s, job.request.chunks, .{ .group = job.join.group, .images = job.request.images.len > 0, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
++            _ = store.keepWith(r.cacheKey(), at, s, r.chunks, .{ .group = job.join.group, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{}, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
          }
  
          /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
-@@ -250,6 +252,16 @@ pub const LaneHost = struct {
+@@ -252,6 +255,23 @@ pub const LaneHost = struct {
          }
      };
  
++    /// Whether the cache may serve or keep a request: without images always; with them only when the server keyed their
++    /// positions by content (cache_key, one id a position: a kept state is found by tokens, and every picture's positions
++    /// hold the same placeholder). Upstream's server always keys them; TF_DS_IMAGE_CACHE=0 leaves the key empty.
++    fn cacheable(r: *const Request) bool {
++        return r.images.len == 0 or r.cache_key.len == r.prompt.len;
++    }
++
 +    /// The pictures' identities the durable tier gets for a request: its `cache_media` only when they name exactly the
 +    /// spans the engine runs (`images`: the spans its restored rows and tower work are placed by), one for one; anything
 +    /// else gives none, and the tier then misses and keeps nothing for it (a disk hit must not resume pictures placed
@@ -65,12 +79,25 @@ index 69be46e248372b3bef16c4c781f2fbd72456123b..3367d54f1467dfd93c0f40518e6a39ec
 +        return r.cache_media;
 +    }
 +
-     /// The ids the prompt cache keys a request by: its prompt, or with images the prompt with each picture's positions made
-     /// from the picture's content (Request.cache_key).
-     /// Whether the cache may serve or keep a request: without images always; with them only when the server keyed their
-@@ -1020,7 +1032,7 @@ pub const LaneHost = struct {
-         if (!cacheable(r)) return false;
-         const key = keyOf(r);
+     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
+         var enforced = info_;
+         enforced.loop_guard = true;
+@@ -580,7 +600,7 @@ pub const LaneHost = struct {
+         const r = job.request;
+         var reuse: lanes.stream.Reuse = .{};
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+-        if (h.cache) |store| if (store.lookup(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
++        if (cacheable(r)) if (h.cache) |store| if (store.lookup(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
+             job.entry = l.entry;
+             job.kept0 = store.counts.kept;
+             job.marks = l.marks;
+@@ -1066,10 +1086,10 @@ pub const LaneHost = struct {
+     fn park(h: *LaneHost, job: *Job) bool {
+         const store = h.cache orelse return false;
+         const r = job.request;
+-        if (r.images.len > 0 and r.cache_key.len == 0) return false; // pictures without their digest key: never from disk
++        if (!cacheable(r)) return false;
+         const key = r.cacheKey();
          const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
 -        const probe = store.probe(key, r.chunks);
 +        const probe = store.probeMedia(key, r.chunks, r.images.len > 0, tierMedia(r));
@@ -78,7 +105,7 @@ index 69be46e248372b3bef16c4c781f2fbd72456123b..3367d54f1467dfd93c0f40518e6a39ec
              job.tried_disk = true;
              h.lock();
 diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
-index 03280c53c46f604c0e32d0a95356607fcfe86aae..172a3763808f9d6901c808b93ba43c8b03ca360c 100644
+index 2b73f69806a0dea3cc65580978e3b6900ca83d9e..821d8fcda0c1938387fc6b00753934d77949800a 100644
 --- a/zig/src/core/prompt_cache.zig
 +++ b/zig/src/core/prompt_cache.zig
 @@ -77,8 +77,71 @@ pub const Want = struct {
@@ -184,7 +211,7 @@ index 03280c53c46f604c0e32d0a95356607fcfe86aae..172a3763808f9d6901c808b93ba43c8b
      };
  };
  
-@@ -382,6 +455,8 @@ pub const Probe = struct { memory: ?*Entry = null, durable: ?Point = null };
+@@ -384,6 +457,8 @@ pub const Probe = struct { memory: ?*Entry = null, durable: ?Point = null };
  pub const KeepInfo = struct {
      group: u64 = 0,
      images: bool = false,
@@ -193,7 +220,7 @@ index 03280c53c46f604c0e32d0a95356607fcfe86aae..172a3763808f9d6901c808b93ba43c8b
      parent: ?u64 = null,
      fork: u32 = 0,
      lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
-@@ -507,13 +582,19 @@ pub const Store = struct {
+@@ -509,13 +584,19 @@ pub const Store = struct {
  
      /// What `key` would resume, changing nothing in memory: the best usable kept state, and the tier's longer point.
      pub fn probe(s: *Store, key: []const u32, starts: []const u32) Probe {
@@ -214,7 +241,7 @@ index 03280c53c46f604c0e32d0a95356607fcfe86aae..172a3763808f9d6901c808b93ba43c8b
          const p = t.vtable.lookup(t.ptr, &want) orelse return .{ .memory = m };
          if (!s.pointFits(p, key, starts, have)) return .{ .memory = m };
          s.stats.disk_hits += 1;
-@@ -945,7 +1026,7 @@ pub const Store = struct {
+@@ -947,7 +1028,7 @@ pub const Store = struct {
          s.held += charged;
          s.counts.kept += 1;
          if (s.tier) |t| { // write at keep: the tier stages the state's bytes between rounds
@@ -1102,10 +1129,10 @@ index 93483e297031a42a3c42ed94ee609654520ee33e..57ece3a890e836c728ecf1a2301d40b9
      .{ .name = "cancel read", .f = checkCancelRead },
      .{ .name = "fair reads", .f = checkFairReads },
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index 48032ead6c4ee6bfc0f06a37b2b6bb174b293db3..a18a7f92bd6bec8fd9d93eb6f4679d74359b7191 100644
+index 7ca8c4b53cde8f00cfaba07b620e441040928acb..c68c9ef83a10508dbcc4800227a69c4b6b16b649 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
-@@ -213,6 +213,67 @@ fn markEnds(marks: []const u32, at: usize) bool {
+@@ -214,6 +214,67 @@ fn markEnds(marks: []const u32, at: usize) bool {
      return false;
  }
  
@@ -1173,22 +1200,7 @@ index 48032ead6c4ee6bfc0f06a37b2b6bb174b293db3..a18a7f92bd6bec8fd9d93eb6f4679d74
  /// Room left past a kept state's extent while placements fit so, for its conversation's next turn to resume in place.
  pub const growth_rows = 16 * model.chunk_rows;
  
-@@ -763,12 +824,8 @@ pub const Lanes = struct {
-             // dead in the sequence for Engram's n-grams, but it needs no rows and no run of the tower)
-             const resume_at: usize = if (kept) |sn| sn.at else 0;
-             for (s.images) |img| {
--                if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
--                for (seq.items[img.at..][0..img.tokens]) |*q| {
--                    if (q.* != @as(i64, image_id)) return error.BadImageSpan;
--                    q.* = -1;
--                }
--                if (@as(usize, img.at) + img.tokens <= resume_at) continue;
-+                try markPicture(seq.items, img.at, img.tokens, image_id);
-+                if (!pictureNeedsRows(img.at, img.tokens, resume_at)) continue;
-                 if (img.rows) {
-                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
-                     try rows.appendSlice(gpa, img.bytes);
-@@ -780,6 +837,11 @@ pub const Lanes = struct {
+@@ -879,6 +940,11 @@ pub const Lanes = struct {
                  try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
                  at_row += img.tokens;
              }
@@ -1302,10 +1314,10 @@ index 3e21f42b214964cbaca231c05f4c5374ef0d8b0b..4a790c2a7afed51672ca062ea6d3d7aa
  fn imageRows(a: std.mem.Allocator, io: std.Io, imgs: []const ImageRows, hidden: usize) ![]const lanes.stream.Image {
      const out = try a.alloc(lanes.stream.Image, imgs.len);
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index 4d5f05b0f3d5e61d752e7b1da28021a5d7520e62..c63efef4a7a49f7e96f41108eae2bead66312055 100644
+index a4438643fb7cf77e67ed3bb0dcf077d605e4d7a2..2f30738633884ca02d14ad27189cf505911721ed 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
-@@ -411,6 +411,7 @@ pub fn spillSettings(dir: []const u8, gib: f64, min_free_gib: f64, quota: f64, m
+@@ -415,6 +415,7 @@ pub fn spillSettings(dir: []const u8, gib: f64, min_free_gib: f64, quota: f64, m
      var s: spill_tier.Settings = .{ .dir = dir, .gib = gib, .min_free_gib = min_free_gib, .quota = quota, .min_tokens = min_tokens, .turns = turns, .flush_ms = flush_ms };
      if (getenv("TF_DS_SPILL_STAGING_MIB")) |v| s.staging_mib = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadSpillSetting;
      if (s.staging_mib < spill_tier.min_staging_mib) return error.BadSpillSetting;
@@ -1313,7 +1325,7 @@ index 4d5f05b0f3d5e61d752e7b1da28021a5d7520e62..c63efef4a7a49f7e96f41108eae2bead
      return s;
  }
  
-@@ -438,7 +439,7 @@ pub fn getenvFn(name: [:0]const u8) ?[]const u8 {
+@@ -442,7 +443,7 @@ pub fn getenvFn(name: [:0]const u8) ?[]const u8 {
  pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *model.Model, s: ?spill_tier.Settings, layout: *const model.Model.spill.StateLayout) !@import("fingerprint.zig").Exchange {
      const envp = try rank_identity.Extra.envFor(getenvFn, s != null);
      var fbuf: [256]u8 = undefined;
@@ -1322,7 +1334,7 @@ index 4d5f05b0f3d5e61d752e7b1da28021a5d7520e62..c63efef4a7a49f7e96f41108eae2bead
      // TF_DS_KV_SHARD's switches every rank's planner takes (carry, twins) and its part size: agreed in `features`
      const kvs: kv_lanes.Settings = if (m.kvs != null) try kv_lanes.Settings.fromEnv(getenvFn) else .{ .carry = false, .twins = false };
      const part_rows: u64 = if (m.caches.shard) |x| x.part else 0;
-@@ -457,7 +458,10 @@ pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *m
+@@ -461,7 +462,10 @@ pub fn rankExchange(gpa: std.mem.Allocator, io: std.Io, mo: model.Options, m: *m
          .rank_cache_sha = envp.rank_cache_sha,
          .engram_revision = envp.engram_revision,
          .features = features,
@@ -2075,79 +2087,99 @@ index 264220c987b0833c5dd23c911c758ef09fcdaf6f..0515f9a0f1afb6ed4c7a90910393ad3a
  test "two ranks: a follower still incomplete past status_wait gives the restore up as timeout, never validate; the point restores again" {
      const pr = try Pair.start("pwait", 0, 83);
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 91dadbb81618d9008e96c73a331cfbca6ce973b1..dfd151b6271a8f775b28238daab6beef7aec4e57 100644
+index 2e78a2a0ed67664c059d85c141bf7968c34c5dfe..13179f7a3144ff5254ca045298d571d1f7290830 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
 @@ -177,6 +177,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
          .prompt = rendered.ids,
          .images = rendered.images,
-         .cache_key = rendered.key,
+         .cache_key = rendered.cache_key,
 +        .cache_media = rendered.media,
          .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
          .sampling = sampling,
          .eos = if (stops_opt.ignore_eos) &.{} else srv.eos,
 diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
-index ac33ab1e8039996c5dc1fa56d006d73239494a6b..976cc3a3d23b2cf9c524dde617d60909843474fd 100644
+index 605fa18c2a6d745f1ad2717c0c11dfac0f83dceb..3440a0e1f5eab303ec6b447745bb2b187f9183f8 100644
 --- a/zig/src/server/prompt.zig
 +++ b/zig/src/server/prompt.zig
-@@ -10,8 +10,9 @@ const api = @import("engine_api");
- const Value = json.Value;
+@@ -11,7 +11,9 @@ const Value = json.Value;
  const Cx = errors.Cx;
  
--/// `key`: with images, the prompt cache's ids for the prompt (see `cacheKey`); empty without.
--pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, key: []const u32 = &.{} };
-+/// `key`: with images, the prompt cache's ids for the prompt (see `spans`); empty without. `media`: with `key`, each
-+/// image's span and full payload digest (the durable tier's identity of it; the key's ids derive from the digest).
-+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, key: []const u32 = &.{}, media: []const api.prompt_cache.Media = &.{} };
+ /// With images, `cache_key` is what the prompt cache matches: the ids with each image span spelled by its digest.
+-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{} };
++/// `media`: with it, each image's span and full payload digest (the durable tier's identity of it; the key's ids derive
++/// from the digest, prompt_cache.pictureId).
++pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, media: []const api.prompt_cache.Media = &.{} };
  
  pub const isTitle = messages_mod.isTitleRequest;
  
-@@ -61,21 +62,16 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
-     if (input.images.len > 0) {
-         var r = try spans(srv, cx, prompt, input.images, history_len);
-         // TF_DS_IMAGE_CACHE=0: pictures keep nothing and resume nothing, as before (no key: the cache refuses such a request)
--        if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) {
+@@ -57,7 +59,16 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+     var history_len: usize = 0;
+     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
+     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
+-    if (input.images.len > 0) return spans(srv, cx, prompt, history_len, input.images);
++    if (input.images.len > 0) {
++        var r = try spans(srv, cx, prompt, history_len, input.images);
++        // TF_DS_IMAGE_CACHE=0: pictures keep nothing and resume nothing (no key: LaneHost.cacheable refuses the request)
 +        if (!api.prompt_cache.imageCacheOn(if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| std.mem.span(v) else null)) {
-             r.key = &.{};
++            r.cache_key = &.{};
 +            r.media = &.{};
-             r.history_len = 0;
--        };
++            r.history_len = 0;
 +        }
-         return r;
-     }
++        return r;
++    }
      return .{ .ids = prompt, .history_len = history_len };
  }
  
--/// The prompt cache's id for position `j` of a picture whose payload hashes to `seed`: above every vocabulary id, so it
--/// never equals a text token, and the same for the same picture at any place in any prompt.
--fn pictureId(seed: u64, j: u32) u32 {
--    return 0x8000_0000 | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);
--}
--
- /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
- /// the payload the engine reads), the images in prompt order. `history_raw`: the history's length in `ids` (0: none), returned
- /// as its length in the expanded prompt. The prompt cache keys a kept state by tokens, and every picture's positions hold
-@@ -86,6 +82,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8, hi
-     var out: std.ArrayList(u32) = .empty;
+@@ -69,6 +80,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
      var key: std.ArrayList(u32) = .empty;
      var placed: std.ArrayList(api.Image) = .empty;
+     var history_extra: usize = 0;
 +    var media: std.ArrayList(api.prompt_cache.Media) = .empty;
-     var history_len: usize = 0;
      for (ids, 0..) |id, i| {
-         if (history_raw > 0 and i == history_raw) history_len = out.items.len;
-@@ -105,11 +102,12 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8, hi
+         if (id != vision.token) {
+             try out.append(cx.a, id);
+@@ -84,17 +96,20 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
+         };
+         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
          try out.appendNTimes(cx.a, vision.token, prep.tokens);
-         var digest: [32]u8 = undefined;
-         std.crypto.hash.sha2.Sha256.hash(prep.payload, &digest, .{});
--        const seed = std.mem.readInt(u64, digest[0..8], .little);
--        for (0..prep.tokens) |j| try key.append(cx.a, pictureId(seed, @intCast(j)));
+-        try spellImage(cx.a, &key, prep.payload, prep.tokens);
++        var digest: [32]u8 = undefined;
++        std.crypto.hash.sha2.Sha256.hash(prep.payload, &digest, .{});
 +        try media.append(cx.a, .{ .start = @intCast(out.items.len - prep.tokens), .len = prep.tokens, .digest = digest });
-+        // (the cache ids recipe 0006 made: the digest's first 8 bytes seed them, prompt_cache.pictureId)
-+        for (0..prep.tokens) |j| try key.append(cx.a, api.prompt_cache.pictureId(&digest, @intCast(j)));
++        try spellImage(cx.a, &key, &digest, prep.tokens);
+         if (i < history_len) history_extra += prep.tokens - 1;
      }
      if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
--    return .{ .ids = out.items, .images = placed.items, .key = key.items, .history_len = history_len };
-+    return .{ .ids = out.items, .images = placed.items, .key = key.items, .media = media.items, .history_len = history_len };
+-    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
++    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .media = media.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
  }
  
- /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
+-/// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's digest.
+-fn spellImage(a: std.mem.Allocator, key: *std.ArrayList(u32), payload: []const u8, tokens: u32) !void {
+-    const h = std.hash.Wyhash.hash(0, payload);
+-    for (0..tokens) |j| try key.append(a, 0x8000_0000 | @as(u32, @truncate((h +% @as(u64, j) *% 0x9e37_79b9_7f4a_7c15) >> 33)));
++/// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's SHA-256
++/// (prompt_cache.pictureId, so the durable tier's mediaKeys check binds them to the full digest a point records).
++fn spellImage(a: std.mem.Allocator, key: *std.ArrayList(u32), digest: *const [32]u8, tokens: u32) !void {
++    for (0..tokens) |j| try key.append(a, api.prompt_cache.pictureId(digest, @intCast(j)));
+ }
+ 
+ test "an image span's key depends on the image and the position, never on the vocabulary" {
+@@ -105,9 +120,13 @@ test "an image span's key depends on the image and the position, never on the vo
+     defer same.deinit(a);
+     var other: std.ArrayList(u32) = .empty;
+     defer other.deinit(a);
+-    try spellImage(a, &one, "the same pixels", 64);
+-    try spellImage(a, &same, "the same pixels", 64);
+-    try spellImage(a, &other, "other pixels", 64);
++    var d1: [32]u8 = undefined;
++    var d2: [32]u8 = undefined;
++    std.crypto.hash.sha2.Sha256.hash("the same pixels", &d1, .{});
++    std.crypto.hash.sha2.Sha256.hash("other pixels", &d2, .{});
++    try spellImage(a, &one, &d1, 64);
++    try spellImage(a, &same, &d1, 64);
++    try spellImage(a, &other, &d2, 64);
+     try std.testing.expectEqualSlices(u32, one.items, same.items);
+     try std.testing.expect(!std.mem.eql(u32, one.items, other.items));
+     for (one.items) |id| try std.testing.expect(id >= 0x8000_0000);

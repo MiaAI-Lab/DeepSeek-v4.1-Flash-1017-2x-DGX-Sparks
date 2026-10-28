@@ -19,6 +19,11 @@
 # 1,062 MiB a rank against 1,783 MiB replicated (721 MiB a rank saved, 360 B a token), so that pool holds two full 1M
 # windows. Decode here runs NCCL collectives each compressed layer (round 2: -10.6 % at one stream); 0022 moves them
 # onto the RDMA ring. By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): Snaps keeps upstream's tail; Loaded.window as before.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): Snaps keeps upstream's tail; Loaded.window as before.
+
 diff --git a/tools/dsv41_shard_emulate/cuda_runtime.h b/tools/dsv41_shard_emulate/cuda_runtime.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..532814e354cf305353f4dd10c5d10780fc112ca1
@@ -345,7 +350,7 @@ index 6257e8f3c8bcbca386061f0d89031fafbdbba050..597ff0e6e288f317cceb813de7aaf18e
 +/// A device byte span (Comm.sendSpans / recvSpans).
 +pub const Span = struct { ptr: u64, bytes: usize };
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index 2c76760c7f39c1e91feef24015406d410dcb12b3..b8fc2892103b012080dc9c085bfbe9479e669fd5 100644
+index e185261dc87e1d9145bd3082e5665455fe8a3d84..034b7823d33935070d2f95217cec2550e8775326 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -95,8 +95,9 @@ pub const Reader = struct {
@@ -384,7 +389,7 @@ index 2c76760c7f39c1e91feef24015406d410dcb12b3..b8fc2892103b012080dc9c085bfbe947
      }
  };
  
-@@ -433,7 +436,10 @@ pub const Lanes = struct {
+@@ -526,7 +529,10 @@ pub const Lanes = struct {
          const len = ids.len;
          if (len == 0) return error.EmptyPrompt;
          const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
@@ -397,19 +402,19 @@ index 2c76760c7f39c1e91feef24015406d410dcb12b3..b8fc2892103b012080dc9c085bfbe947
          const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
          var taken: [max_streams][2]usize = undefined;
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4e01841ad 100644
+index 39bb48ab963b3e94a70e7e67e1b9223ecbced4a5..961e6ae6f2340b745083a993e27813227661b076 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -28,6 +28,8 @@ const link = @import("link.zig");
- const ring2d = @import("ring2d.zig");
+@@ -30,6 +30,8 @@ const ring2d = @import("ring2d.zig");
  const rdma = @import("rdma.zig");
+ const rdma_env = @import("rdma_env.zig");
  const pool_mod = @import("pool.zig");
 +const shard = @import("shard.zig");
 +const shard_ops = @import("shard_ops.zig");
  
  /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
  pub const chunk_rows = 2048;
-@@ -50,6 +52,12 @@ pub const Options = struct {
+@@ -52,6 +54,12 @@ pub const Options = struct {
      engram_dir: ?[]const u8 = null, // the Engram tables (none: a checkpoint without Engram layers)
      token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
      pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
@@ -422,7 +427,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
      drafts: bool = true, // load the DSpark drafter
      rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated), else NCCL: TP2's
      // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
-@@ -141,6 +149,11 @@ pub const Model = struct {
+@@ -145,6 +153,11 @@ pub const Model = struct {
      // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
      two: ?prompt2d.Two = null,
      rdma_rings: ?ring2d.Rings = null,
@@ -434,7 +439,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
  
      /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
      /// and sets up every buffer. Needs `ctx` current on this thread.
-@@ -167,7 +180,7 @@ pub const Model = struct {
+@@ -171,7 +184,7 @@ pub const Model = struct {
          m.streams = o.streams;
          m.round_ms = o.round_ms orelse &draft.round_ms;
          if (m.round_ms.len == 0) return error.BadRoundMs;
@@ -443,7 +448,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
          m.fill_slot = 0;
          m.prof = false;
          m.timer = null;
-@@ -189,6 +202,7 @@ pub const Model = struct {
+@@ -196,6 +209,7 @@ pub const Model = struct {
          m.pgraphs = null;
          m.two = null;
          m.rdma_rings = null;
@@ -451,7 +456,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
          const d = ctx.d;
          m.cfg = try Config.read(a, io, o.model_dir);
          const c = &m.cfg;
-@@ -213,6 +227,28 @@ pub const Model = struct {
+@@ -220,6 +234,28 @@ pub const Model = struct {
          errdefer m.fan.close();
          m.comm = try m.fan.comm(o.rank, o.world);
          errdefer m.comm.deinit();
@@ -480,7 +485,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
          // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
          if (sp.pair == null and o.rdma_devices != null) {
              const list = o.rdma_devices.?;
-@@ -243,8 +279,9 @@ pub const Model = struct {
+@@ -250,8 +286,9 @@ pub const Model = struct {
  
          // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream can reach (the window, not the pool)
          const half = c.rope_dim / 2;
@@ -492,7 +497,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
          m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
          errdefer m.rope_buf.free();
          {
-@@ -282,8 +319,17 @@ pub const Model = struct {
+@@ -289,8 +326,17 @@ pub const Model = struct {
          }
          m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
          m.eng.round_rows = o.round_rows;
@@ -512,7 +517,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
          m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
          errdefer m.blas.close();
          m.eng.blas = &m.blas;
-@@ -293,7 +339,8 @@ pub const Model = struct {
+@@ -300,7 +346,8 @@ pub const Model = struct {
              r.* = try m.arena.take(m.streams * m.eng.ringBytes());
              try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
          }
@@ -522,7 +527,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
          m.amax = try m.arena.take(round.max_rows * 4);
          if (o.graphs) m.graphs = round.Graphs.init(gpa);
          if (o.side) try m.rd.useSide(&m.eng);
-@@ -355,9 +402,91 @@ pub const Model = struct {
+@@ -358,9 +405,91 @@ pub const Model = struct {
          m.ids64 = try a.alloc(i64, chunk_rows);
          m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
          m.logits = try a.alloc(f32, round.max_rows * m.vocab);
@@ -614,7 +619,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
      pub fn close(m: *Model) void {
          m.joinAhead();
          m.stream.synchronize() catch {};
-@@ -382,6 +511,7 @@ pub const Model = struct {
+@@ -385,6 +514,7 @@ pub const Model = struct {
          if (m.tables) |*t| t.close();
          if (m.rdma_rings) |*r| r.close(m.gpa);
          m.blas.close();
@@ -622,7 +627,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
          m.arena.deinit();
          m.rope_buf.free();
          m.ex.unload();
-@@ -489,23 +619,67 @@ pub const Model = struct {
+@@ -493,23 +623,67 @@ pub const Model = struct {
      /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
      /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
      /// codes and scales and its index keys, the rows view() places at those positions.
@@ -692,7 +697,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
      fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
          const d = m.ctx.d;
          try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");
-@@ -711,7 +885,7 @@ pub const Model = struct {
+@@ -728,7 +902,7 @@ pub const Model = struct {
          const e = &m.eng;
          if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
          const t0 = m.now();
@@ -701,7 +706,7 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
          if (m.prof) {
              m.t_enqueue = m.now() - t0;
              try m.stream.synchronize();
-@@ -808,3 +982,14 @@ pub const Model = struct {
+@@ -825,3 +999,14 @@ pub const Model = struct {
          try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
      }
  };
@@ -717,13 +722,13 @@ index f406ddf974059a21877a0ad4b82ab8a7908d9aa7..3f8aec53ab69572057eb22c0741486e4
 +    try std.testing.expectEqual(@as(?usize, null), try Model.pickWindow(null, 2101248, null));
 +}
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index 49e02c7791fcb7ef33d642966653f70b5ec3d63f..c61cc7f5a0ae1c280ec330a81b32a777d3cdd7c8 100644
+index 2c933f6745a5d83df0b8f9f66d265dc4bd985bbc..99e9aeaf79240cd004144fdde2ccb7f1bb5a430b 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
-@@ -19,6 +19,18 @@
- //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
- //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
+@@ -21,6 +21,18 @@
  //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
+ //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
+ //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
 +//!   TF_DS_POOL=P, TF_DS_WINDOW=W                (0008, pool.zig) the pool's positions, every stream's extents
 +//!                                               together (unset: the context), and the window a request may use
 +//!                                               (rank 0: the context; a follower without it takes rank 0's);
@@ -739,7 +744,7 @@ index 49e02c7791fcb7ef33d642966653f70b5ec3d63f..c61cc7f5a0ae1c280ec330a81b32a777
  //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
  //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
  //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
-@@ -64,6 +76,9 @@ pub const Loaded = struct {
+@@ -66,6 +78,9 @@ pub const Loaded = struct {
      snaps: ?Snaps = null,
      /// Images in requests (the server renders their placeholders; the tower runs on this rank).
      vision: ?lanes.stream.Vision = null,
@@ -749,7 +754,7 @@ index 49e02c7791fcb7ef33d642966653f70b5ec3d63f..c61cc7f5a0ae1c280ec330a81b32a777
  };
  
  pub const Snaps = struct {
-@@ -135,6 +150,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+@@ -139,6 +154,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
          .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
          .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
          .pool = try pool_mod.resolve(o.context, getenv("TF_DS_POOL")), // may exceed the window: more kept prompts stay resident
@@ -757,17 +762,17 @@ index 49e02c7791fcb7ef33d642966653f70b5ec3d63f..c61cc7f5a0ae1c280ec330a81b32a777
          .drafts = o.drafts,
          .arena_bytes = arena_gib << 30,
          .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
-@@ -152,7 +168,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+@@ -158,7 +174,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
      // the pool is the model's (preallocated): a stream takes no device memory of its own
      const L = lanes_mod.Lanes;
-     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
+     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
 -    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
 +    const window: ?usize = if (st.m.kvs != null or st.m.pool_cap != o.context) st.m.window_cap else null;
 +    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window };
  }
  
  fn deinitFn(ptr: *anyopaque) void {
-@@ -177,12 +194,31 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -183,12 +200,31 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
          error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
          error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
@@ -4251,7 +4256,7 @@ index 0000000000000000000000000000000000000000..5bd7240c213c17d6f9b9afd09e4d3aa1
 +    std.testing.refAllDecls(Planner);
 +}
 diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
-index 9c692e5e12f52d0c03c159e56a6c3d8abc8e0e61..c801dfe7cd3184ee4dc136e98374dbd0167bbc63 100644
+index b921294ec9241c36fd37d3f380cf145a31a2ff08..a2b907f38dd89fd46a2d3cef903cd46b5cb624f7 100644
 --- a/zig/src/families/dsv41/prompt.zig
 +++ b/zig/src/families/dsv41/prompt.zig
 @@ -34,6 +34,8 @@ const tri_index = @import("tri_index.zig");
@@ -4583,7 +4588,7 @@ index 9c692e5e12f52d0c03c159e56a6c3d8abc8e0e61..c801dfe7cd3184ee4dc136e98374dbd0
      try e.ops.copyRows(e.s, ch.lat, hd * 2, ch.lat2, hd * 2, hd * 2, full);
      try e.exact.rope(e.s, ch.lat2, hd, hd - rd, rot.cos, rot.sin, ch.gpos, full, rd / 2, false);
      try tri_attn.fp4Store(e.t, ch.lat2, hd, cs.comp_codes[li], cs.comp_scales[li], ch.groups, full, hd, 16, true);
-@@ -1413,6 +1599,12 @@ pub fn endLayer(ch: *Chunk) void {
+@@ -1418,6 +1604,12 @@ pub fn endLayer(ch: *Chunk) void {
      std.mem.swap(u64, &ch.pre, &ch.pre_f);
  }
  
@@ -6263,10 +6268,10 @@ index 0000000000000000000000000000000000000000..5238df5c5e82aa9e829641b626db4825
 +    };
 +};
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index 8576cc1b4a1bacf8cf1ece7826837f752cb0746a..5dec09df7f91b53a2982d457538447395ffdfaeb 100644
+index b3da953e4ff686c0c349c55057a103f409f7a1d0..359a11fcf56184e68c9739703bd7c46d690d7587 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
-@@ -371,8 +371,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -389,8 +389,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
      const h = try gpa.create(Host);
      errdefer gpa.destroy(h);
      h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
@@ -6279,7 +6284,7 @@ index 8576cc1b4a1bacf8cf1ece7826837f752cb0746a..5dec09df7f91b53a2982d45753844739
      });
      errdefer gpa.free(h.startup);
      // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
-@@ -385,7 +388,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -403,7 +406,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
      };
      // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
      const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;

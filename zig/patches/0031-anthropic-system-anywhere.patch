@@ -22,8 +22,10 @@ are still refused as before.
  zig/src/server/late_system_test.zig    | 22 ++++++++++++++++++----
  2 files changed, 19 insertions(+), 13 deletions(-)
 
+Rebased onto TensorFold fbbc971 (28-oct-2026): applies unchanged after 0001-0029.
+
 diff --git a/zig/src/server/anthropic_translate.zig b/zig/src/server/anthropic_translate.zig
-index 8a155f5..c3912d5 100644
+index 8a155f5f7fcacef4c1c3eeb284845795446587b8..c3912d5dd80c67fee484ab4bcd9e3c3d74065af3 100644
 --- a/zig/src/server/anthropic_translate.zig
 +++ b/zig/src/server/anthropic_translate.zig
 @@ -76,18 +76,10 @@ fn messages(cx: *Cx, value: ?Value, system: ?Value) errors.Refused!Value {
@@ -47,7 +49,7 @@ index 8a155f5..c3912d5 100644
              const clear_ok = clear == null or clear.? == .null or (clear.? == .string and std.mem.eql(u8, clear.?.string, "never"));
              if (!clear_ok or json.truthyField(message, "output_config")) return cx.refuse("turn-scoped system messages and per-message output_config are unsupported");
 diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
-index 4a061f8..6a2da11 100644
+index 4a061f8b71ca4dc7e879e4c16d70258e01d14736..6a2da11268ea867c66ba69b363824ca747e64b8b 100644
 --- a/zig/src/server/late_system_test.zig
 +++ b/zig/src/server/late_system_test.zig
 @@ -20,6 +20,13 @@ const misplaced_body =
@@ -86,6 +88,3 @@ index 4a061f8..6a2da11 100644
  }
  
  const clear_old_body =
--- 
-2.43.0
-

@@ -21,11 +21,14 @@
 # 64.0 ms/chunk (mean of 8). A repeated sweep of 8 fresh conversations (500 to 32K words) then grows rank 0's GPU
 # memory only by the prompt cache's kept states (+38 MiB a pass, as with GRAPHS=0), with rank 1's RSS flat (the sweeps
 # ran before the launch was moved ahead of the put, which changes no GPU work).
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): applies unchanged after 0001-0029.
+
 diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
-index 847b4b29..40c63fe2 100644
+index bef75043f9809c876c5da567a22a0aa70e17b0e7..c5fd1125d6d936687195f8e33fd4114a8debf52b 100644
 --- a/zig/src/families/dsv41/dsv41.zig
 +++ b/zig/src/families/dsv41/dsv41.zig
-@@ -95,6 +95,7 @@ test {
+@@ -99,6 +99,7 @@ test {
      refAll(ring2d);
      refAll(text);
      refAll(round);
@@ -35,7 +38,7 @@ index 847b4b29..40c63fe2 100644
      refAll(markov_tokens);
 diff --git a/zig/src/families/dsv41/graph_cache.zig b/zig/src/families/dsv41/graph_cache.zig
 new file mode 100644
-index 00000000..cdbe0e29
+index 0000000000000000000000000000000000000000..cdbe0e29c18f3603261e491681bc3d130824d16f
 --- /dev/null
 +++ b/zig/src/families/dsv41/graph_cache.zig
 @@ -0,0 +1,119 @@
@@ -159,7 +162,7 @@ index 00000000..cdbe0e29
 +    try std.testing.expectEqual(@as(u64, 472), c.evicted);
 +}
 diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
-index e61e4861..6f025c65 100644
+index e61e4861e9f5b1b9421a9ea1a79220697330726e..6f025c65580856b30038503f7e182f151ca8df3e 100644
 --- a/zig/src/families/dsv41/lanes_main.zig
 +++ b/zig/src/families/dsv41/lanes_main.zig
 @@ -21,7 +21,7 @@ const cuda = @import("cuda");
@@ -181,7 +184,7 @@ index e61e4861..6f025c65 100644
              serial = !std.mem.eql(u8, val, "0");
          } else if (std.mem.eql(u8, key, "--fix-k")) {
 diff --git a/zig/src/families/dsv41/layer_main.zig b/zig/src/families/dsv41/layer_main.zig
-index d7328143..94b0b8fa 100644
+index d7328143b806cb5311005eccaff51ebff3c5f400..94b0b8fae88d11c8b31f0eec54d0f8ba985ab24c 100644
 --- a/zig/src/families/dsv41/layer_main.zig
 +++ b/zig/src/families/dsv41/layer_main.zig
 @@ -499,7 +499,7 @@ pub fn main(init: std.process.Init) !u8 {
@@ -194,10 +197,10 @@ index d7328143..94b0b8fa 100644
          const ok = try runLight(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, rounds, tokens, if (use_graphs) &gs else null);
          if (use_graphs) {
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index 49967f9b..f6d390c7 100644
+index 9c8b3fc979e664b83abb916edd91b1cee42e3b74..c4c125f87167f4e08e11413374b91f2bfe133a36 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -63,6 +63,7 @@ pub const Options = struct {
+@@ -65,6 +65,7 @@ pub const Options = struct {
      // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
      rdma_kernels: ?[]const u8 = null, // world 4: the rings' kernels' image (rdma_gather.cu's fatbin; null: the embedded one)
      graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
@@ -205,7 +208,7 @@ index 49967f9b..f6d390c7 100644
      side: bool = false, // the mixes' side work on a stream of its own (round.Round.useSide)
      prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
      engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
-@@ -343,7 +344,7 @@ pub const Model = struct {
+@@ -350,7 +351,7 @@ pub const Model = struct {
          m.rd = try round.Round.init(&m.eng, &m.arena, a, m.request_cap);
          if (m.kvs != null) try m.rd.useShard(&m.eng, &m.arena, a);
          m.amax = try m.arena.take(round.max_rows * 4);
@@ -215,7 +218,7 @@ index 49967f9b..f6d390c7 100644
          if (o.prefetch) try m.rd.usePrefetch(&m.eng);
          if (o.drafts) {
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index 1c57752f..e00a5e08 100644
+index 2ebaa8c3677a1550acfe62d2aff282fdfe605081..c2ae5f681b2370d2230327ddb5c2a4887a636fc3 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
 @@ -17,6 +17,9 @@
@@ -228,7 +231,7 @@ index 1c57752f..e00a5e08 100644
  //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
  //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
  //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
-@@ -205,6 +208,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+@@ -207,6 +210,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
          .rdma_devices = nonEmpty(getenv("TF_RDMA_DEVICES")),
          .rdma_kernels = getenv("TF_DS_RDMA_KERNELS"),
          .graphs = if (getenv("TF_DS_GRAPHS")) |v| !std.mem.eql(u8, v, "0") else false,
@@ -236,7 +239,7 @@ index 1c57752f..e00a5e08 100644
          .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,
          .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
          .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
-@@ -620,6 +624,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -624,6 +628,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
          error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
          error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
@@ -245,7 +248,7 @@ index 1c57752f..e00a5e08 100644
          error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
          error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
 diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
-index b7ba5cb9..b8e6c489 100644
+index b7ba5cb9677afd66c808adc0f6c9a88d14baf02b..b8e6c48909e240a9d14e260cfa9faf20d4f899b7 100644
 --- a/zig/src/families/dsv41/round.zig
 +++ b/zig/src/families/dsv41/round.zig
 @@ -30,6 +30,7 @@ const ops_mod = @import("ops.zig");
