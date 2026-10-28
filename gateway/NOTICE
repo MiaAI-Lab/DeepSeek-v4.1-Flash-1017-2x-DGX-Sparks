@@ -5,10 +5,11 @@ Sufyan's reference vLLM gateway
   https://github.com/sfxnz/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark
   Author: Sufyan (@sfxnz), https://github.com/sfxnz
 
-The token-route/fallback design and invariants were informed by that repository. Parity cases in gateway/casos and
-gateway/src/paridad are derived from its tests/api_eval.py and tools/api_eval_fixtures.py. That reference material and
-the derived parity cases retain the following MIT License notice; the gateway's original code remains Apache-2.0 under
-the repository's LICENSE.
+The token-route/fallback design and invariants follow Sufyan's (@sfxnz) gateway in that repository. The parity cases
+in gateway/casos and gateway/src/paridad are derived from Sufyan's tests/api_eval.py and tools/api_eval_fixtures.py in
+it. Those cases, here and in the image's /casos, carry the following MIT License notice; the gateway's original code
+remains Apache-2.0 under the repository's LICENSE. The ds41-gateway image carries this file at
+/usr/share/doc/ds41-gateway/NOTICE.
 
 MIT License
 

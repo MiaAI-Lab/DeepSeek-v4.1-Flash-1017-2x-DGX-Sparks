@@ -24,6 +24,8 @@ RUN groupadd --system --gid 10001 ds41 \
 COPY --from=builder /src/target/release/ds41-gateway /usr/local/bin/ds41-gateway
 COPY --from=builder /src/target/release/ds41-paridad /usr/local/bin/ds41-paridad
 COPY --from=builder /src/casos /casos
+# The MIT notice of Sufyan's (@sfxnz) parity cases, which ship in /casos.
+COPY NOTICE /usr/share/doc/ds41-gateway/NOTICE
 ARG GATEWAY_HASH=unknown
 LABEL tf.gateway=${GATEWAY_HASH}
 USER ds41

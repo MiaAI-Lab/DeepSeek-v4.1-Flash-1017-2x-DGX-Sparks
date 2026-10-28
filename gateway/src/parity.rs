@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use deepseek_recipe::anthropic::MessagesRequest;
 use deepseek_recipe::openai::{ChatCompletionRequest, ResponsesRequest};
@@ -75,6 +75,8 @@ pub struct GatewayConfig {
     pub engine_logprobs: Option<bool>,
     /// Test-only host-to-address overrides for image fetches.
     pub dns_overrides: HashMap<String, IpAddr>,
+    /// How long an admitted request may take to send its body (`None`: no limit).
+    pub body_timeout: Option<Duration>,
 }
 
 impl Default for GatewayConfig {
@@ -93,6 +95,7 @@ impl Default for GatewayConfig {
             served_name: "DeepSeek-V4.1-Flash-1017".to_string(),
             engine_logprobs: None,
             dns_overrides: HashMap::new(),
+            body_timeout: None,
         }
     }
 }
@@ -185,6 +188,15 @@ pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
         Err(error) => return Err(ApiError::fallback(error.to_string())),
     };
     let model = converted_model(&object, &config.served_name);
+    if let Some(lower) =
+        gateway.prompt_surely_exceeds(&converted.conversation, config.max_model_len as usize)
+    {
+        return Err(ApiError::bad_request(format!(
+            "This model's maximum context length is {} tokens. However, the messages have at \
+             least {lower} tokens. Please reduce the length of the messages.",
+            config.max_model_len
+        )));
+    }
     let encoded = gateway.prepare_conversation(&converted.conversation)?;
     let images = images::resolve(
         &encoded.image_sources,

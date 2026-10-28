@@ -7,10 +7,13 @@
   With `API_KEY=1`, gateway middleware loads `API_KEY_FILE` once, rejects a missing or empty key at startup, and requires
   the actual Bearer or `x-api-key` value on every route except public `/health`, before reading a body; comparisons are
   constant-time and failures are API-shaped 401 responses. `GATEWAY_MAX_CONCURRENT` (default 3) queues excess requests
-  instead of rejecting them, holding each permit through its response body/SSE. The 512 MiB sizing is
-  `floor((512-235)/70)=3` (four requests would need 515 MiB); `GATEWAY_MEMORY` remains `1g` because the former 512m
-  container cap stalled Hernan's startup. Sufyan's MIT attribution and the derived parity cases' notice are in
-  `gateway/NOTICE`. The duplicate `zig/patches/0009-disk-cache.patch` bundle and `tools/disk_cache_check.py` are removed;
+  instead of rejecting them, holding each permit through its response body/SSE. The sizing is measured: 57 MiB idle and
+  up to 784 MiB an admitted request, so `GATEWAY_MEMORY` is `3g` (`floor((3072-64)/800)=3`). Bodies are read within
+  `GATEWAY_BODY_TIMEOUT` (60 s, then 408) and over 64 MiB are a 413; `GATEWAY_MAX_CONNECTIONS` (64) caps open connections;
+  a text prompt that cannot fit the context is refused after a piecewise count instead of being tokenized whole. Image
+  URLs are fetched by the gateway's own client: no proxies, every resolved address and every redirect target checked
+  against the destination filter. Sufyan's MIT attribution and the derived parity cases' notice are in
+  `gateway/NOTICE`, which the image carries at `/usr/share/doc/ds41-gateway/NOTICE`. The duplicate `zig/patches/0009-disk-cache.patch` bundle and `tools/disk_cache_check.py` are removed;
   Mia's current spill-v2/cache implementation and all other main-branch changes are preserved.
 
 - `ABLIT=1` on a read-only Hugging Face blob cache: `prepare.sh` gives the overlay's work folder its own writable copy of

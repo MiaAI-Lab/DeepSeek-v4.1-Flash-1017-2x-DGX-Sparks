@@ -84,6 +84,8 @@ done
 [[ "$GATEWAY_MEMORY" =~ ^[0-9]+([.][0-9]+)?[mMgG]$ ]] || die "GATEWAY_MEMORY is a size with an m or g suffix (512m, 1g), not $GATEWAY_MEMORY"
 [[ "$GATEWAY_CPUS" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v c="$GATEWAY_CPUS" 'BEGIN { exit !(c > 0) }' || die "GATEWAY_CPUS is a positive number, not $GATEWAY_CPUS"
 [[ "$GATEWAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONCURRENT is a positive count, not $GATEWAY_MAX_CONCURRENT"
+[[ "$GATEWAY_MAX_CONNECTIONS" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONNECTIONS is a positive count, not $GATEWAY_MAX_CONNECTIONS"
+[[ "$GATEWAY_BODY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_BODY_TIMEOUT is a positive number of seconds, not $GATEWAY_BODY_TIMEOUT"
 [[ "$GATEWAY_LOG" =~ ^(debug|info|warn|error)$ ]] || die "GATEWAY_LOG is debug, info, warn or error, not $GATEWAY_LOG"
 [[ -n "$GATEWAY_IMAGE_TOKEN" ]] || die "GATEWAY_IMAGE_TOKEN is empty: give the served tokenizer's image-token spelling"
 for v in GATEWAY_MAX_IMAGES GATEWAY_MAX_IMAGE_MB; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
@@ -320,7 +322,8 @@ GATEWAY_LISTEN="$HOST:$PORT"; [[ "$HOST" != *:* ]] || GATEWAY_LISTEN="[$HOST]:$P
 GATEWAY_ARGS=(--listen "$GATEWAY_LISTEN" --engine "http://127.0.0.1:$ENGINE_PORT" --tokenizer /served/tokenizer.json
               --served-name "$SERVED_NAME" --image-token "$GATEWAY_IMAGE_TOKEN" --max-model-len "$CONTEXT"
               --max-images "$GATEWAY_MAX_IMAGES" --max-image-mb "$GATEWAY_MAX_IMAGE_MB"
-              --max-concurrent "$GATEWAY_MAX_CONCURRENT" --log "$GATEWAY_LOG")
+              --max-concurrent "$GATEWAY_MAX_CONCURRENT" --max-connections "$GATEWAY_MAX_CONNECTIONS"
+              --body-timeout "$GATEWAY_BODY_TIMEOUT" --log "$GATEWAY_LOG")
 if [[ "$THINKING" == 1 ]]; then GATEWAY_ARGS+=(--default-thinking); else GATEWAY_ARGS+=(--default-thinking=false); fi
 [[ -z "$REASONING_EFFORT" ]] || GATEWAY_ARGS+=(--default-effort "$REASONING_EFFORT")
 [[ "$GATEWAY_STRICT" != 1 ]] || GATEWAY_ARGS+=(--strict)
@@ -338,7 +341,11 @@ if [[ "$DRY" != 1 ]]; then
 fi
 GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
              --restart on-failure:3 --read-only --tmpfs /tmp -v "$GATEWAY_MODEL_DIR:/served:ro")
-if [[ "$API_KEY" == 1 ]]; then GATEWAY_RUN+=(-v "$API_KEY_FILE:/run/secrets/key:ro" -e API_KEY_FILE=/run/secrets/key); fi
+# The key file is mode 600 and belongs to the user running this script (api_key_ensure, and the smoke test reads it), so
+# with a key the gateway runs as that uid:gid instead of the image's ds41 (10001), which could not read it.
+if [[ "$API_KEY" == 1 ]]; then
+  GATEWAY_RUN+=(--user "$(id -u):$(id -g)" -v "$API_KEY_FILE:/run/secrets/key:ro" -e API_KEY_FILE=/run/secrets/key)
+fi
 GATEWAY_RUN+=("$GATEWAY_IMAGE")
 DATA=/hf/$DATA_SUB
 KIT=/hf/$KIT_SUB/kit

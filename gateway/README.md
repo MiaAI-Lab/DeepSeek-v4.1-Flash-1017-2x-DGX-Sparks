@@ -62,10 +62,14 @@ The defaults are in `scripts/config.sh`; the flags are in `src/main.rs`. The imp
 | `GATEWAY_API_SAMPLING` | `--api-sampling` | 1 |
 | `GATEWAY_MAX_IMAGES`, `GATEWAY_MAX_IMAGE_MB` | `--max-images`, `--max-image-mb` | 600, 64 |
 | `GATEWAY_LOG` | `--log` | info |
+| `GATEWAY_MAX_CONCURRENT` | `--max-concurrent` | 3 |
+| `GATEWAY_MAX_CONNECTIONS` | `--max-connections` | 64 |
+| `GATEWAY_BODY_TIMEOUT` | `--body-timeout` (seconds) | 60 |
 | `API_KEY` | `--require-key` | 0 |
 
-With `API_KEY=1` the recipe mounts the key at `/run/secrets/key` and passes `--require-key`; the gateway forwards
-`Authorization` / `x-api-key` to the engine and lets it decide.
+With `API_KEY=1` the recipe mounts the key at `/run/secrets/key`, passes `--require-key` and runs the container as the
+uid:gid of the user who runs `start.sh`, the owner of the mode-600 key file; the gateway forwards `Authorization` /
+`x-api-key` to the engine and lets it decide.
 
 ## Images
 
@@ -78,8 +82,12 @@ default) the destination filter rejects, for IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `1
 `64:ff9b::/96`, `64:ff9b:1::/48`, `100::/64`, `2001::/23`, `2001:db8::/32`, `2002::/16`, `3fff::/20`, `fc00::/7`,
 `fe80::/10`, `fec0::/10` and `ff00::/8`. IPv4-mapped and 6to4 addresses are checked through their embedded IPv4
 address. These are the loopback, private, carrier-grade NAT, link-local, multicast, broadcast, reserved, documentation,
-benchmarking, discard, translation and tunnelling ranges; every redirect and resolved address is checked, so an image URL
-cannot make the gateway fetch a private or non-routable destination. `GATEWAY_MAX_IMAGES` (600), `GATEWAY_MAX_IMAGE_MB`
+benchmarking, discard, translation and tunnelling ranges. The fetch uses the gateway's own HTTP client (the image crate
+only streams the body under the size limits): environment proxies are ignored, the resolver hands the client only the
+addresses the filter allows, so a second DNS answer cannot swap in another one, an address spelled in the URL (decimal,
+hexadecimal, IPv4-mapped) is checked as the address it parses to, and every redirect goes through the same checks, at
+most five times. So an image URL cannot make the gateway fetch a private or non-routable destination; the tests in
+`src/images.rs` run that production client against a loopback server, with a positive control. `GATEWAY_MAX_IMAGES` (600), `GATEWAY_MAX_IMAGE_MB`
 (64) and 8192-character URLs still apply.
 
 ## Parity battery

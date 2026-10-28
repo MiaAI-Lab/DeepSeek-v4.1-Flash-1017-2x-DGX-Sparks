@@ -498,12 +498,18 @@ counted by the gateway, with private destinations rejected by default. The gatew
 health and is 200 only while the engine is 200.
 
 **Ports, memory and queueing.** The gateway is the only listener on `HOST:PORT`; the engine is on loopback. The container
-is capped at `GATEWAY_MEMORY` (1g) and `GATEWAY_CPUS` (2), runs read-only with a `tmpfs` at `/tmp`, and has no GPU, Python
-or OpenCV. The earlier 512m cap stalled Hernan's startup, so the container default stays 1g. Independently,
-`GATEWAY_MAX_CONCURRENT=3` bounds request memory to the conservative 512 MiB budget: 235 MiB idle plus 70 MiB for a
-188,000-token request, hence `floor((512-235)/70)=3`; four would require 515 MiB. Excess requests wait rather than
-receiving a 429/503, and a permit remains held until the response body or SSE stream finishes (or the client disconnects).
-Raising the concurrency needs a corresponding memory measurement/cap.
+is capped at `GATEWAY_MEMORY` (3g) and `GATEWAY_CPUS` (2), runs read-only with a `tmpfs` at `/tmp`, and has no GPU, Python
+or OpenCV. `GATEWAY_MAX_CONCURRENT=3` admits three requests at a time; excess requests wait rather than receiving a
+429/503, and a permit remains held until the response body or SSE stream finishes (or the client disconnects). The cap
+comes from measured peaks of the release binary (three runs each, fresh process): 57 MiB idle; one admitted request adds
+159 MiB for a 188,000-token prompt, up to 522 MiB for a 64 MiB body of images, and up to 784 MiB for a prompt that fits
+the context but is made of 128-byte tokens. With 800 MiB a request, `floor((3072-64)/800)=3`; three 64 MiB image requests
+at once peaked at 1.5 GiB. A body of text that cannot fit the context is refused after counting at most a few pieces of
+it (64 MiB: 0.7 s and 447 MiB, where tokenizing all of it took 26 s and 6.4 GiB). Bodies are read within
+`GATEWAY_BODY_TIMEOUT` (60 s; 408 after it, giving the permit back) and a declared or actual body over 64 MiB is a 413
+before it is read. At most `GATEWAY_MAX_CONNECTIONS` (64) client connections are open at once, so requests queued for a
+permit and idle keep-alive connections cannot pile up; the next client waits in the kernel's accept queue. Raising the
+concurrency needs the cap raised by 800 MiB a request.
 
 **Settings** (defaults and notes in `scripts/config.sh`):
 
@@ -513,8 +519,10 @@ Raising the concurrency needs a corresponding memory measurement/cap.
 | `ENGINE_PORT` | 8887 | the engine's loopback port; may not equal `PORT` |
 | `TOKEN_ROUTE` | 0 | `1` without the gateway: serve the token route where the engine is (experiments); `API_GATEWAY=1` implies it |
 | `GATEWAY_IMAGE` | `ds41-gateway:<hash of gateway/>` | the gateway image `prepare.sh` builds; set it to use a prebuilt one |
-| `GATEWAY_MEMORY`, `GATEWAY_CPUS` | 1g, 2 | the container's `--memory` and `--cpus` |
+| `GATEWAY_MEMORY`, `GATEWAY_CPUS` | 3g, 2 | the container's `--memory` and `--cpus` |
 | `GATEWAY_MAX_CONCURRENT` | 3 | simultaneous request permits; excess requests queue, including through streaming responses |
+| `GATEWAY_MAX_CONNECTIONS` | 64 | open client connections; further clients wait to be accepted |
+| `GATEWAY_BODY_TIMEOUT` | 60 | seconds an admitted request may take to send its body; 408 after it |
 | `GATEWAY_STRICT` | 0 | `1`: the API's 400 instead of the fallback |
 | `GATEWAY_BLOCK_PRIVATE_URLS` | 1 | `1`: reject loopback, private, link-local and reserved image destinations |
 | `GATEWAY_API_SAMPLING` | 1 | `1`: use the API's sampling policy; `0`: the client's temperature/top_p/seed |

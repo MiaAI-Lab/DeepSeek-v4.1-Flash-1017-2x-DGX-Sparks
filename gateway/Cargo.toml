@@ -28,6 +28,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 subtle = "2.6"
 http-body = "1"
+http-body-util = "0.1"
 pin-project-lite = "0.2"
 
 [dev-dependencies]

@@ -34,9 +34,23 @@ API open, as the native recipe does by default.
 
 `GATEWAY_MAX_CONCURRENT` (default 3) admits that many requests and queues the rest instead of rejecting them at the cap.
 A permit covers the whole response body, including an SSE stream, and is released on completion or client cancellation.
-The default derives from a conservative 512 MiB budget: 235 MiB idle RSS plus 70 MiB for a 188,000-token request gives
-`floor((512-235)/70)=3`; four concurrent requests would need 515 MiB. The container default is nevertheless `1g`, since
-the old 512m cap stalled Hernan's startup. Raising the permit count requires a new memory measurement and a suitable cap.
+The default derives from measured peaks of the release binary (three runs each, fresh process, median and range):
+
+| request | peak over idle (57 MiB) |
+| --- | --- |
+| 188,000-token prompt (0.7 MiB) | 159 MiB (159-160) |
+| 64 MiB body of images | 484 MiB (482-522) |
+| prompt that fits the context, made of 128-byte tokens (12 MiB) | 763 MiB (748-784) |
+| 64 MiB body of text that cannot fit, refused after the piecewise count | 447 MiB (447-448) |
+
+With 800 MiB a request and 64 MiB idle, `floor((3072-64)/800)=3` under the `3g` container default; three 64 MiB image
+requests at once peaked at 1,469 MiB (1,424-1,515). Before the piecewise count, the 64 MiB text body was tokenized whole
+and took 6,537 MiB and 26 s only to be refused. Raising the permit count needs the cap raised by 800 MiB a request.
+
+The body of an admitted request is read by the same middleware, within `GATEWAY_BODY_TIMEOUT` (60 s): a client that has
+not sent its whole body by then gets a 408 and its permit goes back. A body over 64 MiB, declared in `content-length` or
+found while reading, is a 413. `GATEWAY_MAX_CONNECTIONS` (64) caps the open client connections, so connections waiting
+for a permit and idle keep-alive connections are bounded too; the next client waits in the kernel's accept queue.
 
 ## Fallback and strict mode
 
@@ -100,9 +114,9 @@ cargo build --release --locked --bin ds41-gateway
 ```
 
 The flags and their defaults are in `gateway/src/main.rs` and `gateway/README.md`. The container runs as an unprivileged
-user, read-only, with `--memory` and `--cpus` from `GATEWAY_MEMORY` / `GATEWAY_CPUS`, and no GPU. The memory default is
-`1g` because 512m stalled Hernan's startup; the independent concurrency default still uses the conservative 512 MiB
-request budget described above.
+user, read-only, with `--memory` and `--cpus` from `GATEWAY_MEMORY` / `GATEWAY_CPUS`, and no GPU. With `API_KEY=1` it runs
+as the uid and gid of the user who runs `start.sh`, who owns the mode-600 key file it mounts; otherwise as the image's
+unprivileged `ds41` user (uid 10001). The memory default is `3g`, sized for three admitted requests as described above.
 
 ## Parity battery without a GPU
 

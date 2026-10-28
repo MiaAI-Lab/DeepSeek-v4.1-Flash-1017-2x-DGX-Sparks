@@ -89,8 +89,9 @@ pub async fn resolve(
     })
 }
 
-/// The fetcher of one resolve call.  The filtered variant keeps the test-only DNS
-/// overrides while still checking every destination.
+/// The fetcher of one resolve call.  Both variants use a client this module builds,
+/// so the destination policy is the gateway's own code and the tests exercise the
+/// production path; the third-party crate only streams the body under the limits.
 enum ImageFetcherImpl {
     Plain(ReqwestImageFetcher),
     Filtered(FilteredFetcher),
@@ -105,76 +106,71 @@ impl ImageFetcher for ImageFetcherImpl {
     }
 }
 
+/// The most redirects one image fetch follows.
+const MAX_REDIRECTS: usize = 5;
+
 fn build_fetcher(
     settings: &ImageSettings,
     max_image_bytes: usize,
 ) -> Result<ImageFetcherImpl, ApiError> {
-    let filter: Option<Arc<dyn DestinationFilter>> = settings
+    let filter = settings
         .block_private_urls
         .then(|| Arc::new(destination_allowed) as Arc<dyn DestinationFilter>);
-    if let Some(filter) = filter {
-        if settings.dns_overrides.is_empty() {
-            let fetcher = ReqwestImageFetcher::new().map_err(|error| {
-                ApiError::internal(format!("cannot build the image fetcher: {error}"))
-            })?;
-            let rule = Arc::clone(&filter);
-            let fetcher = fetcher
-                .with_destination_filter(move |host: &str, address: IpAddr| {
-                    rule.allows(host, address)
-                })
-                .map_err(|error| {
-                    ApiError::internal(format!("cannot build the image fetcher: {error}"))
-                })?;
-            return Ok(ImageFetcherImpl::Plain(fetcher));
-        }
-        let resolver = FilteringOverrideResolver {
-            filter: Arc::clone(&filter),
-            overrides: settings
-                .dns_overrides
-                .iter()
-                .map(|(host, address)| (host.to_ascii_lowercase(), *address))
-                .collect(),
-        };
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .no_proxy()
-            .dns_resolver(Arc::new(resolver))
-            .redirect(filtered_redirect_policy(filter.clone()))
-            .build()
-            .map_err(|error| {
-                ApiError::internal(format!("cannot build the image client: {error}"))
-            })?;
-        let inner = ReqwestImageFetcher::from_client(client, max_image_bytes);
-        return Ok(ImageFetcherImpl::Filtered(FilteredFetcher {
-            inner,
-            filter,
-        }));
-    }
-    if settings.dns_overrides.is_empty() {
-        let fetcher = ReqwestImageFetcher::new().map_err(|error| {
-            ApiError::internal(format!("cannot build the image fetcher: {error}"))
-        })?;
-        return Ok(ImageFetcherImpl::Plain(fetcher));
-    }
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::limited(5));
-    for (host, address) in &settings.dns_overrides {
-        builder = builder.resolve(host, SocketAddr::new(*address, 0));
-    }
-    let client = builder
-        .build()
-        .map_err(|error| ApiError::internal(format!("cannot build the image client: {error}")))?;
-    Ok(ImageFetcherImpl::Plain(ReqwestImageFetcher::from_client(
-        client,
-        max_image_bytes,
-    )))
+    build_fetcher_with(filter, &settings.dns_overrides, max_image_bytes)
 }
 
-/// A fetcher that keeps the client's DNS overrides and applies the destination
-/// filter to the initial URL, every resolved address and every redirect.
+/// Build the fetcher for `filter` (`None`: no destination policy).
+///
+/// With a filter, every destination is checked by this module: the host of the
+/// initial URL when it is an address, every address a host name resolves to (the
+/// client connects only to the addresses the resolver returned, so a second DNS
+/// answer cannot swap in another one), and every redirect target, which goes
+/// through the same two checks.  Proxies from the environment are ignored, since a
+/// proxy would make the connection on the client's behalf to an unchecked address.
+fn build_fetcher_with(
+    filter: Option<Arc<dyn DestinationFilter>>,
+    dns_overrides: &HashMap<String, IpAddr>,
+    max_image_bytes: usize,
+) -> Result<ImageFetcherImpl, ApiError> {
+    let overrides: HashMap<String, IpAddr> = dns_overrides
+        .iter()
+        .map(|(host, address)| (host.to_ascii_lowercase(), *address))
+        .collect();
+    let builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .no_proxy();
+    let Some(filter) = filter else {
+        let mut builder = builder.redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS));
+        for (host, address) in &overrides {
+            builder = builder.resolve(host, SocketAddr::new(*address, 0));
+        }
+        let client = builder.build().map_err(|error| {
+            ApiError::internal(format!("cannot build the image client: {error}"))
+        })?;
+        return Ok(ImageFetcherImpl::Plain(ReqwestImageFetcher::from_client(
+            client,
+            max_image_bytes,
+        )));
+    };
+    let resolver = FilteringOverrideResolver {
+        filter: Arc::clone(&filter),
+        overrides,
+    };
+    let client = builder
+        .dns_resolver(Arc::new(resolver))
+        .redirect(filtered_redirect_policy(Arc::clone(&filter)))
+        .build()
+        .map_err(|error| ApiError::internal(format!("cannot build the image client: {error}")))?;
+    let inner = ReqwestImageFetcher::from_client(client, max_image_bytes);
+    Ok(ImageFetcherImpl::Filtered(FilteredFetcher {
+        inner,
+        filter,
+    }))
+}
+
+/// A fetcher that applies the destination filter to the initial URL, every
+/// resolved address and every redirect.
 struct FilteredFetcher {
     inner: ReqwestImageFetcher,
     filter: Arc<dyn DestinationFilter>,
@@ -203,8 +199,9 @@ impl ImageFetcher for FilteredFetcher {
     }
 }
 
-/// A resolver that applies the test-only name overrides before the destination
-/// filter, so an overridden name cannot bypass the filter.
+/// The resolver of the filtered client: it applies the test-only name overrides
+/// (empty in production) before the destination filter, so an overridden name
+/// cannot bypass the filter, and returns only the addresses the filter allows.
 struct FilteringOverrideResolver {
     filter: Arc<dyn DestinationFilter>,
     overrides: HashMap<String, IpAddr>,
@@ -236,7 +233,8 @@ impl Resolve for FilteringOverrideResolver {
 /// checked by the resolver when the client resolves them.
 fn filtered_redirect_policy(filter: Arc<dyn DestinationFilter>) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() > 5 {
+        // The first entry of `previous` is the initial URL, as in `Policy::limited`.
+        if attempt.previous().len() > MAX_REDIRECTS {
             return attempt.error(TooManyRedirects);
         }
         match validate_ip_address_host(attempt.url(), filter.as_ref()) {
@@ -449,46 +447,200 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn a_redirect_to_a_private_address_is_rejected() {
+    /// A loopback server for the fetcher tests: `/image.png` is a small PNG,
+    /// `/to/<n>` redirects to the n-th entry of `locations`, and `/chain/<n>`
+    /// redirects to `/chain/<n-1>` until `/chain/0`, which is the PNG.  It counts
+    /// the requests that reach it, so a rejection can be shown to happen before
+    /// any connection.
+    async fn spawn_server(
+        locations: impl FnOnce(u16) -> Vec<String>,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind");
         let port = listener.local_addr().expect("address").port();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut request = [0; 1024];
-            let _ = stream.read(&mut request).await;
-            let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/image.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        });
-        let filter: Arc<dyn DestinationFilter> = Arc::new(destination_allowed);
-        let client = reqwest::Client::builder()
-            .resolve(
-                "fake.test",
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            )
-            .redirect(filtered_redirect_policy(Arc::clone(&filter)))
-            .build()
-            .expect("client");
-        let fetcher = FilteredFetcher {
-            inner: ReqwestImageFetcher::from_client(client, 1024),
-            filter,
+        let locations = locations(port);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let png = {
+            let image = image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .expect("encode PNG");
+            bytes
         };
-        let budget = ImageByteBudget::new(1024, 1024, 0);
-        let error = fetcher
-            .fetch(&format!("http://fake.test:{port}/redirect"), &budget)
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let locations = locations.clone();
+                let png = png.clone();
+                tokio::spawn(async move {
+                    let mut request = [0; 2048];
+                    let read = stream.read(&mut request).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    let redirect = |location: String| {
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes()
+                    };
+                    let response = if let Some(n) = path.strip_prefix("/to/") {
+                        redirect(locations[n.parse::<usize>().unwrap()].clone())
+                    } else if let Some(n) = path.strip_prefix("/chain/")
+                        && let Ok(n) = n.parse::<usize>()
+                        && n > 0
+                    {
+                        redirect(format!("/chain/{}", n - 1))
+                    } else {
+                        let mut response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            png.len()
+                        )
+                        .into_bytes();
+                        response.extend_from_slice(&png);
+                        response
+                    };
+                    let _ = stream.write_all(&response).await;
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// The production fetcher with a filter that also admits `allowed.test`, the
+    /// one name that may reach the loopback test server.  Every other name and
+    /// address goes through `destination_allowed`, as in production.
+    fn test_fetcher() -> ImageFetcherImpl {
+        let filter: Arc<dyn DestinationFilter> = Arc::new(|host: &str, address: IpAddr| {
+            host == "allowed.test" || destination_allowed(host, address)
+        });
+        let overrides = [
+            ("allowed.test", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ("blocked.test", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ("mapped.test", "::ffff:127.0.0.1".parse().unwrap()),
+        ]
+        .into_iter()
+        .map(|(host, address)| (host.to_owned(), address))
+        .collect();
+        build_fetcher_with(Some(filter), &overrides, 1 << 20).expect("fetcher")
+    }
+
+    fn budget() -> ImageByteBudget {
+        ImageByteBudget::new(1 << 20, 1 << 20, 0)
+    }
+
+    fn rejected(result: Result<Vec<u8>, ImageError>) -> String {
+        match result {
+            Err(ImageError::DestinationRejected { host, .. }) => host,
+            other => panic!("expected a destination rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_production_fetcher_reaches_an_allowed_destination() {
+        // Positive control: without it, the rejections below could be any failure.
+        let (port, _) = spawn_server(|_| Vec::new()).await;
+        let fetcher = test_fetcher();
+        let bytes = fetcher
+            .fetch(&format!("http://allowed.test:{port}/image.png"), &budget())
             .await
-            .expect_err("private redirect");
+            .expect("allowed fetch");
+        assert!(bytes.starts_with(b"\x89PNG"));
+        let bytes = fetcher
+            .fetch(
+                &format!("http://allowed.test:{port}/chain/{MAX_REDIRECTS}"),
+                &budget(),
+            )
+            .await
+            .expect("five redirects are followed");
+        assert!(bytes.starts_with(b"\x89PNG"));
+    }
+
+    #[tokio::test]
+    async fn a_sixth_redirect_is_refused() {
+        let (port, _) = spawn_server(|_| Vec::new()).await;
+        let error = test_fetcher()
+            .fetch(
+                &format!("http://allowed.test:{port}/chain/{}", MAX_REDIRECTS + 1),
+                &budget(),
+            )
+            .await
+            .expect_err("too many redirects");
         assert!(
-            matches!(
-                error,
-                ImageError::DestinationRejected { ref host, .. } if host == "127.0.0.1"
-            ),
-            "{error}"
+            matches!(error, ImageError::Fetch { .. }),
+            "expected a fetch error, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn every_redirect_target_is_checked_before_connecting() {
+        // Each redirect leaves an allowed host for a loopback destination spelled a
+        // different way. The server must see only the first request of each case.
+        let targets = |port: u16| {
+            vec![
+                (format!("http://127.0.0.1:{port}/image.png"), "127.0.0.1"),
+                (format!("http://2130706433:{port}/image.png"), "127.0.0.1"),
+                (format!("http://0x7f.1:{port}/image.png"), "127.0.0.1"),
+                (
+                    format!("http://[::ffff:127.0.0.1]:{port}/image.png"),
+                    "::ffff:7f00:1",
+                ),
+                (format!("http://[::1]:{port}/image.png"), "::1"),
+                (
+                    format!("http://blocked.test:{port}/image.png"),
+                    "blocked.test",
+                ),
+                (
+                    format!("http://mapped.test:{port}/image.png"),
+                    "mapped.test",
+                ),
+                (format!("http://localhost:{port}/image.png"), "localhost"),
+            ]
+        };
+        let (port, hits) =
+            spawn_server(|port| targets(port).into_iter().map(|(url, _)| url).collect()).await;
+        let targets = targets(port);
+        let fetcher = test_fetcher();
+        for (index, (url, host)) in targets.iter().enumerate() {
+            let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+            let result = fetcher
+                .fetch(&format!("http://allowed.test:{port}/to/{index}"), &budget())
+                .await;
+            assert_eq!(rejected(result), *host, "redirect to {url}");
+            let after = hits.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(after - before, 1, "redirect to {url} reached the server");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_initial_url_spelled_as_an_address_is_rejected_without_connecting() {
+        let (port, hits) = spawn_server(|_| Vec::new()).await;
+        let fetcher = test_fetcher();
+        for (url, host) in [
+            (format!("http://127.0.0.1:{port}/image.png"), "127.0.0.1"),
+            (format!("http://2130706433:{port}/image.png"), "127.0.0.1"),
+            (
+                format!("http://[::ffff:127.0.0.1]:{port}/image.png"),
+                "::ffff:7f00:1",
+            ),
+            (
+                format!("http://blocked.test:{port}/image.png"),
+                "blocked.test",
+            ),
+        ] {
+            assert_eq!(
+                rejected(fetcher.fetch(&url, &budget()).await),
+                host,
+                "{url}"
+            );
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

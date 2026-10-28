@@ -499,3 +499,160 @@ async fn finishing_an_sse_body_releases_its_slot() {
 async fn cancelling_an_sse_body_releases_its_slot() {
     check_sse_permit_release(true).await;
 }
+
+/// Send `head` and then `body` in pieces over raw TCP, and return the status line of
+/// the reply, or `None` when no reply comes within `wait`.
+async fn raw_request(
+    url: &str,
+    head: &str,
+    body: &[u8],
+    pause: Duration,
+    wait: Duration,
+) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let address = url.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    stream.write_all(head.as_bytes()).await.expect("head");
+    if !body.is_empty() {
+        tokio::time::sleep(pause).await;
+        let _ = stream.write_all(body).await;
+    }
+    let mut reply = vec![0; 512];
+    let read = tokio::time::timeout(wait, stream.read(&mut reply))
+        .await
+        .ok()?
+        .ok()?;
+    let reply = String::from_utf8_lossy(&reply[..read]).to_string();
+    reply.lines().next().map(str::to_owned)
+}
+
+fn timed_config(timeout: Duration) -> GatewayConfig {
+    GatewayConfig {
+        body_timeout: Some(timeout),
+        ..GatewayConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn a_slow_body_is_408_and_gives_its_slot_back() {
+    let (engine, _) = spawn_basic_engine().await;
+    let semaphore = Arc::new(Semaphore::new(1));
+    let url = spawn_gateway(
+        &engine,
+        timed_config(Duration::from_millis(300)),
+        Arc::clone(&semaphore),
+    )
+    .await;
+    let head = "POST /v1/messages HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: 20\r\n\r\n";
+    // Control: the same 20 bytes sent at once are read (and refused as JSON, 400).
+    let status = raw_request(
+        &url,
+        head,
+        b"{\"not\": \"a request\"}",
+        Duration::ZERO,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("a reply");
+    assert!(status.contains(" 400 "), "{status}");
+    // The body never comes: 408 at the timeout, not a hang.
+    let started = std::time::Instant::now();
+    let status = raw_request(&url, head, b"", Duration::ZERO, Duration::from_secs(5))
+        .await
+        .expect("a reply");
+    assert!(status.contains(" 408 "), "{status}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // The slot came back: the one permit is free again.
+    assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn a_body_over_the_limit_is_413_before_it_is_read() {
+    let (engine, _) = spawn_basic_engine().await;
+    let url = spawn_gateway(
+        &engine,
+        timed_config(Duration::from_secs(5)),
+        Arc::new(Semaphore::new(1)),
+    )
+    .await;
+    let over = ds41_gateway::security::MAX_BODY_BYTES + 1;
+    let head = format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {over}\r\n\r\n"
+    );
+    let status = raw_request(&url, &head, b"", Duration::ZERO, Duration::from_secs(2))
+        .await
+        .expect("a reply without waiting for the body");
+    assert!(status.contains(" 413 "), "{status}");
+}
+
+#[tokio::test]
+async fn the_listener_keeps_at_most_max_connections_open() {
+    use ds41_gateway::listener::LimitedListener;
+    let router = Router::new().route("/", any(|| async { "ok" }));
+    let listener = LimitedListener::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind"),
+        1,
+    );
+    let address = axum::serve::Listener::local_addr(&listener).expect("address");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    let url = format!("http://{address}");
+    let head = "GET / HTTP/1.1\r\nhost: x\r\n\r\n";
+    // Control: with the slot free, a request is answered.
+    let status = raw_request(&url, head, b"", Duration::ZERO, Duration::from_secs(2)).await;
+    assert!(status.is_some_and(|line| line.contains(" 200 ")));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // An idle connection takes the only slot; the next client waits to be accepted.
+    let idle = tokio::net::TcpStream::connect(address).await.expect("idle");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waiting = tokio::spawn({
+        let url = url.clone();
+        async move { raw_request(&url, head, b"", Duration::ZERO, Duration::from_secs(5)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a second connection was served while the first held the slot"
+    );
+    drop(idle);
+    let status = waiting.await.expect("join");
+    assert!(status.is_some_and(|line| line.contains(" 200 ")));
+}
+
+#[tokio::test]
+async fn a_chunked_body_over_the_limit_is_413() {
+    let (engine, _) = spawn_basic_engine().await;
+    let url = spawn_gateway(
+        &engine,
+        timed_config(Duration::from_secs(20)),
+        Arc::new(Semaphore::new(1)),
+    )
+    .await;
+    // No content-length: the limit is found while reading, one MiB chunk at a time.
+    let chunk = vec![0x20_u8; 1024 * 1024];
+    let chunks = ds41_gateway::security::MAX_BODY_BYTES / chunk.len() + 1;
+    let body = chunk_stream(chunk, chunks);
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(reqwest::Body::wrap_stream(body))
+        .send()
+        .await;
+    match response {
+        Ok(response) => assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE),
+        // The server may answer and close before the client finishes sending.
+        Err(error) => panic!("no reply: {error}"),
+    }
+}
+
+fn chunk_stream(
+    chunk: Vec<u8>,
+    count: usize,
+) -> impl tokio_stream::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+    tokio_stream::iter((0..count).map(move |_| Ok(chunk.clone())))
+}

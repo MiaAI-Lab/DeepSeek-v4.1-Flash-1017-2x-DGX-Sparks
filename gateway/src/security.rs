@@ -1,13 +1,17 @@
 //! Authentication and admission control for the complete public router.
 //!
 //! This middleware runs before route extractors, so an unauthorized or queued request's
-//! body is not read by a handler. The semaphore permit lives in the response body: an
-//! SSE response therefore keeps its slot until the stream ends or the client disconnects.
+//! body is not read by a handler. An admitted request's body is read here, under the
+//! API's 64 MiB limit and the configured body timeout, so a client that sends its body
+//! slowly gives its slot back instead of holding it. The semaphore permit lives in the
+//! response body: an SSE response therefore keeps its slot until the stream ends or the
+//! client disconnects.
 
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -96,8 +100,60 @@ pub async fn guard(State(state): State<AppState>, request: Request, next: Next) 
             return error_response(ApiError::internal("the request limiter is closed"));
         }
     };
+    let request = match read_body(request, state.config.body_timeout).await {
+        Ok(request) => request,
+        Err(error) => return error_response(error),
+    };
     let response = next.run(request).await;
     hold_permit(response, permit)
+}
+
+/// The largest request body any route takes (the API's 64 MiB).
+pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Buffer the body of an admitted request within the size limit and the timeout.
+async fn read_body(request: Request, timeout: Option<Duration>) -> Result<Request, ApiError> {
+    let too_large = || {
+        ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+            format!("the request body is larger than {MAX_BODY_BYTES} bytes"),
+            "request_too_large",
+        )
+    };
+    // A declared length over the limit is refused before any of the body is read.
+    let declared = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_BODY_BYTES as u64) {
+        return Err(too_large());
+    }
+    let (parts, body) = request.into_parts();
+    let read = axum::body::to_bytes(body, MAX_BODY_BYTES);
+    let bytes = match timeout {
+        Some(limit) => tokio::time::timeout(limit, read).await.map_err(|_| {
+            ApiError::new(
+                StatusCode::REQUEST_TIMEOUT.as_u16(),
+                format!(
+                    "the request body was not received within {} s",
+                    limit.as_secs_f64()
+                ),
+                "invalid_request_error",
+            )
+        })?,
+        None => read.await,
+    };
+    let bytes = bytes.map_err(|error| {
+        let over_limit = std::error::Error::source(&error)
+            .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+        if over_limit {
+            too_large()
+        } else {
+            ApiError::bad_request(format!("cannot read the request body: {error}"))
+        }
+    })?;
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 fn authorized(headers: &HeaderMap, keys: Option<&ApiKeys>) -> bool {

@@ -166,6 +166,8 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         self.assertIn("-v /tmp/ds41-home/.cache/huggingface/tensorfold-dsv41/45ee5d0f/model:/served:ro", out)
         self.assertIn("-v /tmp/ds41-home/.local/state/dsv41-tensorfold/api-key:/run/secrets/key:ro", out)
         self.assertIn("-e API_KEY_FILE=/run/secrets/key", out)
+        # The key file is the invoking user's, mode 600: the gateway must run as that user to read it.
+        self.assertIn(f"--user {os.getuid()}:{os.getgid()} -v /tmp/ds41-home/.local/state/dsv41-tensorfold/api-key", out)
         self.assertIn(
             "--listen 0.0.0.0:8888 --engine http://127.0.0.1:8887 "
             "--tokenizer /served/tokenizer.json --served-name DeepSeek-V4.1-Flash-1017 --image-token",
@@ -174,12 +176,19 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         gateway_tokens = self._gateway_tokens(out)
         self.assertEqual(gateway_tokens[gateway_tokens.index("--image-token") + 1], "<\uff5cdeepseek_image\uff5c>")
         self.assertIn(
-            "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --max-concurrent 3 --log debug "
+            "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --max-concurrent 3 --max-connections 64 "
+            "--body-timeout 60 --log debug "
             "--default-thinking --strict --block-private-urls=false --api-sampling=false --require-key",
             out,
         )
         self.assertNotIn("-e API_KEY=0", out)
         self.assertNotIn("--host 0.0.0.0 --port 8888", out)
+
+    def test_without_a_key_the_gateway_keeps_the_image_user(self):
+        result = self.run_start(API_GATEWAY=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--user", result.stdout)
+        self.assertNotIn("/run/secrets/key", result.stdout)
 
     def test_gateway_argv_has_no_duplicate_binary_and_flags_are_accepted(self):
         """Docker runs ENTRYPOINT + the arguments after the image; argv[1] must be --listen, not the binary again."""
@@ -257,6 +266,8 @@ class ApiGatewaySettingsTest(unittest.TestCase):
             ({"GATEWAY_IMAGE_TOKEN": ""}, "GATEWAY_IMAGE_TOKEN is empty"),
             ({"GATEWAY_MAX_IMAGES": 0}, "GATEWAY_MAX_IMAGES is a positive count"),
             ({"GATEWAY_MAX_IMAGE_MB": 0}, "GATEWAY_MAX_IMAGE_MB is a positive count"),
+            ({"GATEWAY_MAX_CONNECTIONS": 0}, "GATEWAY_MAX_CONNECTIONS is a positive count"),
+            ({"GATEWAY_BODY_TIMEOUT": "1.5"}, "GATEWAY_BODY_TIMEOUT is a positive number of seconds"),
         ]
         for extra, message in cases:
             with self.subTest(extra=extra):

@@ -85,6 +85,7 @@ fn config(served_name: &str) -> GatewayConfig {
         served_name: served_name.to_string(),
         engine_logprobs: None,
         dns_overrides: HashMap::new(),
+        body_timeout: None,
     }
 }
 

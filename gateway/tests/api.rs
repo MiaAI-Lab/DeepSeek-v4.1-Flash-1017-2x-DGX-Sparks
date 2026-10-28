@@ -717,6 +717,42 @@ async fn context_limit_is_the_exact_api_400_before_the_engine() {
 }
 
 #[tokio::test]
+async fn a_prompt_far_over_the_context_is_refused_without_tokenizing_all_of_it() {
+    let gw = gateway();
+    // 24 MiB of words against a 1,000-token context: refused after the first piece.
+    let text = "word ".repeat(24 * 1024 * 1024 / 5);
+    let request = json!({
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [{"role": "user", "content": text}]
+    });
+    let (engine, mock) = spawn_mock(vec![usage(1, 0)], Duration::ZERO, true).await;
+    let url = spawn_gateway(&engine, gw, 1_000).await;
+    let response = post_json(&format!("{url}/v1/chat/completions"), request).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("body");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.starts_with(
+            "This model's maximum context length is 1000 tokens. However, the messages have at least "
+        ),
+        "{message}"
+    );
+    assert!(mock.body.lock().unwrap().is_none(), "engine was touched");
+    // The bound shows where the count stopped: within the first piece or two (about 52k
+    // tokens each), not after the whole text (about five million tokens).
+    let lower: usize = message
+        .split("at least ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .expect("a count in the message");
+    assert!(
+        (1_000..200_000).contains(&lower),
+        "stopped at {lower} tokens"
+    );
+}
+
+#[tokio::test]
 async fn length_finish_reason_is_preserved() {
     let gw = gateway();
     let ids = text_ids(&gw, "partial");

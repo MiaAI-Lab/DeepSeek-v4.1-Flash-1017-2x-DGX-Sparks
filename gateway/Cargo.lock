@@ -682,6 +682,7 @@ dependencies = [
  "deepseek-recipe-encoding",
  "deepseek-recipe-image",
  "http-body",
+ "http-body-util",
  "image",
  "pin-project-lite",
  "quick-xml",
