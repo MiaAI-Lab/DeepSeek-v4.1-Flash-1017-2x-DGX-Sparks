@@ -143,7 +143,8 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; th
   [[ "$live_head" == "$live_worker" ]] || die "the two running ranks disagree on the ported features ($live_head here, $live_worker on $(worker_host 1)): run ./start.sh restart"
   [[ "$live_head" == "$(port_identity)" ]] || \
     die "the running ranks use other spill / KV-shard / pool settings ($live_head, asked: $(port_identity)); run ./start.sh restart"
-  [[ "$(prepared_state 2>/dev/null)" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
+  state=$(prepared_state) || die "cannot tell whether the setup is ready: see the error above"
+  [[ "$state" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
     die "the requested configuration differs from the prepared server; run ./start.sh restart with the same settings (including ABLIT)"
   log "$CONTAINER_NAME is already running on both Sparks (port $PORT): nothing to do. ./start.sh restart restarts it, ./stop.sh stops it."
   exit 0
@@ -151,7 +152,15 @@ fi
 
 # ---------------------------------------------------------------- 1. setup
 step 1 "Setup: image, checkpoint, Engram's tables, weight files and kit; the worker's NFS volume and disk"
-if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 2>/dev/null)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
+# (a state that cannot be computed is an error here, not "equal to a missing marker": both read empty otherwise)
+need_prepare=0
+case "${PREPARE:-auto}" in
+  1) need_prepare=1 ;;
+  0) ;;
+  *) state=$(prepared_state) || die "cannot tell whether the setup is ready: see the error above"
+     [[ "$state" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || need_prepare=1 ;;
+esac
+if (( need_prepare )); then
   if (( DRY )); then log "DRY_RUN: scripts/prepare.sh would run now (not ready yet)"
   else
     # setup builds the image and writes ~106 GB files: with ~104 GiB of a Spark's memory held by a running rank that can freeze it

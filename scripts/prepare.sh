@@ -297,5 +297,5 @@ else
     die "writing rank 1's weight file on $(worker_host 1) failed"
 fi
 
-prepared_state > "$PREPARED_MARKER"
+write_prepared_marker || die "cannot record the prepared state (the previous marker is left as it was): see the error above"
 log "Done: both Sparks are ready. Start the server with ./start.sh (port $PORT)."
