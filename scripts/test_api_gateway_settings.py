@@ -466,6 +466,16 @@ API_GATEWAY=1 API_URL=http://127.0.0.1:8888 CONTAINER_NAME=rank STATE_DIR={tmp} 
         self.assertNotEqual(base, identity(GATEWAY_STRICT="1"))
         self.assertNotEqual(base, identity(GATEWAY_MAX_CONCURRENT="4"))
         self.assertNotEqual(base, identity(API_KEY="1"))
+        # The key the gateway loaded: rotating it in the same file is another gateway.
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="ds41-identity-") as tmp:
+            key = Path(tmp) / "key"
+            key.write_text("old-key\n")
+            before = identity(API_KEY="1", API_KEY_FILE=str(key))
+            self.assertEqual(before, identity(API_KEY="1", API_KEY_FILE=str(key)))
+            key.write_text("new-key\n")
+            self.assertNotEqual(before, identity(API_KEY="1", API_KEY_FILE=str(key)))
 
 
 if __name__ == "__main__":

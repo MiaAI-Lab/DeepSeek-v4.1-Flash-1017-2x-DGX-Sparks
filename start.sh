@@ -167,6 +167,9 @@ gateway_identity() {
     done
     printf '%s\n' "$HOST" "$PORT" "$ENGINE_PORT" "$SERVED_NAME" "$CONTEXT" "$THINKING" "$REASONING_EFFORT" "$API_KEY" \
       "$API_KEY_FILE" "$DATA_DIR"
+    # the key the gateway loaded at its start: a key rotated in the same file is another gateway (only a digest of it,
+    # inside this digest)
+    if [[ "$API_KEY" == 1 && -r "$API_KEY_FILE" ]]; then sha256sum < "$API_KEY_FILE"; else echo no-key-file; fi
   } | sha256sum | cut -c1-16
 }
 # Remove ds41-gateway after saving its log (FOREGROUND's stops: a gateway that exited keeps its last words).
@@ -206,9 +209,13 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; th
   [[ "$(prepared_state 2>/dev/null)" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
     die "the requested configuration differs from the prepared server; run ./start.sh restart with the same settings (including ABLIT)"
   if [[ "$API_GATEWAY" == 1 ]]; then
-    live_gateway=$(docker inspect -f '{{index .Config.Labels "tf.recipe.gateway"}}' ds41-gateway 2>/dev/null || true)
-    [[ -z "$live_gateway" || "$live_gateway" == "$(gateway_identity)" ]] || \
-      die "ds41-gateway was started with other settings than these: run ./start.sh restart"
+    # a gateway that exists is reused only with exactly these settings (and this key); one without the label, or whose
+    # label cannot be read, is not
+    if docker inspect ds41-gateway >/dev/null 2>&1; then
+      live_gateway=$(docker inspect -f '{{index .Config.Labels "tf.recipe.gateway"}}' ds41-gateway 2>/dev/null || true)
+      [[ "$live_gateway" == "$(gateway_identity)" ]] || \
+        die "ds41-gateway was started with other settings or another key than these: run ./start.sh restart"
+    fi
     if ! running_gateway; then
       gateway_recover "$URL" || die "the ranks are running but ds41-gateway is not, and it could not be started again: run ./start.sh restart"
       log "ds41-gateway was not running: started it again on $HOST:$PORT"
@@ -406,8 +413,7 @@ if [[ "$DRY" != 1 ]]; then
   [[ -n "$GATEWAY_MODEL_DIR" ]] || GATEWAY_MODEL_DIR=$DATA_DIR/model
   [[ -d "$GATEWAY_MODEL_DIR" ]] || die "the served folder $GATEWAY_MODEL_DIR does not exist: prepare.sh downloads the model there"
 fi
-GATEWAY_RUN=(docker run -d --name ds41-gateway --label "tf.recipe.gateway=$(gateway_identity)" --network host
-             --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
+GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
              --restart on-failure:3 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges
              -v "$GATEWAY_MODEL_DIR:/served:ro")
 # The key file is mode 600 and belongs to the user running this script (api_key_ensure, and the smoke test reads it), so
@@ -435,6 +441,8 @@ if [[ "$API_KEY" == 1 ]]; then
   if (( DRY )); then log "DRY_RUN: API_KEY=1: the key would be read from $API_KEY_FILE (created, mode 600, when missing)"
   else api_key_ensure; AUTH=(-H "@$(api_header_file)"); fi
 fi
+# The gateway's settings digest takes in its key, which exists from here on (api_key_ensure creates it on a first start).
+GATEWAY_RUN=("${GATEWAY_RUN[@]:0:5}" --label "tf.recipe.gateway=$(gateway_identity)" "${GATEWAY_RUN[@]:5}")
 step 3 "Launch: container $CONTAINER_NAME, rank 1 on the worker, then rank 0 here"
 # spill files a crashed run left as root go back to their directory's owner (scripts/port.sh; nothing with SPILL_GIB=0)
 (( DRY )) || port_spill_fix_both
