@@ -22,10 +22,14 @@ Audit fixes in chat.zig: a failed allocation in the mailbox or the reader no
 longer drops a round silently (a token-only reply ends with OutOfMemory; the
 text path is unchanged); a client that leaves during the held-back last round
 cancels it as in any other round; the token reply's runtime object carries the
-request's thinking and effort instead of false/null. zig fmt applied.
+request's thinking and effort instead of false/null. A streamed token reply
+gets the text routes' keep-alive: TokenSink has a ping, the SSE writer sends
+": ping" after ping_after_ns of silence (a long cold prefill, when the route is
+used without the gateway), and the silence is counted from the submit.
+zig fmt applied.
 
 Checked with Zig 0.17.0 on x86_64, CPU-only harness (zig/tests/server):
-build.sh builds fake_serve and tensorfold-native; zig_test.sh 116/116 and 90/90;
+build.sh builds fake_serve and tensorfold-native; zig_test.sh 117/117 and 90/90;
 token_route_smoke.py against fake_serve 34/35, the same as before the rebase
 (logprobs content fails on both with the fake engine).
 ---
@@ -43,12 +47,12 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  zig/src/families/dsv41/text.zig          |   27 +-
  zig/src/native/cuda.zig                  |   12 +-
  zig/src/server/auth.zig                  |    1 +
- zig/src/server/chat.zig                  |  644 ++++++++++++--
- zig/src/server/generate.zig              |  619 +++++++++++++
- zig/src/server/generate_test.zig         | 1005 ++++++++++++++++++++++
+ zig/src/server/chat.zig                  |  658 ++++++++++++--
+ zig/src/server/generate.zig              |  630 +++++++++++++
+ zig/src/server/generate_test.zig         | 1045 ++++++++++++++++++++++
  zig/src/server/metrics.zig               |   29 +
  zig/src/server/prompt.zig                |   25 +-
- zig/src/server/prompt_test.zig           |  144 ++++
+ zig/src/server/prompt_test.zig           |  144 +++
  zig/src/server/root.zig                  |    4 +
  zig/src/server/routes.zig                |    8 +
  zig/src/server/serve.zig                 |    1 +
@@ -61,7 +65,7 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  zig/tests/server/fake_serve.zig          |    2 +-
  zig/tests/server/fixtures/scripts.json   |   92 +-
  zig/tests/server/token_route_smoke.py    |  207 +++++
- 32 files changed, 3229 insertions(+), 101 deletions(-)
+ 32 files changed, 3290 insertions(+), 105 deletions(-)
  create mode 100644 zig/src/server/generate.zig
  create mode 100644 zig/src/server/generate_test.zig
  create mode 100644 zig/src/server/prompt_test.zig
@@ -794,7 +798,7 @@ index 475ae2af..bd6fc2c6 100644
      if (std.mem.startsWith(u8, path, "/responses/")) return true;
      for ([_][]const u8{ "/chat/completions", "/completions", "/decisions", "/models" }) |end| if (std.mem.endsWith(u8, path, end)) return true;
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 69cd0ded..d6072b09 100644
+index 69cd0ded..01816570 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
 @@ -11,6 +11,7 @@ const prompt_mod = @import("prompt.zig");
@@ -822,10 +826,16 @@ index 69cd0ded..d6072b09 100644
  };
  
  /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
-@@ -47,6 +58,32 @@ pub const Sink = struct {
- /// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill).
- const ping_after_ns: i96 = 25 * std.time.ns_per_s;
+@@ -44,8 +55,37 @@ pub const Sink = struct {
+     ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+ };
  
+-/// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill).
+-const ping_after_ns: i96 = 25 * std.time.ns_per_s;
++/// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill). A var
++/// only so that a test can shorten it.
++pub var ping_after_ns: i96 = 25 * std.time.ns_per_s;
++
 +/// The end of a token-only reply: what stopped it, and the id or text that did, as the token route reports it.
 +pub const TokenStop = union(enum) { eos, token: u32, text: []const u8 };
 +
@@ -837,6 +847,8 @@ index 69cd0ded..d6072b09 100644
 +    ready: ?*const fn (ctx: *anyopaque, cached: u32) error{Closed}!void = null,
 +    /// The logprobs of a round, right after that round's tokens.
 +    scored: ?*const fn (ctx: *anyopaque, logprobs: []const api.Logprob) error{Closed}!void = null,
++    /// A keep-alive while the reply is silent (a long cold prefill), as the text sinks have.
++    ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
 +};
 +
 +/// What ``generateTokens`` returns: the whole reply's ids and the stats the token route puts in its JSON.
@@ -851,11 +863,10 @@ index 69cd0ded..d6072b09 100644
 +    speculative: Value,
 +    scored: []const api.Logprob,
 +};
-+
+ 
  pub const Reply = struct {
      content: []const u8,
-     stop_sequence: ?[]const u8,
-@@ -63,6 +100,20 @@ pub const Reply = struct {
+@@ -63,6 +103,20 @@ pub const Reply = struct {
  
  pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
  
@@ -876,7 +887,7 @@ index 69cd0ded..d6072b09 100644
  /// Events the engine thread hands this request, read by the request's own thread.
  const Mailbox = struct {
      io: std.Io,
-@@ -71,8 +122,14 @@ const Mailbox = struct {
+@@ -71,8 +125,14 @@ const Mailbox = struct {
      cond: std.Io.Condition = .init,
      tokens: std.ArrayList(u32) = .empty,
      chunks: std.ArrayList(usize) = .empty, // where each round's tokens end
@@ -891,7 +902,7 @@ index 69cd0ded..d6072b09 100644
      finished: bool = false,
      reason: api.Reason = .stop,
      stats: api.Stats = .{},
-@@ -91,10 +148,56 @@ const Mailbox = struct {
+@@ -91,10 +151,56 @@ const Mailbox = struct {
                  m.prefilled_ns = std.Io.Clock.awake.now(m.io).toNanoseconds();
              },
              .tokens => |t| {
@@ -950,7 +961,7 @@ index 69cd0ded..d6072b09 100644
                  m.finished = true;
                  m.reason = f.reason;
                  m.stats = f.stats;
-@@ -110,6 +213,9 @@ const Mailbox = struct {
+@@ -110,6 +216,9 @@ const Mailbox = struct {
      fn deinit(m: *Mailbox) void {
          m.tokens.deinit(m.gpa);
          m.chunks.deinit(m.gpa);
@@ -960,7 +971,7 @@ index 69cd0ded..d6072b09 100644
          m.gpa.free(m.widths);
          m.gpa.free(m.raised);
          m.gpa.free(m.telemetry);
-@@ -138,6 +244,7 @@ pub const Prepared = struct {
+@@ -138,6 +247,7 @@ pub const Prepared = struct {
      sampled: bool, // a sampling config, which the reply labels "exact"; greedy otherwise
      drafts: bool,
      stops: fields_mod.Stops,
@@ -968,7 +979,7 @@ index 69cd0ded..d6072b09 100644
      preparing: bool,
  };
  
-@@ -156,14 +263,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -156,14 +266,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
      if (preparing) _ = srv.preparing.fetchAdd(1, .acq_rel);
      errdefer release(srv, preparing);
      if (gone.check()) return error.Cancelled;
@@ -986,7 +997,7 @@ index 69cd0ded..d6072b09 100644
      if (gone.check()) return error.Cancelled;
      if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
      const window: i64 = srv.info.context_window;
-@@ -174,14 +281,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -174,14 +284,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
          if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
          limit = @min(limit, room);
      }
@@ -1006,7 +1017,7 @@ index 69cd0ded..d6072b09 100644
      var request: api.Request = .{
          .prompt = rendered.ids,
          .images = rendered.images,
-@@ -189,13 +296,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -189,13 +299,14 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
          .cache_media = rendered.media,
          .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
          .sampling = sampling,
@@ -1024,7 +1035,7 @@ index 69cd0ded..d6072b09 100644
          .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
      };
      try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
-@@ -209,7 +317,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+@@ -209,7 +320,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
              request.think_end = srv.think_close_end;
          }
      }
@@ -1033,7 +1044,7 @@ index 69cd0ded..d6072b09 100644
  }
  
  /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
-@@ -260,6 +368,62 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+@@ -260,6 +371,63 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
      return result;
  }
  
@@ -1071,6 +1082,7 @@ index 69cd0ded..d6072b09 100644
 +    release(srv, preparing);
 +    preparing = false;
 +    var gen: Generation = .{
++        .last_out_ns = submitted,
 +        .srv = srv,
 +        .a = a,
 +        .box = &box,
@@ -1096,7 +1108,7 @@ index 69cd0ded..d6072b09 100644
  /// The ``ended`` line of a submitted reply that ends without one: its client left, or it failed.
  fn logEnded(id: []const u8, e: Failure, message: []const u8, prompt: usize, tokens: usize, after: f64) void {
      const why: ?[]const u8 = switch (e) {
-@@ -323,6 +487,9 @@ const Shown = struct {
+@@ -323,6 +491,9 @@ const Shown = struct {
  };
  
  /// The token loop and the text it streams.
@@ -1106,7 +1118,7 @@ index 69cd0ded..d6072b09 100644
  const Generation = struct {
      last_out_ns: i96 = 0, // the last byte a streaming sink heard; a ping goes out after ping_after_ns of silence
      srv: *Server,
-@@ -331,6 +498,16 @@ const Generation = struct {
+@@ -331,6 +502,16 @@ const Generation = struct {
      id: api.Id,
      reply_id: []const u8, // the id the client gets, which the done line prints
      sink: ?Sink,
@@ -1123,7 +1135,7 @@ index 69cd0ded..d6072b09 100644
      thinking: bool,
      stops: reply_text.Stops,
      ignore_eos: bool,
-@@ -338,6 +515,8 @@ const Generation = struct {
+@@ -338,6 +519,8 @@ const Generation = struct {
      tools: []const Value,
      calls: ?tool_stream.Streamer = null,
      collected: std.ArrayList(u32) = .empty,
@@ -1132,7 +1144,7 @@ index 69cd0ded..d6072b09 100644
      token_ids: bool = false, // the request asked for its ids back (Input.token_ids)
      visible: reply_text.Incremental = .{},
      hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
-@@ -347,6 +526,7 @@ const Generation = struct {
+@@ -347,6 +530,7 @@ const Generation = struct {
      first_ns: ?i96 = null,
      last_ns: ?i96 = null,
      reason: ?[]const u8 = null, // the server ended the reply (a stop string, the length) before the engine said so
@@ -1140,7 +1152,7 @@ index 69cd0ded..d6072b09 100644
      engine_done: bool = false,
      consumed: usize = 0,
      chunk_index: usize = 0,
-@@ -355,6 +535,10 @@ const Generation = struct {
+@@ -355,6 +539,10 @@ const Generation = struct {
          return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
      }
  
@@ -1151,7 +1163,7 @@ index 69cd0ded..d6072b09 100644
      /// What closes a call the model's end token left open (``tool_parse.closeCall``); nothing when a stop string, the length or ``ignore_eos`` ended the reply instead.
      fn closeCall(g: *const Generation, text: []const u8) Allocator.Error![]const u8 {
          const t = g.collected.items;
-@@ -364,16 +548,22 @@ const Generation = struct {
+@@ -364,16 +552,22 @@ const Generation = struct {
  
      /// The engine's stop check, here: the newest tokens' text holds a stop string.
      fn stopHit(g: *Generation) Allocator.Error!bool {
@@ -1178,7 +1190,7 @@ index 69cd0ded..d6072b09 100644
          var landed: usize = 0;
          for (chunk) |t| {
              if (g.reason != null) break;
-@@ -428,6 +618,92 @@ const Generation = struct {
+@@ -428,6 +622,92 @@ const Generation = struct {
          }
      }
  
@@ -1271,7 +1283,7 @@ index 69cd0ded..d6072b09 100644
      fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
          sink.call(sink.ctx, delta) catch {
              g.cancel();
-@@ -457,20 +733,47 @@ const Generation = struct {
+@@ -457,20 +737,47 @@ const Generation = struct {
          while (true) {
              m.mutex.lockUncancelable(m.io);
              var chunk: ?[]u32 = null;
@@ -1322,7 +1334,22 @@ index 69cd0ded..d6072b09 100644
                  return;
              }
              if (gone.check()) {
-@@ -490,54 +793,16 @@ const Generation = struct {
+@@ -478,10 +785,12 @@ const Generation = struct {
+                 return error.Cancelled;
+             }
+             const tokens = chunk orelse {
+-                if (g.sink) |sink| if (sink.ping) |ping| {
++                const ping_ctx: ?*anyopaque = if (g.sink) |sink| sink.ctx else if (g.token_sink) |ts| ts.ctx else null;
++                const ping_fn = if (g.sink) |sink| sink.ping else if (g.token_sink) |ts| ts.ping else null;
++                if (ping_ctx) |ctx| if (ping_fn) |ping| {
+                     const now = nowNs(g.srv.io);
+                     if (now - g.last_out_ns > ping_after_ns) {
+-                        ping(sink.ctx) catch {
++                        ping(ctx) catch {
+                             g.cancel();
+                             return error.Cancelled;
+                         };
+@@ -490,54 +799,16 @@ const Generation = struct {
                  };
                  continue;
              };
@@ -1380,7 +1407,7 @@ index 69cd0ded..d6072b09 100644
          const prefilled = m.prefilled_ns;
          const total = seconds(finished_ns - submitted);
          const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
-@@ -571,6 +836,13 @@ const Generation = struct {
+@@ -571,6 +842,13 @@ const Generation = struct {
              try loop_field.put(a, "period", try json.intValue(a, period));
              try runtime.put(a, "loop", .{ .object = loop_field });
          }
@@ -1394,7 +1421,7 @@ index 69cd0ded..d6072b09 100644
          const s = m.stats;
          const spec = try json.newObject(a);
          try spec.put(a, "rounds", try json.intValue(a, s.rounds));
-@@ -579,6 +851,53 @@ const Generation = struct {
+@@ -579,6 +857,53 @@ const Generation = struct {
          try spec.put(a, "acceptance_rate", .{ .float = if (s.drafted > 0) @as(f64, @floatFromInt(s.accepted)) / @as(f64, @floatFromInt(s.drafted)) else 0 });
          try spec.put(a, "tokens_per_round", .{ .float = if (s.rounds > 0) @as(f64, @floatFromInt(g.collected.items.len)) / @as(f64, @floatFromInt(s.rounds)) else 0 });
          if (m.telemetry.len > 0) if ((try json.parse(a, m.telemetry)) == .ok) try spec.put(a, "proposer", (try json.parse(a, m.telemetry)).ok);
@@ -1448,7 +1475,7 @@ index 69cd0ded..d6072b09 100644
          const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
          const reply: Reply = .{
              .content = content,
-@@ -590,16 +909,49 @@ const Generation = struct {
+@@ -590,16 +915,49 @@ const Generation = struct {
              .cached_tokens = m.cached orelse 0,
              .completion_tokens = g.collected.items.len,
              .reasoning_tokens = reply_text.reasoningCount(g.collected.items, think_end),
@@ -1502,7 +1529,7 @@ index 69cd0ded..d6072b09 100644
  };
  
  /// The request's stop strings as the engine checks them after each token: the newest tokens' text holds one.
-@@ -644,3 +996,163 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
+@@ -644,3 +1002,163 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
      @memcpy(&out, &hex);
      return out;
  }
@@ -1668,10 +1695,10 @@ index 69cd0ded..d6072b09 100644
 +}
 diff --git a/zig/src/server/generate.zig b/zig/src/server/generate.zig
 new file mode 100644
-index 00000000..b8167c08
+index 00000000..463761cb
 --- /dev/null
 +++ b/zig/src/server/generate.zig
-@@ -0,0 +1,619 @@
+@@ -0,0 +1,630 @@
 +//! POST /inference/v1/generate: vLLM's token-in/token-out route, behind TENSORFOLD_TOKEN_ROUTE.
 +const std = @import("std");
 +const api = @import("engine_api");
@@ -1974,7 +2001,11 @@ index 00000000..b8167c08
 +    sendValue(conn, a, e.status, .{ .object = wrapped });
 +}
 +
-+pub const NoGone = struct { pub fn check(_: *const @This()) bool { return false; } };
++pub const NoGone = struct {
++    pub fn check(_: *const @This()) bool {
++        return false;
++    }
++};
 +
 +fn sendValue(conn: *Conn, a: Allocator, code: u16, payload: Value) void {
 +    const body = json.stringify(a, payload, .{}) catch return;
@@ -2123,7 +2154,14 @@ index 00000000..b8167c08
 +    failed: bool = false,
 +
 +    fn sink(s: *Stream) chat.TokenSink {
-+        return .{ .ctx = s, .call = call, .ready = ready, .scored = scored };
++        return .{ .ctx = s, .call = call, .ready = ready, .scored = scored, .ping = ping };
++    }
++
++    /// An SSE comment, as the text routes send: a client or proxy sees bytes during a long cold prefill.
++    fn ping(ctx: *anyopaque) error{Closed}!void {
++        const s: *Stream = @ptrCast(@alignCast(ctx));
++        if (s.failed) return;
++        return sse.comment(s.conn, "ping");
 +    }
 +
 +    fn scored(ctx: *anyopaque, logprobs: []const api.Logprob) error{Closed}!void {
@@ -2293,10 +2331,10 @@ index 00000000..b8167c08
 +}
 diff --git a/zig/src/server/generate_test.zig b/zig/src/server/generate_test.zig
 new file mode 100644
-index 00000000..98985ef7
+index 00000000..c295474f
 --- /dev/null
 +++ b/zig/src/server/generate_test.zig
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,1045 @@
 +//! T007: the token route's validation table and one valid request.
 +const std = @import("std");
 +const api = @import("engine_api");
@@ -2423,6 +2461,8 @@ index 00000000..98985ef7
 +const SlowEngine = struct {
 +    rounds: []const []const u32 = &.{},
 +    delay_ms: i64 = 60,
++    /// Silence before the first round, as a cold prefill.
++    first_delay_ms: i64 = 0,
 +    thread: ?std.Thread = null,
 +
 +    const Args = struct { e: *SlowEngine, id: api.Id, logprobs: u8, sink: api.Sink };
@@ -2442,6 +2482,7 @@ index 00000000..98985ef7
 +
 +    fn run(args: Args) void {
 +        const sink = args.sink;
++        if (args.e.first_delay_ms > 0) std.Io.sleep(std.testing.io, .fromMilliseconds(args.e.first_delay_ms), .awake) catch {};
 +        sink.event(sink.ctx, args.id, &.{ .prefilled = 0 });
 +        for (args.e.rounds) |round| {
 +            sink.event(sink.ctx, args.id, &.{ .tokens = round });
@@ -2546,7 +2587,7 @@ index 00000000..98985ef7
 +
 +test "token route accepts a valid request and keeps its ids" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } } };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }} };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2577,7 +2618,11 @@ index 00000000..98985ef7
 +        .history_len = req.history_len,
 +        .images = req.images,
 +    };
-+    const gone: struct { pub fn check(_: *const @This()) bool { return false; } } = .{};
++    const gone: struct {
++        pub fn check(_: *const @This()) bool {
++            return false;
++        }
++    } = .{};
 +    const prepared = try chat.prepare(srv, &cx, input, gone);
 +    const reply = try chat.generateTokens(srv, &cx, prepared, null, gone);
 +    try std.testing.expectEqual(@as(usize, 2), reply.ids.len);
@@ -2610,7 +2655,7 @@ index 00000000..98985ef7
 +
 +test "whole token reply: EOS ends with stop and counts the EOS" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 104, 111, 108, 97, 32, 109, 117, 110, 100, 111, 1 } }, .cached = 7 };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 104, 111, 108, 97, 32, 109, 117, 110, 100, 111, 1 }}, .cached = 7 };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2629,7 +2674,7 @@ index 00000000..98985ef7
 +
 +test "whole token reply: a text stop reports its text and keeps its tokens" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 104, 111, 108, 97, 32, 109, 117, 110, 100, 111 } } };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 104, 111, 108, 97, 32, 109, 117, 110, 100, 111 }} };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2646,7 +2691,7 @@ index 00000000..98985ef7
 +
 +test "whole token reply: a stop token reports its id" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 42 } } };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 42 }} };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2663,7 +2708,7 @@ index 00000000..98985ef7
 +
 +test "whole token reply: ignore_eos keeps an EOS token and stops on the engine" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 1 } } };
++    var engine: FakeEngine = .{ .rounds = &.{&.{1}} };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2679,7 +2724,7 @@ index 00000000..98985ef7
 +
 +test "whole token reply: length stops at max_tokens" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11, 12, 13 } }, .reason = .length };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11, 12, 13 }}, .reason = .length };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2770,7 +2815,7 @@ index 00000000..98985ef7
 +
 +test "streaming token reply: a mid-reply engine failure is an error event and [DONE]" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } }, .reason = .failed };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }}, .reason = .failed };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2823,6 +2868,39 @@ index 00000000..98985ef7
 +        rounds += 1;
 +    }
 +    try std.testing.expectEqual(@as(usize, 2), rounds);
++}
++
++fn streamWithSilence(a: std.mem.Allocator, ping_after_ms: i64) ![]const u8 {
++    const saved = chat.ping_after_ns;
++    defer chat.ping_after_ns = saved;
++    chat.ping_after_ns = ping_after_ms * std.time.ns_per_ms;
++    var text: TestText = .{};
++    var engine: SlowEngine = .{ .rounds = &.{&.{ 10, 1 }}, .delay_ms = 0, .first_delay_ms = 400 };
++    defer engine.deinit();
++    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    const gone: NoGone = .{};
++    return callStream(srv, a, "{\"token_ids\":[1],\"sampling_params\":{\"max_tokens\":100},\"stream\":true}", gone);
++}
++
++test "streaming token reply: a silent prefill gets pings, as the text routes do" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    // 400 ms of silence against a 50 ms threshold: pings before the first round, and the reply still ends.
++    const out = try streamWithSilence(arena.allocator(), 50);
++    const ping = std.mem.indexOf(u8, out, ": ping\n\n") orelse return error.NoPing;
++    const round = std.mem.indexOf(u8, out, "\"token_ids\": [10") orelse return error.NoRound;
++    try std.testing.expect(ping < round);
++    try std.testing.expect(std.mem.indexOf(u8, out, "data: [DONE]") != null);
++    // Control: under the default threshold the same silence sends none.
++    const quiet = try streamWithSilence(arena.allocator(), 25_000);
++    try std.testing.expect(std.mem.indexOf(u8, quiet, ": ping") == null);
++    try std.testing.expect(std.mem.indexOf(u8, quiet, "data: [DONE]") != null);
 +}
 +
 +test "streaming token reply: a gone client cancels once and sends no more tokens" {
@@ -2954,7 +3032,7 @@ index 00000000..98985ef7
 +
 +test "token route prompt_token_ids are the expanded prompt, not the generated ids" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } } };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }} };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2972,7 +3050,7 @@ index 00000000..98985ef7
 +
 +test "token route streaming prompt_token_ids expand image markers" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } } };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }} };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -2989,7 +3067,7 @@ index 00000000..98985ef7
 +
 +test "token route metrics count ok, refused, failed and cancelled" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } } };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }} };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -3005,7 +3083,7 @@ index 00000000..98985ef7
 +    try std.testing.expectEqual(@as(u64, 1), srv.metrics.tokenRouteCount("ok"));
 +    try std.testing.expectEqual(@as(u64, 1), srv.metrics.tokenRouteCount("refused"));
 +
-+    var engine2: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } }, .reason = .failed };
++    var engine2: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }}, .reason = .failed };
 +    var srv2 = try Server.init(std.testing.allocator, std.testing.io, engine2.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -3120,7 +3198,7 @@ index 00000000..98985ef7
 +
 +test "token route images expand and usage counts the expanded prompt" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } } };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }} };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -3175,7 +3253,7 @@ index 00000000..98985ef7
 +
 +test "token route reports logprobs from the engine's scored event" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } }, .logprobs = true };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }}, .logprobs = true };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -3193,7 +3271,7 @@ index 00000000..98985ef7
 +
 +test "token route passes logprobs to the engine; the fake scores only when asked" {
 +    var text: TestText = .{};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } }, .logprobs = true };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }}, .logprobs = true };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},
@@ -3215,7 +3293,7 @@ index 00000000..98985ef7
 +test "token route keeps every top_logprob after the fake trashes its buffer" {
 +    var text: TestText = .{};
 +    const top = [_]api.TopLogprob{.{ .id = 42, .logprob = -0.5, .rank = 1 }};
-+    var engine: FakeEngine = .{ .rounds = &.{ &.{ 10, 11 } }, .logprobs = true, .top = &top };
++    var engine: FakeEngine = .{ .rounds = &.{&.{ 10, 11 }}, .logprobs = true, .top = &top };
 +    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
 +        .served_name = "test-model",
 +        .model_ids = &.{"test-model"},

@@ -133,7 +133,7 @@ gateway_hash() {
 }
 GATEWAY_IMAGE="${GATEWAY_IMAGE:-ds41-gateway:$(gateway_hash)}"
 # Measured peaks (release binary, 1M-token context, one encode at a time): 57 MiB idle; three admitted requests each with
-# an 8 MiB prompt and 55 MiB of images at once 1,722 MiB. 3g holds the three; each further admitted request adds ~200 MiB.
+# an 8 MiB prompt and 55 MiB of images at once 1,701 MiB. 3g holds the three; each further admitted request adds ~200 MiB.
 GATEWAY_MEMORY="${GATEWAY_MEMORY:-3g}"
 GATEWAY_CPUS="${GATEWAY_CPUS:-2}"
 GATEWAY_MAX_CONCURRENT="${GATEWAY_MAX_CONCURRENT:-3}"  # excess requests queue; permits cover response bodies/SSE too
@@ -141,6 +141,7 @@ GATEWAY_MAX_CONNECTIONS="${GATEWAY_MAX_CONNECTIONS:-256}"  # open client connect
 GATEWAY_MAX_CONNECTIONS_PER_PEER="${GATEWAY_MAX_CONNECTIONS_PER_PEER:-32}"  # from one address; more are closed at once
 GATEWAY_HEADER_TIMEOUT="${GATEWAY_HEADER_TIMEOUT:-30}" # seconds to send a request header, also between keep-alive requests
 GATEWAY_BODY_TIMEOUT="${GATEWAY_BODY_TIMEOUT:-60}"     # seconds an admitted request may take to send its body (then 408)
+GATEWAY_WRITE_TIMEOUT="${GATEWAY_WRITE_TIMEOUT:-60}"   # seconds a reply may wait on a client that stopped reading (then closed)
 GATEWAY_MAX_PROMPT_MB="${GATEWAY_MAX_PROMPT_MB:-8}"    # largest rendered prompt encoded (MiB); larger is a 400, not encoded
 GATEWAY_STRICT="${GATEWAY_STRICT:-0}"     # 1: the API's 400 instead of falling back to the engine
 GATEWAY_BLOCK_PRIVATE_URLS="${GATEWAY_BLOCK_PRIVATE_URLS:-1}"  # 1: reject private image destinations

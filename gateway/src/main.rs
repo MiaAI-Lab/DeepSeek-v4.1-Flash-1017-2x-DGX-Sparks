@@ -59,10 +59,10 @@ struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     api_sampling: Option<bool>,
     /// Maximum images per request.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_positive_usize)]
     max_images: Option<usize>,
     /// Maximum total image megabytes per request.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_positive_usize)]
     max_image_mb: Option<usize>,
     /// Require a valid `Authorization: Bearer` or `x-api-key` credential.
     #[arg(long)]
@@ -85,6 +85,9 @@ struct Cli {
     /// Seconds an admitted request may take to send its body (default: 60).
     #[arg(long, value_parser = parse_positive_usize)]
     body_timeout: Option<usize>,
+    /// Seconds a connection's writes may stay blocked (a client not reading its reply) before it is closed (default: 60).
+    #[arg(long, value_parser = parse_positive_usize)]
+    write_timeout: Option<usize>,
     /// Largest rendered prompt the gateway encodes, in MiB; a larger one is a 400 (default: 8).
     #[arg(long, value_parser = parse_positive_usize)]
     max_prompt_mb: Option<usize>,
@@ -104,9 +107,14 @@ const DEFAULT_MAX_CONNECTIONS_PER_PEER: usize = 32;
 const DEFAULT_HEADER_TIMEOUT_SECS: usize = 30;
 // A 64 MiB body at about 1 MiB/s; a slower client gives its admission slot back.
 const DEFAULT_BODY_TIMEOUT_SECS: usize = 60;
+// A client that has not taken a byte of its reply for this long is gone or stalling; its permit goes back.
+const DEFAULT_WRITE_TIMEOUT_SECS: usize = 60;
+const DEFAULT_MAX_IMAGES: usize = 600;
+const DEFAULT_MAX_IMAGE_MB: usize = 64;
 // Admitted requests. Measured peaks of the release binary at a 1M-token context, one encode at a time (three runs
-// each, the highest): 57 MiB idle; one request with an 8 MiB prompt and 55 MiB of images 1,294 MiB; three of them at
-// once 1,722 MiB, under the recipe's 3 GiB container cap (GATEWAY_MEMORY=3g in scripts/config.sh). Each further
+// each, the highest): 57 MiB idle; one request with an 8 MiB prompt and 55 MiB of images 1,247 MiB; three of them at
+// once 1,701 MiB, under the recipe's 3 GiB container cap (GATEWAY_MEMORY=3g in scripts/config.sh). At one token a byte
+// the token count keeps three with images at 1,587 MiB (4,011 MiB without it). Each further
 // admitted request adds about 200 MiB (its body, JSON and images); the encode itself is not repeated.
 const DEFAULT_MAX_CONCURRENT: usize = 3;
 
@@ -139,13 +147,9 @@ fn api_key_setting(value: Result<String, std::env::VarError>) -> Result<bool, St
     match value {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Err(std::env::VarError::NotUnicode(_)) => Err("API_KEY is not valid text".to_string()),
-        Ok(value) => match value.as_str() {
-            "1" | "true" | "TRUE" | "yes" => Ok(true),
-            "0" | "false" | "FALSE" | "no" => Ok(false),
-            _ => Err(format!(
-                "API_KEY is 1 or 0 (true/false, yes/no), not {value:?}"
-            )),
-        },
+        Ok(value) => parse_bool(&value).ok_or_else(|| {
+            format!("API_KEY is 1 or 0 (true/false, yes/no, any case), not {value:?}")
+        }),
     }
 }
 
@@ -153,12 +157,17 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    env(name).and_then(|value| match value.as_str() {
-        "1" | "true" | "TRUE" | "yes" => Some(true),
-        "0" | "false" | "FALSE" | "no" => Some(false),
+/// 1/0, true/false or yes/no, in any case.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
         _ => None,
-    })
+    }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env(name).and_then(|value| parse_bool(&value))
 }
 
 #[tokio::main]
@@ -194,14 +203,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .api_sampling
         .or_else(|| env_bool("GATEWAY_API_SAMPLING"))
         .unwrap_or(true);
-    let max_images = cli
-        .max_images
-        .or_else(|| env("GATEWAY_MAX_IMAGES").and_then(|value| value.parse().ok()))
-        .unwrap_or(600);
-    let max_image_mb = cli
-        .max_image_mb
-        .or_else(|| env("GATEWAY_MAX_IMAGE_MB").and_then(|value| value.parse().ok()))
-        .unwrap_or(64);
+    let max_images = positive_setting(cli.max_images, "GATEWAY_MAX_IMAGES", DEFAULT_MAX_IMAGES)?;
+    let max_image_mb = positive_setting(
+        cli.max_image_mb,
+        "GATEWAY_MAX_IMAGE_MB",
+        DEFAULT_MAX_IMAGE_MB,
+    )?;
     let require_key = cli.require_key || api_key_setting(std::env::var("API_KEY"))?;
     let api_key_file = cli
         .api_key_file
@@ -233,6 +240,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cli.body_timeout,
         "GATEWAY_BODY_TIMEOUT",
         DEFAULT_BODY_TIMEOUT_SECS,
+    )?;
+    let write_timeout = positive_setting(
+        cli.write_timeout,
+        "GATEWAY_WRITE_TIMEOUT",
+        DEFAULT_WRITE_TIMEOUT_SECS,
     )?;
     let max_prompt_mb = positive_setting(
         cli.max_prompt_mb,
@@ -292,13 +304,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     eprintln!(
         "ds41-gateway listening on {listen} (engine {}, model {served_name}, max_model_len {max_model_len}, \
          {max_concurrent} admitted requests, {max_connections} connections ({max_connections_per_peer} a peer), \
-         header timeout {header_timeout} s, body timeout {body_timeout} s, prompts up to {max_prompt_mb} MiB)",
+         header timeout {header_timeout} s, body timeout {body_timeout} s, write timeout {write_timeout} s, prompts up to {max_prompt_mb} MiB)",
         state.engine.base()
     );
     listener::serve(
         listener,
         health::router(state),
         Duration::from_secs(header_timeout as u64),
+        Duration::from_secs(write_timeout as u64),
     )
     .await?;
     Ok(())
@@ -306,9 +319,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// A positive count from the command line, else from `name` in the environment, else `default`.
 fn positive_setting(cli: Option<usize>, name: &str, default: usize) -> Result<usize, String> {
+    count_setting(cli, name, env(name), default)
+}
+
+/// [`positive_setting`] with the variable's value given: an invalid one is an error, never the default.
+fn count_setting(
+    cli: Option<usize>,
+    name: &str,
+    value: Option<String>,
+    default: usize,
+) -> Result<usize, String> {
     match cli {
         Some(value) => Ok(value),
-        None => env(name)
+        None => value
             .map(|value| parse_positive_usize(&value).map_err(|error| format!("{name}: {error}")))
             .transpose()
             .map(|value| value.unwrap_or(default)),
@@ -381,8 +404,8 @@ async fn auto_max_model_len(engine: &EngineClient) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, api_key_setting, load_api_keys,
-        parse_positive_usize,
+        DEFAULT_IMAGE_TOKEN, DEFAULT_MAX_CONCURRENT, api_key_setting, count_setting, load_api_keys,
+        parse_bool, parse_positive_usize,
     };
 
     #[test]
@@ -392,7 +415,16 @@ mod tests {
         assert_eq!(api_key_setting(Ok("1".into())), Ok(true));
         assert_eq!(api_key_setting(Ok("yes".into())), Ok(true));
         assert_eq!(api_key_setting(Ok("0".into())), Ok(false));
-        for bad in ["", "enabled", "True", "2"] {
+        for (spelling, on) in [
+            ("YES", true),
+            ("True", true),
+            ("No", false),
+            ("FALSE", false),
+        ] {
+            assert_eq!(api_key_setting(Ok(spelling.into())), Ok(on), "{spelling:?}");
+            assert_eq!(parse_bool(spelling), Some(on), "{spelling:?}");
+        }
+        for bad in ["", "enabled", "on", "2"] {
             assert!(api_key_setting(Ok(bad.into())).is_err(), "{bad:?}");
         }
         let not_text = std::ffi::OsString::from("x");
@@ -429,5 +461,27 @@ mod tests {
         assert_eq!(parse_positive_usize("4"), Ok(4));
         assert!(parse_positive_usize("0").is_err());
         assert!(parse_positive_usize("not-a-number").is_err());
+    }
+
+    #[test]
+    fn a_count_setting_that_is_not_a_positive_integer_stops_startup() {
+        // The command line wins; without it the default stands only when the variable is unset.
+        let set = |value: &str| Some(value.to_string());
+        assert_eq!(
+            count_setting(Some(5), "GATEWAY_MAX_IMAGES", set("9"), 600),
+            Ok(5)
+        );
+        assert_eq!(
+            count_setting(None, "GATEWAY_MAX_IMAGES", None, 600),
+            Ok(600)
+        );
+        assert_eq!(
+            count_setting(None, "GATEWAY_MAX_IMAGES", set("9"), 600),
+            Ok(9)
+        );
+        for bad in ["64g", "600foo", "0", "-1"] {
+            let error = count_setting(None, "GATEWAY_MAX_IMAGE_MB", set(bad), 64).expect_err(bad);
+            assert!(error.starts_with("GATEWAY_MAX_IMAGE_MB:"), "{error}");
+        }
     }
 }

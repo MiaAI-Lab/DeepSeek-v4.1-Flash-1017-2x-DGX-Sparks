@@ -82,13 +82,15 @@ done
 [[ -z "${TF_DS_API_EFFORTS:-}" || "$TF_DS_API_EFFORTS" =~ ^[01]$ ]] || die "TF_DS_API_EFFORTS is empty, 0 or 1, not $TF_DS_API_EFFORTS"
 [[ "$ENGINE_PORT" =~ ^[1-9][0-9]*$ ]] && (( ENGINE_PORT <= 65535 )) || die "ENGINE_PORT is 1 to 65535, not $ENGINE_PORT"
 [[ "$API_GATEWAY" != 1 || "$ENGINE_PORT" != "$PORT" ]] || die "ENGINE_PORT and PORT are both $PORT: the engine and the gateway need different ports"
-[[ "$GATEWAY_MEMORY" =~ ^[0-9]+([.][0-9]+)?[mMgG]$ ]] || die "GATEWAY_MEMORY is a size with an m or g suffix (512m, 1g), not $GATEWAY_MEMORY"
+[[ "$GATEWAY_MEMORY" =~ ^([0-9]+([.][0-9]+)?)[mMgG]$ ]] && awk -v m="${BASH_REMATCH[1]}" 'BEGIN { exit !(m > 0) }' ||
+  die "GATEWAY_MEMORY is a size over zero with an m or g suffix (512m, 1g), not $GATEWAY_MEMORY"
 [[ "$GATEWAY_CPUS" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v c="$GATEWAY_CPUS" 'BEGIN { exit !(c > 0) }' || die "GATEWAY_CPUS is a positive number, not $GATEWAY_CPUS"
 [[ "$GATEWAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONCURRENT is a positive count, not $GATEWAY_MAX_CONCURRENT"
 [[ "$GATEWAY_MAX_CONNECTIONS" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONNECTIONS is a positive count, not $GATEWAY_MAX_CONNECTIONS"
 [[ "$GATEWAY_BODY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_BODY_TIMEOUT is a positive number of seconds, not $GATEWAY_BODY_TIMEOUT"
 [[ "$GATEWAY_MAX_CONNECTIONS_PER_PEER" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_CONNECTIONS_PER_PEER is a positive count, not $GATEWAY_MAX_CONNECTIONS_PER_PEER"
 [[ "$GATEWAY_HEADER_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_HEADER_TIMEOUT is a positive number of seconds, not $GATEWAY_HEADER_TIMEOUT"
+[[ "$GATEWAY_WRITE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_WRITE_TIMEOUT is a positive number of seconds, not $GATEWAY_WRITE_TIMEOUT"
 [[ "$GATEWAY_MAX_PROMPT_MB" =~ ^[1-9][0-9]*$ ]] || die "GATEWAY_MAX_PROMPT_MB is a positive count, not $GATEWAY_MAX_PROMPT_MB"
 # With a key the gateway runs as the key's owner (below), so that owner may not be root: the network-facing process
 # would then run as root. Run start.sh as the non-root user who owns API_KEY_FILE.
@@ -335,7 +337,7 @@ GATEWAY_ARGS=(--listen "$GATEWAY_LISTEN" --engine "http://127.0.0.1:$ENGINE_PORT
               --max-images "$GATEWAY_MAX_IMAGES" --max-image-mb "$GATEWAY_MAX_IMAGE_MB"
               --max-concurrent "$GATEWAY_MAX_CONCURRENT" --max-connections "$GATEWAY_MAX_CONNECTIONS"
               --max-connections-per-peer "$GATEWAY_MAX_CONNECTIONS_PER_PEER" --header-timeout "$GATEWAY_HEADER_TIMEOUT"
-              --body-timeout "$GATEWAY_BODY_TIMEOUT" --max-prompt-mb "$GATEWAY_MAX_PROMPT_MB" --log "$GATEWAY_LOG")
+              --body-timeout "$GATEWAY_BODY_TIMEOUT" --write-timeout "$GATEWAY_WRITE_TIMEOUT" --max-prompt-mb "$GATEWAY_MAX_PROMPT_MB" --log "$GATEWAY_LOG")
 if [[ "$THINKING" == 1 ]]; then GATEWAY_ARGS+=(--default-thinking); else GATEWAY_ARGS+=(--default-thinking=false); fi
 [[ -z "$REASONING_EFFORT" ]] || GATEWAY_ARGS+=(--default-effort "$REASONING_EFFORT")
 [[ "$GATEWAY_STRICT" != 1 ]] || GATEWAY_ARGS+=(--strict)

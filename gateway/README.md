@@ -67,6 +67,7 @@ The defaults are in `scripts/config.sh`; the flags are in `src/main.rs`. The imp
 | `GATEWAY_MAX_CONNECTIONS_PER_PEER` | `--max-connections-per-peer` | 32 |
 | `GATEWAY_HEADER_TIMEOUT` | `--header-timeout` (seconds) | 30 |
 | `GATEWAY_BODY_TIMEOUT` | `--body-timeout` (seconds) | 60 |
+| `GATEWAY_WRITE_TIMEOUT` | `--write-timeout` (seconds) | 60 |
 | `GATEWAY_MAX_PROMPT_MB` | `--max-prompt-mb` | 8 |
 | `API_KEY` | `--require-key` | 0 |
 

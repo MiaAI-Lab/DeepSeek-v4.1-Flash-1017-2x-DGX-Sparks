@@ -7,9 +7,13 @@
 //! waits in the kernel's accept queue (or, over its own address's cap, is closed).
 //! [`serve`] gives every connection a deadline for the request header: a client that
 //! connects and sends nothing, sends its header slowly, or keeps an idle keep-alive
-//! connection past the deadline is closed, and its slot goes back.
+//! connection past the deadline is closed, and its slot goes back. A connection whose
+//! writes make no progress for the write deadline (a client that stopped reading a
+//! streamed reply, so the kernel's send buffer stays full) is closed too: the response
+//! body is dropped with it, and so is the admission permit it held.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -24,6 +28,7 @@ use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Sleep;
 
 /// A `TcpListener` that keeps at most `max` accepted connections open, and at most
 /// `per_peer` from one IP address.
@@ -66,19 +71,28 @@ impl LimitedListener {
                 .expect("the connection semaphore is never closed");
             let (stream, address) = axum::serve::Listener::accept(&mut self.inner).await;
             let peer = address.ip().to_canonical();
-            {
+            let admitted = {
                 let mut peers = self.peers.lock().expect("peer table poisoned");
                 let open = peers.entry(peer).or_insert(0);
-                if *open >= self.per_peer {
-                    // Over this address's cap: close it at once and give the slot back.
-                    drop(stream);
-                    drop(slot);
-                    continue;
+                let admitted = *open < self.per_peer;
+                if admitted {
+                    *open += 1;
                 }
-                *open += 1;
+                admitted
+            };
+            if !admitted {
+                // Over this address's cap: close it at once and give the slot back, then let
+                // other tasks run, so a queue full of one address's connections cannot keep
+                // this loop busy.
+                drop(stream);
+                drop(slot);
+                tokio::task::yield_now().await;
+                continue;
             }
             let stream = LimitedStream {
                 inner: stream,
+                write_timeout: None,
+                stalled: None,
                 _slot: slot,
                 _peer: PeerSlot {
                     peer,
@@ -115,8 +129,45 @@ pin_project! {
     pub struct LimitedStream {
         #[pin]
         inner: TcpStream,
+        // How long a write may stay blocked before the connection is given up; `None` waits.
+        write_timeout: Option<Duration>,
+        // Running while a write is blocked; cleared by any write that goes through.
+        stalled: Option<Pin<Box<Sleep>>>,
         _slot: OwnedSemaphorePermit,
         _peer: PeerSlot,
+    }
+}
+
+/// Pass a write's result through, or fail it once writes have been blocked for `limit`.
+///
+/// A blocked write (`Pending`) starts the clock and arms its timer, so the task is woken
+/// at the deadline even if the socket never becomes writable; a write that goes through
+/// stops it. The error ends hyper's connection, which drops the response body and with it
+/// the admission permit.
+fn within_write_deadline<T>(
+    stalled: &mut Option<Pin<Box<Sleep>>>,
+    limit: Option<Duration>,
+    context: &mut Context<'_>,
+    poll: Poll<io::Result<T>>,
+) -> Poll<io::Result<T>> {
+    match poll {
+        Poll::Ready(result) => {
+            *stalled = None;
+            Poll::Ready(result)
+        }
+        Poll::Pending => {
+            let Some(limit) = limit else {
+                return Poll::Pending;
+            };
+            let timer = stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+            match timer.as_mut().poll(context) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the client has not read the reply for the write timeout",
+                ))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
     }
 }
 
@@ -136,7 +187,9 @@ impl AsyncWrite for LimitedStream {
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.project().inner.poll_write(context, buffer)
+        let this = self.project();
+        let poll = this.inner.poll_write(context, buffer);
+        within_write_deadline(this.stalled, *this.write_timeout, context, poll)
     }
 
     fn poll_write_vectored(
@@ -144,7 +197,9 @@ impl AsyncWrite for LimitedStream {
         context: &mut Context<'_>,
         buffers: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.project().inner.poll_write_vectored(context, buffers)
+        let this = self.project();
+        let poll = this.inner.poll_write_vectored(context, buffers);
+        within_write_deadline(this.stalled, *this.write_timeout, context, poll)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -164,14 +219,17 @@ impl AsyncWrite for LimitedStream {
 ///
 /// Each connection gets `header_timeout` to send a complete request header, counted
 /// from the moment it waits for one: on a new connection and between keep-alive
-/// requests. A response that is still streaming (SSE) is not cut by it.
+/// requests. A response that is still streaming (SSE) is not cut by it. A connection
+/// whose writes stay blocked for `write_timeout` (the client stopped reading) is closed.
 pub async fn serve(
     mut listener: LimitedListener,
     router: Router,
     header_timeout: Duration,
+    write_timeout: Duration,
 ) -> io::Result<()> {
     loop {
-        let (stream, _) = listener.accept().await;
+        let (mut stream, _) = listener.accept().await;
+        stream.write_timeout = Some(write_timeout);
         let _ = stream.inner.set_nodelay(true);
         let service = TowerToHyperService::new(router.clone());
         tokio::spawn(async move {

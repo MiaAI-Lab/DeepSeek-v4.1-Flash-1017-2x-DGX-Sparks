@@ -182,7 +182,7 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         self.assertEqual(gateway_tokens[gateway_tokens.index("--image-token") + 1], "<\uff5cdeepseek_image\uff5c>")
         self.assertIn(
             "--max-model-len 1048576 --max-images 600 --max-image-mb 64 --max-concurrent 3 --max-connections 256 "
-            "--max-connections-per-peer 32 --header-timeout 30 --body-timeout 60 --max-prompt-mb 8 --log debug "
+            "--max-connections-per-peer 32 --header-timeout 30 --body-timeout 60 --write-timeout 60 --max-prompt-mb 8 --log debug "
             "--default-thinking --strict --block-private-urls=false --api-sampling=false --require-key",
             out,
         )
@@ -290,6 +290,8 @@ class ApiGatewaySettingsTest(unittest.TestCase):
             ({"ENGINE_PORT": 8888}, "ENGINE_PORT and PORT are both 8888"),
             ({"GATEWAY_MEMORY": "512"}, "GATEWAY_MEMORY is a size"),
             ({"GATEWAY_MEMORY": "1.5x"}, "GATEWAY_MEMORY is a size"),
+            ({"GATEWAY_MEMORY": "0m"}, "GATEWAY_MEMORY is a size over zero"),
+            ({"GATEWAY_MEMORY": "0.0g"}, "GATEWAY_MEMORY is a size over zero"),
             ({"GATEWAY_CPUS": 0}, "GATEWAY_CPUS is a positive number"),
             ({"GATEWAY_LOG": "verbose"}, "GATEWAY_LOG is debug, info, warn or error"),
             ({"GATEWAY_IMAGE_TOKEN": ""}, "GATEWAY_IMAGE_TOKEN is empty"),
@@ -299,6 +301,7 @@ class ApiGatewaySettingsTest(unittest.TestCase):
             ({"GATEWAY_BODY_TIMEOUT": "1.5"}, "GATEWAY_BODY_TIMEOUT is a positive number of seconds"),
             ({"GATEWAY_MAX_CONNECTIONS_PER_PEER": 0}, "GATEWAY_MAX_CONNECTIONS_PER_PEER is a positive count"),
             ({"GATEWAY_HEADER_TIMEOUT": "x"}, "GATEWAY_HEADER_TIMEOUT is a positive number of seconds"),
+            ({"GATEWAY_WRITE_TIMEOUT": 0}, "GATEWAY_WRITE_TIMEOUT is a positive number of seconds"),
             ({"GATEWAY_MAX_PROMPT_MB": 0}, "GATEWAY_MAX_PROMPT_MB is a positive count"),
         ]
         for extra, message in cases:

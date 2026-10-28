@@ -35,22 +35,37 @@ API open, as the native recipe does by default.
 `GATEWAY_MAX_CONCURRENT` (default 3) admits that many requests and queues the rest instead of rejecting them at the cap.
 A permit covers the whole response body, including an SSE stream, and is released on completion or client cancellation.
 The default comes from measured peaks of the release binary at the recipe's 1M-token context (three runs each, fresh
-process; median and range). Encoding a prompt takes up to about 120 bytes of memory per byte of prompt, whatever its token count, so a rendered prompt over `GATEWAY_MAX_PROMPT_MB` (8 MiB; a million tokens of ordinary text is about 4 MiB) is a 400 before it is encoded, and one request encodes at a time; image fetches run outside that slot.
+process; median and range). Encoding a prompt keeps memory for every byte of it and more for every token: about 120
+bytes a byte for ordinary text, and up to about 360 at one token a byte (digits and punctuation such as `1,1,1`), the
+most there can be. So one request encodes at a time (image fetches run outside that slot), and two checks come first.
+A rendered prompt over `GATEWAY_MAX_PROMPT_MB` (8 MiB; a million tokens of ordinary English is about 7 MiB) is a 400.
+A prompt over 1 MiB is then counted a piece at a time, with the encoder's own tokenizer, in pieces of up to 256 KiB cut
+where the tokenizer itself splits (after a newline, at the end of a run of digits, before the space after a letter), so
+that the count is exact there; a cut elsewhere is allowed 64 tokens. A prompt counted at more than twice the context is
+a 400 without the encode; up to that it is encoded whole, and an overflow gets the API's exact context 400 with its
+exact count.
 
 | admitted requests | peak (idle: 57 MiB) |
 | --- | --- |
-| one 188,000-token prompt (0.7 MiB) | 206 MiB (206-206) |
-| one 8 MiB prompt of ordinary text | 1,025 MiB (986-1,026) |
-| one 64 MiB body of images | 529 MiB (529-536) |
-| one 8 MiB prompt and 55 MiB of images | 1,294 MiB (1,232-1,294) |
-| three 8 MiB prompts at once | 1,079 MiB (1,063-1,127) |
-| three 64 MiB image bodies at once | 949 MiB (939-977) |
-| three 8 MiB prompts with 55 MiB of images each, at once | 1,692 MiB (1,685-1,722) |
+| one 188,000-token prompt (0.7 MiB) | 206 MiB (205-207) |
+| one 8 MiB prompt of ordinary text | 993 MiB (990-1,030) |
+| one 64 MiB body of images | 536 MiB (536-536) |
+| one 8 MiB prompt and 55 MiB of images | 1,247 MiB (1,231-1,247) |
+| three 8 MiB prompts at once | 1,091 MiB (1,078-1,098) |
+| three 64 MiB image bodies at once | 1,015 MiB (920-1,021) |
+| three 8 MiB prompts with 55 MiB of images each, at once | 1,670 MiB (1,625-1,701) |
+| one 2 MiB prompt at one token a byte, 2.08 million tokens (the most the count admits) | 808 MiB (806-808) |
+| three of those with 55 MiB of images each, at once | 1,586 MiB (1,566-1,587) |
+| one 8 MiB prompt at one token a byte, 8.2 million tokens, refused by the count | 249 MiB (237-252) |
+| three of those with 55 MiB of images each, at once | 882 MiB (856-908) |
 | a 64 MiB body of text, refused by the prompt limit before encoding | 441 MiB (441-441) |
 
-Three at once stay under the `3g` container default with room to spare. Without the single encode slot the last case
-took 3,574 MiB (3,505-3,600), and before the prompt limit a 64 MiB body of text was encoded whole: 6,537 MiB and 26 s
-only to be refused for its length. Each further admitted request adds about 200 MiB (its body, JSON and images).
+Three at once stay under the `3g` container default with room to spare. Without the token count, the 8 MiB prompt at
+one token a byte took 2,926 MiB (2,918-2,935) alone and 3,991 MiB (3,980-4,011) three at once with images, over the
+cap. Without the single encode slot the three ordinary prompts with images took 3,574 MiB (3,505-3,600), and before the
+prompt limit a 64 MiB body of text was encoded whole: 6,537 MiB and 26 s only to be refused for its length. Each
+further admitted request adds about 200 MiB (its body, JSON and images). The count costs time only for a prompt over
+1 MiB: the 2 MiB prompt above takes 6.8 s to count and encode, the refused 8 MiB one 3.6 s.
 
 The body of an admitted request is read by the same middleware, within `GATEWAY_BODY_TIMEOUT` (60 s): a client that has
 not sent its whole body by then gets a 408 and its permit goes back. A `content-length` over 64 MiB is a 413 before
@@ -62,7 +77,9 @@ one pass over its bytes, object keys included) is a 400 before it is parsed: a p
 and hold far fewer values. The parsed body is not cloned on the way to the encoder. Connections: `GATEWAY_MAX_CONNECTIONS` (256) open at most,
 `GATEWAY_MAX_CONNECTIONS_PER_PEER` (32) from one address (more are closed at once, so one client cannot take every
 slot; behind a reverse proxy every client has the proxy's address, so raise it to `GATEWAY_MAX_CONNECTIONS` there), and `GATEWAY_HEADER_TIMEOUT` (30 s) for a request header, on a new connection and between keep-alive requests, so
-a silent, slow or idle connection gives its slot back. The gateway speaks HTTP/1.1.
+a silent, slow or idle connection gives its slot back. A reply that has not moved for `GATEWAY_WRITE_TIMEOUT` (60 s)
+because the client stopped reading it (the kernel's buffers are full) closes its connection, and the response's permit
+goes back with it. The gateway speaks HTTP/1.1.
 
 ## Fallback and strict mode
 

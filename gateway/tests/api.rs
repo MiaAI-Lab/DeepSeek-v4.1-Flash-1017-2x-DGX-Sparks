@@ -762,6 +762,53 @@ async fn a_prompt_over_the_byte_limit_is_refused_before_it_is_encoded() {
 }
 
 #[tokio::test]
+async fn a_prompt_of_more_than_twice_the_context_is_refused_before_it_is_encoded() {
+    let config = GatewayConfig {
+        max_model_len: 100_000,
+        strict: true,
+        ..GatewayConfig::default()
+    };
+    let request = |content: String| {
+        json!({
+            "model": "DeepSeek-V4.1-Flash-1017",
+            "messages": [{"role": "user", "content": content}]
+        })
+    };
+    let (engine, mock) = spawn_mock(vec![usage(1, 0)], Duration::ZERO, true).await;
+    let url = spawn_gateway_config(&engine, gateway(), config).await;
+    // 1.5 MiB at one token a byte, fifteen times the context: refused on the count, with
+    // the gateway's own context 400; the encoder never takes the 1.5 million tokens.
+    let response = post_json(
+        &format!("{url}/v1/chat/completions"),
+        request("1,".repeat(786_432)),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("body");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert_eq!(
+        message,
+        "This model's maximum context length is 100000 tokens. However, the messages hold more \
+         than twice that (200000 tokens). Please reduce the length of the messages."
+    );
+    assert!(mock.body.lock().unwrap().is_none(), "engine was touched");
+    // Control: 1.2 MiB of English, about 175,000 tokens, over the context but under twice
+    // it: encoded whole, and the API's exact context 400 with the exact count.
+    let english = "The phenomenological reduction suspends the natural attitude.\n".repeat(20_000);
+    let response = post_json(&format!("{url}/v1/chat/completions"), request(english)).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("body");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.starts_with(
+            "This model's maximum context length is 100000 tokens. However, you requested "
+        ),
+        "{message}"
+    );
+    assert!(mock.body.lock().unwrap().is_none(), "engine was touched");
+}
+
+#[tokio::test]
 async fn one_request_encodes_at_a_time() {
     // The test holds the gateway's only encode slot: a request waits for it, then goes on.
     let slot = Arc::new(tokio::sync::Semaphore::new(1));

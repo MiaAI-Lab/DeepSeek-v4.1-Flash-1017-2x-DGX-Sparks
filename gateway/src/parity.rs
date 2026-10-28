@@ -110,7 +110,7 @@ impl Default for GatewayConfig {
 }
 
 /// The default of `GatewayConfig::max_prompt_bytes` (`GATEWAY_MAX_PROMPT_MB=8`): a million
-/// tokens of ordinary text renders to about 4 MiB.
+/// tokens of ordinary English renders to about 7 MiB (0.145 tokens a byte, measured).
 pub const DEFAULT_MAX_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 
 /// One prepared request.
@@ -207,16 +207,18 @@ pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
         Err(error) => return Err(ApiError::fallback(error.to_string())),
     };
     let model = converted_model(&object, &config.served_name);
-    // Encoding takes memory in proportion to the prompt's bytes (about 120 bytes a byte), so one request encodes
-    // at a time: three admitted requests each with a prompt at the byte limit would otherwise encode at once. The
-    // slot covers only the size check, the render and the encode (seconds, no network); image fetches run outside it.
+    // Encoding takes memory for the prompt's bytes and tokens (about 120 bytes a byte of ordinary text, up to 360 at
+    // one token a byte), so one request encodes at a time: three admitted requests each with a prompt at the byte limit
+    // would otherwise encode at once. The slot covers only the checks, the render and the encode (seconds, no network);
+    // image fetches run outside it.
     let encoded = {
         let _slot = config
             .encode_slot
             .acquire()
             .await
             .map_err(|_| ApiError::internal("the encode slot is closed"))?;
-        let prompt_bytes = gateway.rendered_prompt_bytes(&converted.conversation);
+        let rendered = gateway.render(&converted.conversation);
+        let prompt_bytes = rendered.prompt.len();
         if prompt_bytes > config.max_prompt_bytes {
             return Err(ApiError::bad_request(format!(
                 "The rendered prompt is {prompt_bytes} bytes; this gateway encodes prompts of at most {} bytes \
@@ -224,6 +226,17 @@ pub async fn prepare<R: ProtocolRequest + DeserializeOwned>(
                 config.max_prompt_bytes
             )));
         }
+        // Memory also grows with the tokens: up to one a byte. A prompt counted at more than twice the context is
+        // refused here; up to that it is encoded whole and an overflow gets the API's exact context 400 below.
+        let context = config.max_model_len as usize;
+        if gateway.prompt_tokens_over(&rendered, context.saturating_mul(2))? {
+            return Err(ApiError::bad_request(format!(
+                "This model's maximum context length is {context} tokens. However, the messages hold more than \
+                 twice that ({} tokens). Please reduce the length of the messages.",
+                context.saturating_mul(2)
+            )));
+        }
+        drop(rendered);
         gateway.prepare_conversation(&converted.conversation)?
     };
     let images = images::resolve(

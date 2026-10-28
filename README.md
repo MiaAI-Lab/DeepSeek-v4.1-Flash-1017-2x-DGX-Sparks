@@ -510,17 +510,24 @@ health and is 200 only while the engine is 200.
 is capped at `GATEWAY_MEMORY` (3g) and `GATEWAY_CPUS` (2), runs read-only with a `tmpfs` at `/tmp`, with no capabilities
 (`--cap-drop ALL`, `no-new-privileges`), and has no GPU, Python or OpenCV. `GATEWAY_MAX_CONCURRENT=3` admits three
 requests at a time; excess requests wait rather than receiving a 429/503, and a permit remains held until the response
-body or SSE stream finishes (or the client disconnects). Encoding a prompt takes up to about 120 bytes of memory per byte of prompt, whatever its token count, so a rendered prompt over `GATEWAY_MAX_PROMPT_MB` (8 MiB; a million tokens of ordinary text is about 4 MiB) is a 400 before it is encoded, and one request encodes at a time; image fetches run outside that slot. Measured peaks of the release binary at the
-recipe's 1M-token context (three runs each, fresh process, the highest): 57 MiB idle; a 188,000-token prompt 206 MiB; one
-request with an 8 MiB prompt and 55 MiB of images 1,294 MiB; three of them at once 1,722 MiB (3,600 MiB before encodes
-took turns). An admitted request's body is read within `GATEWAY_BODY_TIMEOUT` (60 s; then 408, and the permit goes back)
+body or SSE stream finishes (or the client disconnects). Encoding a prompt keeps about 120 bytes of memory a byte of
+ordinary text and up to about 360 at one token a byte, so one request encodes at a time (image fetches run outside that
+slot), a rendered prompt over `GATEWAY_MAX_PROMPT_MB` (8 MiB; a million tokens of ordinary English is about 7 MiB) is a
+400, and a prompt over 1 MiB is first counted in pieces and is a 400 without the encode when it holds more than twice
+the context (up to that, an overflow gets the API's exact context 400). Measured peaks of the release binary at the
+recipe's 1M-token context (three runs each, fresh process, the highest): 57 MiB idle; a 188,000-token prompt 207 MiB;
+one request with an 8 MiB prompt and 55 MiB of images 1,247 MiB; three of them at once 1,701 MiB (3,600 MiB before
+encodes took turns); three with the largest prompt the count admits at one token a byte (2 MiB, 2.08 million tokens)
+and 55 MiB of images each 1,587 MiB (an 8 MiB one took 4,011 MiB before the count; it is now refused at 908 MiB).
+An admitted request's body is read within `GATEWAY_BODY_TIMEOUT` (60 s; then 408, and the permit goes back)
 and up to 64 MiB: a larger `content-length` is a 413 before anything is read, a larger chunked body a 413 when it crosses
 the limit; it is copied frame by frame into one buffer that never grows past 64 MiB, so a body split into tiny chunks
 costs no more than a whole one. A body of tiny JSON values is refused before it is parsed when it holds more than about
 a million of them (parsed, each takes 32 bytes or more). At most
 `GATEWAY_MAX_CONNECTIONS` (256) connections are open, `GATEWAY_MAX_CONNECTIONS_PER_PEER` (32) from one address (more
 are closed at once), and each has `GATEWAY_HEADER_TIMEOUT` (30 s) to send a request header, on a new connection and
-between keep-alive requests; the gateway speaks HTTP/1.1. Raising the concurrency adds about 200 MiB a request to the
+between keep-alive requests; a reply the client has stopped reading for `GATEWAY_WRITE_TIMEOUT` (60 s) closes its
+connection and gives its permit back; the gateway speaks HTTP/1.1. Raising the concurrency adds about 200 MiB a request to the
 peak.
 
 **Settings** (defaults and notes in `scripts/config.sh`):
@@ -537,6 +544,7 @@ peak.
 | `GATEWAY_MAX_CONNECTIONS_PER_PEER` | 32 | open connections from one address; more are closed at once |
 | `GATEWAY_HEADER_TIMEOUT` | 30 | seconds to send a request header, also between keep-alive requests |
 | `GATEWAY_BODY_TIMEOUT` | 60 | seconds an admitted request may take to send its body; 408 after it |
+| `GATEWAY_WRITE_TIMEOUT` | 60 | seconds a reply may wait on a client that stopped reading it; then the connection closes |
 | `GATEWAY_MAX_PROMPT_MB` | 8 | largest rendered prompt the gateway encodes; a larger one is a 400 before encoding |
 | `GATEWAY_STRICT` | 0 | `1`: the API's 400 instead of the fallback |
 | `GATEWAY_BLOCK_PRIVATE_URLS` | 1 | `1`: reject loopback, private, link-local and reserved image destinations |

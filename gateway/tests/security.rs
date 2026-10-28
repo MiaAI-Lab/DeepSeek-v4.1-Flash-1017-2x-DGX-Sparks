@@ -594,6 +594,24 @@ async fn spawn_limited(
     per_peer: usize,
     header_timeout: Duration,
 ) -> std::net::SocketAddr {
+    spawn_limited_writes(
+        router,
+        max,
+        per_peer,
+        header_timeout,
+        Duration::from_secs(60),
+    )
+    .await
+}
+
+/// [`spawn_limited`] with a write deadline of its own.
+async fn spawn_limited_writes(
+    router: Router,
+    max: usize,
+    per_peer: usize,
+    header_timeout: Duration,
+    write_timeout: Duration,
+) -> std::net::SocketAddr {
     use ds41_gateway::listener::{LimitedListener, serve};
     let listener = LimitedListener::new(
         tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -603,7 +621,7 @@ async fn spawn_limited(
         per_peer,
     );
     let address = listener.local_addr().expect("address");
-    tokio::spawn(serve(listener, router, header_timeout));
+    tokio::spawn(serve(listener, router, header_timeout, write_timeout));
     address
 }
 
@@ -794,4 +812,124 @@ fn chunk_stream(
     count: usize,
 ) -> impl tokio_stream::Stream<Item = Result<Vec<u8>, std::io::Error>> {
     tokio_stream::iter((0..count).map(move |_| Ok(chunk.clone())))
+}
+
+/// A router whose `/forever` streams without end and `/finite` streams 4 MiB, each response
+/// holding one of `permits` in its body, as the gateway's admission permit is held.
+fn streaming_router(permits: Arc<Semaphore>) -> Router {
+    fn chunks(
+        permits: &Arc<Semaphore>,
+    ) -> impl Iterator<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+        let permit = Arc::clone(permits)
+            .try_acquire_owned()
+            .expect("the permit is free");
+        std::iter::repeat_with(move || {
+            let _held = &permit;
+            Ok(Bytes::from(vec![b'x'; 64 * 1024]))
+        })
+    }
+    let forever = Arc::clone(&permits);
+    Router::new()
+        .route(
+            "/forever",
+            any(move || {
+                let permits = Arc::clone(&forever);
+                async move { Body::from_stream(tokio_stream::iter(chunks(&permits))) }
+            }),
+        )
+        .route(
+            "/finite",
+            any(move || {
+                let permits = Arc::clone(&permits);
+                async move { Body::from_stream(tokio_stream::iter(chunks(&permits).take(64))) }
+            }),
+        )
+}
+
+/// Wait up to `wait` for `permits` to have one free.
+async fn permit_back_within(permits: &Semaphore, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < deadline {
+        if permits.available_permits() == 1 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_a_stream_is_closed_and_gives_its_permit_back() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let head = |path: &str| format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+
+    // Control: a client that reads takes the whole reply under a short write deadline.
+    let permits = Arc::new(Semaphore::new(1));
+    let address = spawn_limited_writes(
+        streaming_router(Arc::clone(&permits)),
+        8,
+        8,
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+    )
+    .await;
+    let mut reader = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("reader");
+    reader
+        .write_all(head("/finite").as_bytes())
+        .await
+        .expect("request");
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), reader.read_to_end(&mut reply))
+        .await
+        .expect("the reply ends")
+        .expect("read");
+    assert!(reply.starts_with(b"HTTP/1.1 200"));
+    assert!(reply.len() > 4 * 1024 * 1024, "{} bytes", reply.len());
+    assert!(permit_back_within(&permits, Duration::from_secs(2)).await);
+
+    // A client that never reads: once the socket buffers are full, the write stays blocked,
+    // the connection is closed at the deadline and the permit comes back.
+    let mut stalled = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("stalled");
+    stalled
+        .write_all(head("/forever").as_bytes())
+        .await
+        .expect("request");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "the stream holds the permit"
+    );
+    assert!(permit_back_within(&permits, Duration::from_secs(10)).await);
+    drop(stalled);
+
+    // Control: with a long deadline the same client still holds the permit after 2 s.
+    let permits = Arc::new(Semaphore::new(1));
+    let address = spawn_limited_writes(
+        streaming_router(Arc::clone(&permits)),
+        8,
+        8,
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+    )
+    .await;
+    let mut stalled = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("stalled");
+    stalled
+        .write_all(head("/forever").as_bytes())
+        .await
+        .expect("request");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "the stream holds the permit"
+    );
+    assert!(!permit_back_within(&permits, Duration::from_secs(2)).await);
+    drop(stalled);
 }

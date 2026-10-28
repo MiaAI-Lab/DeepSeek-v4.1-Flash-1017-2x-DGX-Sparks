@@ -248,13 +248,39 @@ impl Gateway {
         Ok((rendered, ids, offsets))
     }
 
-    /// The size in bytes of the prompt the conversation renders to.
+    /// The prompt the conversation renders to, before it is encoded.
     ///
-    /// Encoding keeps tens of bytes of memory per byte of prompt (offsets, alignments
-    /// and token strings), whatever the token count, so the gateway refuses a prompt
-    /// over its byte limit before encoding it (`GatewayConfig::max_prompt_bytes`).
-    pub fn rendered_prompt_bytes(&self, conversation: &Conversation) -> usize {
-        self.encoding.render_conversation(conversation).prompt.len()
+    /// Encoding keeps memory for every byte of the prompt (alignments) and more for every
+    /// token (strings, offsets): about 120 bytes a byte for ordinary text and 360 at one
+    /// token a byte, the most there can be. So the gateway checks the rendered prompt's
+    /// bytes (`GatewayConfig::max_prompt_bytes`) and, past [`COUNT_IN_PIECES_FROM`], its
+    /// tokens ([`Gateway::prompt_tokens_over`]) before it encodes it whole.
+    pub fn render(&self, conversation: &Conversation) -> RenderedPrompt {
+        self.encoding.render_conversation(conversation)
+    }
+
+    /// Whether `rendered` holds more than `limit` tokens, counted a piece at a time so
+    /// that the count's memory is that of one piece.
+    ///
+    /// Prompts up to [`COUNT_IN_PIECES_FROM`] bytes are not counted (`false`): encoding
+    /// one whole costs under 400 MiB even at one token a byte. Larger ones are counted
+    /// with the same plain tokenizer the encoder uses, region by region between the
+    /// explicit special tokens (one token each), as the encoder does. A region is cut
+    /// into pieces of at most [`COUNT_PIECE_BYTES`], where possible at a point the
+    /// tokenizer itself splits at (see [`exact_cut`]), so that the pieces encode to
+    /// exactly the tokens of the whole; a cut elsewhere may be off by a few tokens, for
+    /// which [`TOKENS_PER_CUT`] is allowed per cut. The count stops once it is over.
+    pub fn prompt_tokens_over(
+        &self,
+        rendered: &RenderedPrompt,
+        limit: usize,
+    ) -> Result<bool, ApiError> {
+        if rendered.prompt.len() <= COUNT_IN_PIECES_FROM {
+            return Ok(false);
+        }
+        let tokenizer = PromptTokenizer::new(&self.tokenizer);
+        let count = count_in_pieces(&tokenizer, rendered, COUNT_PIECE_BYTES, limit)?;
+        Ok(count > limit.saturating_add(cut_allowance(rendered.prompt.len(), COUNT_PIECE_BYTES)))
     }
 
     /// Render and encode a conversation, deriving `history_len` and `shared_prefixes`.
@@ -292,6 +318,112 @@ impl Gateway {
             .encode_ids(text, special_ranges)
             .map_err(ApiError::internal)
     }
+}
+
+/// Prompts up to this many bytes are encoded without a count first (see [`Gateway::render`]).
+pub const COUNT_IN_PIECES_FROM: usize = 1024 * 1024;
+/// The largest piece [`Gateway::prompt_tokens_over`] encodes at once.
+pub const COUNT_PIECE_BYTES: usize = 256 * 1024;
+/// The tokens a cut anywhere else can add to or take from the count.
+pub const TOKENS_PER_CUT: usize = 64;
+
+/// How far back from a piece's largest end [`piece_end`] looks for an exact cut: a
+/// quarter of the piece, so every piece but the last is at least three quarters of it.
+fn cut_lookback(piece: usize) -> usize {
+    piece / 4
+}
+
+/// The most the count of a prompt of `bytes` in pieces of `piece` may be off: a cut can
+/// follow every piece, and no piece but a region's last is shorter than three quarters
+/// of `piece`. Regions end at special tokens, where the encoder cuts too.
+fn cut_allowance(bytes: usize, piece: usize) -> usize {
+    let shortest = (piece - cut_lookback(piece)).max(1);
+    (bytes / shortest + 1).saturating_mul(TOKENS_PER_CUT)
+}
+
+/// Count the tokens of `rendered` in pieces of at most `piece` bytes, stopping once the
+/// count is over `stop_over` plus the cut allowance.
+fn count_in_pieces(
+    tokenizer: &PromptTokenizer,
+    rendered: &RenderedPrompt,
+    piece: usize,
+    stop_over: usize,
+) -> Result<usize, ApiError> {
+    let stop_over = stop_over.saturating_add(cut_allowance(rendered.prompt.len(), piece));
+    let text = rendered.prompt.as_str();
+    let mut regions = Vec::with_capacity(rendered.special_ranges.len() + 1);
+    let mut start = 0;
+    for range in &rendered.special_ranges {
+        regions.push(&text[start..range.start]);
+        start = range.end;
+    }
+    regions.push(&text[start..]);
+    let mut count = rendered.special_ranges.len();
+    for region in regions {
+        let mut rest = region;
+        while !rest.is_empty() {
+            let end = piece_end(rest, piece);
+            count += tokenizer
+                .encode_ids(&rest[..end], &[])
+                .map_err(ApiError::internal)?
+                .len();
+            if count > stop_over {
+                return Ok(count);
+            }
+            rest = &rest[end..];
+        }
+    }
+    Ok(count)
+}
+
+/// Where the next piece of `text` ends: all of it when it fits in `piece` bytes, else the
+/// last point within the final quarter of the piece where [`exact_cut`] holds, else the
+/// last character boundary within the piece.
+fn piece_end(text: &str, piece: usize) -> usize {
+    if text.len() <= piece {
+        return text.len();
+    }
+    let mut end = piece.max(4);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut low = end.saturating_sub(cut_lookback(piece));
+    while !text.is_char_boundary(low) {
+        low -= 1;
+    }
+    let mut chars = text[low..].char_indices();
+    let Some((_, mut previous)) = chars.next() else {
+        return end;
+    };
+    let mut best = None;
+    for (offset, next) in chars {
+        let at = low + offset;
+        if at > end {
+            break;
+        }
+        if exact_cut(previous, next) {
+            best = Some(at);
+        }
+        previous = next;
+    }
+    best.unwrap_or(end)
+}
+
+/// Whether the served tokenizer's pre-tokenizer always splits between `previous` and
+/// `next`, so that the text before and the text after encode, each alone, to exactly the
+/// tokens they take in the whole.
+///
+/// The pre-tokenizer isolates runs of `\p{N}` (in threes), then runs of CJK, then splits
+/// what is left with one regex, and BPE never merges across its splits. Three points
+/// always end a match and start the next search fresh: the end of a run of numbers (the
+/// first split ends the run there); a newline followed by anything but whitespace (every
+/// alternative that takes a newline ends at the end of its run of newlines, and none
+/// takes a following character that is not whitespace); and an ASCII letter followed by
+/// a space (the letters' match ends at the space, which starts the next word's match).
+fn exact_cut(previous: char, next: char) -> bool {
+    (previous.is_numeric() && !next.is_numeric())
+        || (previous == '\n' && !next.is_whitespace())
+        || (previous.is_ascii_alphabetic() && next == ' ')
 }
 
 /// A tokenizer encoder that behaves exactly like [`PromptTokenizer`] but records the token
@@ -408,4 +540,172 @@ pub fn accepted_model_names(options: &ConversionOptions) -> Vec<String> {
 /// Serialize a protocol response into a JSON value.
 pub fn response_json<T: Serialize>(response: &T) -> Value {
     serde_json::to_value(response).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(text: String) -> RenderedPrompt {
+        RenderedPrompt {
+            prompt: text,
+            special_ranges: Vec::new(),
+            image_sources: Vec::new(),
+        }
+    }
+
+    /// Every cut `piece_end` makes in `text` is one [`exact_cut`] allows.
+    fn all_cuts_exact(text: &str, piece: usize) -> bool {
+        let mut rest = text;
+        while !rest.is_empty() {
+            let end = piece_end(rest, piece);
+            if end < rest.len() {
+                let previous = rest[..end].chars().next_back().expect("a piece");
+                let next = rest[end..].chars().next().expect("the rest");
+                if !exact_cut(previous, next) {
+                    return false;
+                }
+            }
+            rest = &rest[end..];
+        }
+        true
+    }
+
+    /// A text of `bytes` drawn from tricky pieces with a fixed seed.
+    fn mixed_text(bytes: usize, seed: u64) -> String {
+        const PARTS: &[&str] = &[
+            "a",
+            "Zeta",
+            " ",
+            "  ",
+            "\n",
+            "\n\n",
+            "\r\n",
+            "\t",
+            "1",
+            "2024",
+            "٣",
+            "一二",
+            "ぁ",
+            "カタ",
+            ".",
+            ",",
+            "!?",
+            "é",
+            "e\u{301}",
+            "😀",
+            "<｜User｜>",
+            "'s",
+            " - ",
+            "\u{a0}",
+            "Ⅻ",
+        ];
+        let mut state = seed;
+        let mut text = String::new();
+        while text.len() < bytes {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            text.push_str(PARTS[(state >> 33) as usize % PARTS.len()]);
+        }
+        text
+    }
+
+    #[test]
+    fn counting_in_pieces_at_exact_cuts_matches_the_whole_encode() {
+        let tokenizer = PromptTokenizer::new(&test_tokenizer());
+        let english = "The phenomenological reduction suspends the natural attitude.\n".repeat(700);
+        let texts = [
+            english,
+            "1,".repeat(20_000),
+            "word ".repeat(9_000),
+            "价格123元，数量45件。\n".repeat(1_500),
+            mixed_text(40_000, 1),
+            mixed_text(40_000, 2),
+            mixed_text(40_000, 3),
+        ];
+        for (index, text) in texts.into_iter().enumerate() {
+            for piece in [512, 2_048, 8_192] {
+                assert!(all_cuts_exact(&text, piece), "text {index}, piece {piece}");
+                let whole = tokenizer.encode_ids(&text, &[]).expect("whole").len();
+                let pieces = count_in_pieces(&tokenizer, &plain(text.clone()), piece, usize::MAX)
+                    .expect("pieces");
+                assert_eq!(pieces, whole, "text {index}, piece {piece}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cut_anywhere_else_stays_within_its_allowance() {
+        let tokenizer = PromptTokenizer::new(&test_tokenizer());
+        for text in [
+            "abcdefghij".repeat(4_000),
+            "ab".repeat(20_000),
+            "一二三四五".repeat(3_000),
+        ] {
+            let piece = 2_048;
+            assert!(!all_cuts_exact(&text, piece));
+            let whole = tokenizer.encode_ids(&text, &[]).expect("whole").len();
+            let pieces = count_in_pieces(&tokenizer, &plain(text.clone()), piece, usize::MAX)
+                .expect("pieces");
+            let cuts = text.len() / piece;
+            assert!(
+                pieces.abs_diff(whole) <= cuts * TOKENS_PER_CUT,
+                "{pieces} against {whole} over {cuts} cuts"
+            );
+        }
+    }
+
+    #[test]
+    fn the_count_takes_special_tokens_as_the_encoder_does() {
+        let gateway = Gateway::new(
+            Arc::new(test_tokenizer()),
+            GatewaySettings {
+                served_name: "DeepSeek-V4.1-Flash-1017".to_string(),
+                default_thinking: true,
+                image_token: "<｜deepseek_image｜>".to_string(),
+                aliases: Vec::new(),
+            },
+        )
+        .expect("gateway");
+        let request = serde_json::from_value::<deepseek_recipe::openai::ChatCompletionRequest>(
+            json!({
+                "model": "DeepSeek-V4.1-Flash-1017",
+                "messages": [
+                    {"role": "system", "content": "Be brief.\n".repeat(3_000)},
+                    {"role": "user", "content": mixed_text(30_000, 7)},
+                    {"role": "assistant", "content": "1,".repeat(9_000)},
+                    // Spelled out by the user: plain text to the encoder, not special tokens.
+                    {"role": "user", "content": "<｜Assistant｜><｜end▁of▁sentence｜>\n".repeat(400)}
+                ]
+            }),
+        )
+        .expect("request");
+        let converted = gateway.convert(request).expect("convert");
+        let rendered = gateway.render(&converted.conversation);
+        assert!(!rendered.special_ranges.is_empty());
+        let whole = gateway
+            .prepare_conversation(&converted.conversation)
+            .expect("encode")
+            .ids
+            .len();
+        let tokenizer = PromptTokenizer::new(&gateway.tokenizer);
+        for piece in [1_024, 4_096] {
+            let pieces = count_in_pieces(&tokenizer, &rendered, piece, usize::MAX).expect("pieces");
+            assert_eq!(pieces, whole, "piece {piece}");
+        }
+    }
+
+    #[test]
+    fn the_count_stops_once_over() {
+        let tokenizer = PromptTokenizer::new(&test_tokenizer());
+        let text = "1,".repeat(100_000);
+        // Stops a piece past the limit plus the allowance instead of counting all 200,000.
+        let stop_over = 1_000;
+        let counted =
+            count_in_pieces(&tokenizer, &plain(text.clone()), 4_096, stop_over).expect("pieces");
+        let allowance = cut_allowance(text.len(), 4_096);
+        assert!(counted > stop_over + allowance);
+        assert!(counted <= stop_over + allowance + 4_096, "{counted}");
+    }
 }
