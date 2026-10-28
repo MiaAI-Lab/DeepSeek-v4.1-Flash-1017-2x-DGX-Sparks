@@ -18,10 +18,21 @@ import urllib.request
 import zlib
 
 args = sys.argv[1:]
+
+
+def arg(name, default):
+    if name not in args:
+        return default
+    i = args.index(name) + 1
+    if i >= len(args) or args[i].startswith("--"):
+        sys.exit(f"{name} needs a value")
+    return args[i]
+
+
 URL = args[0].rstrip("/") if args and not args[0].startswith("--") else "http://127.0.0.1:8888"
-MODEL = args[args.index("--model") + 1] if "--model" in args else "DeepSeek-V4.1-Flash-1017"
-SAVE = args[args.index("--save") + 1] if "--save" in args else None
-COMPARE = args[args.index("--compare") + 1] if "--compare" in args else None
+MODEL = arg("--model", "DeepSeek-V4.1-Flash-1017")
+SAVE = arg("--save", None)
+COMPARE = arg("--compare", None)
 failed = []
 
 
@@ -46,8 +57,63 @@ def check(name, ok, detail=""):
         failed.append(name)
 
 
+def message(r):
+    """The reply's assistant message when r is a completion, else None: an HTTP error, an error object, no choices or
+    a message that is not the assistant's is never read as the model's reply."""
+    if not isinstance(r, dict) or "error" in r or not isinstance(r.get("choices"), list) or not r["choices"]:
+        return None
+    m = r["choices"][0].get("message") if isinstance(r["choices"][0], dict) else None
+    if not isinstance(m, dict) or m.get("role", "assistant") != "assistant":
+        return None
+    return m
+
+
 def text(r):
-    return ((r.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    """The reply's text content, "" when there is none (a tool call's empty content, or no completion at all)."""
+    c = (message(r) or {}).get("content")
+    return c if isinstance(c, str) else ""
+
+
+def reply_text(r):
+    """The reply's text when r is a completion with non-empty text content, else None."""
+    return text(r) or None
+
+
+def prompt_tokens(r):
+    usage = r.get("usage") if isinstance(r, dict) else None
+    return usage.get("prompt_tokens") if isinstance(usage, dict) else None
+
+
+def strict_json(s):
+    """json.loads without the NaN / Infinity extensions, which are not JSON."""
+    def refuse(name):
+        raise ValueError(f"{name} is not JSON")
+    return json.loads(s, parse_constant=refuse)
+
+
+def well_formed_call(c):
+    """An OpenAI tool call: an id, type "function", and a function with a name and JSON-object arguments."""
+    if not isinstance(c, dict) or not isinstance(c.get("id"), str) or not c["id"] or c.get("type") != "function":
+        return False
+    f = c.get("function")
+    if not isinstance(f, dict) or not isinstance(f.get("name"), str) or not f["name"] or not isinstance(f.get("arguments"), str):
+        return False
+    try:
+        return isinstance(strict_json(f["arguments"]), dict)
+    except ValueError:
+        return False
+
+
+def tool_calls_ok(r, name, city):
+    """Every call in the reply is well formed and calls the one tool offered, `name`, with its required string `city`;
+    the first asks for `city`. Returns the calls only when they can be sent back as the conversation's next turn."""
+    calls = (message(r) or {}).get("tool_calls")
+    if not isinstance(calls, list) or not calls or not all(well_formed_call(c) for c in calls):
+        return False, []
+    got = [strict_json(c["function"]["arguments"]).get("city") for c in calls]
+    if any(c["function"]["name"] != name for c in calls) or not all(isinstance(g, str) and g for g in got):
+        return False, []
+    return city in got[0].lower(), calls
 
 
 def png(w, h, pixel):
@@ -84,15 +150,14 @@ r = chat([{"role": "user", "content": "What is the capital of France? One word."
 check("text", "paris" in text(r).lower(), repr(text(r)[:60]) + f" {time.time() - t:.1f}s")
 
 r = chat([{"role": "user", "content": "What is 17 * 23? Answer with the number."}], 2000, thinking=True)
-m = (r.get("choices") or [{}])[0].get("message") or {}
-check("thinking", "391" in (m.get("content") or "") and len(m.get("reasoning_content") or "") > 0,
-      f"reasoning {len(m.get('reasoning_content') or '')} chars, answer {(m.get('content') or '')[:40]!r}")
+m = message(r) or {}
+reasoning = m.get("reasoning_content") if isinstance(m.get("reasoning_content"), str) else ""
+check("thinking", "391" in text(r) and len(reasoning) > 0, f"reasoning {len(reasoning)} chars, answer {text(r)[:40]!r}")
 
 tools = [{"type": "function", "function": {"name": "get_weather", "description": "Current weather of a city",
           "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
 r = chat([{"role": "user", "content": "What's the weather in Tokyo? Use the tool."}], 300, tools=tools)
-calls = ((r.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
-ok = bool(calls) and calls[0]["function"]["name"] == "get_weather" and "tokyo" in json.loads(calls[0]["function"]["arguments"]).get("city", "").lower()
+ok, calls = tool_calls_ok(r, "get_weather", "tokyo")
 check("tool call", ok, json.dumps(calls)[:120] if calls else json.dumps(r)[:160])
 if ok:
     msgs = [{"role": "user", "content": "What's the weather in Tokyo? Use the tool."},
@@ -118,7 +183,7 @@ else:
 long = " ".join(f"Item {i}: fox {i} jumps over dog {i * 7}." for i in range(1500))
 t = time.time()
 r = chat([{"role": "user", "content": long + "\nWhat is item 1234's dog number? The number only."}], 20)
-check("long prompt", "8638" in text(r), f"{(r.get('usage') or {}).get('prompt_tokens')} tokens, {text(r)[:20]!r}, {time.time() - t:.1f}s")
+check("long prompt", "8638" in text(r), f"{prompt_tokens(r)} tokens, {text(r)[:20]!r}, {time.time() - t:.1f}s")
 
 # ---------------------------------------------------------------- one at a time == several at once
 prompts = ["Write a haiku about the sea.", "List the first ten prime numbers.", "Explain TCP in two sentences.",
@@ -126,17 +191,32 @@ prompts = ["Write a haiku about the sea.", "List the first ten prime numbers.", 
            "What causes the seasons on Earth? Two sentences.", "Translate 'good morning' into French, Spanish and German.",
            "Give three tips for writing clear documentation."]
 req = lambda p: chat([{"role": "user", "content": p}], 160)
-solo = [text(req(p)) for p in prompts]
+solo = [reply_text(req(p)) or "" for p in prompts]
 with cf.ThreadPoolExecutor(len(prompts)) as ex:
-    burst = [text(r) for r in ex.map(req, prompts)]
+    burst = [reply_text(r) or "" for r in ex.map(req, prompts)]
 same = sum(bool(a) and a == b for a, b in zip(solo, burst))
 check("concurrent == solo", same == len(prompts), f"{same} of {len(prompts)} equal")
 if SAVE:
     json.dump(solo, open(SAVE, "w"))
 if COMPARE:
-    ref = json.load(open(COMPARE))
-    same = sum(a == b for a, b in zip(solo, ref))
-    check("equal to the saved replies", same == len(ref), f"{same} of {len(ref)} equal")
+    # every reply and its saved reference: as many as the prompts, non-empty text, equal exactly
+    try:
+        ref = json.load(open(COMPARE))
+        why = ""
+    except (OSError, ValueError) as e:
+        ref, why = [], f"cannot read {COMPARE}: {e}"
+    if why:
+        pass
+    elif not isinstance(ref, list):
+        why = f"{COMPARE} holds a {type(ref).__name__}, not a list of replies"
+    elif len(ref) != len(prompts):
+        why = f"{COMPARE} holds {len(ref)} replies, not {len(prompts)}"
+    elif not all(isinstance(x, str) and x for x in ref):
+        why = f"{COMPARE} has an empty or non-text reply"
+    elif not all(solo):
+        why = "an empty reply here"
+    same = 0 if why else sum(a == b for a, b in zip(solo, ref))
+    check("equal to the saved replies", not why and same == len(prompts), why or f"{same} of {len(prompts)} equal")
 
 print(f"\n{'all passed' if not failed else 'FAILED: ' + ', '.join(failed)}")
 sys.exit(1 if failed else 0)
