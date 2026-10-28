@@ -6,6 +6,13 @@
   series rebased onto it: `0002` and `0006` are gone (the engine's `TF_DS_ENGRAM_LEAD` and `3de79d8` do their jobs),
   twelve patches are adapted to the engine's prompt pass in pieces (`TF_FILL_CHUNKS`, `TF_FILL_CUT_IN`; `start.sh` passes
   `TF_FILL_*`), and `0034` holds two follow-ups. Details in `zig/patches/README.md`. By **eleata**.
+  Three behaviour changes come with the pin even with every switch off: a DSML call to a tool the request did not
+  offer is now returned as a `tool_calls` entry under the model's own name (`tool_parse.zig`, as #67 asks), so a client
+  that runs call names without checking them against its own tool list should check them; the prompt cache's `tail`
+  rule passes over a kept state within the window's rows of the prompt's end (`prompt_cache.zig` `find`); and prompts
+  with pictures keep and resume states by default, keyed by the pictures' SHA-256 digests (`TF_DS_IMAGE_CACHE=0` turns
+  it off). Also from the engine: a malformed `TF_FILL_*` value is ignored silently (the pass then runs whole), and
+  `TF_DS_SOLO_OVERHEAD` / `TF_DS_NO_COPIES` count as on for any set value other than `0`, an empty one included.
 - `zig/patches/0030-anthropic-context-management-lenient.patch` (always on): the Anthropic frontend accepts any
   `clear_thinking_<date>` edit in `context_management` with any `keep`. It accepted only `clear_thinking_20251015` with
   `keep: "all"`, so a client that clears earlier thinking when the user sends a message mid-conversation (the original
