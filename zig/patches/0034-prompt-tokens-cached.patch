@@ -1,0 +1,275 @@
+# server: /metrics counts the prompt tokens restored from kept prompt states (tensorfold:prompt_tokens_cached_total).
+# The engine already knows each request's cached count (it is in the reply's usage.prompt_tokens_details.cached_tokens
+# and on the `done ... cached=N` log line) but /metrics published only prompt_tokens_total, so a dashboard could not
+# tell cached from computed prefill: on an agent workload where 98.4% of 674 M prompt tokens were restored from the
+# prompt cache (3,153 requests, summed from the log), sparkDash showed every token as computed prefill.
+# - A backport of upstream ashhart/TensorFold ce0d9053be ("feat(metrics): count prompt tokens restored from kept
+#   prompt states", PR #531), which this fork branched before: Info.prompt_cache says the engine keeps prompt states;
+#   each finished request adds the cached count its `prefilled` event reported; /metrics then carries
+#   tensorfold:prompt_tokens_cached_total and repeats it with prompt_tokens_total as vLLM's prefix_cache_hits_total and
+#   prefix_cache_queries_total. An engine that keeps no prompt states leaves all three out, as before. Same names, help
+#   text and tests as upstream.
+# - Added for this fork: the CUDA host (native/cuda.zig) sets Info.prompt_cache when it built a prompt cache, so the
+#   DeepSeek-V4.1 lane publishes the counter (`--prompt-cache-gib 0` leaves it out). Host test: the flag follows the cache.
+# Switch: none (always on). Replies and the decode path are unchanged: one integer add per finished request under the
+# metrics mutex. The right long-term home is the engine fork: once its branch takes ashhart #531, a repin of TF_REF
+# carries this and the patch goes (a repin onto upstream v1.1.x itself is not a drop-in: it serves no DeepSeek-V4.1).
+diff --git a/docs/api.md b/docs/api.md
+index 3032adb4..e5a0978c 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -331,6 +331,10 @@ The readings vLLM also has are repeated under its names (`num_requests_running`,
+ `tensorfold:` prefix for the metric name. `client_disconnections_total` (requests the client walked away from)
+ and `preemptions_total` (background work that gave up a lane to a later request) are published where the
+ server counts those events, and never at a fabricated zero.
++An engine that keeps prompt states between requests (Flash Next, GLM-5.3-Flash and DeepSeek-V4.1 on CUDA unless
++`--prompt-cache-gib 0`) adds `prompt_tokens_cached_total` (already vLLM's name), the prompt tokens of finished requests
++restored from a kept state, and repeats it with `prompt_tokens_total` as vLLM's `prefix_cache_hits_total` and
++`prefix_cache_queries_total`. An engine that keeps no prompt states leaves all three out.
+ 
+ The native `--dashboard` flag adds a self-contained `/dashboard` page and its `/stats` JSON snapshot; both routes
+ return 404 when the flag is off, and the page polls once per second without adding access-log noise.
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 2a50f6f9..38d07e94 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -145,6 +145,8 @@ pub const Info = struct {
+     structures: bool = false,
+     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
+     prefill_step: u32 = 0,
++    /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
++    prompt_cache: bool = false,
+     /// A line the server prints once at startup (the engine's memory plan); empty: none.
+     startup: []const u8 = "",
+     /// The reasoning efforts the family's template takes as numbers: each name passes as asked and the template hears
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 279bfac5..0f3fda80 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -202,7 +202,9 @@ const Host = struct {
+         h.clock = .{ .io = io };
+         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
+         errdefer h.core.deinit();
+-        h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
++        var with = info;
++        with.prompt_cache = h.cache != null; // (/metrics then counts the prompt tokens restored from kept states)
++        h.host = api.LaneHost.init(h.gpa, io, &h.core, with);
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
+         if (h.cache) |*store| h.host.cache = store;
+@@ -595,3 +597,37 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
+     }
+     try std.testing.expectEqual(@as(usize, 40), restored.tokens.items.len);
+ }
++
++test "the engine says it keeps prompt states exactly when the host has a prompt cache" {
++    const gpa = std.testing.allocator;
++    const Nothing = struct {
++        fn release(_: *anyopaque) void {}
++        fn bytes(_: *anyopaque, _: u32) u64 {
++            return 0;
++        }
++        fn save(_: *anyopaque, _: ?*anyopaque, _: u32) anyerror!api.prompt_cache.Saved {
++            return error.Unused;
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: api.prompt_cache.Saved) anyerror!void {
++            return error.Unused;
++        }
++        fn drop(_: *anyopaque, _: api.prompt_cache.Saved) void {}
++    };
++    const vt: api.prompt_cache.Snapshots.VTable = .{ .bytes = Nothing.bytes, .save = Nothing.save, .restore = Nothing.restore, .drop = Nothing.drop };
++    for ([_]bool{ false, true }) |keeps| {
++        var target: lanes.fake.Fake = .{ .gpa = gpa };
++        defer target.deinit();
++        const h = try gpa.create(Host);
++        defer gpa.destroy(h);
++        h.* = .{ .gpa = gpa, .gpu = null, .family = &target, .release = Nothing.release, .inner = target.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
++        if (keeps) h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &target, .vtable = &vt }, .{}, 1 << 20);
++        defer if (h.cache) |*store| store.deinit();
++        try h.serve(std.testing.io, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = 7, .hidden_rows = true }, 8, .{ .lanes = 2 }, null);
++        defer {
++            h.host.stop();
++            h.core.deinit();
++            h.cfg.deinit(gpa);
++        }
++        try std.testing.expectEqual(keeps, h.host.engine().info().prompt_cache);
++    }
++}
+diff --git a/zig/src/native/flashnext_host.zig b/zig/src/native/flashnext_host.zig
+index 1469ca7a..b0a9415a 100644
+--- a/zig/src/native/flashnext_host.zig
++++ b/zig/src/native/flashnext_host.zig
+@@ -439,6 +439,7 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
+     h.* = .{ .gpa = gpa, .io = io, .eng = eng, .follower = follower, .info_ = .{ .name = "flashnext-zig", .lanes = 1, .context_window = @intCast(if (window > 0) @min(window, limit) else limit) } };
+     h.warm = .{ .queue = eng.r.queue };
+     if (!eng.followsPeer() and budget > 0) h.cache = pc.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop, .charged = Snaps.charged, .spare = Snaps.spare, .trim = Snaps.trim, .reuses = Snaps.reuses } }, .{ .lookahead = 1 }, budget);
++    h.info_.prompt_cache = h.cache != null;
+     try h.start();
+     return h;
+ }
+diff --git a/zig/src/native/glm_host.zig b/zig/src/native/glm_host.zig
+index ba0a6e52..dab885b4 100644
+--- a/zig/src/native/glm_host.zig
++++ b/zig/src/native/glm_host.zig
+@@ -106,6 +106,7 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, window: u32, speed_up:
+         const B = glm.backend.Backend;
+         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &h.back, .vtable = &.{ .bytes = B.snapBytes, .save = B.snapSave, .restore = B.snapRestore, .drop = B.snapDrop, .write = B.snapWrite, .read = B.snapRead, .forget = B.snapForget } }, .{ .lookahead = 1, .planned = true }, budget);
+         h.host.cache = &h.cache.?;
++        h.host.info_.prompt_cache = true;
+     }
+     errdefer if (h.cache) |*store| store.deinit();
+     if (learn) |root| {
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 69cd0ded..0b78e808 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -249,7 +249,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     release(srv, preparing); // a background request waits only while a foreground one prepares
+     preparing = false;
+     var gen: Generation = .{ .last_out_ns = submitted, .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids };
+-    defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
++    defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+         if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 8dcdc1cd..b07812c8 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -36,6 +36,7 @@ pub const Metrics = struct {
+     gpa: std.mem.Allocator,
+     mutex: std.Io.Mutex = .init,
+     prompt: u64 = 0,
++    cached: u64 = 0,
+     generation: u64 = 0,
+     drafted: u64 = 0,
+     accepted: u64 = 0,
+@@ -48,10 +49,11 @@ pub const Metrics = struct {
+     tpot: TpotHistogram = .{},
+     requests: std.ArrayList(struct { key: []const u8, status: u16, count: u64 }) = .empty,
+ 
+-    pub fn note(m: *Metrics, io: std.Io, prompt: usize, generation: usize, drafted: u64, accepted: u64, rounds: u64, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
++    pub fn note(m: *Metrics, io: std.Io, prompt: usize, cached: usize, generation: usize, drafted: u64, accepted: u64, rounds: u64, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
+         m.mutex.lockUncancelable(io);
+         defer m.mutex.unlock(io);
+         m.prompt += prompt;
++        m.cached += cached;
+         m.generation += generation;
+         m.drafted += drafted;
+         m.accepted += accepted;
+@@ -113,6 +115,8 @@ pub const Metrics = struct {
+         try gauge(w, "requests_waiting", "gauge", "Requests queued or held until a lane is free.", status.waiting);
+         try gauge(w, "generation_tokens_running", "gauge", "Generated tokens held by live streams.", status.generation_tokens);
+         try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
++        const keeps = engine.info().prompt_cache;
++        if (keeps) try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests restored from kept prompt states.", snap.cached);
+         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
+         const live = streams[0..@min(status.streams, streams.len)];
+         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
+@@ -136,6 +140,10 @@ pub const Metrics = struct {
+         try pools(w, "kv_cache_usage_perc", "stream", live, window);
+         try gauge(w, "spec_decode_num_draft_tokens_total", "counter", "Draft tokens verified on finished requests, this server's single draft counter.", snap.drafted);
+         try gauge(w, "spec_decode_num_accepted_tokens_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
++        if (keeps) {
++            try gauge(w, "prefix_cache_queries_total", "counter", "Prompt tokens of finished requests, looked up in the kept prompt states, under vLLM's name.", snap.prompt);
++            try gauge(w, "prefix_cache_hits_total", "counter", "Prompt tokens of finished requests restored from kept prompt states, under vLLM's name.", snap.cached);
++        }
+         try histogram(w, "e2e_request_latency_seconds", "Seconds from arrival to the reply leaving, under vLLM's name.", snap.latency);
+         try histogram(w, "request_decode_time_seconds", "Seconds a finished request spent decoding, under vLLM's name.", snap.decode);
+         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
+@@ -275,7 +283,7 @@ test "edges and numbers" {
+ test "metrics record rounds prefill and per-token timing" {
+     const gpa = std.testing.allocator;
+     var m: Metrics = .{ .gpa = gpa };
+-    m.note(std.testing.io, 10, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 1_024_000_000, 3));
++    m.note(std.testing.io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 1_024_000_000, 3));
+     try std.testing.expectEqual(@as(u64, 2), m.rounds);
+     try std.testing.expectEqual(@as(u64, 1), m.prefill.n);
+     try std.testing.expectEqual(@as(u64, 1), m.tpot.n);
+@@ -288,8 +296,9 @@ test "metrics record rounds prefill and per-token timing" {
+ }
+ 
+ const RenderStub = struct {
+-    pub fn info(_: *anyopaque) api.Info {
+-        return .{};
++    pub fn info(ctx: *anyopaque) api.Info {
++        const s: *@This() = @ptrCast(@alignCast(ctx));
++        return s.info_value;
+     }
+     pub fn submit(_: *anyopaque, _: api.Id, _: *const api.Request, _: api.Sink) api.SubmitError!void {
+         unreachable;
+@@ -303,6 +312,7 @@ const RenderStub = struct {
+         const s: *@This() = @ptrCast(@alignCast(ctx));
+         return s.memory_value;
+     }
++    info_value: api.Info = .{},
+     status_value: api.Status = .{ .running = 1, .waiting = 2, .generation_tokens = 3 },
+     memory_value: ?api.Memory = null,
+ 
+@@ -314,7 +324,7 @@ const RenderStub = struct {
+ test "render exposes live counters, rounds, prefill and TPOT without cache family" {
+     const gpa = std.testing.allocator;
+     var m: Metrics = .{ .gpa = gpa };
+-    m.note(std.testing.io, 10, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 3_000_000_000, 3));
++    m.note(std.testing.io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 3_000_000_000, 3));
+     var stub: RenderStub = .{};
+     var out: std.Io.Writer.Allocating = .init(gpa);
+     defer out.deinit();
+@@ -325,6 +335,8 @@ test "render exposes live counters, rounds, prefill and TPOT without cache famil
+     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_prefill_seconds_sum 0.25") != null);
+     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_time_per_output_token_seconds_sum 1") != null);
+     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_tokens_cached_total") == null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "prefix_cache_queries_total") == null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "prefix_cache_hits_total") == null);
+     try std.testing.expect(std.mem.indexOf(u8, body, "device_memory_bytes") == null); // unknown memory: no gauge
+     stub.memory_value = .{ .active = 7 << 30, .peak = 8 << 30 };
+     var known: std.Io.Writer.Allocating = .init(gpa);
+@@ -334,6 +346,22 @@ test "render exposes live counters, rounds, prefill and TPOT without cache famil
+     try std.testing.expect(std.mem.indexOf(u8, known.written(), "tensorfold:device_memory_peak_bytes 8589934592\n") != null);
+ }
+ 
++test "render counts restored prompt tokens where the engine keeps prompt states" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    m.note(std.testing.io, 100, 0, 3, 0, 0, 2, 1.0, null, null, null, null);
++    m.note(std.testing.io, 120, 96, 3, 0, 0, 2, 1.0, null, null, null, null);
++    var stub: RenderStub = .{ .info_value = .{ .prompt_cache = true } };
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:prompt_tokens_total 220\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:prompt_tokens_cached_total 96\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:prefix_cache_queries_total 220\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:prefix_cache_hits_total 96\n") != null);
++}
++
+ test "metrics snapshot allocation failure releases the mutex" {
+     const io = std.testing.io;
+     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+@@ -358,7 +386,7 @@ test "metrics snapshot allocation failure releases the mutex" {
+     try std.testing.expect(failing.has_induced_failure);
+     failing.fail_index = std.math.maxInt(usize);
+     m.httpRequest(io, "client", 200);
+-    m.note(io, 10, 3, 0, 0, 2, 1.0, null, null, 0.25, null);
++    m.note(io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, null);
+     try m.render(io, &out.writer, stub.engine(), 4096);
+     try std.testing.expect(std.mem.indexOf(u8, out.written(), "requests_total{key=\"client\",status=\"200\"} 2") != null);
+     try std.testing.expect(std.mem.indexOf(u8, out.written(), "prompt_tokens_total 10") != null);
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 62701b52..5cc87769 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -255,10 +255,10 @@ pub const Server = struct {
+     }
+ 
+     /// Counts one finished request for /metrics.
+-    pub fn noteRequest(srv: *Server, prompt_len: usize, generated: usize, drafted: u64, accepted: u64, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
++    pub fn noteRequest(srv: *Server, prompt_len: usize, cached: usize, generated: usize, drafted: u64, accepted: u64, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
+         const now = clock.nowNs(srv.io);
+         const tpot = srv.metrics.tpotValue(first, last, generated);
+-        srv.metrics.note(srv.io, prompt_len, generated, drafted, accepted, rounds, @max(0, clock.seconds(now - received)), if (first) |f| clock.seconds(f - received) else null, if (first) |f| @max(0, clock.seconds(now - f)) else null, prefill, tpot);
++        srv.metrics.note(srv.io, prompt_len, cached, generated, drafted, accepted, rounds, @max(0, clock.seconds(now - received)), if (first) |f| clock.seconds(f - received) else null, if (first) |f| @max(0, clock.seconds(now - f)) else null, prefill, tpot);
+     }
+ 
+     /// Accepts connections until ``stop`` is set, each on its own thread.

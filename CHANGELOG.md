@@ -23,6 +23,12 @@
   default equals uncapped graphs; `GRAPH_CAP=0` keeps the old behavior. `scripts/port_test.sh` checks that both ranks
   get the setting. By **E-Zou Shen ([ezoushen](https://github.com/ezoushen))**, [pull request #70](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70);
   renumbered 0031 to 0033.
+- `zig/patches/0034-prompt-tokens-cached.patch` (always on): `/metrics` publishes
+  `tensorfold:prompt_tokens_cached_total` (prompt tokens restored from kept prompt states) and vLLM's
+  `prefix_cache_hits_total` / `prefix_cache_queries_total`, so a dashboard can tell cached from computed prefill; before,
+  only `prompt_tokens_total` was published and every prompt token read as computed. A backport of upstream
+  ashhart/TensorFold `ce0d9053be` (#531) plus the CUDA host's flag; it goes once the pinned fork carries that commit and
+  `TF_REF` moves to it. Host tests for the counter, its absence without a prompt cache, and the CUDA host's flag.
 - `start.sh` compares the two ranks' Engram folders before anything is stopped when the spill tier is on
   (`port_engram_check`, `scripts/port.sh`). The engine's rank fingerprint covers the folder's regular files by name and
   size (`zig/patches/0016`, `fingerprint.zig`'s `listing()`), and a Hugging Face snapshot holds symlinks into `blobs/`:
