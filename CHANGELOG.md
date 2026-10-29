@@ -20,6 +20,12 @@
   with pictures keep and resume states by default, keyed by the pictures' SHA-256 digests (`TF_DS_IMAGE_CACHE=0` turns
   it off). Also from the engine: a malformed `TF_FILL_*` value is ignored silently (the pass then runs whole), and
   `TF_DS_SOLO_OVERHEAD` / `TF_DS_NO_COPIES` count as on for any set value other than `0`, an empty one included.
+- `zig/patches/0038-aligned-index-views.patch` (always on): the prompt pass's indexer scores rows in blocks, and a block
+  size that was not a multiple of 16 (137,612 compressed keys gave 121-row blocks) put a later block's views off the
+  16-byte boundary the kit's kernels were captured for: no matching variant, `MissingTritonVariant`. Blocks are now a
+  multiple of 16 rows (a row's scores are its own: no bits change), and a replay cut with an odd first row copies the
+  positions to an aligned buffer. From the 4x recipe's `0005` and `0007` (Mia's AI Lab), carried onto the `fbbc971` pin;
+  a host test for the block size. It may be related to #65 and #36, but that is not shown.
 - `zig/patches/0037-rendezvous-ports-early.patch` (on): rank 0 opens its follower's port before its weights load and takes
   the connection afterwards. It used to listen only after its own weights had loaded, while the worker retried its
   connect for a fixed 300 s, so a worker that finished loading more than 300 s before the head (the head reading its
