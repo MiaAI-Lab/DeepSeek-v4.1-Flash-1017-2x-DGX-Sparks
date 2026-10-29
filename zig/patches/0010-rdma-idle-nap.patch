@@ -1,8 +1,14 @@
+
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): TF_RDMA_GID_INDEX's parse now lives in upstream's rdma_env.zig (26f5ba8); only the idle nap is added here.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): TF_RDMA_GID_INDEX's parse now lives in upstream's rdma_env.zig (26f5ba8); only the idle nap is added here.
+
 diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
-index 008baed4..d6e4d8d1 100644
+index c84c5b64f668d352717f851f9ee46a8eb582725c..7cfde04733aa24ab245c0613c65f5f62fa3805e0 100644
 --- a/zig/src/families/dsv41/rdma.zig
 +++ b/zig/src/families/dsv41/rdma.zig
-@@ -24,8 +24,13 @@ const collect_threads = 256;
+@@ -25,8 +25,52 @@ const collect_threads = 256;
  const wc_recv_rdma_with_imm = 129;
  const host_register_portable = 0x01;
  const host_register_devicemap = 0x02;
@@ -14,13 +20,7 @@ index 008baed4..d6e4d8d1 100644
 +extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
 +
 +pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
- 
- /// The served ring has its own GID selection, independent of NCCL's.
- pub fn parseGidIndex(text: ?[]const u8) error{InvalidRdmaGidIndex}!u8 {
-@@ -43,6 +48,45 @@ pub fn servedGidIndex() error{InvalidRdmaGidIndex}!u8 {
-     };
- }
- 
++
 +/// TF_RDMA_IDLE_S: seconds with nothing posted or reaped before the proxy naps (0: never nap; default 2).
 +fn parseIdleNs(text: []const u8) Error!u64 {
 +    const seconds = std.fmt.parseFloat(f64, text) catch return error.BadRdmaIdle;
@@ -59,11 +59,10 @@ index 008baed4..d6e4d8d1 100644
 +    const ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
 +    _ = std.c.nanosleep(&ts, null);
 +}
-+
+ 
  /// ibv_mtu is an ordered enum, 1=256 through 5=4096. Both ends use the smaller active MTU.
  fn pathMtu(local: c_int, remote: c_int) error{BadMtu}!c_int {
-     if (local < 1 or local > 5 or remote < 1 or remote > 5) return error.BadMtu;
-@@ -171,6 +215,9 @@ pub const Ring = struct {
+@@ -157,6 +201,9 @@ pub const Ring = struct {
      running: std.atomic.Value(bool) = .init(false),
      failed: std.atomic.Value(bool) = .init(false),
      why: [128]u8 = @splat(0),
@@ -73,7 +72,7 @@ index 008baed4..d6e4d8d1 100644
  
      // the metadata block: flags [slots][world], doorbell, sizes [slots], sent [slots], abort word
      fn flags(r: *const Ring) [*]u64 {
-@@ -196,6 +243,8 @@ pub const Ring = struct {
+@@ -182,6 +229,8 @@ pub const Ring = struct {
      pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, k: Kernels, devices: []const []const u8, rank: u32, world: u32, s: Settings) Error!*Ring {
          if (world < 2 or world > max_ranks or rank >= world or devices.len == 0 or devices.len > max_devices) return error.BadInfo;
          if (s.slots < 2 or s.slots > seqs.max_slots or s.max_bytes == 0 or s.max_bytes % 64 != 0) return error.BadInfo;
@@ -82,7 +81,7 @@ index 008baed4..d6e4d8d1 100644
          const r = try gpa.create(Ring);
          errdefer gpa.destroy(r);
          var verbs = try Verbs.open(null);
-@@ -211,7 +260,7 @@ pub const Ring = struct {
+@@ -197,7 +246,7 @@ pub const Ring = struct {
          var scalars = try cuda.DeviceBuffer.alloc(d, 80);
          errdefer scalars.free();
          try scalars.fill8(0, null);
@@ -91,7 +90,7 @@ index 008baed4..d6e4d8d1 100644
          r.v = &r.verbs;
          errdefer for (r.nics[0..r.nd]) |*n| r.closeNic(n);
          for (devices) |name| {
-@@ -357,8 +406,16 @@ pub const Ring = struct {
+@@ -343,8 +392,16 @@ pub const Ring = struct {
          var arrivals: seqs.Arrivals = .{ .nd = nd };
          var posted: u64 = 0;
          var wc: [64]vabi.Wc = undefined;
@@ -108,7 +107,7 @@ index 008baed4..d6e4d8d1 100644
              while (posted < ring) {
                  const q = posted + 1;
                  const slot: usize = @intCast(q % r.s.slots);
-@@ -385,6 +442,7 @@ pub const Ring = struct {
+@@ -371,6 +428,7 @@ pub const Ring = struct {
                      r.fail("ibv_poll_cq failed");
                      return;
                  }
@@ -116,7 +115,7 @@ index 008baed4..d6e4d8d1 100644
                  for (wc[0..@intCast(k)]) |w| {
                      if (w.status != vabi.wc_success) {
                          r.fail(r.v.statusText(w.status));
-@@ -407,6 +465,22 @@ pub const Ring = struct {
+@@ -393,6 +451,22 @@ pub const Ring = struct {
                      }
                  }
              }
@@ -139,9 +138,9 @@ index 008baed4..d6e4d8d1 100644
          }
      }
  
-@@ -549,6 +623,18 @@ test "served GID defaults to 5 and accepts explicit 3 without silently accepting
-     for ([_][]const u8{ "", "-1", "+3", " 3", "3 ", "0x3", "3_0", "256", "invalid" }) |value|
-         try std.testing.expectError(error.InvalidRdmaGidIndex, parseGidIndex(value));
+@@ -527,6 +601,18 @@ test "the info a peer reads is a plain extern struct (it crosses the link as byt
+     try std.testing.expectEqual(@as(usize, 116), @offsetOf(Info, "active_mtu"));
+     try std.testing.expectEqual(@as(usize, 136), @offsetOf(Info, "recv"));
  }
 +test "the RDMA proxy's idle back-off parses its settings" {
 +    try std.testing.expectEqual(default_idle_ns, try parseIdleNs("2"));
@@ -158,7 +157,7 @@ index 008baed4..d6e4d8d1 100644
  test "RDMA MTU negotiation is symmetric for every supported port MTU and rejects invalid metadata" {
      for (1..6) |a| for (1..6) |b| {
          try std.testing.expectEqual(@as(c_int, @intCast(@min(a, b))), try pathMtu(@intCast(a), @intCast(b)));
-@@ -598,3 +684,11 @@ test "connect programs the negotiated MTU and configured GID and rejects bad pee
+@@ -588,3 +674,11 @@ test "connect programs the negotiated MTU and configured GID and rejects bad pee
      try std.testing.expectError(error.BadMtu, r.connect(&peers));
      try std.testing.expectEqual(@as(usize, 0), Probe.calls);
  }

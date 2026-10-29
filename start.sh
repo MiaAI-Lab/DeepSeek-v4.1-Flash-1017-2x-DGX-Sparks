@@ -23,8 +23,7 @@
 # Setup: WORKER (an ssh target, key-based) in scripts/local.sh.
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and their notes in scripts/config.sh):
 #   serving  CONTEXT, POOL, PARALLEL, ROUND_ROWS, MAX_TOKENS, THINKING, REASONING_EFFORT, THINKING_BUDGET, TEMPERATURE, TOP_P, TOP_K, DRAFTS,
-#            SERVED_NAME, HOST, PORT, RDMA, RDMA_IDLE_S, RDMA_NAP_US, GRAPHS, GRAPH_CAP, SIDE, PREFETCH, ENGRAM_AIO, REPLAY_FLOOR,
-#            PREFILL_INTERLEAVE_MS, PREFILL_YIELD, STEP_AHEAD
+#            SERVED_NAME, HOST, PORT, RDMA, RDMA_IDLE_S, RDMA_NAP_US, GRAPHS, GRAPH_CAP, SIDE, PREFETCH, ENGRAM_AIO, REPLAY_FLOOR
 #   nodes    WORKER, FABRIC_PEER, MASTER_ADDR, MASTER_PORT, SOCKET_IFNAME, NCCL_RAILS, NCCL_DEBUG
 #   files    EAQ_V1_1 (0 | 1), ABLIT (0 | 1), ABLIT_REVISION, MODEL_ID, MODEL_REVISION, ENGRAM_ID, ENGRAM_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER, NFS_VOLUME,
 #            WORKER_ENGRAM_DIR, WORKER_CACHE_DIR, STATE_DIR, LOG_DIR, LOG_KEEP, LOG_MAX_SIZE, LOG_MAX_FILE
@@ -70,10 +69,9 @@ for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] ||
 [[ "$MEMGUARD_GIB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "MEMGUARD_GIB is a number of GiB (2.5 is fine; 0 turns it off), not $MEMGUARD_GIB"
 [[ "$MEMGUARD_HOLD_S" =~ ^[0-9]+(\.[0-9]+)?$ && "$MEMGUARD_HARD_GIB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "MEMGUARD_HOLD_S is a number of seconds and MEMGUARD_HARD_GIB a number of GiB, not $MEMGUARD_HOLD_S and $MEMGUARD_HARD_GIB"
 [[ "$PREFILL_INTERLEAVE_MS" =~ ^[0-9]+$ ]] && (( PREFILL_INTERLEAVE_MS <= 5000 )) || die "PREFILL_INTERLEAVE_MS is 0 to 5000 milliseconds, not $PREFILL_INTERLEAVE_MS"
-[[ "$PREFILL_YIELD" == 0 || "$PREFILL_YIELD" == 1 ]] || die "PREFILL_YIELD is 0 or 1, not $PREFILL_YIELD"
 [[ -z "$LOG_MAX_SIZE" || "$LOG_MAX_SIZE" =~ ^[1-9][0-9]*[kmg]$ ]] || die "LOG_MAX_SIZE is a size such as 100m (k, m or g), or empty for the docker daemon's own setting, not $LOG_MAX_SIZE"
 [[ "$LOG_MAX_FILE" =~ ^[1-9][0-9]*$ ]] || die "LOG_MAX_FILE is a number of files, 1 or more, not $LOG_MAX_FILE"
-for v in EAQ_V1_1 THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY STEP_AHEAD; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+for v in EAQ_V1_1 THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$GRAPH_CAP" =~ ^[0-9]+$ ]] || die "GRAPH_CAP is a count of CUDA graphs a rank keeps, 0 for all, not $GRAPH_CAP"
 [[ "$RDMA_IDLE_S" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$RDMA_IDLE_S" 'BEGIN { exit !(value <= 3600) }' || die "RDMA_IDLE_S is 0 to 3600 seconds (0 turns the nap off), not $RDMA_IDLE_S"
 [[ "$RDMA_NAP_US" =~ ^[1-9][0-9]*$ ]] && awk -v value="$RDMA_NAP_US" 'BEGIN { exit !(value <= 1000000) }' || die "RDMA_NAP_US is 1 to 1000000 microseconds, not $RDMA_NAP_US"
@@ -262,18 +260,16 @@ foreground() {
   exit "$code"
 }
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)
-# zig/patches/0034: how long rank 1 retries its connect to rank 0 (seconds, default 300); both ranks refuse anything else
+# zig/patches/0035: how long rank 1 retries its connect to rank 0 (seconds, default 300); both ranks refuse anything else
 [[ -z "${TF_DS_CONNECT_S:-}" ]] || { [[ "$TF_DS_CONNECT_S" =~ ^[1-9][0-9]{0,4}$ ]] && (( TF_DS_CONNECT_S <= 86400 )); } ||
   die "TF_DS_CONNECT_S is a count of seconds from 1 to 86400, not $TF_DS_CONNECT_S"
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDMA_IDLE_S=$RDMA_IDLE_S" "TF_RDMA_NAP_US=$RDMA_NAP_US" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
-[[ "$PREFILL_YIELD" == 0 ]] || ENGINE_ENV+=("TF_DS_PREFILL_YIELD=1")   # zig/patches/0037, both ranks alike
 ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
 ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
-(( STEP_AHEAD == 0 )) || ENGINE_ENV+=("TF_DS_STEP_AHEAD=1")   # zig/patches/0038: rank 0 reads it, rank 1 ignores it
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|PREFILL_YIELD|STEP_AHEAD|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 # each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response

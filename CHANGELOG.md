@@ -2,32 +2,11 @@
 
 ## Unreleased
 
-- `zig/patches/0038-step-ahead.patch` (`STEP_AHEAD=1`; off by default): when a reply ends and nothing else runs or waits,
-  rank 0 reads it ahead while the client runs its tools. An agent's next request is its last prompt, the reply and the tool
-  results, but the prompt cache keeps states only at a prompt pass's chunk ends, so that request resumed at its previous
-  prompt's last kept chunk end and read its own previous reply again (on one Hermes Agent deployment: 2,178 of the 3,277
-  tokens a step re-read were its own previous reply). The background pass reads prompt + reply, cut at the last chunk
-  end that leaves the window, and keeps a state there; it is the next request's own cold pass up to that point, so replies
-  keep their bits. A queued pass yields to any arrival; with prompt steps (`0037`) a request that continues a pass that is
-  mid-way waits for its state, and one that does not cancels it. The author's agent-loop measurement: time to first token
-  of a step 1.99 s to 1.34 s (8 steps, 62-72K tokens). By **Coinupbtc ([Coinupbtc](https://github.com/Coinupbtc))**
-  ([pull request #41](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/41)), rebased by **Braincramps ([Braincramps](https://github.com/Braincramps))**
-  ([pull request #66](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/66)) and carried onto the prompt steps here; host tests, also run with prompts read a chunk a turn.
-  Its two open questions from the review of #41 (a run with `SPILL_GIB` and `KV_SHARD=1`, and whether a pass may park on a
-  disk restore) are not answered by a run: it is off by default, and **not run on a pair here**.
-- `zig/patches/0037-prompt-steps.patch` (`PREFILL_YIELD=1`; off by default): a prompt can be read a chunk at a time. Until
-  now a prompt's whole pass ran inside its admission, so a request that arrived while a long prompt was being read waited
-  for all of it (a 250K-token cold prompt: two minutes; the live streams already got decode rounds between its chunks,
-  `PREFILL_INTERLEAVE_MS`, but admission waited). With the switch on, rank 0 reads its admitted prompts a chunk a turn, in
-  turn, with the live streams' rounds between two chunks: a short request that arrives meanwhile is read after one chunk
-  and decodes beside the long one, which finishes about as soon as it would have. Replies are the same bits (each chunk is
-  the unchanged 2,048-row chunk, from the same positions; the slot's rows and rings live in the slot between chunks);
-  rank 0 sends rank 1 a new frame to return to a prompt another prompt's chunk interrupted, so both ranks need the image.
-  Prompts with pictures are read whole either way. Off, the code that runs is the code that ran before. Host tests with
-  the fake backend (a late short request completes first, with the same tokens as solo; cancels, a refused request, a full
-  pool), and the existing host suites also run with prompts read a chunk a turn (`TF_TEST_PREFILL_STEPS=1`: parked and
-  deferred restores, pair break, stall monitor, prompt-cache resume and eviction). **Run on the pair:** Measured on the pair (engine `629c524` + 0001-0038, 70K-token cold prompt, a short request sent 8 s in): the short request took 26.7 s with the switch off and 0.98 s on, the long prompt 34.5 s and 34.2 s with the same reply hash; `tools/exact.py` gave IDENTICAL on all 31 cases and `tools/validate.py` passed; two 33K-token cold prompts read at the same time with short requests during both answered the shorts in 0.4-1.6 s and equalled their cached reruns; a client that left mid-prompt freed its slot (the next request took 1.4 s). `tools/prefill_yield_check.py` repeats the first measurement. Design after the 4x recipe's `0031` by **Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus))**
-  ([pull request #15](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/15)); re-written for this recipe's spill tier, parked requests, KV parts and pair handling.
+- The engine pin moves to `fbbc971` (BertholomusAI's `deepseek-v41-zig` tip of 2026-10-23, was `629c524`), with the
+  series rebased onto it: `0002` and `0006` are gone (the engine's `TF_DS_ENGRAM_LEAD` and `3de79d8` do their jobs),
+  twelve patches are adapted to the engine's prompt pass in pieces (`TF_FILL_CHUNKS`, `TF_FILL_CUT_IN`; `start.sh` passes
+  `TF_FILL_*`), and `0034` holds two follow-ups. Details in `zig/patches/README.md`. By **eleata**.
+- `zig/patches/0035-rendezvous-ports-early.patch` (on): rank 0 opens its follower's port before its weights load and takes
 - `zig/patches/0036-metrics-cached-prompt-tokens.patch` (always on, issue #58): `/metrics` publishes
   `prompt_tokens_cached_total`, the prompt tokens of finished requests restored from kept prompt states (they are in
   `prompt_tokens_total` too), repeated under vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`; `/health`
@@ -38,21 +17,6 @@
   counter and its vLLM names are by **manuel1618 ([manuel1618](https://github.com/manuel1618))**
   ([pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4x recipe, a backport of BertholomusAI's `ce0d9053`), adapted here with
   `/health` and `/v1/models` added; host tests in `zig/src/server/status_totals_test.zig` and `metrics.zig`.
-- `zig/patches/0035-aligned-index-views.patch` (always on): the prompt pass's indexer scores rows in blocks, and a block
-  size that was not a multiple of 16 (137,612 compressed keys gave 121-row blocks) put a later block's views off the
-  16-byte boundary the kit's kernels were captured for: no matching variant, `MissingTritonVariant`. Blocks are now a
-  multiple of 16 rows (a row's scores are its own: no bits change), and a replay cut with an odd first row copies the
-  positions to an aligned buffer. From the 4x recipe's `0005` and `0007` (Mia's AI Lab); a host test for the block
-  size. Not run on a pair: it may be related to #65 and #36 but that is not shown, so compare replies with
-  `tools/exact.py` before relying on it.
-- `zig/patches/0034-rendezvous-ports-early.patch` (on): rank 0 opens its follower's port before its weights load and takes
-  the connection afterwards. It used to listen only after its own weights had loaded, while the worker retried its
-  connect for a fixed 300 s, so a worker that finished loading more than 300 s before the head (the head reading its
-  weights cold, say) exited with `ConnectFailed`; now it waits in the port's backlog. `TF_DS_CONNECT_S` (default 300)
-  sets that retry window on both ranks; `start.sh` refuses a value that is not 1 to 86400. Host tests: a peer that
-  connects before the accept (also through `Fan`) is linked once rank 0 takes its port, and the setting's parsing; a
-  `scripts/port_test.sh` check that it reaches both ranks. After the 4x recipe's `0035` (Mia's AI Lab), which found it
-  there (its issue #3, diagnosed by shanedertrain).
 - `./stop.sh` exits 1 when a rank could not be stopped or a Spark's containers could not be listed (ssh or `docker ps`
   failed), and says which Spark it left alone. Before, such a Spark counted as having no container, stop.sh exited 0,
   and `./start.sh restart` went on to launch a rank while the old one might still hold the GPU's memory. The prepared

@@ -24,6 +24,12 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 
 ## Engine
 
+- **The engine pin `fbbc971` and the rebase of the patch series onto it** (`TF_REF` and `zig/Dockerfile`'s pin, the retirement of
+  `zig/patches/0002-c3-engram-lanes.patch` and `0006-image-prompt-cache.patch`, the twelve patches adapted to the engine's prompt
+  pass in pieces, `zig/patches/0034-rebase-followups.patch`, and the `TF_FILL_*` settings passed by `start.sh`) was authored by
+  **eleata** ([eleata](https://github.com/eleata)) in [pull request #77](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/77)
+  (commit [`b478ccc`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/77/commits/b478ccc071ed0bfd60da64d27d9b0262f239cf3d)); carried as sent, with the
+  follow-ups Mia's AI Lab added on top (see the entries below).
 - **EAQ v1.1 support** (`EAQ_V1_1=1`) was authored by **Mykhailo Tamarin** ([MykhailoTamarin](https://github.com/MykhailoTamarin))
   in [pull request #57](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/57) (Apache-2.0):
   **`zig/patches/0024-mixed-pack.patch`** and **`zig/patches-inputs/0001-mixed-pack-rank-cache.patch`** (the EAQ v1.1 mixed
@@ -148,18 +154,7 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   cached-token counter, its vLLM-named repeats and the engine flag that turns them on were authored by
   **[manuel1618](https://github.com/manuel1618)** in [pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4-Spark recipe
   (commit [`03f489f`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/03f489f)), a backport of BertholomusAI's `ce0d9053`; adapted here by Mia's AI Lab,
-  which added the `/health` totals and `max_model_len`. **`0034-rendezvous-ports-early.patch`** and
-  **`0035-aligned-index-views.patch`** were written by Mia's AI Lab after the 4-Spark recipe's `0035`, `0005` and `0007`.
-- **`zig/patches/0037-prompt-steps.patch`** (a prompt read a chunk at a time, with other requests admitted between its chunks) follows the design of
-  the 4-Spark recipe's `0031`, authored by **Mauvis Ledford ([krunkosaurus](https://github.com/krunkosaurus))** in
-  [pull request #15](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/15) (commit [`b2bf975`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/b2bf975)): the loop that advances admitted prompts a chunk a turn, `Engine.fillStream`,
-  the fake chunked backend and the late-request host tests. It was re-written here against this tree's spill tier, parked requests, KV parts and
-  pair-broken handling, with the follower's `fill_resume` frame, by Mia's AI Lab.
-- **`zig/patches/0038-step-ahead.patch`** (a finished reply read ahead while the client runs its tools, `STEP_AHEAD`) was authored by
-  **[Coinupbtc](https://github.com/Coinupbtc)** in [pull request #41](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/41)
-  (commit [`7714eae`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/41/commits/7714eaec5f54c2c6f05b5c2cb0f48931d06195ea)), rebased onto this series by
-  **[Braincramps](https://github.com/Braincramps)** in [pull request #66](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/66)
-  (commit [`1418489`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/66/commits/1418489d7a9b8cc9190c06839fc0afeea7c3c894)); carried here after `0037` with the wait for a pass in progress and its test added by Mia's AI Lab.
+  which added the `/health` totals and `max_model_len`. **`0035-rendezvous-ports-early.patch`** was written by Mia's AI Lab after the 4-Spark recipe's `0035`.
 - **`zig/patches/0004-call-gate.patch`** (`tool_choice` enforcement) was written by Mia's AI Lab (Apache-2.0). Its new file,
   `zig/src/core/lanes/call_gate.zig`, is Mia's AI Lab's Zig call gate for the Flash Next CUDA engine (commits `49350ed6` and
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's

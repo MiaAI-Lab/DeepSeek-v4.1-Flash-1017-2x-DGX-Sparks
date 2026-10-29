@@ -4,7 +4,7 @@ Subject: [PATCH] dsv41 lanes: enforce tool_choice required
 The CUDA host advertises call_gates. A required or named tool choice opens the answer with the template tool-call token and completes an offered name. Requests without tool_choice are unchanged. A lone drafted fast path still skips a request that must call a tool.
 
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index 0d8b53c..db84803 100644
+index d9d7406f0f5b484302ae1a4911effb8f78bc98ea..3c91cfcdb045a153cf6d0959a2cc1d98f4699f6c 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
 @@ -35,6 +35,16 @@ pub const CallGate = struct {
@@ -25,10 +25,10 @@ index 0d8b53c..db84803 100644
  
  /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 522cff3..21b2edd 100644
+index 83b94b84fc1cef8d362088f3019fdc8136e13238..bedd287ea6266f77d31c6a35d01d0fd96e95d01c 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -327,6 +327,15 @@ pub const LaneHost = struct {
+@@ -355,6 +355,15 @@ pub const LaneHost = struct {
              .think_close = r.think_close,
              .think_end = if (r.think_end) |t| t else -1,
              .loop_guard = r.loop_guard,
@@ -46,7 +46,7 @@ index 522cff3..21b2edd 100644
              .images = r.images,
 diff --git a/zig/src/core/lanes/call_gate.zig b/zig/src/core/lanes/call_gate.zig
 new file mode 100644
-index 0000000..07a2666
+index 0000000000000000000000000000000000000000..07a2666f4ee9fba4636c753a8533d177005fc7a3
 --- /dev/null
 +++ b/zig/src/core/lanes/call_gate.zig
 @@ -0,0 +1,220 @@
@@ -271,10 +271,10 @@ index 0000000..07a2666
 +    try std.testing.expect(blank == null);
 +}
 diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
-index 1199e77..4c6929d 100644
+index 9a8f84cb691005d3484caf20f385afd68fe4dbc4..8f2e93042408db1e9599f362dea61f6afaaec804 100644
 --- a/zig/src/core/lanes/engine.zig
 +++ b/zig/src/core/lanes/engine.zig
-@@ -93,11 +93,14 @@ pub const Engine = struct {
+@@ -150,11 +150,14 @@ pub const Engine = struct {
          const position: u64 = s.prompt_len;
          const drawn = try e.backend.first(s, position);
          var feed: Feed = .{ .handle = drawn };
@@ -291,7 +291,7 @@ index 1199e77..4c6929d 100644
              asked = d;
              try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
              s.dropHeld(e.gpa);
-@@ -382,9 +385,20 @@ pub const Engine = struct {
+@@ -441,9 +444,20 @@ pub const Engine = struct {
          }
          const budget_cut = s.thinkCut(committed.items);
          const loop_cut = sm.loopCut(s, committed.items);
@@ -314,7 +314,7 @@ index 1199e77..4c6929d 100644
              cut = loop_cut;
              path = path[0 .. loop_cut.? + 1];
              committed.shrinkRetainingCapacity(loop_cut.? + 1);
-@@ -523,9 +537,14 @@ pub const Engine = struct {
+@@ -582,9 +596,14 @@ pub const Engine = struct {
          }
          var current: Feed = .{ .handle = s.inflight.? };
          s.inflight = null;
@@ -331,7 +331,7 @@ index 1199e77..4c6929d 100644
              token = try e.readFeed(current); // the last queued step: no new one
              s.mode = .verify;
          } else {
-@@ -546,8 +565,10 @@ pub const Engine = struct {
+@@ -605,8 +624,10 @@ pub const Engine = struct {
      fn landInflight(e: *Engine, s: *Stream) !void {
          var current: Feed = .{ .handle = s.inflight.? };
          s.inflight = null;
@@ -344,7 +344,7 @@ index 1199e77..4c6929d 100644
          s.rounds += 1;
          const landed = try s.commit(e.gpa, &.{token});
          s.pending = token;
-@@ -566,6 +587,16 @@ pub const Engine = struct {
+@@ -625,6 +646,16 @@ pub const Engine = struct {
          }
      }
  
@@ -362,7 +362,7 @@ index 1199e77..4c6929d 100644
      fn forcedNext(e: *Engine, s: *Stream) !?u32 {
          if (s.popForce()) |t| return t;
 diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
-index 1d6ba84..b3adb39 100644
+index 1d6ba843de3cacc97518ed7fd54d21baa591cbe8..b3adb39bba8ab87241fa9960d78b708fd31d3447 100644
 --- a/zig/src/core/lanes/stream.zig
 +++ b/zig/src/core/lanes/stream.zig
 @@ -1,6 +1,7 @@
@@ -423,10 +423,10 @@ index 1d6ba84..b3adb39 100644
              const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
              if (s.isEos(t) or s.stopped()) {
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index c37f635..ba8f5ef 100644
+index a6eae705cb092245ea73761cf77ef1a604ae4624..3a6630803ac42575d3ecdc4ff29881a602b2b5dd 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
-@@ -377,7 +377,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -395,7 +395,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
      };
      // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
      const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
@@ -436,7 +436,7 @@ index c37f635..ba8f5ef 100644
      return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
  }
 diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
-index 29a5382..0001a3e 100644
+index 29a53829355d149e6121a1829a704f138336829e..0001a3e448ccbc32b54d8741c788eaa28693d638 100644
 --- a/zig/src/server/server.zig
 +++ b/zig/src/server/server.zig
 @@ -159,7 +159,7 @@ pub const Server = struct {

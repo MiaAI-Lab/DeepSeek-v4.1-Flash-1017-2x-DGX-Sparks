@@ -4,9 +4,9 @@
   python3 tools/prefill_yield_check.py [--url http://127.0.0.1:8888] [--long-words 64000] [--delay 8] [--salt yieldtest]
 
 Sends one long COLD prompt (greedy, thinking off, 24 tokens out), and `--delay` seconds later a short request (16 tokens
-out). Prints each request's seconds and the long reply's token sha. With PREFILL_YIELD=0 the short request is read after
-the whole long prompt; with PREFILL_YIELD=1 it is read after one chunk, so its seconds drop from about the long prompt's
-prefill time to a few seconds. The long prompt is byte-identical for the same --salt, so its token sha can be compared
+out). Prints each request's seconds and the long reply's token sha. Without the engine's TF_FILL_CHUNKS and TF_FILL_CUT_IN (or, on the earlier
+engine pin, this recipe's PREFILL_YIELD=1) the short request is read after the whole long prompt; with them it is read
+between two pieces of it, so its seconds drop from about the long prompt's prefill time to a few seconds. The long prompt is byte-identical for the same --salt, so its token sha can be compared
 between a run before and a run after a restart (a restart empties the prompt cache; a second run on the same server is
 not cold and the script says so). The long reply must not depend on the setting: the same sha is the check.
 Stdlib only. API key as tools/exact.py (API_KEY, else API_KEY_FILE).

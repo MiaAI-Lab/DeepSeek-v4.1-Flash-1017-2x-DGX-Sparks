@@ -518,7 +518,7 @@ check_ "POOL: the derived sharding pool goes through start.sh's 0008 mapping, on
   fol=$(grep "^FOLLOW=\"" "$here/../start.sh")
   die() { echo "DIE: $*"; exit 1; }; warn() { :; }; log() { :; }
   TP=2 CONTEXT=1048576 PARALLEL=4 ROUND_ROWS=16 HF_CACHE=/x/hf NFS_PATH=/x/hf POOL= KV_SHARD=1 SPILL_GIB=0
-  REPLAY_FLOOR=0 HF_HUB_OFFLINE=1 PREFILL_INTERLEAVE_MS=0 PREFILL_YIELD=0 STEP_AHEAD=0 RDMA_IDLE_S=2 RDMA_NAP_US=500 DRAFTS=1 GRAPHS=1 GRAPH_CAP=128 SIDE=0 PREFETCH=0 ENGRAM_AIO=0
+  REPLAY_FLOOR=0 HF_HUB_OFFLINE=1 PREFILL_INTERLEAVE_MS=0 RDMA_IDLE_S=2 RDMA_NAP_US=500 DRAFTS=1 GRAPHS=1 GRAPH_CAP=128 SIDE=0 PREFETCH=0 ENGRAM_AIO=0
   source "$here/port.sh"; port_validate >/dev/null; port_map
   eval "$eng"; eval "$fol"
   all=$(printf "%s\n" "${ENGINE_ENV[@]}")
@@ -652,18 +652,12 @@ EOF
     [[ "$(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")" == "TF_DS_GRAPH_CAP=128 " ]] || { echo "a raw TF_DS_GRAPH_CAP export reached a rank: $(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")"; exit 1; }
     grun port nographs.out SPILL_GIB=0 KV_SHARD=0 GRAPHS=0 || exit 1
     ! grep -q -- "--graph-cap" "$G_T/nographs.out" || { echo "rank 1 got --graph-cap with GRAPHS=0 (an image from before 0033 refuses it)"; exit 1; }'
-  check_ "golden: TF_DS_CONNECT_S reaches both ranks as given; a value that is not 1 to 86400 refuses the start (0034)" '
+  check_ "golden: TF_DS_CONNECT_S reaches both ranks as given; a value that is not 1 to 86400 refuses the start (0035)" '
     grun port conn.out SPILL_GIB=0 KV_SHARD=0 TF_DS_CONNECT_S=900 || exit 1
     [[ "$(grep -c -- " -e TF_DS_CONNECT_S=900 " "$G_T/conn.out")" == 2 ]] || { echo "TF_DS_CONNECT_S is not on both ranks"; exit 1; }
     for bad in 0 -1 abc 86401 "30;true"; do
       ! grun port badconn.out TF_DS_CONNECT_S="$bad" 2>/dev/null && grep -q "TF_DS_CONNECT_S is a count of seconds" "$G_T/badconn.out.log" || { echo "TF_DS_CONNECT_S=$bad did not refuse the start"; exit 1; }
     done'
-  check_ "golden: PREFILL_YIELD=1 reaches both ranks; another value refuses the start; a raw TF_DS_PREFILL_YIELD export loses (0037)" '
-    grun port yield.out SPILL_GIB=0 KV_SHARD=0 PREFILL_YIELD=1 || exit 1
-    [[ "$(grep -c -- " -e TF_DS_PREFILL_YIELD=1 " "$G_T/yield.out")" == 2 ]] || { echo "PREFILL_YIELD=1 is not on both ranks"; exit 1; }
-    ! grun port badyield.out PREFILL_YIELD=2 2>/dev/null && grep -q "PREFILL_YIELD is 0 or 1" "$G_T/badyield.out.log" || { echo "PREFILL_YIELD=2 did not refuse the start"; exit 1; }
-    grun port rawyield.out SPILL_GIB=0 KV_SHARD=0 TF_DS_PREFILL_YIELD=1 || exit 1
-    ! grep -q -- "TF_DS_PREFILL_YIELD" "$G_T/rawyield.out" || { echo "a raw TF_DS_PREFILL_YIELD export reached a rank"; exit 1; }'
   check_ "golden: a LOG_MAX_SIZE that is not a size refuses the start (#49)" '
     ! grun port badlog.out LOG_MAX_SIZE="100m;true" 2>/dev/null && grep -q "LOG_MAX_SIZE is a size" "$G_T/badlog.out.log"'
   check_ "golden: KV_SHARD=1 POOL=2101248 adds only its variables to $gbase's POOL=2101248 (0008: TF_DS_POOL, TF_DS_WINDOW, --pool)" '

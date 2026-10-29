@@ -20,7 +20,7 @@ refused rather than dropped.)
  1 file changed, 8 insertions(+), 4 deletions(-)
 
 diff --git a/zig/src/server/anthropic_translate.zig b/zig/src/server/anthropic_translate.zig
-index f70b6a1..e7f01b8 100644
+index f70b6a112c34a6cfd82c81aae4332505a35d2e77..e7f01b8b37a29a0d561df73fbff01cad0897e2bf 100644
 --- a/zig/src/server/anthropic_translate.zig
 +++ b/zig/src/server/anthropic_translate.zig
 @@ -284,10 +284,14 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
@@ -42,5 +42,3 @@ index f70b6a1..e7f01b8 100644
      }
      return .{ .object = chat };
  }
--- 
-2.43.0

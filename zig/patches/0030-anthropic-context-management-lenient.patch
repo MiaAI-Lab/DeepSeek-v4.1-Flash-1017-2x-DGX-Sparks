@@ -22,8 +22,10 @@ its own, so nothing else changes.
  zig/src/server/late_system_test.zig    | 33 ++++++++++++++++++++++++++
  2 files changed, 39 insertions(+), 3 deletions(-)
 
+Rebased onto TensorFold fbbc971 (28-oct-2026): applies unchanged after 0001-0029.
+
 diff --git a/zig/src/server/anthropic_translate.zig b/zig/src/server/anthropic_translate.zig
-index e7f01b8..8a155f5 100644
+index e7f01b8b37a29a0d561df73fbff01cad0897e2bf..8a155f5f7fcacef4c1c3eeb284845795446587b8 100644
 --- a/zig/src/server/anthropic_translate.zig
 +++ b/zig/src/server/anthropic_translate.zig
 @@ -199,12 +199,15 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
@@ -46,7 +48,7 @@ index e7f01b8..8a155f5 100644
      for ([_][]const u8{ "container", "mcp_servers", "service_tier" }) |name| if (body.field(name)) |v| {
          const fine = (v == .array and v.array.len == 0) or (v == .string and std.mem.eql(u8, v.string, "auto"));
 diff --git a/zig/src/server/late_system_test.zig b/zig/src/server/late_system_test.zig
-index a5ef71b..4a061f8 100644
+index a5ef71bd18c1aca8ca1a317aef77649c3b47651d..4a061f8b71ca4dc7e879e4c16d70258e01d14736 100644
 --- a/zig/src/server/late_system_test.zig
 +++ b/zig/src/server/late_system_test.zig
 @@ -208,3 +208,36 @@ test "a mid-conversation system message renders the same prompt on Messages and
@@ -86,6 +88,3 @@ index a5ef71b..4a061f8 100644
 +    try std.testing.expectEqual(@as(u16, 400), bogus.status);
 +    try std.testing.expect(std.mem.indexOf(u8, bogus.body, "context_management supports clear_thinking edits only") != null);
 +}
--- 
-2.43.0
-
