@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
+  unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
+  `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
 - `zig/patches/0035-engram-lead-failure-paths.patch` (always on): Engram prompt reads fail safely with
   `TF_DS_ENGRAM_LEAD` and without it. A read that fails on one rank only (a disk or memory fault) left that rank out of
   the layer's collective while the other waited in it; it now ends the pair (`EngramRankFault`, status 75 for the
@@ -42,7 +45,7 @@
   `/v1/models` names `max_model_len` (the context window; sparkDash's Context tile reads it). Computed prompt tokens
   are `prompt_tokens_total - cached_tokens_total`. Counters are left out for an engine that keeps no prompt states. The
   counter and its vLLM names are by **manuel1618 ([manuel1618](https://github.com/manuel1618))**
-  ([pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4x recipe, a backport of BertholomusAI's `ce0d9053`), adapted here with
+  ([pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4x recipe, a backport of the TensorFold commit `ce0d9053` by juliankang4), adapted here with
   `/health` and `/v1/models` added; host tests in `zig/src/server/status_totals_test.zig` and `metrics.zig`.
 - `./stop.sh` exits 1 when a rank could not be stopped or a Spark's containers could not be listed (ssh or `docker ps`
   failed), and says which Spark it left alone. Before, such a Spark counted as having no container, stop.sh exited 0,

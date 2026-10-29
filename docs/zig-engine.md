@@ -64,7 +64,7 @@ equal rank 0's context and streams, or the two ranks wait on each other.
 
 ## Not verified
 
-Served and measured on one pair of Sparks (README, Status). Still open:
+Served and measured on one pair of Sparks ([measurements](measurements.md)). Still open:
 
 - other cabling and hardware: the two rails (the cabled port and its PCIe twin) carry traffic on the pair this was run on,
   with zero RDMA error counters, but `TF_RDMA_GID_INDEX` comes from the GID `scripts/nodes.sh` found on that pair;

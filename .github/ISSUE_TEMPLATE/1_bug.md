@@ -12,7 +12,7 @@ assignees: ""
      or reach out on X:
       * https://x.com/MiaAI_lab
 
-     This recipe has not served a request yet (README, Status): a first report that rank 0 or rank 1 exits at
+     This recipe has not served a request yet (docs/measurements.md): a first report that rank 0 or rank 1 exits at
      start is useful, with both ranks' logs.
 
      If you have found a bug, then fill out the template below.
@@ -87,7 +87,7 @@ curl -s http://<head-address>:8888/v1/chat/completions \
         * "no RoCE device or RoCE v2 GID for the link" -> WORKER is reached over another network: set FABRIC_PEER to
           the worker's CX7 address.
         * `start.sh` refuses port 8888 -> something else listens there; set PORT.
-        * prepare.sh: "does not see every file over NFS" -> the head's HF_CACHE is not exported to the worker (README, NFS).
+        * prepare.sh: "does not see every file over NFS" -> the head's HF_CACHE is not exported to the worker (docs/requirements.md, NFS).
         * prepare.sh: the kit does not check out -> KIT_REF was changed, or the checkpoint's config is not the one the
           RoPE tables are made for.
         * rank 1 exits at start with a missing input -> its weight file, Engram's tables or the token map: prepare.sh

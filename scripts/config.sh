@@ -124,7 +124,7 @@ CONTEXT="${CONTEXT:-1048576}"
 # zig/patches/0008: the positions the streams' extents and kept prompts share (rank 0's and rank 1's --pool), when more than CONTEXT: more
 # long prompts stay resident (each kept prompt holds its extent) and more long requests run at once. Empty (default): CONTEXT, as before.
 # It may not be smaller than CONTEXT. Its KV caches grow with it (about 0.9 GiB a rank per 1,048,576 positions, in host memory: measure the
-# head's headroom first, see README); the RoPE tables stay the window's size. TF_DS_POOL, and TF_DS_WINDOW (= CONTEXT) on both ranks.
+# head's headroom first, see docs/memory-and-safety.md); the RoPE tables stay the window's size. TF_DS_POOL, and TF_DS_WINDOW (= CONTEXT) on both ranks.
 # With KV_SHARD=1 (scripts/port.sh) the same POOL is cut into one part a Spark, each holding a whole CONTEXT window, and each Spark
 # keeps only its own part's compressed KV: about half the KV memory a Spark for the same POOL (measured at 2,101,248 positions:
 # 1,062 MiB a rank against 1,783 MiB replicated; decode 1-4% slower). Empty with KV_SHARD=1: the pool it needs (2,101,248 at 1,048,576).
