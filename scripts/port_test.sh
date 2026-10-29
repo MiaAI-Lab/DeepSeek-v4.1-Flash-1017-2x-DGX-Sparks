@@ -652,7 +652,7 @@ EOF
     [[ "$(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")" == "TF_DS_GRAPH_CAP=128 " ]] || { echo "a raw TF_DS_GRAPH_CAP export reached a rank: $(grep -o -- "TF_DS_GRAPH_CAP=[0-9]*" "$G_T/rawcap.out" | tr "\n" " ")"; exit 1; }
     grun port nographs.out SPILL_GIB=0 KV_SHARD=0 GRAPHS=0 || exit 1
     ! grep -q -- "--graph-cap" "$G_T/nographs.out" || { echo "rank 1 got --graph-cap with GRAPHS=0 (an image from before 0033 refuses it)"; exit 1; }'
-  check_ "golden: TF_DS_CONNECT_S reaches both ranks as given; a value that is not 1 to 86400 refuses the start (0035)" '
+  check_ "golden: TF_DS_CONNECT_S reaches both ranks as given; a value that is not 1 to 86400 refuses the start (0037)" '
     grun port conn.out SPILL_GIB=0 KV_SHARD=0 TF_DS_CONNECT_S=900 || exit 1
     [[ "$(grep -c -- " -e TF_DS_CONNECT_S=900 " "$G_T/conn.out")" == 2 ]] || { echo "TF_DS_CONNECT_S is not on both ranks"; exit 1; }
     for bad in 0 -1 abc 86401 "30;true"; do

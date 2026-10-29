@@ -30,6 +30,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   **eleata** ([eleata](https://github.com/eleata)) in [pull request #77](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/77)
   (commit [`b478ccc`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/77/commits/b478ccc071ed0bfd60da64d27d9b0262f239cf3d)); carried as sent, with the
   follow-ups Mia's AI Lab added on top (see the entries below).
+- **`zig/patches/0035-engram-lead-failure-paths.patch`** (an Engram prompt read that fails on one rank ends the pair as
+  `EngramRankFault`, a table shorter than the hasher's row range is refused at start, the follower joins its Engram readers on
+  every exit, and the AIO, `Model.open`, `Pool.init` and `Tables.open` failure paths release what they made) was authored by
+  **Hector Isaza** ([hecisaza](https://github.com/hecisaza)) in [pull request #79](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/79)
+  (commit [`549f473`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/79/commits/549f473d4a5fd2ba39dc6eb666255a18bece098e)); carried as sent.
 - **EAQ v1.1 support** (`EAQ_V1_1=1`) was authored by **Mykhailo Tamarin** ([MykhailoTamarin](https://github.com/MykhailoTamarin))
   in [pull request #57](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/57) (Apache-2.0):
   **`zig/patches/0024-mixed-pack.patch`** and **`zig/patches-inputs/0001-mixed-pack-rank-cache.patch`** (the EAQ v1.1 mixed
@@ -154,7 +159,7 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   cached-token counter, its vLLM-named repeats and the engine flag that turns them on were authored by
   **[manuel1618](https://github.com/manuel1618)** in [pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4-Spark recipe
   (commit [`03f489f`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/03f489f)), a backport of BertholomusAI's `ce0d9053`; adapted here by Mia's AI Lab,
-  which added the `/health` totals and `max_model_len`. **`0035-rendezvous-ports-early.patch`** was written by Mia's AI Lab after the 4-Spark recipe's `0035`.
+  which added the `/health` totals and `max_model_len`. **`0037-rendezvous-ports-early.patch`** was written by Mia's AI Lab after the 4-Spark recipe's `0035`.
 - **`zig/patches/0004-call-gate.patch`** (`tool_choice` enforcement) was written by Mia's AI Lab (Apache-2.0). Its new file,
   `zig/src/core/lanes/call_gate.zig`, is Mia's AI Lab's Zig call gate for the Flash Next CUDA engine (commits `49350ed6` and
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's

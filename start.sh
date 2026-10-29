@@ -260,7 +260,7 @@ foreground() {
   exit "$code"
 }
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)
-# zig/patches/0035: how long rank 1 retries its connect to rank 0 (seconds, default 300); both ranks refuse anything else
+# zig/patches/0037: how long rank 1 retries its connect to rank 0 (seconds, default 300); both ranks refuse anything else
 [[ -z "${TF_DS_CONNECT_S:-}" ]] || { [[ "$TF_DS_CONNECT_S" =~ ^[1-9][0-9]{0,4}$ ]] && (( TF_DS_CONNECT_S <= 86400 )); } ||
   die "TF_DS_CONNECT_S is a count of seconds from 1 to 86400, not $TF_DS_CONNECT_S"
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDMA_IDLE_S=$RDMA_IDLE_S" "TF_RDMA_NAP_US=$RDMA_NAP_US" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")

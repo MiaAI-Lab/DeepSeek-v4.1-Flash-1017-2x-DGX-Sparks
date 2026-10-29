@@ -2,11 +2,32 @@
 
 ## Unreleased
 
+- `zig/patches/0035-engram-lead-failure-paths.patch` (always on): Engram prompt reads fail safely with
+  `TF_DS_ENGRAM_LEAD` and without it. A read that fails on one rank only (a disk or memory fault) left that rank out of
+  the layer's collective while the other waited in it; it now ends the pair (`EngramRankFault`, status 75 for the
+  supervisor to restart both ranks). A table shorter than the hasher's row range is refused at start, the follower
+  joins its Engram readers on every exit, an AIO allocation failure records no batch, and `Model.open`, `Pool.init` and
+  `Tables.open` release what they made on failure. A read failure on both ranks now restarts the pair too, instead of
+  failing one request. By **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
 - The engine pin moves to `fbbc971` (BertholomusAI's `deepseek-v41-zig` tip of 2026-10-23, was `629c524`), with the
   series rebased onto it: `0002` and `0006` are gone (the engine's `TF_DS_ENGRAM_LEAD` and `3de79d8` do their jobs),
   twelve patches are adapted to the engine's prompt pass in pieces (`TF_FILL_CHUNKS`, `TF_FILL_CUT_IN`; `start.sh` passes
   `TF_FILL_*`), and `0034` holds two follow-ups. Details in `zig/patches/README.md`. By **eleata**.
-- `zig/patches/0035-rendezvous-ports-early.patch` (on): rank 0 opens its follower's port before its weights load and takes
+  Three behaviour changes come with the pin even with every switch off: a DSML call to a tool the request did not
+  offer is now returned as a `tool_calls` entry under the model's own name (`tool_parse.zig`, as #67 asks), so a client
+  that runs call names without checking them against its own tool list should check them; the prompt cache's `tail`
+  rule passes over a kept state within the window's rows of the prompt's end (`prompt_cache.zig` `find`); and prompts
+  with pictures keep and resume states by default, keyed by the pictures' SHA-256 digests (`TF_DS_IMAGE_CACHE=0` turns
+  it off). Also from the engine: a malformed `TF_FILL_*` value is ignored silently (the pass then runs whole), and
+  `TF_DS_SOLO_OVERHEAD` / `TF_DS_NO_COPIES` count as on for any set value other than `0`, an empty one included.
+- `zig/patches/0037-rendezvous-ports-early.patch` (on): rank 0 opens its follower's port before its weights load and takes
+  the connection afterwards. It used to listen only after its own weights had loaded, while the worker retried its
+  connect for a fixed 300 s, so a worker that finished loading more than 300 s before the head (the head reading its
+  weights cold, say) exited with `ConnectFailed`; now it waits in the port's backlog. `TF_DS_CONNECT_S` (default 300)
+  sets that retry window on both ranks; `start.sh` refuses a value that is not 1 to 86400. Host tests: a peer that
+  connects before the accept (also through `Fan`) is linked once rank 0 takes its port, and the setting's parsing; a
+  `scripts/port_test.sh` check that it reaches both ranks. After the 4x recipe's `0035` (Mia's AI Lab), which found it
+  there (its issue #3, diagnosed by shanedertrain).
 - `zig/patches/0036-metrics-cached-prompt-tokens.patch` (always on, issue #58): `/metrics` publishes
   `prompt_tokens_cached_total`, the prompt tokens of finished requests restored from kept prompt states (they are in
   `prompt_tokens_total` too), repeated under vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`; `/health`
