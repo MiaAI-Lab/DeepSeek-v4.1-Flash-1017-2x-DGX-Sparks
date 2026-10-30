@@ -80,6 +80,24 @@ nccl_extra_collect
 check_workers
 need_workers
 port_validate
+# TF_FILL_* runs a prompt pass in pieces (upstream a27d2f0), but with KV_SHARD=1 patch 0018 binds a pass's parts and
+# twins for the whole pass: it runs whole, so every TF_FILL_* switch is inert (no pieces, no cut-ins). Warned here,
+# before anything is stopped, so nobody reads the switches as enabled; 0005's interleave stays on for such a pass, so
+# the other streams keep decoding between its row chunks (issue #83).
+if [[ "$KV_SHARD" == 1 ]]; then
+  fill=""
+  while IFS='=' read -r name value; do
+    [[ -z "$value" ]] || fill+="${fill:+, }$name=$value"
+  done < <(env | grep -E '^TF_FILL_[A-Z0-9_]+=' || true)
+  if [[ -n "$fill" ]]; then
+    if (( PREFILL_INTERLEAVE_MS > 0 )); then
+      rest="0005's interleave still gives the other streams their decode rounds between its row chunks (PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS)"
+    else
+      rest="PREFILL_INTERLEAVE_MS is 0, so the pass runs with no rounds for the other streams: set it to keep them decoding"
+    fi
+    warn "TF_FILL_* is inert with KV_SHARD=1 ($fill): 0018 binds a prompt pass's parts and twins for the whole pass, so it runs whole (no pieces, no cut-ins). $rest (issue #83); unset TF_FILL_* to silence this, or set KV_SHARD=0 for pieces and cut-ins"
+  fi
+fi
 # the spill tier's directory on each Spark (scripts/port.sh): local disk, yours, outside the export and the model folders,
 # above SPILL_FLOOR_GIB; created when missing (DRY_RUN: not). Checked here, before the flags, the variables and the
 # tf.recipe.port label are made and before a running pair is compared with them: a spill tier that is on by default
