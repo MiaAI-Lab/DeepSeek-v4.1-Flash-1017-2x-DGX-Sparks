@@ -20,6 +20,13 @@
   Before it, one conversation of about 600K tokens ran from 0 fourteen times in 36 hours on a pair (4 restores, 10
   hits). Host tests in `lane_host_robust_test.zig` (each also with the prompt pass in pieces and cut-ins),
   `kv_lanes.zig` and `parts.zig` ("11 room", three mutants). By **[nuk3s](https://github.com/nuk3s)**.
+- `zig/patches/0041-service-between-pieces.patch` (always on): with the spill tier on (`SPILL_GIB`) and `TF_FILL_CHUNKS`
+  set, the run loop asked for the service of parked work (restores, staged writes, deferred retries) on every loop while
+  a prompt pass waited for its next piece, and the service fence (`0020`) refused it each time: `tensorfold:service_refused`
+  went up, the log called it "an engine bug" once, a debug build panicked, and parked work moved only inside a piece. The
+  run loop now services it between two pieces, as `Stream.between` does inside one. Nothing changes without
+  `TF_FILL_CHUNKS`, with `SPILL_GIB=0` or with `KV_SHARD=1`. A host test that panics without the fix.
+  By **[nuk3s](https://github.com/nuk3s)**.
 - `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
   it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
   the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
