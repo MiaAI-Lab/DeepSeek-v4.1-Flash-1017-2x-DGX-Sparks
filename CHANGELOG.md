@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `zig/patches/0041-service-between-pieces.patch` (always on): with the spill tier on (`SPILL_GIB`) and `TF_FILL_CHUNKS`
+  set, the run loop asked for the service of parked work (restores, staged writes, deferred retries) on every loop while
+  a prompt pass waited for its next piece, and the service fence (`0020`) refused it each time: `tensorfold:service_refused`
+  went up, the log called it "an engine bug" once, a debug build panicked, and parked work moved only inside a piece. The
+  run loop now services it between two pieces, as `Stream.between` does inside one. Nothing changes without
+  `TF_FILL_CHUNKS`, with `SPILL_GIB=0` or with `KV_SHARD=1`. A host test that panics without the fix.
+  By **[nuk3s](https://github.com/nuk3s)**.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
