@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `zig/patches/0018-dsv41-kv-shard-lanes.patch`: with `KV_SHARD=1` a prompt pass runs whole (its parts and twins bind
+  for the whole pass), so the engine's `TF_FILL_*` switches are inert there — and they used to turn `0005`'s prefill
+  interleave off as well, leaving a KV-shard user with no pieces, no cut-ins and no interleave. The lane host now sees
+  that the backend's pool is in parts (`kv_parts`, dsv41's shard) and keeps the interleave on for it, so the other
+  streams keep their decode rounds between the pass's row chunks; `start.sh` warns when `TF_FILL_*` is set with
+  `KV_SHARD=1`, and `docs/configuration.md` says why (issue #83). A pass in pieces under sharding, so a short prompt
+  cuts in, is not part of this: 0018 binds a pass's parts for the whole pass. A host test covers the condition.
+
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).

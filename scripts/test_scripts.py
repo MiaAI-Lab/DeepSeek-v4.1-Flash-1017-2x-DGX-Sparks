@@ -370,6 +370,20 @@ detect_links() {
         self.assertTrue(self.prepared(), out)
         self.assertIn("Not ready yet", out)
 
+    def test_fill_switches_with_kv_sharding_are_warned(self):
+        # 0018 runs a pass whole with KV_SHARD=1, so TF_FILL_* is inert there; the start says so and keeps the interleave
+        code, out = self.run_script(["start.sh", "restart"],
+                                    {"PREPARE": "0", "KV_SHARD": "1", "TF_FILL_CHUNKS": "4", "PREFILL_INTERLEAVE_MS": "250"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("TF_FILL_* is inert with KV_SHARD=1", out)
+        self.assertIn("TF_FILL_CHUNKS=4", out)
+        self.assertIn("interleave still gives the other streams", out)
+
+    def test_fill_switches_without_kv_sharding_are_not_warned(self):
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "KV_SHARD": "0", "TF_FILL_CHUNKS": "4"})
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("TF_FILL_* is inert", out)
+
 
 class PreparedState(ScriptTest):
     BODY = 'image_ident() { echo image-ident; }\nprepared_state'

@@ -23,6 +23,9 @@ Rebased onto TensorFold fbbc971 (28-oct-2026): with TF_DS_KV_SHARD a pass runs w
 
 Rebased onto TensorFold fbbc971 (28-oct-2026): with TF_DS_KV_SHARD a pass runs whole (no pieces, no cut-ins); Fill keeps the part id for setPartial.
 
+# With KV_SHARD=1 a pass runs whole (no pieces, no cut-ins), so every TF_FILL_* switch is inert; the lane host
+# keeps 0005's interleave on for it (LaneHost.wholePasses, from the shard's kv_parts) and start.sh warns when
+# TF_FILL_* is set with KV_SHARD=1 (issue #83).
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
 index a0e7bfe64f7c31fad429a6174979ec12d60acd5f..79bcd3ed163443ee34a439014d4319f7456b0c82 100644
 --- a/zig/src/core/engine_api.zig
@@ -42,10 +45,21 @@ index a0e7bfe64f7c31fad429a6174979ec12d60acd5f..79bcd3ed163443ee34a439014d4319f7
  
  pub const Engine = struct {
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 0faacd4175cc42a56c3e897890fec3f2b74996dd..cd46c84ab87d8e9687f087eed927479cda6f5b90 100644
+index 0faacd4..d88478d 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -75,6 +75,9 @@ pub const LaneHost = struct {
+@@ -62,7 +62,9 @@ pub const LaneHost = struct {
+     // rounds for the other live streams for up to this many ms, their tokens delivered, so a cold long prompt slows a
+     // chat instead of freezing it for the whole pass; the other jobs' cancels are taken there too (issue #3). The
+     // passing job itself is left alone: its own cancel stays in `cancels` for its pass to see, admissions wait.
+-    // Off when TF_FILL_CHUNKS runs passes in pieces (the two are alternatives, not meant to combine).
++    // Off when TF_FILL_CHUNKS runs passes in pieces (the two are alternatives, not meant to combine), unless the
++    // backend runs passes whole whatever that says: there the switches are inert and the interleave is the only
++    // mechanism left, so it stays on.
+     interleave_ns: i96 = 0,
+     passing: ?*Job = null, // the job whose prompt pass runs inside addStream (Stream.between's caller)
+     between_err: ?anyerror = null,
+@@ -75,6 +77,9 @@ pub const LaneHost = struct {
      host_counts: HostCounts = .{},
      /// What status reports under `cache` (published on the engine thread at each noteLive; null until configured).
      tele: ?api.CacheStats = null,
@@ -55,7 +69,7 @@ index 0faacd4175cc42a56c3e897890fec3f2b74996dd..cd46c84ab87d8e9687f087eed927479c
  
      const Mark = struct { at: i96, tokens: u64 };
      const full_retry_ns: i96 = std.time.ns_per_s;
-@@ -269,6 +272,7 @@ pub const LaneHost = struct {
+@@ -269,6 +274,7 @@ pub const LaneHost = struct {
              .streams = n,
              .generation_tokens = h.live_generated,
              .cache = h.tele,
@@ -63,7 +77,28 @@ index 0faacd4175cc42a56c3e897890fec3f2b74996dd..cd46c84ab87d8e9687f087eed927479c
          };
      }
  
-@@ -724,6 +728,11 @@ pub const LaneHost = struct {
+@@ -526,9 +532,18 @@ pub const LaneHost = struct {
+         return true;
+     }
+ 
+-    /// The prefill interleave is on: TF_DS_PREFILL_INTERLEAVE_MS set and passes not run in pieces (TF_FILL_CHUNKS).
++    /// Whether the backend runs a prompt pass whole whatever TF_FILL_CHUNKS says: one whose pool is in parts over the
++    /// ranks (dsv41's KV_SHARD=1, its `kv_parts`) binds a pass's parts and twins for the whole pass (0018), so every
++    /// TF_FILL_* switch is inert there.
++    fn wholePasses(h: *const LaneHost) bool {
++        return h.kv_parts != null;
++    }
++
++    /// The prefill interleave is on: TF_DS_PREFILL_INTERLEAVE_MS set and passes not run in pieces (TF_FILL_CHUNKS),
++    /// unless the backend runs them whole anyway (`wholePasses`): there the switches are inert and the interleave is
++    /// the only mechanism left, so it stays on (issue #83).
+     fn interleaving(h: *const LaneHost) bool {
+-        return h.interleave_ns > 0 and h.core.fill_chunks == 0;
++        return h.interleave_ns > 0 and (h.core.fill_chunks == 0 or h.wholePasses());
+     }
+ 
+     fn betweenWanted(ptr: *anyopaque) bool {
+@@ -724,6 +739,11 @@ pub const LaneHost = struct {
  
      fn noteLive(h: *LaneHost) void {
          const tele = h.telemetry();
@@ -75,7 +110,7 @@ index 0faacd4175cc42a56c3e897890fec3f2b74996dd..cd46c84ab87d8e9687f087eed927479c
          h.lock();
          defer h.unlock();
          h.live_tokens.clearRetainingCapacity();
-@@ -733,6 +742,7 @@ pub const LaneHost = struct {
+@@ -733,6 +753,7 @@ pub const LaneHost = struct {
              h.live_generated += @intCast(job.stream.emitted().len);
          };
          if (tele) |t| h.tele = t;
@@ -83,6 +118,38 @@ index 0faacd4175cc42a56c3e897890fec3f2b74996dd..cd46c84ab87d8e9687f087eed927479c
      }
  
      /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
+@@ -1131,6 +1152,26 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
+     try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+ }
+ 
++test "prefill interleave: on when the backend runs passes whole whatever TF_FILL_CHUNKS says (KV sharding)" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.interleave_ns = 250 * std.time.ns_per_ms;
++    core.fill_chunks = 4; // TF_FILL_CHUNKS: pieces, which turn the interleave off on their own
++    try std.testing.expect(!host.interleaving());
++    // dsv41 with KV_SHARD=1: its pool is in parts, and 0018 runs a pass whole, so TF_FILL_* is inert
++    host.kv_parts = .{ .ctx = undefined, .read = struct {
++        fn read(_: *anyopaque, _: *lanes.kv_parts.Stats) void {}
++    }.read };
++    try std.testing.expect(host.interleaving());
++}
++
+ test "prefill interleave: a decoding stream keeps getting tokens and its cancel lands during another's prompt pass" {
+     const gpa = std.testing.allocator;
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+@@ -1210,3 +1251,4 @@ test {
+     _ = @import("lane_host_test.zig");
+     _ = @import("lane_host_tier_test.zig");
+ }
++
 diff --git a/zig/src/core/lanes/kv_parts.zig b/zig/src/core/lanes/kv_parts.zig
 new file mode 100644
 index 0000000000000000000000000000000000000000..a32daa4196c0933e29c9fa78771964be5d2d93bc
