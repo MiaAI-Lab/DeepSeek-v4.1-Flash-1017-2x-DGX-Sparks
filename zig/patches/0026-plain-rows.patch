@@ -1,8 +1,8 @@
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index 62b939a..49967f9 100644
+index 9b5efeb8a36b1e19880ae79bd4ceaf539ae0b954..9c8b3fc979e664b83abb916edd91b1cee42e3b74 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -68,6 +68,7 @@ pub const Options = struct {
+@@ -70,6 +70,7 @@ pub const Options = struct {
      engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
      arena_bytes: usize = 0, // the device arena's first block (0: it grows from 256 MiB blocks as the buffers ask)
      round_rows: usize = round.default_rows, // a round's rows at most (TF_DS_ROUND_ROWS; the four-node lane's 48)
@@ -10,7 +10,7 @@ index 62b939a..49967f9 100644
      streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
      round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
      vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
-@@ -318,6 +319,7 @@ pub const Model = struct {
+@@ -325,6 +326,7 @@ pub const Model = struct {
          }
          m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
          m.eng.round_rows = o.round_rows;
@@ -19,7 +19,7 @@ index 62b939a..49967f9 100644
          errdefer if (m.kvs) |*x| x.k.unload(); // (registered before the load: nothing between them leaks it)
          if (mode != .off) {
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index a0516fc..1c57752 100644
+index 37fa2d9393a64b9a529d0bfbb121f049ed363573..2ebaa8c3677a1550acfe62d2aff282fdfe605081 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
 @@ -13,6 +13,8 @@
@@ -31,7 +31,7 @@ index a0516fc..1c57752 100644
  //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
  //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
  //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
-@@ -211,6 +213,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+@@ -213,6 +215,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
          .drafts = o.drafts,
          .arena_bytes = arena_gib << 30,
          .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
@@ -39,7 +39,7 @@ index a0516fc..1c57752 100644
          .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
          .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
      };
-@@ -617,6 +620,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -621,6 +624,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
          error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
          error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
@@ -48,7 +48,7 @@ index a0516fc..1c57752 100644
          error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
          error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
 diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
-index df44fa5..245f56f 100644
+index 65492a529ea4983bc64b50836ed6676e42aea9bc..6806b8bdbef0f1b7b7b9c221d94d269fd3e02e5e 100644
 --- a/zig/src/families/dsv41/prompt.zig
 +++ b/zig/src/families/dsv41/prompt.zig
 @@ -125,6 +125,7 @@ pub const Engine = struct {

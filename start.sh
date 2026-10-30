@@ -118,7 +118,7 @@ port_check_extra "$@"
 
 # rank 0's command (its serve flags need no link): built first, so the flags can be checked before anything is stopped
 # API_GATEWAY=1: the engine moves to loopback and the gateway takes HOST:PORT. With API_GATEWAY=0 this is Mia's command;
-# only the derived image tag changes when patch 0035 enters zig/patches/.
+# only the derived image tag changes when patch 0039 enters zig/patches/.
 SERVE_HOST=$HOST; SERVE_PORT=$PORT
 if [[ "$API_GATEWAY" == 1 ]]; then SERVE_HOST=127.0.0.1; SERVE_PORT=$ENGINE_PORT; fi
 SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$SERVE_HOST" --port "$SERVE_PORT" --name "$SERVED_NAME"
@@ -206,7 +206,8 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; th
   [[ "$live_head" == "$live_worker" ]] || die "the two running ranks disagree on the ported features ($live_head here, $live_worker on $(worker_host 1)): run ./start.sh restart"
   [[ "$live_head" == "$(port_identity)" ]] || \
     die "the running ranks use other spill / KV-shard / pool settings ($live_head, asked: $(port_identity)); run ./start.sh restart"
-  [[ "$(prepared_state 2>/dev/null)" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
+  state=$(prepared_state) || die "cannot tell whether the setup is ready: see the error above"
+  [[ "$state" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || \
     die "the requested configuration differs from the prepared server; run ./start.sh restart with the same settings (including ABLIT)"
   if [[ "$API_GATEWAY" == 1 ]]; then
     # The gateway is reused (or started again) only when its label reads back equal to these settings' digest, key
@@ -225,7 +226,15 @@ fi
 
 # ---------------------------------------------------------------- 1. setup
 step 1 "Setup: image, checkpoint, Engram's tables, weight files and kit; the worker's NFS volume and disk"
-if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 2>/dev/null)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
+# (a state that cannot be computed is an error here, not "equal to a missing marker": both read empty otherwise)
+need_prepare=0
+case "${PREPARE:-auto}" in
+  1) need_prepare=1 ;;
+  0) ;;
+  *) state=$(prepared_state) || die "cannot tell whether the setup is ready: see the error above"
+     [[ "$state" == "$(cat "$PREPARED_MARKER" 2>/dev/null)" ]] || need_prepare=1 ;;
+esac
+if (( need_prepare )); then
   if (( DRY )); then log "DRY_RUN: scripts/prepare.sh would run now (not ready yet)"
   else
     # setup builds the image and writes ~106 GB files: with ~104 GiB of a Spark's memory held by a running rank that can freeze it
@@ -353,18 +362,21 @@ foreground() {
   exit "$code"
 }
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)
+# zig/patches/0037: how long rank 1 retries its connect to rank 0 (seconds, default 300); both ranks refuse anything else
+[[ -z "${TF_DS_CONNECT_S:-}" ]] || { [[ "$TF_DS_CONNECT_S" =~ ^[1-9][0-9]{0,4}$ ]] && (( TF_DS_CONNECT_S <= 86400 )); } ||
+  die "TF_DS_CONNECT_S is a count of seconds from 1 to 86400, not $TF_DS_CONNECT_S"
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDMA_IDLE_S=$RDMA_IDLE_S" "TF_RDMA_NAP_US=$RDMA_NAP_US" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 [[ "${TOKEN_ROUTE:-0}" != 1 ]] || ENGINE_ENV+=("TENSORFOLD_TOKEN_ROUTE=1")
 [[ -z "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=$TF_DS_API_EFFORTS")
 # API_GATEWAY=1: the effort names must render the API table (minimal 50, low 50, medium 75, high 75,
-# xhigh 75, max 100); the engine's own table (25/50/62/75/88/100) is the native one. 0035 carries both.
+# xhigh 75, max 100); the engine's own table (25/50/62/75/88/100) is the native one. 0039 carries both.
 [[ "${API_GATEWAY:-0}" != 1 || -n "${TF_DS_API_EFFORTS:-}" ]] || ENGINE_ENV+=("TF_DS_API_EFFORTS=1")
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
 ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|API_EFFORTS)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" | grep -v '^TENSORFOLD_TOKEN_ROUTE=' || true)
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|API_EFFORTS)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" | grep -v '^TENSORFOLD_TOKEN_ROUTE=' || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 # each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response
@@ -406,7 +418,7 @@ if [[ "$GATEWAY_API_SAMPLING" == 1 ]]; then GATEWAY_ARGS+=(--api-sampling); else
 # file. Resolve it explicitly so a missing path is a message, not a silent exit under `set -e`.
 # A dry run prints the commands without touching the filesystem: prepare.sh may not have downloaded the model yet.
 GATEWAY_MODEL_DIR=$DATA_DIR/model
-if [[ "$DRY" != 1 ]]; then
+if [[ "$DRY" != 1 && "$API_GATEWAY" == 1 ]]; then   # only the gateway reads it
   GATEWAY_MODEL_DIR=$(readlink -f "$DATA_DIR/model" 2>/dev/null || true)
   [[ -n "$GATEWAY_MODEL_DIR" ]] || GATEWAY_MODEL_DIR=$DATA_DIR/model
   [[ -d "$GATEWAY_MODEL_DIR" ]] || die "the served folder $GATEWAY_MODEL_DIR does not exist: prepare.sh downloads the model there"

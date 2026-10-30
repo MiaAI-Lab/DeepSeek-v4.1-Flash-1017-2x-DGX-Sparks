@@ -26,8 +26,10 @@ same path as before.
  zig/src/server/sse.zig       |  7 +++++++
  4 files changed, 49 insertions(+), 5 deletions(-)
 
+Rebased onto TensorFold fbbc971 (28-oct-2026): applies unchanged after 0001-0029.
+
 diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
-index e0946e24..6fc62239 100644
+index e0946e24f438491b334dc2374bdf8730c6125ba6..6fc62239f2a5333c8056eac564a26e8c9cfedfbd 100644
 --- a/zig/src/server/anthropic.zig
 +++ b/zig/src/server/anthropic.zig
 @@ -106,7 +106,14 @@ const Wire = struct {
@@ -47,7 +49,7 @@ index e0946e24..6fc62239 100644
  
      fn open(ctx: *anyopaque) error{Closed}!void {
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 924fce3c..69cd0ded 100644
+index b57261f6b9a462dc76423fb94cc83a5d9775a745..23bde8ae2399ec54decb0694919dc71ccc69da93 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
 @@ -41,8 +41,12 @@ pub const Input = struct {
@@ -80,7 +82,7 @@ index 924fce3c..69cd0ded 100644
      srv: *Server,
      a: Allocator,
      box: *Mailbox,
-@@ -472,8 +477,21 @@ const Generation = struct {
+@@ -475,8 +480,21 @@ const Generation = struct {
                  g.cancel();
                  return error.Cancelled;
              }
@@ -104,7 +106,7 @@ index 924fce3c..69cd0ded 100644
      }
  
 diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
-index 516f69da..fac413f3 100644
+index 516f69da54b224a853b24bb9f3e35124816fb0ea..fac413f3fda55dc9bdab90e27c1cd567babb6c6b 100644
 --- a/zig/src/server/openai.zig
 +++ b/zig/src/server/openai.zig
 @@ -34,6 +34,8 @@ pub const Out = struct {
@@ -159,7 +161,7 @@ index 516f69da..fac413f3 100644
                  error.Cancelled => return,
                  error.Refused => if (cx.kind != .other and cx.kind != .server) {
 diff --git a/zig/src/server/sse.zig b/zig/src/server/sse.zig
-index de30ac12..b6befa54 100644
+index de30ac1212249f6930898166264196887fbfdf03..b6befa54247765ad830de630bdd96c6f879b461a 100644
 --- a/zig/src/server/sse.zig
 +++ b/zig/src/server/sse.zig
 @@ -23,6 +23,13 @@ pub fn done(conn: *Conn) error{Closed}!void {
@@ -176,6 +178,3 @@ index de30ac12..b6befa54 100644
  /// ``event: KIND`` then its data line (Responses and Messages events).
  pub fn event(conn: *Conn, a: Allocator, kind: []const u8, payload: json.Value) error{Closed}!void {
      const text = json.stringify(a, payload, .{}) catch return error.Closed;
--- 
-2.43.0
-

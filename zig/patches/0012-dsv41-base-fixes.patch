@@ -9,11 +9,16 @@
 # No switch (always on). A pass reads the rows an unbroken pass reads, so replies are unchanged: exact.py identical to
 # the daily baseline on the pair with the fix in (every run since the round-1 engine, 31/31 there, 39/39 later).
 # By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): upstream's fillBegin resets the read-ahead marks (and the Engram lead's) without joining; resetEngramAhead joins first and does both, and fillBegin calls it.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): upstream's fillBegin resets the read-ahead marks (and the Engram lead's) without joining; resetEngramAhead joins first and does both, and fillBegin calls it.
+
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index 07d01c139e01a4ce221cd2944acfbc9f638e4a62..f406ddf974059a21877a0ad4b82ab8a7908d9aa7 100644
+index 68deb3b8a60bf8f79641064bf3152501fd2aac21..39bb48ab963b3e94a70e7e67e1b9223ecbced4a5 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -518,6 +518,21 @@ pub const Model = struct {
+@@ -522,6 +522,23 @@ pub const Model = struct {
          try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
      }
  
@@ -25,20 +30,27 @@ index 07d01c139e01a4ce221cd2944acfbc9f638e4a62..f406ddf974059a21877a0ad4b82ab8a7
 +    /// coordinator, docs/port/dsv41-state.md); until it lands, a restore calls this right before the resumed pass.
 +    pub fn resetEngramAhead(m: *Model) void {
 +        m.joinAhead();
-+        if (m.eh) |*eh| {
++        if (m.eh) |*eh| { // rows read ahead for another prompt are not this one's, even at the same positions
++            eh.ahead_start = std.math.maxInt(usize);
 +            eh.ahead_ready = .{ false, false };
 +            eh.ahead_n = 0;
 +            eh.ahead_err = null;
++            if (eh.lead_on) m.lead.reset(eh);
 +        }
 +    }
 +
      /// Each layer's gate_bias_vl (f32 [experts], the checkpoint's extra file) on the device: Gate.forward's bias at
      /// image-span positions.
      fn loadVisionBias(m: *Model, path: []const u8) !void {
-@@ -557,6 +572,9 @@ pub const Model = struct {
+@@ -561,11 +578,9 @@ pub const Model = struct {
  
      pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
          if (slot >= m.streams) return error.BadSlot;
+-        if (m.eh) |*eh| { // rows read ahead for another prompt are not this one's, even at the same positions
+-            eh.ahead_start = std.math.maxInt(usize);
+-            eh.ahead_ready = .{ false, false };
+-            if (eh.lead_on) m.lead.reset(eh);
+-        }
 +        // a read-ahead an earlier pass left (cancelled between chunks) never feeds this one: a resume at that pass's
 +        // next chunk start would otherwise take its rows, hashed from the other prompt's ids
 +        m.resetEngramAhead();
@@ -46,10 +58,10 @@ index 07d01c139e01a4ce221cd2944acfbc9f638e4a62..f406ddf974059a21877a0ad4b82ab8a7
          m.ch.spans = &.{};
          m.view = try m.caches.view(&m.eng, slot, base);
 diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
-index d6e4d8d1e99b5aca1c1361a5c5e8a55399981259..309fed77d926dd1e26ac9e92f07470a1558edb2d 100644
+index 7cfde04733aa24ab245c0613c65f5f62fa3805e0..c7745098e3a6dde7e792c93f25a8cb996357bcef 100644
 --- a/zig/src/families/dsv41/rdma.zig
 +++ b/zig/src/families/dsv41/rdma.zig
-@@ -409,7 +409,8 @@ pub const Ring = struct {
+@@ -395,7 +395,8 @@ pub const Ring = struct {
          // A decode round's gathers come microseconds apart; only a long quiet spell naps. The first gather after one
          // waits out at most one nap, and the next doorbell or completion spins again.
          const naps = r.idle_ns > 0;

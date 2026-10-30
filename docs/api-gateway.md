@@ -2,7 +2,7 @@
 
 `gateway/` builds `ds41-gateway`, a Rust front end that gives TensorFold's token-in/token-out route the DeepSeek API's
 surface. It is off by default (`API_GATEWAY=0`); `API_GATEWAY=1` starts it on `HOST:PORT` and moves the engine to
-`127.0.0.1:ENGINE_PORT`. The engine image is unchanged apart from `zig/patches/0035-token-route.patch`.
+`127.0.0.1:ENGINE_PORT`. The engine image is unchanged apart from `zig/patches/0039-token-route.patch`.
 
 ## Routes
 
@@ -124,13 +124,56 @@ The served tokenizer's image-token spelling is given by `GATEWAY_IMAGE_TOKEN`; t
   thinking prompt faithfully.
 - Grammar-constrained decoding (`guided_json`, `guided_regex`, `guided_choice`, `grammar`, `structured_outputs`) falls
   back; `json_object`/`json_schema`/`regex` are written into the prompt without a grammar.
-- Patch 0035 serves `logprobs` / `top_logprobs` on the token route. They fall back only if the running engine's health
+- Patch 0039 serves `logprobs` / `top_logprobs` on the token route. They fall back only if the running engine's health
   reports `logprobs: false` (for example, an engine without that patch).
 - The image token count is the API's own estimate; the engine's prompt length can differ by the tokenizer's special
   tokens. The comparator reports both.
 - `n > 1` is not converted; it falls back.
 - The gateway does not retry a failed engine call and does not drain requests on stop: `stop.sh` stops it first.
 - No Python is in the serving path. The Python in `scripts/` is for the recipe's checks and tests.
+
+## With the recipe: what a client sees, settings, back out
+
+**What changes for a client.** The model names are the served name, `DeepSeek-V4.1-Flash` and `deepseek-flash`.
+Thinking, `reasoning_effort`, `max_tokens` / `max_completion_tokens`, the API's sampling policy and stop sequences are
+handled on the API side; the engine's own `top_k` and `min_p` still apply. Grammar/structured output, `thinking_budget`,
+`previous_response_id` and other Zig-only fields use the fallback until the engine serves them. The token route supports
+`logprobs`; the gateway falls back only when engine health says that support is unavailable. Images are fetched and
+counted by the gateway, with private destinations rejected by default. The gateway's `/health` reports the engine's
+health and is 200 only while the engine is 200.
+
+**Settings** (defaults and notes in `scripts/config.sh`):
+
+| Setting | Default | |
+| --- | --- | --- |
+| `API_GATEWAY` | 0 | `1`: gateway on `HOST:PORT`, engine on `127.0.0.1:ENGINE_PORT`, token route on |
+| `ENGINE_PORT` | 8887 | the engine's loopback port; may not equal `PORT` |
+| `TOKEN_ROUTE` | 0 | `1` without the gateway: serve the token route where the engine is (experiments); `API_GATEWAY=1` implies it |
+| `GATEWAY_IMAGE` | `ds41-gateway:<hash of gateway/>` | the gateway image `prepare.sh` builds; set it to use a prebuilt one |
+| `GATEWAY_MEMORY`, `GATEWAY_CPUS` | 3g, 2 | the container's `--memory` and `--cpus` |
+| `GATEWAY_MAX_CONCURRENT` | 3 | simultaneous request permits; excess requests queue, including through streaming responses |
+| `GATEWAY_MAX_CONNECTIONS` | 256 | open client connections; further clients wait to be accepted |
+| `GATEWAY_MAX_CONNECTIONS_PER_PEER` | 32 | open connections from one address; more are closed at once |
+| `GATEWAY_HEADER_TIMEOUT` | 30 | seconds to send a request header, also between keep-alive requests |
+| `GATEWAY_BODY_TIMEOUT` | 60 | seconds an admitted request may take to send its body; 408 after it |
+| `GATEWAY_WRITE_TIMEOUT` | 60 | seconds a reply may wait on a client that stopped reading it; then the connection closes |
+| `GATEWAY_MAX_PROMPT_MB` | 8 | largest rendered prompt the gateway encodes; a larger one is a 400 before encoding |
+| `GATEWAY_STRICT` | 0 | `1`: the API's 400 instead of the fallback |
+| `GATEWAY_BLOCK_PRIVATE_URLS` | 1 | `1`: reject loopback, private, link-local and reserved image destinations |
+| `GATEWAY_API_SAMPLING` | 1 | `1`: use the API's sampling policy; `0`: the client's temperature/top_p/seed |
+| `GATEWAY_IMAGE_TOKEN` | `<｜deepseek_image｜>` | the served tokenizer's image-token spelling |
+| `GATEWAY_MAX_IMAGES`, `GATEWAY_MAX_IMAGE_MB` | 600, 64 | the API's per-request image limits |
+| `GATEWAY_LOG` | info | debug, info, warn or error; one line per request (id, route, api/fallback, reason, ms) |
+| `TF_DS_API_EFFORTS` | unset | `1`: patch 0039's API effort table (minimal 50, low 50, medium 75, high 75, xhigh 75, max 100) on the engine |
+
+**Back out.** `API_GATEWAY=0 ./start.sh restart` brings the engine back to `HOST:PORT`, stops the gateway and leaves the
+token route off; the engine image is the same. To return to an engine without patch 0039, remove
+`zig/patches/0039-token-route.patch` and run `./start.sh restart` (the image is rebuilt, as with any patch).
+
+**Parity check.** The comparator (`ds41-paridad`) is built into the gateway image. Run
+`ds41-paridad casos --casos gateway/casos`, `ds41-paridad render` and `ds41-paridad e2e` as described in
+`gateway/README.md`; the CPU battery uses the TensorFold checkout's `fake_serve` and needs no GPU, and each run writes
+`informes/cpu/informe.{json,html}`. `docs/api-gateway.md` has the contract summary, the fallback and the known limits.
 
 ## Running it
 

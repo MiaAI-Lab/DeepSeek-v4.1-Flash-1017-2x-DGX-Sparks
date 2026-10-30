@@ -16,7 +16,7 @@
 # (scripts/memavail.sh) counts the same pages.
 # By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index ba8f5efeed3b349e2177a274463e26fd49f291d1..8576cc1b4a1bacf8cf1ece7826837f752cb0746a 100644
+index 3a6630803ac42575d3ecdc4ff29881a602b2b5dd..b3da953e4ff686c0c349c55057a103f409f7a1d0 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
 @@ -111,10 +111,15 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
@@ -45,7 +45,7 @@ index ba8f5efeed3b349e2177a274463e26fd49f291d1..8576cc1b4a1bacf8cf1ece7826837f75
  }
  
  fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
-@@ -352,6 +357,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -370,6 +375,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
      defer if (!opened) loaded.deinit(loaded.ctx);
      const model = cuda.usage(false).device - held0;
      const after = try pool(a, io, &g.ctx, problem) orelse return null;
@@ -55,7 +55,7 @@ index ba8f5efeed3b349e2177a274463e26fd49f291d1..8576cc1b4a1bacf8cf1ece7826837f75
      const room = after.room(model);
      const streams = budget.admit(room, loaded.stream_bytes, o.lanes, o.lanes_fixed) catch |e| {
          problem.* = switch (e) {
-@@ -405,6 +413,16 @@ test "this host's /proc/meminfo reads whole and parses (Linux)" {
+@@ -423,6 +431,16 @@ test "this host's /proc/meminfo reads whole and parses (Linux)" {
      try std.testing.expect(budget.meminfo(text) != null);
  }
  

@@ -26,11 +26,16 @@
 # The scheduler hooks follow BadAd84's block-tier design (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118);
 # GLM's 0111 builds on its 0089 kept states (Thomas Wade, PR #65), whose place the native prompt cache's conversations
 # take here. By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): cache keys are upstream's Request.cacheKey() (3de79d8, which replaces 0006); Rules keeps upstream's tail beside grid/window; a woken request is admitted first unless a pass fills in pieces; the run loop runs fillOne and the tier's service.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): cache keys are upstream's Request.cacheKey() (3de79d8, which replaces 0006); Rules keeps upstream's tail beside grid/window; a woken request is admitted first unless a pass fills in pieces; the run loop runs fillOne and the tier's service.
+
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index 1234369f0da4a9584ad347f1bf55e268c5aa08c3..65d8a2bd0be5c00ae1a277ed8da433ddfaef2c1f 100644
+index 3c91cfcdb045a153cf6d0959a2cc1d98f4699f6c..a0e7bfe64f7c31fad429a6174979ec12d60acd5f 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
-@@ -173,6 +173,131 @@ pub const Open = struct {
+@@ -177,6 +177,131 @@ pub const Open = struct {
      /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
      device: ?u32 = null,
      segments: ?u32 = null,
@@ -162,7 +167,7 @@ index 1234369f0da4a9584ad347f1bf55e268c5aa08c3..65d8a2bd0be5c00ae1a277ed8da433dd
  };
  
  /// An opened engine; ``close`` stops its thread and frees its backend.
-@@ -205,6 +330,8 @@ pub const Status = struct {
+@@ -209,6 +334,8 @@ pub const Status = struct {
      streams: usize = 0,
      /// Generated tokens held by live streams, excluding their prompts.
      generation_tokens: u64 = 0,
@@ -171,7 +176,7 @@ index 1234369f0da4a9584ad347f1bf55e268c5aa08c3..65d8a2bd0be5c00ae1a277ed8da433dd
  };
  
  pub const SubmitError = error{ Closed, Busy };
-@@ -286,6 +413,7 @@ test {
+@@ -290,6 +417,7 @@ test {
      _ = @import("lane_host.zig");
      _ = @import("lane_host_reuse_test.zig");
      _ = @import("prompt_cache.zig");
@@ -180,7 +185,7 @@ index 1234369f0da4a9584ad347f1bf55e268c5aa08c3..65d8a2bd0be5c00ae1a277ed8da433dd
      _ = @import("keepalive.zig");
  }
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c172351cd 100644
+index c7afeb1686c782cadb66117c1f585ebada1617c5..0faacd4175cc42a56c3e897890fec3f2b74996dd 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -1,4 +1,10 @@
@@ -194,9 +199,9 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
  const std = @import("std");
  const lanes = @import("lanes");
  const api = @import("engine_api.zig");
-@@ -58,6 +64,15 @@ pub const LaneHost = struct {
+@@ -60,6 +66,15 @@ pub const LaneHost = struct {
      interleave_ns: i96 = 0,
-     filling: ?*Job = null,
+     passing: ?*Job = null, // the job whose prompt pass runs inside addStream (Stream.between's caller)
      between_err: ?anyerror = null,
 +    // -- parked requests (0110). The lists are the engine thread's; changes take the lock (status reads their lengths).
 +    ready: std.ArrayList(*Job) = .empty, // woken: admitted before the queue, in the order they woke
@@ -210,7 +215,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
  
      const Mark = struct { at: i96, tokens: u64 };
      const full_retry_ns: i96 = std.time.ns_per_s;
-@@ -65,6 +80,33 @@ pub const LaneHost = struct {
+@@ -67,6 +82,33 @@ pub const LaneHost = struct {
      const finish_ns: i96 = 5 * std.time.ns_per_s;
      const finish_left: i64 = 256;
      const window_ns: i96 = 2 * std.time.ns_per_s;
@@ -244,7 +249,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
  
      const Job = struct {
          host: *LaneHost,
-@@ -81,13 +123,20 @@ pub const LaneHost = struct {
+@@ -83,12 +125,20 @@ pub const LaneHost = struct {
          entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
          marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
          kept0: u64 = 0, // the store's kept count when the job looked it up
@@ -258,19 +263,19 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
              const job: *Job = @ptrCast(@alignCast(ptr));
              job.reported(); // before a keep can evict the entry the pass restored
-             if (!cacheable(job.request)) return;
--            if (job.host.cache) |store| _ = store.keep(keyOf(job.request), at, s, job.request.chunks);
+-            if (job.host.cache) |store| _ = store.keep(job.request.cacheKey(), at, s, job.request.chunks); // an image span keyed by its digest
 +            const h = job.host;
 +            const store = h.cache orelse return;
-+            _ = store.keepWith(keyOf(job.request), at, s, job.request.chunks, .{ .group = job.join.group, .images = job.request.images.len > 0, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
++            // an image span keyed by its digest (Request.cacheKey)
++            _ = store.keepWith(job.request.cacheKey(), at, s, job.request.chunks, .{ .group = job.join.group, .images = job.request.images.len > 0, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
          }
  
          /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
-@@ -97,7 +146,17 @@ pub const LaneHost = struct {
+@@ -98,7 +148,17 @@ pub const LaneHost = struct {
              const store = job.host.cache orelse return;
              if (!job.started) return;
              job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
--            if (job.stream.reuse_failed) store.resumed(e, keyOf(job.request), false) else if (job.stream.cached == e.at) store.resumed(e, keyOf(job.request), true);
+-            if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.request.cacheKey(), true);
 +            const ok = !job.stream.reuse_failed and job.stream.cached == e.at;
 +            if (!ok) { // it did not compute from that state's rows: a lineage of its own
 +                job.parent = null;
@@ -281,11 +286,11 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
 +                    job.lineage = fresh;
 +                }
 +            }
-+            if (job.stream.reuse_failed) store.resumed(e, keyOf(job.request), false) else if (ok) store.resumed(e, keyOf(job.request), true);
++            if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (ok) store.resumed(e, job.request.cacheKey(), true);
          }
      };
  
-@@ -121,6 +180,17 @@ pub const LaneHost = struct {
+@@ -110,6 +170,17 @@ pub const LaneHost = struct {
          return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms };
      }
  
@@ -303,7 +308,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
      pub fn start(h: *LaneHost) !void {
          h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
      }
-@@ -138,6 +208,8 @@ pub const LaneHost = struct {
+@@ -127,6 +198,8 @@ pub const LaneHost = struct {
          h.cancels.deinit(h.gpa);
          h.decoded.deinit(h.gpa);
          h.live_tokens.deinit(h.gpa);
@@ -312,7 +317,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
      }
  
      pub fn engine(h: *LaneHost) Engine {
-@@ -200,12 +272,13 @@ pub const LaneHost = struct {
+@@ -189,12 +262,13 @@ pub const LaneHost = struct {
          @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
          out.* = .{
              .running = @intCast(h.admitted.items.len),
@@ -327,7 +332,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          };
      }
  
-@@ -253,6 +326,7 @@ pub const LaneHost = struct {
+@@ -242,6 +316,7 @@ pub const LaneHost = struct {
      fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
          job.reported();
          h.gpa.free(job.marks);
@@ -335,7 +340,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          const s = &job.stream;
          const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
          emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
-@@ -289,13 +363,33 @@ pub const LaneHost = struct {
+@@ -278,13 +353,33 @@ pub const LaneHost = struct {
          h.cancels.clearRetainingCapacity();
          if (keep) |k| if (std.mem.indexOfScalar(Id, ids, k) != null) h.cancels.append(h.gpa, k) catch {};
          var dropped: std.ArrayList(*Job) = .empty;
@@ -369,8 +374,8 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          for (dropped.items) |job| h.finish(job, .cancelled, "");
          dropped.deinit(h.gpa);
          for (ids) |id| {
-@@ -323,7 +417,7 @@ pub const LaneHost = struct {
-     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+@@ -313,7 +408,7 @@ pub const LaneHost = struct {
+     /// Prefills the next queued request (while a pass fills, the first that core.cutsIn); false if none or no lane.
      fn admitOne(h: *LaneHost) bool {
          h.lock();
 -        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
@@ -378,12 +383,13 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
              h.unlock();
              return false;
          }
-@@ -342,7 +436,12 @@ pub const LaneHost = struct {
+@@ -341,7 +436,13 @@ pub const LaneHost = struct {
              }
              h.finish_until = null;
          }
--        const job = h.queued.orderedRemove(0);
-+        const job = if (h.ready.items.len > 0) h.ready.orderedRemove(0) else h.queued.orderedRemove(0);
+-        const job = h.queued.orderedRemove(at);
++        // a woken (restored) request goes first, but not while a pass fills: then only a queued one that cuts in
++        const job = if (h.filling == null and h.ready.items.len > 0) h.ready.orderedRemove(0) else h.queued.orderedRemove(at);
 +        if (h.parking()) {
 +            h.unlock();
 +            if (h.park(job)) return true; // waits for a restore, holding no lane
@@ -392,11 +398,11 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          h.admitted.append(h.gpa, job) catch {
              h.unlock();
              h.finish(job, .failed, "out of memory");
-@@ -357,6 +456,13 @@ pub const LaneHost = struct {
+@@ -356,6 +457,13 @@ pub const LaneHost = struct {
              job.kept0 = store.counts.kept;
              job.marks = l.marks;
              reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
-+            if (store.groups) job.join = store.join(keyOf(r), l.entry, r.images.len == 0 and r.drafts);
++            if (store.groups) job.join = store.join(r.cacheKey(), l.entry, r.images.len == 0 and r.drafts);
 +            if (l.entry) |e| {
 +                job.parent = e.point;
 +                job.fork = e.at;
@@ -406,24 +412,24 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          } else |_| {};
          job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
          job.stream = lanes.Stream.init(h.gpa, .{
-@@ -393,7 +499,9 @@ pub const LaneHost = struct {
+@@ -392,7 +500,9 @@ pub const LaneHost = struct {
          const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
          job.began = began;
          if (h.loneFits(job)) return h.runLone(job, began);
--        if (h.interleave_ns > 0 and r.images.len == 0) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
+-        if (h.interleaving() and r.images.len == 0) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
 +        // between two prompt chunks: the other streams' rounds (interleave), and parked work's service, which runs
 +        // with the interleave off too
-+        if (r.images.len == 0 and (h.interleave_ns > 0 or h.servicing())) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
-         h.filling = job;
-         defer h.filling = null;
++        if (r.images.len == 0 and (h.interleaving() or h.servicing())) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
+         h.passing = job;
+         defer h.passing = null;
          h.core.addStream(&job.stream) catch |e| {
-@@ -414,36 +522,44 @@ pub const LaneHost = struct {
+@@ -423,36 +533,44 @@ pub const LaneHost = struct {
  
      fn betweenWanted(ptr: *anyopaque) bool {
          const h: *LaneHost = @ptrCast(@alignCast(ptr));
 -        return h.core.log == null and h.core.runnableCount() > 0;
 +        if (h.core.log != null) return false;
-+        return (h.interleave_ns > 0 and h.core.runnableCount() > 0) or h.pending();
++        return (h.interleaving() and h.core.runnableCount() > 0) or h.pending();
      }
  
      /// Stream.between: decode rounds for the other live streams, interleave_ns at most, between two of the filling
@@ -435,7 +441,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
 -        const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
 -        while (true) {
--            h.takeCancelsKeeping(if (h.filling) |f| f.id else null);
+-            h.takeCancelsKeeping(if (h.passing) |f| f.id else null);
 -            if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
 -            h.core.step() catch |e| {
 -                h.between_err = e; // the pass fails with it; run() then fails the streams the round held
@@ -444,13 +450,13 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
 -            var i: usize = 0;
 -            while (i < h.admitted.items.len) {
 -                const job = h.admitted.items[i];
--                if (job == h.filling or job.prefilled == null) {
+-                if (job == h.passing or job.prefilled == null) {
 -                    i += 1;
 -                    continue;
-+        if (h.interleave_ns > 0) {
++        if (h.interleaving()) {
 +            const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
 +            while (true) {
-+                h.takeCancelsKeeping(if (h.filling) |f| f.id else null);
++                h.takeCancelsKeeping(if (h.passing) |f| f.id else null);
 +                if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
 +                h.core.step() catch |e| {
 +                    h.between_err = e; // the pass fails with it; run() then fails the streams the round held
@@ -459,7 +465,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
 +                var i: usize = 0;
 +                while (i < h.admitted.items.len) {
 +                    const job = h.admitted.items[i];
-+                    if (job == h.filling or job.prefilled == null) {
++                    if (job == h.passing or job.prefilled == null) {
 +                        i += 1;
 +                        continue;
 +                    }
@@ -479,12 +485,12 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
 -            h.noteLive();
 +        }
 +        if (h.servicing()) {
-+            if (h.filling) |f| f.reported(); // its restore is done (a chunk ran): a restore's room may evict that entry now
++            if (h.passing) |f| f.reported(); // its restore is done (a chunk ran): a restore's room may evict that entry now
 +            h.service(h.tier.service_ns);
          }
      }
  
-@@ -461,7 +577,12 @@ pub const LaneHost = struct {
+@@ -470,7 +588,12 @@ pub const LaneHost = struct {
          job.prefilled = done;
          h.unlock();
          job.reported();
@@ -498,7 +504,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          emit(job, .{ .prefilled = job.stream.cached });
      }
  
-@@ -472,7 +593,12 @@ pub const LaneHost = struct {
+@@ -481,7 +604,12 @@ pub const LaneHost = struct {
          if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
          h.lock();
          defer h.unlock();
@@ -512,7 +518,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
      }
  
      /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
-@@ -490,12 +616,18 @@ pub const LaneHost = struct {
+@@ -499,12 +627,18 @@ pub const LaneHost = struct {
                  }
                  host.send(j);
                  host.noteLive();
@@ -532,7 +538,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
              }
          };
          job.began = began;
-@@ -546,6 +678,11 @@ pub const LaneHost = struct {
+@@ -555,6 +689,11 @@ pub const LaneHost = struct {
          job.prefilled = null;
          job.delivered = 0;
          job.prefill_sent = false;
@@ -544,7 +550,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          h.lock();
          h.queued.insert(h.gpa, 0, job) catch {
              h.unlock();
-@@ -575,6 +712,7 @@ pub const LaneHost = struct {
+@@ -584,6 +723,7 @@ pub const LaneHost = struct {
      }
  
      fn noteLive(h: *LaneHost) void {
@@ -552,22 +558,23 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
          h.lock();
          defer h.unlock();
          h.live_tokens.clearRetainingCapacity();
-@@ -583,12 +721,14 @@ pub const LaneHost = struct {
+@@ -592,6 +732,7 @@ pub const LaneHost = struct {
              h.live_tokens.append(h.gpa, @intCast(job.stream.context.items.len)) catch {};
              h.live_generated += @intCast(job.stream.emitted().len);
          };
 +        if (tele) |t| h.tele = t;
      }
  
-     fn run(h: *LaneHost) void {
-         while (true) {
+     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
+@@ -613,6 +754,7 @@ pub const LaneHost = struct {
              h.takeCancels();
              while (h.admitOne()) {}
+             h.fillOne();
 +            if (h.servicing()) h.service(h.tier.service_ns); // restores, staged writes and deferred retries, between rounds and at idle
              if (h.between_err) |e| {
                  h.between_err = null;
                  h.failAll(@errorName(e));
-@@ -597,15 +737,17 @@ pub const LaneHost = struct {
+@@ -621,9 +763,9 @@ pub const LaneHost = struct {
              h.noteLive();
              h.lock();
              if (h.closing) {
@@ -579,7 +586,10 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
                  h.closeAll();
                  continue;
              }
-             if (h.core.activeCount() == 0) {
+@@ -632,8 +774,10 @@ pub const LaneHost = struct {
+                     h.unlock();
+                     continue;
+                 }
 -                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
 -                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
 +                if (h.cancels.items.len == 0 and ((h.queued.items.len == 0 and h.ready.items.len == 0) or h.admitted.items.len >= h.info_.lanes)) {
@@ -589,7 +599,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
                  h.unlock();
                  continue;
              }
-@@ -643,11 +785,217 @@ pub const LaneHost = struct {
+@@ -672,11 +816,217 @@ pub const LaneHost = struct {
          h.lock();
          for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
          for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
@@ -624,8 +634,8 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
 +    fn park(h: *LaneHost, job: *Job) bool {
 +        const store = h.cache orelse return false;
 +        const r = job.request;
-+        if (!cacheable(r)) return false;
-+        const key = keyOf(r);
++        if (r.images.len > 0 and r.cache_key.len == 0) return false; // pictures without their digest key: never from disk
++        const key = r.cacheKey();
 +        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
 +        const probe = store.probe(key, r.chunks);
 +        if (!job.tried_disk) if (probe.durable) |p| {
@@ -807,7 +817,7 @@ index 99177d264b62b383cfb015bf9dd9af858a9eb487..485783dd14dd004e3f972af4079bee2c
  test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
      const gpa = std.testing.allocator;
      var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
-@@ -827,4 +1175,7 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
+@@ -856,4 +1206,7 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
      try std.testing.expectEqual(Reason.cancelled, a.wait());
  }
  
@@ -1263,7 +1273,7 @@ index 0000000000000000000000000000000000000000..9a8a4241e6e07a5a5cbd7f17783ffcf0
 +    try std.testing.expect(!disk.unbound(host.engine()));
 +}
 diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
-index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbcd5587e52 100644
+index 58f887510a25caf71876795ef058745fb1925c15..ea847802177f44462a5f1adabdfc481b1da813ea 100644
 --- a/zig/src/core/prompt_cache.zig
 +++ b/zig/src/core/prompt_cache.zig
 @@ -1,4 +1,8 @@
@@ -1546,10 +1556,10 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
  /// What a family's states depend on beyond their position.
  pub const Rules = struct {
      /// Tokens past the position a state read (Flash Next's MTP head keys row at-1 with token at: 1).
-@@ -46,6 +311,31 @@ pub const Rules = struct {
-     min_gap: u32 = 256,
-     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
+@@ -48,6 +313,31 @@ pub const Rules = struct {
      min_prompt: u32 = 4096,
+     /// Rows a resumed pass must still run past its state (DeepSeek's sliding window): a state nearer the end is passed over.
+     tail: u32 = 0,
 +    /// The family's own resume grid (dsv41: its 2048-row chunk; 0: none): durable points and shared marks stand on it.
 +    grid: u32 = 0,
 +    /// The rows a resumed pass replays at its end (dsv41: the window): a state is usable only this far from the end.
@@ -1578,7 +1588,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
  };
  
  pub const Entry = struct {
-@@ -57,6 +347,11 @@ pub const Entry = struct {
+@@ -59,6 +349,11 @@ pub const Entry = struct {
      used: u64, // the store's clock at its last keep or resume
      last: []u32, // the last prompt that kept or resumed it
      shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
@@ -1590,7 +1600,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
  };
  
  pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
-@@ -67,6 +362,18 @@ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+@@ -69,6 +364,18 @@ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
  /// The entry a backend restores itself (null: the pass starts at 0) and the pass's marks.
  pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
  
@@ -1609,7 +1619,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
  pub const Store = struct {
      gpa: Allocator,
      family: Snapshots,
-@@ -78,6 +385,14 @@ pub const Store = struct {
+@@ -80,6 +387,14 @@ pub const Store = struct {
      counts: Counts = .{},
      shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
      imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
@@ -1624,7 +1634,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
  
      const SHARED_KEYS = 64;
  
-@@ -86,16 +401,32 @@ pub const Store = struct {
+@@ -88,16 +403,32 @@ pub const Store = struct {
      }
  
      pub fn deinit(s: *Store) void {
@@ -1657,7 +1667,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
          s.gpa.destroy(e);
      }
  
-@@ -112,7 +443,25 @@ pub const Store = struct {
+@@ -114,7 +445,25 @@ pub const Store = struct {
  
      /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
      pub fn room(s: *const Store) u64 {
@@ -1684,7 +1694,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
      }
  
      /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
-@@ -120,6 +469,14 @@ pub const Store = struct {
+@@ -122,6 +471,14 @@ pub const Store = struct {
          return at > 0 and (!s.rules.planned or std.mem.indexOfScalar(u32, starts, at) != null);
      }
  
@@ -1696,10 +1706,10 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
 +        return s.rules.eligible(e.at, len);
 +    }
 +
-     /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left.
+     /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row and `tail` left.
      pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
          var best: ?*Entry = null;
-@@ -128,11 +485,216 @@ pub const Store = struct {
+@@ -130,11 +487,216 @@ pub const Store = struct {
              if (best != null and e.at <= best.?.at) continue;
              const n = e.tokens.len;
              if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
@@ -1916,7 +1926,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
      /// Before a prompt pass: restore the longest state `prompt` resumes (from 0: none or a failed copy) and plan its marks.
      pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque) !Plan {
          const l = try s.lookup(a, prompt, history_len, shared, starts);
-@@ -153,8 +715,12 @@ pub const Store = struct {
+@@ -155,8 +717,12 @@ pub const Store = struct {
          if (e == null) s.counts.misses += 1;
          const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
          for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
@@ -1931,7 +1941,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
          }
          s.reserve(prompt, e, marks_);
          return .{ .entry = e, .marks = marks_ };
-@@ -164,7 +730,7 @@ pub const Store = struct {
+@@ -166,7 +732,7 @@ pub const Store = struct {
      fn reserve(s: *Store, prompt: []const u32, from: ?*Entry, marks_: []const u32) void {
          var need: u64 = 0;
          for (marks_) |at| need += s.family.vtable.bytes(s.family.ptr, at);
@@ -1940,7 +1950,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
              const i = s.victimBut(from, prompt) orelse return;
              s.remove(i);
              s.counts.evicted += 1;
-@@ -214,6 +780,7 @@ pub const Store = struct {
+@@ -216,6 +782,7 @@ pub const Store = struct {
          s.clock += 1;
          e.used = s.clock;
          s.counts.hits += 1;
@@ -1948,7 +1958,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
          const last = s.gpa.dupe(u32, prompt) catch return;
          s.gpa.free(e.last);
          e.last = last;
-@@ -249,13 +816,23 @@ pub const Store = struct {
+@@ -251,13 +818,23 @@ pub const Store = struct {
  
      /// The prompt pass stands at `at`: keep its state for `prompt`, evicting to fit; refused (counted) past the budget.
      pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32) bool {
@@ -1972,7 +1982,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
              return true;
          };
          const bytes = s.family.vtable.bytes(s.family.ptr, at);
-@@ -267,15 +844,23 @@ pub const Store = struct {
+@@ -269,15 +846,23 @@ pub const Store = struct {
          while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
              if (s.family.vtable.reuses) |f| if (f(s.family.ptr, at)) break;
              const free_ = s.spare();
@@ -1999,7 +2009,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
          const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
          const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
              s.gpa.destroy(e);
-@@ -292,16 +877,27 @@ pub const Store = struct {
+@@ -294,16 +879,27 @@ pub const Store = struct {
              s.gpa.destroy(e);
              return s.fail(at, err);
          };
@@ -2029,7 +2039,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
          return true;
      }
  
-@@ -329,11 +925,7 @@ pub const Store = struct {
+@@ -331,11 +927,7 @@ pub const Store = struct {
          const read = s.family.vtable.read orelse return have;
          const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
          const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
@@ -2042,7 +2052,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
          const e = s.gpa.create(Entry) catch return have;
          e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
          e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
-@@ -390,8 +982,109 @@ pub const Store = struct {
+@@ -392,8 +984,109 @@ pub const Store = struct {
          };
          return oldest;
      }
@@ -2152,7 +2162,7 @@ index cb9ac8f004bf97c4f2c731c3ac44913a31fd440c..b53e61b36613c0abea46af81c25c1bbc
  /// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr).
  fn note(comptime fmt: []const u8, args: anytype) void {
      if (@import("builtin").is_test) return;
-@@ -409,4 +1102,5 @@ fn floorStart(starts: []const u32, at: u32) u32 {
+@@ -411,4 +1104,5 @@ fn floorStart(starts: []const u32, at: u32) u32 {
  
  test {
      _ = @import("prompt_cache_test.zig");

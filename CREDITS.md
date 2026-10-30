@@ -24,6 +24,17 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 
 ## Engine
 
+- **The engine pin `fbbc971` and the rebase of the patch series onto it** (`TF_REF` and `zig/Dockerfile`'s pin, the retirement of
+  `zig/patches/0002-c3-engram-lanes.patch` and `0006-image-prompt-cache.patch`, the twelve patches adapted to the engine's prompt
+  pass in pieces, `zig/patches/0034-rebase-followups.patch`, and the `TF_FILL_*` settings passed by `start.sh`) was authored by
+  **eleata** ([eleata](https://github.com/eleata)) in [pull request #77](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/77)
+  (commit [`b478ccc`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/77/commits/b478ccc071ed0bfd60da64d27d9b0262f239cf3d)); carried as sent, with the
+  follow-ups Mia's AI Lab added on top (see the entries below).
+- **`zig/patches/0035-engram-lead-failure-paths.patch`** (an Engram prompt read that fails on one rank ends the pair as
+  `EngramRankFault`, a table shorter than the hasher's row range is refused at start, the follower joins its Engram readers on
+  every exit, and the AIO, `Model.open`, `Pool.init` and `Tables.open` failure paths release what they made) was authored by
+  **Hector Isaza** ([hecisaza](https://github.com/hecisaza)) in [pull request #79](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/79)
+  (commit [`549f473`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/79/commits/549f473d4a5fd2ba39dc6eb666255a18bece098e)); carried as sent.
 - **EAQ v1.1 support** (`EAQ_V1_1=1`) was authored by **Mykhailo Tamarin** ([MykhailoTamarin](https://github.com/MykhailoTamarin))
   in [pull request #57](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/57) (Apache-2.0):
   **`zig/patches/0024-mixed-pack.patch`** and **`zig/patches-inputs/0001-mixed-pack-rank-cache.patch`** (the EAQ v1.1 mixed
@@ -44,8 +55,9 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   [BertholomusAI (Albert Lee, @bertholomus)](https://github.com/bertholomus): the `dsv41` family (prompt and decode
   paths, DSpark drafting, Engram, the RDMA ring between two nodes, the vision tower and aligner), in their fork
   [bertholomus/TensorFold, branch `deepseek-v41-zig`](https://github.com/bertholomus/TensorFold/tree/deepseek-v41-zig)
-  at commit [`629c524`](https://github.com/bertholomus/TensorFold/commit/629c524a0ea57512a5342abb498d1b7c25353343)
-  (Apache-2.0). This recipe builds that commit and serves both ranks with it. Commits by other authors in that branch:
+  at commit [`fbbc971`](https://github.com/bertholomus/TensorFold/commit/fbbc97132cd004237d9887b8d3185896efaedc5c), the
+  branch tip of 2026-10-23 (pinned since pull request #77; it was [`629c524`](https://github.com/bertholomus/TensorFold/commit/629c524a0ea57512a5342abb498d1b7c25353343)
+  before) (Apache-2.0). This recipe builds that commit and serves both ranks with it. Commits by other authors in that branch:
   - **[sayyidfareed](https://github.com/sayyidfareed)**: the RDMA GID index and endpoint MTU negotiation (#12) and a
     buffered descriptor for the direct-IO test (#9);
   - **[Lucas Peters (@lucas-peters)](https://github.com/lucas-peters)**: the prompt indexer's 16-byte-aligned row-block
@@ -53,7 +65,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   - **lepetitprince716-prog**: the loader reading each layer's expert run from the rank cache whole (#18);
   - **LeetJoe**: escaping the image placeholder in a message's own text (#17);
   - **Manrique ([hashd1ve](https://github.com/hashd1ve))**: a prefix two conversations share no longer stales the first one's
-    kept states, and the room each kept extent keeps for its conversation's next turn (#26, `629c524`);
+    kept states, and the room each kept extent keeps for its conversation's next turn (#26, `629c524`); and, between `629c524`
+    and `fbbc971`, a prompt pass run in pieces between the other streams' rounds (`TF_FILL_CHUNKS`, `TF_FILL_ROUNDS`, `a27d2f0`),
+    a piece's Engram read-ahead serving the next one with a short prompt run whole (`TF_FILL_FIRST`, `45c25b1`), prompts with images
+    keeping and resuming their prompt states, matched by the images' digests (`3de79d8`), and DSML calls read from their own tags
+    (`4803479`);
   - **[Jay Leaton (jayleaton)](https://github.com/jayleaton)**: the JSON writer escapes a UTF-8 sequence cut off at a string's
     end as U+FFFD instead of slicing past it (`0937cc1`);
   - **[Nathan McBride (nmcbride)](https://github.com/nmcbride)**: the chat-template appends in place when a namespace string
@@ -112,6 +128,24 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   the one worker. The `API_KEY=1` option (a mode-600 key file, mounted read-only into rank 0 for `tensorfold-native serve
   --api-key-file`, and the `Authorization` header in `start.sh` and `tools/client.py`) was written for this recipe; the key
   file's format and permission rule are the engine's (`zig/src/server/auth.zig` in TensorFold, Apache-2.0).
+- Scripts and tests contributed through pull requests, each authored by the person named:
+  - **aoeu10** ([aoeu10](https://github.com/aoeu10)): the check of the worker's model, kit and token-map file view before ranks stop
+    or launch (`scripts/nodes.sh`, `scripts/prepare.sh`, `start.sh`) and `scripts/test_worker_files.py`, in
+    [pull request #25](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/25)
+    (commit [`9840ede`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/9840ede96036ef4950d5cca7886e0b442bdf2e5c));
+  - **Matthew Vandergrift** ([mvandergrift](https://github.com/mvandergrift)): the worker's cache cleanup without bare globs, for a login
+    shell that rejects them (`scripts/prepare.sh`), and `scripts/test_worker_rank_cache.py`, in
+    [pull request #19](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/19)
+    (commit [`8a9093d`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/8a9093da071f45a6139aa7152d57ca0c248b41fc));
+  - **yume-arasaki** ([yume-arasaki](https://github.com/yume-arasaki)): `tools/bench.py` defaulting to the port `scripts/local.sh`
+    sets, and `tools/test_bench_config.py`, in
+    [pull request #39](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/39)
+    (commit [`8432467`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/84324677a9d6a9a22381458f1aba40f7b4ab02d7));
+  - **sunlinhua-dotcom** ([sunlinhua-dotcom](https://github.com/sunlinhua-dotcom)): the `ABLIT=1` fix that gives the overlay's cast MTP
+    tensors their stock F16 back (`scripts/ablit_stock_dtypes.py`, `scripts/prepare.sh`, `scripts/config.sh`), found in
+    [issue #11](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/issues/11) and sent as
+    [pull request #12](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/12)
+    (commit [`32907a1`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/32907a1c70ce92dd3d1710e777625dd199f8cecf)).
 - **`model/chat_template.jinja`** was written by Mia's AI Lab ([Mia-AiLab](https://huggingface.co/Mia-AiLab)) for
   [`Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw): a Jinja
   port of the checkpoint's own `encoding/encoding.py` (DeepSeek, MIT). The file here is that file with one change, by
@@ -127,15 +161,21 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   ([@kerpopule](https://github.com/kerpopule)); `scripts/zig_flags.py` (the serve flags checked against
   `tensorfold-native capabilities --json`), `scripts/publish-image.sh` and the registry pull in `scripts/prepare.sh`, and the
   issue and pull request templates and `FUNDING.yml` in `.github`, by Mia's AI Lab.
-- **`zig/patches/0001-0002`** are changes to BertholomusAI's engine written by Mia's AI Lab for this recipe (Apache-2.0), a second AIO
-  ring for Engram reads (0002, off by default) and a row split of the prefill indexer between the two ranks (0001, by default only in
-  prompt chunks that end at token 131,072 or later). A prompt-cache placement
+- **`zig/patches/0001-c7-indexer-split.patch`** is a change to BertholomusAI's engine written by Mia's AI Lab for this recipe (Apache-2.0),
+  a row split of the prefill indexer between the two ranks; that it is on by default only in prompt chunks that end at token 131,072
+  or later (and the measurement behind it) was authored by **aaa4xu** ([aaa4xu](https://github.com/aaa4xu)) in
+  [pull request #35](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/35) (commits
+  [`2550cda`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/2550cda45573a8a0ff287ec606005412014ed7c1) and
+  [`7b8e40c`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/7b8e40c4e6ddde5e55c4ab6b200c54940d040a24)).
+  A second AIO ring for Engram reads (`0002`, written by Mia's AI Lab, off by default) was retired when the pin moved to `fbbc971`,
+  whose `TF_DS_ENGRAM_LEAD` does its job. A prompt-cache placement
   patch (0003) was dropped when the pin moved to `629c524`, which places kept states itself. The idea of splitting the indexer is credited to drowzeys, from the GLM-5.3-Flash recipe's design; no code of
   that recipe was used. They modify code by TensorFold's contributors and BertholomusAI, which keeps their licences.
 - **`zig/patches/0005-prefill-interleave.patch`** was authored by **[Coinupbtc](https://github.com/Coinupbtc)** (@Coinupbtc), in [pull request #5](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/5)
   (commit [`27e02c6`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/5/commits/27e02c605eae0997ed9161baaf583dd3ad431bb3)) of this repository, for issue #3: between two chunks of a long prompt pass, the other live streams get decode rounds and
   their cancels are taken (`TF_DS_PREFILL_INTERLEAVE_MS`), with its host test and the bit-identity runs in the pull request. It is carried here as it
-  was sent; **`zig/patches/0006-image-prompt-cache.patch`** (issue #2) was written for this recipe on top of it.
+  was sent, and adapted to the `fbbc971` pin by eleata (pull request #77). **`zig/patches/0006-image-prompt-cache.patch`** (issue #2), written
+  for this recipe on top of it, was retired by that pin move: the engine's own `3de79d8` (by Manrique, above) keeps image prompt states.
 - **`zig/patches/0027-tool-call-prose.patch`** (the text before a reply's tool calls is its content) was authored by
   **[Coinupbtc](https://github.com/Coinupbtc)** in [pull request #44](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/44)
   (commit `3ff606e`, sent as `0012`; carried as sent, renumbered after the port's series).
@@ -157,6 +197,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 - **`zig/patches/0033-graph-cap.patch`** (the CUDA graph cache keeps at most `GRAPH_CAP` graphs, issue #69) was authored by
   **E-Zou Shen ([ezoushen](https://github.com/ezoushen))** in [pull request #70](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70)
   (commit [`a1ceaf0`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70/commits/a1ceaf0fd88892712f748e3080e187d2b6526396), sent as `0031`); carried as sent, renumbered.
+- **`zig/patches/0036-metrics-cached-prompt-tokens.patch`** (cached prompt tokens in `/metrics`, `/health` and `max_model_len` in `/v1/models`, issue #58): the
+  cached-token counter, its vLLM-named repeats and the engine flag that turns them on were authored by
+  **[manuel1618](https://github.com/manuel1618)** in [pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4-Spark recipe
+  (commit [`03f489f`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/03f489f)), a backport of the TensorFold commit `ce0d9053` by **[juliankang4](https://github.com/juliankang4)**; adapted here by Mia's AI Lab,
+  which added the `/health` totals and `max_model_len`. **`0037-rendezvous-ports-early.patch`** was written by Mia's AI Lab after the 4-Spark recipe's `0035`, which fixed the problem found in [that recipe's issue #3](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/3) and diagnosed there by **shanedertrain** ([shanedertrain](https://github.com/shanedertrain)). **`0038-aligned-index-views.patch`** was written by Mia's AI Lab after the 4-Spark recipe's `0005` and `0007`.
 - **`zig/patches/0004-call-gate.patch`** (`tool_choice` enforcement) was written by Mia's AI Lab (Apache-2.0). Its new file,
   `zig/src/core/lanes/call_gate.zig`, is Mia's AI Lab's Zig call gate for the Flash Next CUDA engine (commits `49350ed6` and
   `c948979c` of 2026-10-07, with fixes `06cbbf72` and `1b082936`), which is itself a port of the call gate in TensorFold's
@@ -199,6 +244,13 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   ranks' Engram folders are compared before anything is stopped, issue #61) was authored by
   **Qingchen Yu ([markyu0401](https://github.com/markyu0401))** in [pull request #64](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/64)
   (commit [`a004d7e`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/64/commits/a004d7e753fbd4a4b1176cc4291abd6806b01151)); carried as sent.
+- `stop.sh`'s exit status, the prepared marker (`prepared_state`, `write_prepared_marker` in `scripts/config.sh`, their use in `start.sh` and
+  `scripts/prepare.sh`) and the offline tests `scripts/test_scripts.py` were authored by **[SvangenStudios](https://github.com/SvangenStudios)** in
+  [pull request #4](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/4) of the 4-Spark recipe (commits
+  [`f90b78a`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/f90b78a), [`5a2b988`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/5a2b988), [`5dcfe83`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/5dcfe83) and
+  [`adfef6e`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/adfef6e)), adapted here to two ranks; `tools/validate.py` and its tests `tools/test_validate.py` were authored by
+  the same contributor in [pull request #5](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/5) of that recipe (commits [`1a75f9e`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/1a75f9e) and
+  [`47f831f`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/47f831f)).
 
 ## Tools and platform
 

@@ -1,0 +1,32 @@
+# Follow-ups of the rebase onto TensorFold fbbc971 (28-oct-2026):
+# - LaneHost.fillOne marks its job as `passing` while a piece runs (TF_FILL_CHUNKS), as addStream's pass does, so
+#   Stream.between reports its restore and treats it as the job in its pass.
+# - server/prompt.zig spans: a picture whose preparation gives 0 tokens is refused (the history count did
+#   `tokens - 1` on it; upstream debt).
+# No switch; replies unchanged.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 81703c69e5bcd627c7033e347cb0de2400832c7d..a90d26a592b79e03bcfe9703c6f3de5a44c6be25 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -918,6 +918,9 @@ pub const LaneHost = struct {
+     fn fillOne(h: *LaneHost) void {
+         const job = h.filling orelse return;
+         // a piece is a pass's collectives too: under the stall monitor, and a broken pair ends it as addStream's does
++        // the job in its pass for Stream.between, as addStream's pass has it (its restore reported after a chunk)
++        h.passing = job;
++        defer h.passing = null;
+         h.busyEnter();
+         const stepped = h.core.fillStep();
+         h.busyLeave();
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 3440a0e1f5eab303ec6b447745bb2b187f9183f8..cfd6ad475dffdcc33170ed8b4d9a447f44004a22 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -94,6 +94,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
+             error.OutOfMemory => return error.OutOfMemory,
+             error.BadImage => return cx.refuse(problem),
+         };
++        if (prep.tokens == 0) return cx.refuse("image input: a picture gave no tokens");
+         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
+         try out.appendNTimes(cx.a, vision.token, prep.tokens);
+         var digest: [32]u8 = undefined;

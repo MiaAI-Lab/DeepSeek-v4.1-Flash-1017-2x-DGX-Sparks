@@ -75,7 +75,7 @@ declare -A ENGRAM_SHARD_SIZE=([model-00047-of-00048.safetensors]=101535150936 [m
 # The engine: BertholomusAI's TensorFold fork, branch deepseek-v41-zig (the DeepSeek-V4.1-Flash family on TensorFold's
 # native Zig engine, two nodes), at the head of that branch; it serves both ranks.
 TF_REPO="${TF_REPO:-https://github.com/bertholomus/TensorFold.git}"
-TF_REF="${TF_REF:-629c524a0ea57512a5342abb498d1b7c25353343}"   # the branch tip of 2026-10-19 (was 3ff3b2ac; docs/zig-engine.md, "The pin")
+TF_REF="${TF_REF:-fbbc97132cd004237d9887b8d3185896efaedc5c}"   # the branch tip of 2026-10-23 (was 629c524a; docs/zig-engine.md, "The pin")
 # The inputs' tools: the same fork's branch deepseek-v41-zig-tp4, at the commit of the four-node recipe v0.1.1. It adds
 # what the two-node branch lacks: tf-dsv41-rank-cache (a rank's weight file from the checkpoint alone, no GPU, no
 # Python) and the standalone token-map and RoPE-table scripts. Only those are taken; it does not serve here.
@@ -150,7 +150,7 @@ GATEWAY_IMAGE_TOKEN="${GATEWAY_IMAGE_TOKEN-<｜deepseek_image｜>}"  # the serve
 GATEWAY_MAX_IMAGES="${GATEWAY_MAX_IMAGES:-600}"       # the API's per-request image limit
 GATEWAY_MAX_IMAGE_MB="${GATEWAY_MAX_IMAGE_MB:-64}"    # the API's total image megabytes per request
 GATEWAY_LOG="${GATEWAY_LOG:-info}"       # debug, info, warn or error; one line per request
-# TF_DS_API_EFFORTS=1 is engine patch 0035's switch: the API's effort table instead of the lane's. Empty: the engine's.
+# TF_DS_API_EFFORTS=1 is engine patch 0039's switch: the API's effort table instead of the lane's. Empty: the engine's.
 TF_DS_API_EFFORTS="${TF_DS_API_EFFORTS:-}"
 
 # ---------------------------------------------------------------- serving
@@ -163,7 +163,7 @@ CONTEXT="${CONTEXT:-1048576}"
 # zig/patches/0008: the positions the streams' extents and kept prompts share (rank 0's and rank 1's --pool), when more than CONTEXT: more
 # long prompts stay resident (each kept prompt holds its extent) and more long requests run at once. Empty (default): CONTEXT, as before.
 # It may not be smaller than CONTEXT. Its KV caches grow with it (about 0.9 GiB a rank per 1,048,576 positions, in host memory: measure the
-# head's headroom first, see README); the RoPE tables stay the window's size. TF_DS_POOL, and TF_DS_WINDOW (= CONTEXT) on both ranks.
+# head's headroom first, see docs/memory-and-safety.md); the RoPE tables stay the window's size. TF_DS_POOL, and TF_DS_WINDOW (= CONTEXT) on both ranks.
 # With KV_SHARD=1 (scripts/port.sh) the same POOL is cut into one part a Spark, each holding a whole CONTEXT window, and each Spark
 # keeps only its own part's compressed KV: about half the KV memory a Spark for the same POOL (measured at 2,101,248 positions:
 # 1,062 MiB a rank against 1,783 MiB replicated; decode 1-4% slower). Empty with KV_SHARD=1: the pool it needs (2,101,248 at 1,048,576).
@@ -319,10 +319,26 @@ served_in_container() { echo "/hf/$DATA_SUB/model"; }
 # What scripts/prepare.sh last left ready (start.sh runs it again when this line changes). "+stock-dtypes": an overlay
 # checkpoint prepared before scripts/ablit_stock_dtypes.py gets that step on the next start.
 PREPARED_MARKER="$STATE_DIR/prepared"
+# Every field is quoted (printf %q), so a value holding another field's text cannot shift into it, and the template's
+# sha256 is part of it (a changed model/chat_template.jinja is served only after prepare.sh linked it again). It fails
+# (status 1, a message) when the template cannot be hashed: a state that cannot be computed never reads as ready.
 prepared_state() {
-  echo "model=$MODEL_ID@$(snapshot_rev) engram=$ENGRAM_ID@$(engram_rev) image=$(image_ident "$IMAGE") kit=$KIT_REF" \
-       "w=$(worker_host 1) wengram=$WORKER_ENGRAM_DIR wcache=$WORKER_CACHE_DIR ablit=$ABLIT" \
-       "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
+  local i tpl f
+  tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" | cut -c1-64) && [[ -n "$tpl" ]] ||
+    die "cannot hash model/chat_template.jinja (sha256sum)"
+  f=("model=$MODEL_ID@$(snapshot_rev)" "engram=$ENGRAM_ID@$(engram_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF"
+     "w=$(worker_host 1)" "wengram=$WORKER_ENGRAM_DIR" "wcache=$WORKER_CACHE_DIR" "ablit=$ABLIT"
+     "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
+     "hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
+  for i in 2 3; do [[ -z "$(worker_host "$i")" ]] || f+=("w$i=$(worker_host "$i")"); done
+  for i in 1 2 3; do f+=("nfs$i=$(wval NFS_SERVER "$i")"); done
+  (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
+}
+# prepare.sh's last step: computed first and swapped in whole, so a failure leaves the previous marker as it was
+write_prepared_marker() {
+  local state
+  state=$(prepared_state) || return 1
+  printf '%s\n' "$state" > "$PREPARED_MARKER.new" && mv -f "$PREPARED_MARKER.new" "$PREPARED_MARKER"
 }
 
 # ---------------------------------------------------------------- API key

@@ -1,5 +1,5 @@
 diff --git a/zig/src/families/dsv41/checkpoint.zig b/zig/src/families/dsv41/checkpoint.zig
-index 05045c8..eb70693 100644
+index 05045c80fccb72906e82ccd4aeb84c8a56a77a77..eb706931fc5a1477c1f7827abe690e77edccf331 100644
 --- a/zig/src/families/dsv41/checkpoint.zig
 +++ b/zig/src/families/dsv41/checkpoint.zig
 @@ -158,6 +158,7 @@ pub fn read(sh: *const Shards, key: []const u8, out: []u8) !void {

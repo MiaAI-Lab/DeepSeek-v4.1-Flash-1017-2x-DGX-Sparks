@@ -27,11 +27,16 @@
 # link watch; the stall monitor alone had caught it at +135 s), /health went down at 1.78 s and rank 0 exited 75; a stop
 # of both ranks ended as a shutdown (exit 0). Builds on 0014, 0018 and 0019. By Robert Wojciechowski (GitHub @wojo, X @rwojo).
 # Apache-2.0.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): fillOne's pieces run under busyEnter/busyLeave and end on a broken pair as addStream's pass does.
+
+Rebased onto TensorFold fbbc971 (28-oct-2026): fillOne's pieces run under busyEnter/busyLeave and end on a broken pair as addStream's pass does.
+
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index 08a0078f49c22cb2aea20e9b030c23b1df1c6e21..047ff037fc40c093afa4c60fcf4186d454e3316d 100644
+index 79bcd3ed163443ee34a439014d4319f7456b0c82..d8f585a46dee89c74fd5e6522bc5ef51fb245a63 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
-@@ -197,6 +197,9 @@ pub const Spill = struct {
+@@ -201,6 +201,9 @@ pub const Spill = struct {
      load_ms: u32 = 40,
      /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore before it is admitted without it.
      load_wait_ms: u32 = 30_000,
@@ -41,7 +46,7 @@ index 08a0078f49c22cb2aea20e9b030c23b1df1c6e21..047ff037fc40c093afa4c60fcf4186d4
      /// TF_SPILL_FLUSH_MS: a clean shutdown's bound for draining writes.
      flush_ms: u32 = 60_000,
  
-@@ -244,6 +247,8 @@ pub const CacheStats = struct {
+@@ -248,6 +251,8 @@ pub const CacheStats = struct {
      restore_wait_timeouts: u64 = 0,
      restore_wait_ns: u64 = 0,
      restore_wait_max_ns: u64 = 0,
@@ -50,7 +55,7 @@ index 08a0078f49c22cb2aea20e9b030c23b1df1c6e21..047ff037fc40c093afa4c60fcf4186d4
      writes_enqueued: u64 = 0,
      shared_promoted: u64 = 0,
      flushes: u64 = 0,
-@@ -277,7 +282,7 @@ pub const CacheStats = struct {
+@@ -281,7 +286,7 @@ pub const CacheStats = struct {
          .restores_failed = "Disk restores aborted on every rank (missing, damaged, guarded).",
          .restores_cancelled = "Disk restores stopped: no request waited for them any more, or shutdown.",
          .restores_dropped = "Installed disk restores not adopted: no room, or memory already had them.",
@@ -59,7 +64,7 @@ index 08a0078f49c22cb2aea20e9b030c23b1df1c6e21..047ff037fc40c093afa4c60fcf4186d4
          .restores_active = "Disk restore jobs in flight.",
          .restoring_bytes = "Memory the disk restores in flight reserved, charged to the prompt cache's budget.",
          .restore_blocks_done = "Blocks the restores in flight have copied so far.",
-@@ -287,6 +292,8 @@ pub const CacheStats = struct {
+@@ -291,6 +296,8 @@ pub const CacheStats = struct {
          .restore_wait_timeouts = "Requests admitted without their disk restore after TF_SPILL_LOAD_WAIT_MS.",
          .restore_wait_ns = "Nanoseconds requests waited for disk restores.",
          .restore_wait_max_ns = "The longest wait for a disk restore, in nanoseconds.",
@@ -68,7 +73,7 @@ index 08a0078f49c22cb2aea20e9b030c23b1df1c6e21..047ff037fc40c093afa4c60fcf4186d4
          .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
          .shared_promoted = "Disk points promoted to shared prefixes.",
          .flushes = "Clean-shutdown flushes of the disk tier.",
-@@ -334,6 +341,42 @@ pub const Status = struct {
+@@ -338,6 +345,42 @@ pub const Status = struct {
      cache: ?CacheStats = null,
      /// KV ownership's counters and parts (a backend that shards its pool over the ranks: dsv41's TF_DS_KV_SHARD).
      kv_parts: ?KvParts = null,
@@ -112,7 +117,7 @@ index 08a0078f49c22cb2aea20e9b030c23b1df1c6e21..047ff037fc40c093afa4c60fcf4186d4
  
  /// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd72456123b 100644
+index cd46c84ab87d8e9687f087eed927479cda6f5b90..211e08691a9c34321885ff8a5445ebf1604a561a 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -5,6 +5,16 @@
@@ -132,7 +137,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
  const std = @import("std");
  const lanes = @import("lanes");
  const api = @import("engine_api.zig");
-@@ -76,6 +86,32 @@ pub const LaneHost = struct {
+@@ -78,6 +88,32 @@ pub const LaneHost = struct {
      /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
      kv_parts: ?lanes.kv_parts.Source = null,
      kv_tele: ?api.KvParts = null,
@@ -165,7 +170,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
  
      const Mark = struct { at: i96, tokens: u64 };
      const full_retry_ns: i96 = std.time.ns_per_s;
-@@ -89,6 +125,48 @@ pub const LaneHost = struct {
+@@ -91,6 +127,48 @@ pub const LaneHost = struct {
      const lone_pump_commits: u32 = 16;
  
      const Load = struct { job: *Job, restore: *pc.Restore, since: i96 };
@@ -214,7 +219,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
  
      /// How parked work is serviced (LaneHost.configure; the defaults are off).
      pub const TierPolicy = struct {
-@@ -100,6 +178,12 @@ pub const LaneHost = struct {
+@@ -102,6 +180,12 @@ pub const LaneHost = struct {
          load_wait_ns: i96 = 30 * std.time.ns_per_s,
          /// A clean shutdown's bound for draining writes (TF_SPILL_FLUSH_MS).
          flush_ns: u64 = 60 * std.time.ns_per_s,
@@ -227,7 +232,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      };
  
      pub const HostCounts = struct {
-@@ -109,6 +193,8 @@ pub const LaneHost = struct {
+@@ -111,6 +195,8 @@ pub const LaneHost = struct {
          restore_wait_max_ns: u64 = 0,
          cached_tokens: u64 = 0, // prompt tokens passes resumed (memory or restored)
          computed_tokens: u64 = 0, // and computed
@@ -236,7 +241,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      };
  
      const Job = struct {
-@@ -127,6 +213,7 @@ pub const LaneHost = struct {
+@@ -129,6 +215,7 @@ pub const LaneHost = struct {
          marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
          kept0: u64 = 0, // the store's kept count when the job looked it up
          tried_disk: bool = false, // it waited for a restore once: a later lookup takes what memory has
@@ -244,7 +249,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
          join: pc.Join = .{}, // its conversation (0111)
          parent: ?u64 = null, // the durable point its pass resumes from, and where
          fork: u32 = 0,
-@@ -190,12 +277,19 @@ pub const LaneHost = struct {
+@@ -180,12 +267,19 @@ pub const LaneHost = struct {
          h.tier.pump_ns = @min(h.tier.pump_ns, h.tier.service_ns);
          h.tier.load_wait_ns = @as(i96, @max(sp.load_wait_ms, 1)) * std.time.ns_per_ms;
          h.tier.flush_ns = @as(u64, sp.flush_ms) * std.time.ns_per_ms;
@@ -264,7 +269,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      }
  
      /// Stops admitting, cancels what is left and joins the engine thread.
-@@ -206,6 +300,12 @@ pub const LaneHost = struct {
+@@ -196,6 +290,12 @@ pub const LaneHost = struct {
          h.mutex.unlock(h.io);
          if (h.thread) |t| t.join();
          h.thread = null;
@@ -277,7 +282,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
          h.queued.deinit(h.gpa);
          h.admitted.deinit(h.gpa);
          h.cancels.deinit(h.gpa);
-@@ -238,7 +338,7 @@ pub const LaneHost = struct {
+@@ -228,7 +328,7 @@ pub const LaneHost = struct {
          job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
          h.mutex.lockUncancelable(h.io);
          defer h.mutex.unlock(h.io);
@@ -286,7 +291,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
              h.gpa.destroy(job);
              return error.Closed;
          }
-@@ -275,7 +375,7 @@ pub const LaneHost = struct {
+@@ -265,7 +365,7 @@ pub const LaneHost = struct {
          @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
          out.* = .{
              .running = @intCast(h.admitted.items.len),
@@ -295,7 +300,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
              .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
              .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
              .preemptions = 0,
-@@ -283,9 +383,26 @@ pub const LaneHost = struct {
+@@ -273,9 +373,26 @@ pub const LaneHost = struct {
              .generation_tokens = h.live_generated,
              .cache = h.tele,
              .kv_parts = h.kv_tele,
@@ -322,7 +327,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?Memory {
          const source = self(ctx).memory orelse return null;
          return source.read(source.ctx, reset_peak);
-@@ -298,6 +415,8 @@ pub const LaneHost = struct {
+@@ -288,6 +405,8 @@ pub const LaneHost = struct {
      /// A job's cancel hook for its prompt pass: its id is in `cancels`, or the host is closing (read under the lock).
      fn cancelled(ctx: *anyopaque) bool {
          const job: *Job = @ptrCast(@alignCast(ctx));
@@ -331,7 +336,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
          job.host.lock();
          defer job.host.unlock();
          return job.host.closing or std.mem.indexOfScalar(Id, job.host.cancels.items, job.id) != null;
-@@ -383,6 +502,10 @@ pub const LaneHost = struct {
+@@ -373,6 +492,10 @@ pub const LaneHost = struct {
                  unloaded.append(h.gpa, l.restore) catch {};
                  break;
              };
@@ -342,18 +347,18 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
          }
          h.mutex.unlock(h.io);
          // a restore no request waits for any more stops (its reads, DMA and reservations go), exactly once
-@@ -420,6 +543,7 @@ pub const LaneHost = struct {
+@@ -411,6 +534,7 @@ pub const LaneHost = struct {
  
-     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+     /// Prefills the next queued request (while a pass fills, the first that core.cutsIn); false if none or no lane.
      fn admitOne(h: *LaneHost) bool {
 +        if (h.isBroken()) return false;
          h.lock();
          if ((h.queued.items.len == 0 and h.ready.items.len == 0) or h.admitted.items.len >= h.info_.lanes) {
              h.unlock();
-@@ -508,11 +632,17 @@ pub const LaneHost = struct {
-         if (r.images.len == 0 and (h.interleave_ns > 0 or h.servicing())) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
-         h.filling = job;
-         defer h.filling = null;
+@@ -509,12 +633,18 @@ pub const LaneHost = struct {
+         if (r.images.len == 0 and (h.interleaving() or h.servicing())) job.stream.between = .{ .ptr = h, .wanted = betweenWanted, .run = between };
+         h.passing = job;
+         defer h.passing = null;
 -        h.core.addStream(&job.stream) catch |e| {
 +        h.busyEnter();
 +        const added = h.core.addStream(&job.stream);
@@ -361,25 +366,26 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
 +        added catch |e| {
 +            if (h.isBroken()) return h.dropBroken(job);
              if (e == error.Cancelled) return h.cancel(job);
-             if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+             // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
+             if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
 +            h.checkFatal(e);
              return h.drop(job, h.words(e));
          };
 +        if (h.aborted()) return h.dropBroken(job); // (the collectives were stopped under it: its rows are not the model's)
-         h.prefilled(job, began);
-         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
-         if (now - began >= long_pass_ns) {
-@@ -536,15 +666,22 @@ pub const LaneHost = struct {
+         if (h.core.filling == &job.stream) {
+             h.filling = job; // its next pieces run between rounds (fillOne)
+             return true;
+@@ -547,15 +677,22 @@ pub const LaneHost = struct {
      fn between(ptr: *anyopaque) anyerror!void {
          const h: *LaneHost = @ptrCast(@alignCast(ptr));
          if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
 +        h.in_between = true; // (the filling pass stands between two chunks: the service fence's one way in)
 +        defer h.in_between = false;
 +        h.progressed(); // (a chunk ended: the stall monitor's clock restarts)
-         if (h.interleave_ns > 0) {
+         if (h.interleaving()) {
              const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
              while (true) {
-                 h.takeCancelsKeeping(if (h.filling) |f| f.id else null);
+                 h.takeCancelsKeeping(if (h.passing) |f| f.id else null);
                  if (h.core.runnableCount() == 0 or std.Io.Clock.awake.now(h.io).toNanoseconds() - t0 >= h.interleave_ns) break;
 -                h.core.step() catch |e| {
 +                h.stepRound() catch |e| {
@@ -393,7 +399,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
                  var i: usize = 0;
                  while (i < h.admitted.items.len) {
                      const job = h.admitted.items[i];
-@@ -602,7 +739,7 @@ pub const LaneHost = struct {
+@@ -613,7 +750,7 @@ pub const LaneHost = struct {
  
      /// Requests parked or woken (the lock held).
      fn waitingCount(h: *const LaneHost) usize {
@@ -402,7 +408,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      }
  
      /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
-@@ -614,6 +751,8 @@ pub const LaneHost = struct {
+@@ -625,6 +762,8 @@ pub const LaneHost = struct {
              fn committed(ctx: *anyopaque) void {
                  const host: *LaneHost = @ptrCast(@alignCast(ctx));
                  const j = host.lone_job.?;
@@ -411,7 +417,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
                  if (!j.prefill_sent) {
                      j.prefill_sent = true;
                      host.prefilled(j, j.began);
-@@ -624,20 +763,24 @@ pub const LaneHost = struct {
+@@ -635,20 +774,24 @@ pub const LaneHost = struct {
                  host.lone_commits += 1;
                  if (host.lone_commits >= lone_pump_commits and host.servicing()) {
                      host.lone_commits = 0;
@@ -439,7 +445,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
              if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
              h.remove(job);
              h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else h.words(e));
-@@ -658,6 +801,12 @@ pub const LaneHost = struct {
+@@ -669,6 +812,12 @@ pub const LaneHost = struct {
          return x.text(x.ctx, e) orelse @errorName(e);
      }
  
@@ -452,7 +458,39 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      fn drop(h: *LaneHost, job: *Job, message: []const u8) bool {
          h.remove(job);
          if (job.started and !job.stream.finished) h.core.discard(&job.stream);
-@@ -736,11 +885,16 @@ pub const LaneHost = struct {
+@@ -748,11 +897,29 @@ pub const LaneHost = struct {
+     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
+     fn fillOne(h: *LaneHost) void {
+         const job = h.filling orelse return;
+-        const done = h.core.fillStep() catch |e| {
++        // a piece is a pass's collectives too: under the stall monitor, and a broken pair ends it as addStream's does
++        h.busyEnter();
++        const stepped = h.core.fillStep();
++        h.busyLeave();
++        const done = stepped catch |e| {
+             h.filling = null;
+-            _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
++            if (h.isBroken()) {
++                _ = h.dropBroken(job);
++                return;
++            }
++            if (e == error.Cancelled) {
++                _ = h.cancel(job);
++                return;
++            }
++            h.checkFatal(e);
++            _ = h.drop(job, h.words(e));
+             return;
+         };
++        if (h.aborted()) { // (the collectives were stopped under it: its rows are not the model's)
++            h.filling = null;
++            _ = h.dropBroken(job);
++            return;
++        }
+         if (!done) return;
+         h.filling = null;
+         h.prefilled(job, job.began);
+@@ -761,12 +928,17 @@ pub const LaneHost = struct {
  
      fn run(h: *LaneHost) void {
          while (true) {
@@ -462,6 +500,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
 +            }
              h.takeCancels();
              while (h.admitOne()) {}
+             h.fillOne();
              if (h.servicing()) h.service(h.tier.service_ns); // restores, staged writes and deferred retries, between rounds and at idle
              if (h.between_err) |e| {
                  h.between_err = null;
@@ -469,7 +508,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
                  h.failAll(@errorName(e));
                  continue;
              }
-@@ -762,10 +916,12 @@ pub const LaneHost = struct {
+@@ -792,10 +964,12 @@ pub const LaneHost = struct {
                  continue;
              }
              h.unlock();
@@ -483,7 +522,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
              var i: usize = 0;
              while (i < h.admitted.items.len) {
                  const job = h.admitted.items[i];
-@@ -797,10 +953,45 @@ pub const LaneHost = struct {
+@@ -828,10 +1002,45 @@ pub const LaneHost = struct {
          for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
          for (h.ready.items) |job| h.cancels.append(h.gpa, job.id) catch {};
          for (h.loading.items) |l| h.cancels.append(h.gpa, l.job.id) catch {};
@@ -529,7 +568,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      // -- parked work (0110) ---------------------------------------------------------------------------------------
  
      /// Whether admission may park a request: the cache has a tier.
-@@ -816,7 +1007,7 @@ pub const LaneHost = struct {
+@@ -847,7 +1056,7 @@ pub const LaneHost = struct {
  
      /// Work in flight the host must poll (engine thread): restores, writes to stage, requests parked or woken.
      fn pending(h: *const LaneHost) bool {
@@ -538,7 +577,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
          const store = h.cache orelse return false;
          return store.busy();
      }
-@@ -836,18 +1027,75 @@ pub const LaneHost = struct {
+@@ -867,18 +1076,75 @@ pub const LaneHost = struct {
              const room = h.loading.ensureUnusedCapacity(h.gpa, 1);
              h.unlock();
              if (room) |_| {
@@ -616,7 +655,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      /// A woken job to the ready list (the lock held; released here). Out of memory fails it alone.
      fn toReady(h: *LaneHost, job: *Job) void {
          h.ready.append(h.gpa, job) catch {
-@@ -864,8 +1112,10 @@ pub const LaneHost = struct {
+@@ -895,8 +1161,10 @@ pub const LaneHost = struct {
      /// stream valid (dsv41 joins Engram read-ahead before `between`, as recipe 0005 requires).
      fn service(h: *LaneHost, budget_ns: u64) void {
          const store = h.cache orelse return;
@@ -627,7 +666,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
          const n = store.restoring.items.len;
          if (n > 0) { // at most 64 a service, a different first one each time: every restore is polled in turn
              var buf: [64]*pc.Restore = undefined;
-@@ -877,9 +1127,13 @@ pub const LaneHost = struct {
+@@ -908,9 +1176,13 @@ pub const LaneHost = struct {
                  if (spent >= budget_ns and k > 0) break;
                  const share = (budget_ns -| spent) / (m - k);
                  const st = store.restorePoll(r, share);
@@ -642,7 +681,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
          const spent: u64 = @intCast(@max(0, std.Io.Clock.awake.now(h.io).toNanoseconds() - t0));
          const idle = h.filling == null and h.core.activeCount() == 0; // nothing decodes: staging takes what is left
          store.pump(if (idle) budget_ns -| spent else @min(budget_ns -| spent, h.tier.pump_ns));
-@@ -936,6 +1190,222 @@ pub const LaneHost = struct {
+@@ -967,6 +1239,222 @@ pub const LaneHost = struct {
          }
      }
  
@@ -865,7 +904,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
      /// Clean shutdown on the engine thread, nothing left to serve: restores stopped, writes drained within flush_ns.
      fn shutdownTier(h: *LaneHost) void {
          const store = h.cache orelse return;
-@@ -993,9 +1463,11 @@ pub const LaneHost = struct {
+@@ -1024,9 +1512,11 @@ pub const LaneHost = struct {
          t.restore_wait_timeouts = hc.restore_wait_timeouts;
          t.restore_wait_ns = hc.restore_wait_ns;
          t.restore_wait_max_ns = hc.restore_wait_max_ns;
@@ -878,7 +917,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
          return t;
      }
  };
-@@ -1006,6 +1478,12 @@ fn note(comptime fmt: []const u8, args: anytype) void {
+@@ -1037,6 +1527,12 @@ fn note(comptime fmt: []const u8, args: anytype) void {
      std.log.warn("lane host: " ++ fmt, args);
  }
  
@@ -891,7 +930,7 @@ index b67e7e2bd778e47587481587df3e994d4aa93a2e..69be46e248372b3bef16c4c781f2fbd7
  test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
      const gpa = std.testing.allocator;
      var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
-@@ -1185,7 +1663,47 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
+@@ -1216,7 +1712,47 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
      try std.testing.expectEqual(Reason.cancelled, a.wait());
  }
  
@@ -1724,7 +1763,7 @@ index 9a8a4241e6e07a5a5cbd7f17783ffcf0904fa58c..8f85688abb08c339b39db67fb6e7e40c
  test "a turn whose state left memory waits parked for its restore, resumes it exactly, and writes its own keeps forked from it" {
      const r = try Rig.create(.{ .load_ms = 5, .flush_ms = 1000 });
 diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
-index b53e61b36613c0abea46af81c25c1bbcd5587e52..03280c53c46f604c0e32d0a95356607fcfe86aae 100644
+index ea847802177f44462a5f1adabdfc481b1da813ea..2b73f69806a0dea3cc65580978e3b6900ca83d9e 100644
 --- a/zig/src/core/prompt_cache.zig
 +++ b/zig/src/core/prompt_cache.zig
 @@ -192,6 +192,12 @@ pub const TierCounts = struct {
@@ -1764,7 +1803,7 @@ index b53e61b36613c0abea46af81c25c1bbcd5587e52..03280c53c46f604c0e32d0a95356607f
      restored_tokens: u64 = 0,
      writes_enqueued: u64 = 0,
      shared_promoted: u64 = 0,
-@@ -391,6 +404,7 @@ pub const Store = struct {
+@@ -393,6 +406,7 @@ pub const Store = struct {
      roots: std.AutoHashMapUnmanaged(u64, u32) = .empty, // each conversation's first prompt length (join)
      restoring: std.ArrayList(*Restore) = .empty,
      restoring_bytes: u64 = 0, // destinations the restores in flight reserved (charged like kept states)
@@ -1772,7 +1811,7 @@ index b53e61b36613c0abea46af81c25c1bbcd5587e52..03280c53c46f604c0e32d0a95356607f
      next_lineage: u64 = 0,
      stats: Stats = .{},
  
-@@ -521,15 +535,45 @@ pub const Store = struct {
+@@ -523,15 +537,45 @@ pub const Store = struct {
      /// destination is charged to the budget from here until it ends (room made first, as for a keep; nobody holds a
      /// looked-up entry at admission, so any state may go): error.NoRoom when the budget cannot hold it.
      pub fn restoreBegin(s: *Store, p: Point, key: []const u32) !*Restore {
@@ -1820,7 +1859,7 @@ index b53e61b36613c0abea46af81c25c1bbcd5587e52..03280c53c46f604c0e32d0a95356607f
              return error.NoRoom;
          }
          const r = try s.gpa.create(Restore);
-@@ -545,6 +589,14 @@ pub const Store = struct {
+@@ -547,6 +591,14 @@ pub const Store = struct {
          return r;
      }
  
@@ -2403,10 +2442,10 @@ index 6fb5c988a7e654461957974f33bf4f94b595a0a1..72a0d5be5128a9a77cc924fbaf3f3fe7
      const gpa = testing.allocator;
      const p = try Pair.init(gpa, sharded, .{ .twins = false });
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index 711c47b788e65c6df519418aaf3d0f1e8ad5033c..48032ead6c4ee6bfc0f06a37b2b6bb174b293db3 100644
+index ec3a55288cbc05bdaed4b15fd7cad9da90e45fdf..7ca8c4b53cde8f00cfaba07b620e441040928acb 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
-@@ -926,6 +926,7 @@ pub const Lanes = struct {
+@@ -983,6 +983,7 @@ pub const Lanes = struct {
          }
          const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
          const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
@@ -2615,10 +2654,10 @@ index 65480228a2467a080e703cb7aef993f2d56e0ee5..fc388933ad951f497df0d73555f2107e
 +    try std.testing.expectEqual(@as(?usize, 0), gone(&.{l}, 1000));
 +}
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index cb73b4d0f5a2defcd693e00147b94cee23262bef..2027b3bfb2d6a207eac184de0cf9b16dd2365a04 100644
+index a8a99c9afafb6b055cf480c444aace0ee238f41f..1541dbfd763e7eccef5f6d8c71443cb02b559a16 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -622,6 +622,30 @@ pub const Model = struct {
+@@ -626,6 +626,30 @@ pub const Model = struct {
          }
      }
  
@@ -2649,7 +2688,7 @@ index cb73b4d0f5a2defcd693e00147b94cee23262bef..2027b3bfb2d6a207eac184de0cf9b16d
      /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
      /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
      /// codes and scales and its index keys, the rows view() places at those positions.
-@@ -630,18 +654,27 @@ pub const Model = struct {
+@@ -634,18 +658,27 @@ pub const Model = struct {
      /// (the other rank holds none), across parts (a carry) the source's owner sends them straight from its plane and the
      /// destination's owner receives them into its own, both ranks in this same order (lanes.zig runs copyExtent on
      /// every rank in its frame order). The source's rows stay; nothing is freed.
@@ -2682,7 +2721,7 @@ index cb73b4d0f5a2defcd693e00147b94cee23262bef..2027b3bfb2d6a207eac184de0cf9b16d
              const n = at / r;
              const cb = c.head_dim / 2;
              const sb = c.head_dim / 16;
-@@ -690,12 +723,48 @@ pub const Model = struct {
+@@ -694,12 +727,48 @@ pub const Model = struct {
      /// kv source's ratio (BadView). Deterministic: every rank refuses the same arguments alike under the agreed
      /// layout (kv_lanes.zig checks before any rank enqueues its side, so a refused carry leaves no NCCL half waiting).
      pub fn checkExtent(m: *const Model, from: usize, to: usize, at: usize) !void {
@@ -2733,7 +2772,7 @@ index cb73b4d0f5a2defcd693e00147b94cee23262bef..2027b3bfb2d6a207eac184de0cf9b16d
      }
  
      /// Rows [from, from + n) of `plane` (rows of `row` bytes; a sharded plane's rows of this rank's part) to rows
-@@ -1256,6 +1325,45 @@ pub const Model = struct {
+@@ -1273,6 +1342,45 @@ pub const Model = struct {
      }
  };
  
@@ -2780,10 +2819,10 @@ index cb73b4d0f5a2defcd693e00147b94cee23262bef..2027b3bfb2d6a207eac184de0cf9b16d
      try std.testing.expectEqual(@as(?usize, 1048576), try Model.pickWindow(1048576, 2101248, null));
      try std.testing.expectEqual(@as(?usize, 1048576), try Model.pickWindow(1048576, 2101248, "1048576"));
 diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
-index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5d7520e62 100644
+index 15311e75ac26fa0712ecb3032ff7736dc19bd3eb..a4438643fb7cf77e67ed3bb0dcf077d605e4d7a2 100644
 --- a/zig/src/families/dsv41/native.zig
 +++ b/zig/src/families/dsv41/native.zig
-@@ -63,6 +63,9 @@ const prompt = @import("prompt.zig");
+@@ -65,6 +65,9 @@ const prompt = @import("prompt.zig");
  const core = @import("core");
  const shard = @import("shard.zig");
  const kv_lanes = @import("kv_lanes.zig");
@@ -2804,7 +2843,7 @@ index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5
  };
  
  pub const Snaps = struct {
-@@ -132,6 +139,9 @@ const State = struct {
+@@ -134,6 +141,9 @@ const State = struct {
      vision: ?*vision_mod.Vision = null,
      staging: ?cuda.HostBuffer = null, // the spill tier's pinned staging (allocated before the pool)
      events: []cuda.Event = &.{}, // one a staging slot
@@ -2814,7 +2853,7 @@ index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5
  };
  
  fn getenv(name: [:0]const u8) ?[]const u8 {
-@@ -167,11 +177,15 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+@@ -169,11 +179,15 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
      const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
      const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
      if (o.spill != null) try spillPreflight(getenvFn); // (before the staging, the weights and the pool)
@@ -2830,7 +2869,7 @@ index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5
      // the spill tier's staging comes out of memory before the pool is sized (PORT-SPILL-V2: budgeted first)
      if (o.spill) |sp| st.staging = try spillStaging(ctx, sp);
      errdefer if (st.staging) |*b| b.free();
-@@ -241,11 +255,130 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+@@ -245,11 +259,130 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
          tier = st.lanes.spill.?.tier();
      }
      const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
@@ -2962,7 +3001,7 @@ index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5
      // the tier after the prompt cache's store (cuda.zig frees it first) and before the family: its store closes
      if (st.lanes.spill) |t| t.destroy();
      st.lanes.spill = null;
-@@ -512,6 +645,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+@@ -516,6 +649,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
          error.TransferTimeout => "TF_DS_KV_SHARD=1: a KV transfer did not complete in time (a rank's half never ran, or a device fault; the GPU stream holds the unmatched call): restart; if it recurs, TF_DS_KV_SHARD_CARRY=0 or TF_DS_KV_SHARD=0",
          error.KvShardNotStarted, error.BadPlan => "TF_DS_KV_SHARD=1: the KV-part planner was not set up as the lanes need (an engine bug): restart with TF_DS_KV_SHARD=0",
          error.FollowerScanStalled => "rank 1's spill store scan stopped making progress (its log names the store): check its spill disk (TF_DS_SPILL_DIR), or start it with a fresh directory",
@@ -2972,7 +3011,7 @@ index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5
          else => null,
      };
  }
-@@ -526,6 +662,30 @@ test "refusals name what to set" {
+@@ -530,6 +666,30 @@ test "refusals name what to set" {
      try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
  }
  
@@ -3003,7 +3042,7 @@ index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5
  test "the spill tier's refusals from the environment come before anything loads, and each says what to set" {
      const E = struct {
          var kv: ?[]const u8 = null;
-@@ -561,3 +721,152 @@ test "the spill tier's refusals from the environment come before anything loads,
+@@ -565,3 +725,152 @@ test "the spill tier's refusals from the environment come before anything loads,
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SpillNotStarted).?, "TF_DS_SPILL_DIR") != null);
      try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoWeightsId).?, "TF_DS_RANK_CACHE_SHA") != null);
  }
@@ -3157,19 +3196,19 @@ index 10d2c7e26f764ff2b314063b43d68478d5e9f324..4d5f05b0f3d5e61d752e7b1da28021a5
 +    try std.testing.expectEqual(api.LaneHost.pair_exit_code, stuck.code.load(.acquire));
 +}
 diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
-index 309fed77d926dd1e26ac9e92f07470a1558edb2d..5e4f564fb8ccba010156bdf5bb122569fedee033 100644
+index c7745098e3a6dde7e792c93f25a8cb996357bcef..b43b69b355216eee8414610ef732383e4c2db534 100644
 --- a/zig/src/families/dsv41/rdma.zig
 +++ b/zig/src/families/dsv41/rdma.zig
-@@ -30,7 +30,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
+@@ -31,7 +31,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
  
  extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
  
 -pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
 +pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
  
- /// The served ring has its own GID selection, independent of NCCL's.
- pub fn parseGidIndex(text: ?[]const u8) error{InvalidRdmaGidIndex}!u8 {
-@@ -498,7 +498,7 @@ pub const Ring = struct {
+ /// TF_RDMA_IDLE_S: seconds with nothing posted or reaped before the proxy naps (0: never nap; default 2).
+ fn parseIdleNs(text: []const u8) Error!u64 {
+@@ -484,7 +484,7 @@ pub const Ring = struct {
      }
      /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`.
      pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
@@ -3178,7 +3217,7 @@ index 309fed77d926dd1e26ac9e92f07470a1558edb2d..5e4f564fb8ccba010156bdf5bb122569
          if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
          const own: DevicePtr = if (r.s.own_early) recv + @as(u64, r.rank) * n4 * 16 else 0;
          try r.stage(stream, send, n4, own, n4, n4);
-@@ -527,7 +527,7 @@ pub const Ring = struct {
+@@ -513,7 +513,7 @@ pub const Ring = struct {
      /// Every rank's [rows, w_p] fp32 slice straight into dsts[p]; `send` is this rank's slice, contiguous. Every rank
      /// names the same widths, so each peer's ring slot holds rows x w_p floats.
      pub fn gatherInto(r: *Ring, stream: cuda.Stream, send: DevicePtr, rows: u32, own_row4: u32, dsts: []const Dst) Error!void {
@@ -3239,7 +3278,7 @@ index 24f4ee0371d7a4f1f502cf7ec133d0e0e826efea..264220c987b0833c5dd23c911c758ef0
  }
  
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index 65420772f7b4512b9465389072da54335130c589..279bfac5c00a8edc9ec374ee79999ac6e1ffcece 100644
+index 3c44383e2b4662a1065e7e971c8828cb10bb85d4..a72e4d9eb16384944f57603110d1da1b6c9f0967 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
 @@ -164,6 +164,10 @@ const Host = struct {
@@ -3253,7 +3292,7 @@ index 65420772f7b4512b9465389072da54335130c589..279bfac5c00a8edc9ec374ee79999ac6
  
      fn close(p: *anyopaque) void {
          const h: *Host = @ptrCast(@alignCast(p));
-@@ -204,6 +208,9 @@ const Host = struct {
+@@ -211,6 +215,9 @@ const Host = struct {
          if (h.cache) |*store| h.host.cache = store;
          h.host.kv_parts = h.kv_parts;
          if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
@@ -3263,7 +3302,7 @@ index 65420772f7b4512b9465389072da54335130c589..279bfac5c00a8edc9ec374ee79999ac6
          if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
          try h.host.start();
      }
-@@ -402,6 +409,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -420,6 +427,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
      });
      errdefer gpa.free(h.startup);
      if (@hasField(@TypeOf(loaded), "kv_parts")) h.kv_parts = loaded.kv_parts;
@@ -3279,7 +3318,7 @@ index 65420772f7b4512b9465389072da54335130c589..279bfac5c00a8edc9ec374ee79999ac6
      // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
      if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
          const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
-@@ -432,6 +448,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+@@ -450,6 +466,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
      return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
  }
  

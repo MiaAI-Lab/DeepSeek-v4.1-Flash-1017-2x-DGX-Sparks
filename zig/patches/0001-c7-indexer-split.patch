@@ -14,10 +14,10 @@ Credit: the idea of splitting the indexer across ranks is credited to drowzeys (
 copied from that work. The code is written for this recipe.
 ---
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index f88cbc1..59697ee 100644
+index 8ffb29e77a0960a56e1dd0c923ba0bdc3d850d5c..da27b355f658760d2a89a046852e0d09f33e6ca0 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
-@@ -149,6 +149,9 @@ pub const Model = struct {
+@@ -154,6 +154,9 @@ pub const Model = struct {
          m.* = undefined;
          m.gpa = gpa;
          if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
@@ -28,7 +28,7 @@ index f88cbc1..59697ee 100644
          m.img_buf = null;
          m.host = std.heap.ArenaAllocator.init(gpa);
 diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
-index c10e7c9..c523702 100644
+index 936818b1a9e7663d7e8c52361969d6f8707e0b6e..b921294ec9241c36fd37d3f380cf145a31a2ff08 100644
 --- a/zig/src/families/dsv41/prompt.zig
 +++ b/zig/src/families/dsv41/prompt.zig
 @@ -715,6 +715,11 @@ pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: us

@@ -1,0 +1,273 @@
+From b39546ea41a797a41fd12c765002389ac7e8c8eb Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 18:35:50 +0200
+Subject: [PATCH] dsv41: rank 0 opens its followers' ports before its
+ weights load
+
+Rank 0 listened for its follower only after its own weights had loaded (Fan.open after weights.load), and the
+follower retried its connect for a fixed 300 s. A worker that finished loading more than 300 s before the head
+(the head reading its weights cold, or slowly, while the worker's were ready) exited with ConnectFailed.
+
+Fan.bind opens rank 0's ports first (Link.Listener: backlog 1, the kernel completes a connect into it), model.zig
+calls it before the weights load, and Fan.openBound takes the connections afterwards; a follower that is ready
+early waits in its port's backlog. Fan.open is bind + openBound, as before. TF_DS_CONNECT_S (default 300, at most
+a day; a bad value is refused) sets a follower's retry window, which now covers only rank 0's own start up to the
+bind. A bind that fails (the port in use) now fails at the start of the load instead of after it.
+
+Tests: a peer that connects before the accept waits and its frame arrives, and the port closes once taken; the same
+through Fan (a follower already connected while rank 0 is still 'loading'); TF_DS_CONNECT_S parsing.
+
+After the 4x recipe's 0035 (Mia's AI Lab; diagnosed by shanedertrain in its issue 3), written for this engine's two ranks.
+---
+ zig/src/families/dsv41/link.zig     | 66 ++++++++++++++++----
+ zig/src/families/dsv41/model.zig    | 10 ++-
+ zig/src/families/dsv41/prompt2d.zig | 97 +++++++++++++++++++++++++++--
+ 3 files changed, 153 insertions(+), 20 deletions(-)
+
+diff --git a/zig/src/families/dsv41/link.zig b/zig/src/families/dsv41/link.zig
+index fc38893..0a135b7 100644
+--- a/zig/src/families/dsv41/link.zig
++++ b/zig/src/families/dsv41/link.zig
+@@ -34,18 +34,9 @@ pub const Link = struct {
+ 
+     /// Rank 0: listen on `ip`:`port` and take the one peer's connection.
+     pub fn listen(ip: [4]u8, port: u16) !Link {
+-        const fd = try socket();
+-        errdefer _ = c.close(fd);
+-        const one: c_int = 1;
+-        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
+-        var a = addr(ip, port);
+-        if (c.bind(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
+-        if (c.listen(fd, 1) != 0) return error.ListenFailed;
+-        const peer = c.accept(fd, null, null);
+-        if (peer < 0) return error.AcceptFailed;
+-        _ = c.close(fd);
+-        tune(peer);
+-        return .{ .fd = peer };
++        var l = try Listener.bind(ip, port);
++        errdefer l.close();
++        return l.accept();
+     }
+ 
+     /// Rank 1: connect to rank 0, retrying for up to `seconds` while it starts.
+@@ -66,6 +57,38 @@ pub const Link = struct {
+         l.* = undefined;
+     }
+ 
++    /// A port rank 0 listens on for one peer, before it takes the connection: a peer that connects in the meantime
++    /// is completed by the kernel (backlog 1) and waits there until `accept`, so rank 0 can open its ports first
++    /// (before it loads its weights) and take the connections afterwards.
++    pub const Listener = struct {
++        fd: c.fd_t,
++
++        pub fn bind(ip: [4]u8, port: u16) !Listener {
++            const fd = try socket();
++            errdefer _ = c.close(fd);
++            const one: c_int = 1;
++            _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
++            var a = addr(ip, port);
++            if (c.bind(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
++            if (c.listen(fd, 1) != 0) return error.ListenFailed;
++            return .{ .fd = fd };
++        }
++
++        /// The peer's connection (waited for if it has not come yet); the port is closed once it is taken.
++        pub fn accept(l: *Listener) !Link {
++            const peer = c.accept(l.fd, null, null);
++            if (peer < 0) return error.AcceptFailed;
++            l.close();
++            tune(peer);
++            return .{ .fd = peer };
++        }
++
++        pub fn close(l: *Listener) void {
++            if (l.fd >= 0) _ = c.close(l.fd);
++            l.fd = -1;
++        }
++    };
++
+     fn writeAll(l: Link, bytes: []const u8) !void {
+         var done: usize = 0;
+         while (done < bytes.len) {
+@@ -329,6 +352,25 @@ test "frames cross a loopback link in order" {
+     t.join();
+ }
+ 
++test "a peer that connects before rank 0 takes its port waits in the backlog, and the port closes once taken" {
++    const io = std.testing.io;
++    const port: u16 = 27700 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
++    var bound = try Link.Listener.bind(.{ 127, 0, 0, 1 }, port);
++    defer bound.close();
++    // the peer connects now, while nothing accepts: before this change rank 0 listened only after its weights had
++    // loaded, and a peer that was ready earlier gave up after its retry window
++    var peer = try Link.connect(io, .{ 127, 0, 0, 1 }, port, 1);
++    defer peer.close();
++    try peer.send("early");
++    var l = try bound.accept();
++    defer l.close();
++    var buf: [16]u8 = undefined;
++    try std.testing.expectEqualStrings("early", try l.recv(&buf));
++    try std.testing.expectEqual(@as(c.fd_t, -1), bound.fd);
++    // the port is free again after the accept
++    try std.testing.expectError(error.ConnectFailed, Link.connect(io, .{ 127, 0, 0, 1 }, port, 0));
++}
++
+ test "a reply that does not come in time is a timeout, a readable link says so" {
+     const io = std.testing.io;
+     const port: u16 = 29500 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 400)));
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index f6d390c..0c428d4 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -211,6 +211,12 @@ pub const Model = struct {
+         m.stream = try cuda.Stream.init(d, true);
+         errdefer m.stream.deinit();
+ 
++        // rank 0's ports for the followers first: a worker that loads its weights sooner waits in its port's backlog
++        // (before this, rank 0 listened only after its own weights had loaded, and a worker that was ready more
++        // than TF_DS_CONNECT_S earlier exited with ConnectFailed)
++        var ports = try prompt2d.Fan.bind(o.master, o.port, o.rank, o.world);
++        defer ports.close();
++
+         // the weights (and the DSpark blocks) from the lane's rank cache
+         m.cache_dir = try std.Io.Dir.cwd().openDir(io, o.cache_dir, .{ .iterate = true });
+         errdefer m.cache_dir.close(io);
+@@ -224,8 +230,8 @@ pub const Model = struct {
+         errdefer m.w.deinit();
+         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
+ 
+-        // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
+-        m.fan = try prompt2d.Fan.open(io, o.master, o.port, o.rank, o.world);
++        // the ranks' link and NCCL (rank 0 takes the connections its ports have waiting; rank 1 connects)
++        m.fan = try prompt2d.Fan.openBound(io, &ports, o.master, o.port, o.rank, o.world);
+         errdefer m.fan.close();
+         m.comm = try m.fan.comm(o.rank, o.world);
+         errdefer m.comm.deinit();
+diff --git a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+index d792bd6..ee4f949 100644
+--- a/zig/src/families/dsv41/prompt2d.zig
++++ b/zig/src/families/dsv41/prompt2d.zig
+@@ -36,25 +36,74 @@ pub fn split(g: u32, world: u32) !plan.Split {
+     };
+ }
+ 
+-/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, one follower at a time (each
+-/// follower retries its connect while rank 0 gets to it), so two ranks link exactly as before (rank 1 on PORT).
+-/// NCCL's unique id goes from rank 0 down every link. (The port's link to N followers replaces this.)
++/// How long a follower retries its connect to rank 0, in seconds: TF_DS_CONNECT_S, else 300. With rank 0's ports open
++/// before its weights load (`Fan.bind`) a follower that is ready first waits in its port's backlog, so this only
++/// covers rank 0's own start up to that point.
++pub fn connectSeconds() !u32 {
++    return parseConnectSeconds(if (std.c.getenv("TF_DS_CONNECT_S")) |v| std.mem.span(v) else null);
++}
++
++fn parseConnectSeconds(v: ?[]const u8) !u32 {
++    const text = v orelse return 300;
++    const n = std.fmt.parseInt(u32, text, 10) catch return error.BadConnectSeconds;
++    return if (n == 0 or n > 86400) error.BadConnectSeconds else n;
++}
++
++/// The links of a run and its NCCL world: rank 0 listens on PORT + g - 1 for follower g, so two ranks link exactly as
++/// before (rank 1 on PORT). Rank 0's ports are opened first (`bind`, before its weights load) and its followers'
++/// connections taken afterwards (`openBound`): a follower that loaded its weights earlier waits in its port's backlog
++/// instead of giving up after its retry window (a worker that loaded more than 300 s before the head exited with
++/// ConnectFailed). NCCL's unique id goes from rank 0 down every link. (The port's link to N followers replaces this.)
+ pub const Fan = struct {
+     links: [3]?Link = .{ null, null, null },
+ 
+-    pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
++    /// Rank 0's open ports, one for each follower; nothing on a follower.
++    pub const Bound = struct {
++        ls: [3]?Link.Listener = .{ null, null, null },
++
++        pub fn close(b: *Bound) void {
++            for (&b.ls) |*l| {
++                if (l.*) |*x| x.close();
++                l.* = null;
++            }
++        }
++    };
++
++    pub fn bind(ip: [4]u8, port: u16, rank: u32, world: u32) !Bound {
++        var b: Bound = .{};
++        errdefer b.close();
++        if (world > 4) return error.UnsupportedWorld;
++        if (world < 2 or rank != 0) return b;
++        _ = try connectSeconds(); // a bad TF_DS_CONNECT_S refuses on rank 0 too, not only on the follower that would read it
++        for (1..world) |g| b.ls[g - 1] = try Link.Listener.bind(ip, port + @as(u16, @intCast(g - 1)));
++        return b;
++    }
++
++    /// Rank 0 takes each follower's connection from its open port (waiting for those not there yet); a follower
++    /// connects, retrying for connectSeconds().
++    pub fn openBound(io: std.Io, b: *Bound, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
+         var f: Fan = .{};
+         errdefer f.close();
+         if (world > 4) return error.UnsupportedWorld;
+         if (world < 2) return f;
+         if (rank == 0) {
+-            for (1..world) |g| f.links[g - 1] = try Link.listen(ip, port + @as(u16, @intCast(g - 1)));
++            for (1..world) |g| {
++                var l = b.ls[g - 1] orelse return error.NotBound;
++                f.links[g - 1] = try l.accept();
++                b.ls[g - 1] = null;
++            }
+         } else {
+-            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), 300);
++            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), try connectSeconds());
+         }
+         return f;
+     }
+ 
++    pub fn open(io: std.Io, ip: [4]u8, port: u16, rank: u32, world: u32) !Fan {
++        var b = try bind(ip, port, rank, world);
++        defer b.close();
++        return openBound(io, &b, ip, port, rank, world);
++    }
++
+     pub fn close(f: *Fan) void {
+         for (&f.links) |*l| {
+             if (l.*) |*x| x.close();
+@@ -254,3 +303,39 @@ test "a node's split: TP over two, the 2D split over four" {
+     try std.testing.expectEqual(plan.Split{ .rank = 1, .world = 2, .pair = 1 }, try split(3, 4));
+     try std.testing.expectError(error.UnsupportedWorld, split(0, 3));
+ }
++
++test "a follower that connects before rank 0 takes its port is linked once rank 0 does, and NCCL's id can cross" {
++    const io = std.testing.io;
++    const port: u16 = 27600 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 90)));
++    const ip: [4]u8 = .{ 127, 0, 0, 1 };
++    var ports = try Fan.bind(ip, port, 0, 2); // rank 0 opens its port first (before its weights load)
++    defer ports.close();
++    const Follower = struct {
++        fn run(p: u16, got: *[5]u8) void {
++            var f = Fan.open(std.testing.io, .{ 127, 0, 0, 1 }, p, 1, 2) catch return;
++            defer f.close();
++            var buf: [16]u8 = undefined;
++            const r = f.links[0].?.recv(&buf) catch return;
++            if (r.len == got.len) @memcpy(got, r);
++        }
++    };
++    var got: [5]u8 = undefined;
++    @memset(&got, 0);
++    const t = try std.Thread.spawn(.{}, Follower.run, .{ port, &got });
++    // rank 0 is slow: the follower is already connected (waiting in the backlog) when it takes the port
++    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
++    var f = try Fan.openBound(io, &ports, ip, port, 0, 2);
++    defer f.close();
++    try f.links[0].?.send("id-ok");
++    t.join();
++    try std.testing.expectEqualStrings("id-ok", &got);
++    try std.testing.expect(ports.ls[0] == null); // taken: the port is closed
++}
++
++test "TF_DS_CONNECT_S: unset is 300 s, a count of seconds up to a day, anything else is refused" {
++    try std.testing.expectEqual(@as(u32, 300), try parseConnectSeconds(null));
++    try std.testing.expectEqual(@as(u32, 900), try parseConnectSeconds("900"));
++    try std.testing.expectEqual(@as(u32, 86400), try parseConnectSeconds("86400"));
++    for ([_][]const u8{ "", "0", "-5", "abc", "12s", "86401" }) |bad|
++        try std.testing.expectError(error.BadConnectSeconds, parseConnectSeconds(bad));
++}
+-- 
+2.43.0
+

@@ -3,7 +3,7 @@
 
 `API_GATEWAY=0` (the default) must print exactly what the recipe printed before the gateway existed: the recorded
 fixture is the output of `DRY_RUN=1 ./start.sh` on the branch without the feature. The image tag is the one derived
-value that necessarily changes when patch 0035 joins zig/patches, so it is normalized on both sides; every other byte
+value that necessarily changes when patch 0039 joins zig/patches, so it is normalized on both sides; every other byte
 is compared. `API_GATEWAY=1` must move the engine to 127.0.0.1:ENGINE_PORT, enable the token route, and print the
 gateway container with its flags and mounts. Invalid values must be rejected with their message.
 

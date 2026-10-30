@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: eleata <1222931+eleata@users.noreply.github.com>
-Date: Wed, 28 Oct 2026 16:22:48 -0300
+Date: Fri, 30 Oct 2026 11:34:55 -0300
 Subject: [PATCH] dsv41 server: token-in/token-out route behind
  TENSORFOLD_TOKEN_ROUTE
 
@@ -11,12 +11,15 @@ gate covers /inference/. /health reports the flag and /metrics counts its
 results. TF_DS_API_EFFORTS=1 (engine, both ranks) selects the API's effort
 table instead of the lane's.
 
-Rebased onto the recipe's TF_REF 629c524 with zig/patches 0001-0033 of
-MiaAI-Lab main d8e5b28 applied, as zig/Dockerfile applies them (0034 is left
-to the open #77). One conflict, in zig/src/server/chat.zig, with 0032's
-keep-alive ping: both kept (ping_after_ns beside TokenStop/TokenSink/TokenReply,
-and the ping loop now calls commit(tokens, scored)). The token-only test helper
-NoGone.check is pub, as prepare_gate (0023) requires.
+Rebased onto the recipe's TF_REF fbbc971 with zig/patches 0001-0038 of
+MiaAI-Lab main 0e7d421 applied, as zig/Dockerfile applies them; it was 0035
+on 629c524 (#59). Changes for fbbc971 (as in #77's rebase): finish's content
+code moved to the new finish with upstream's tool-only whitespace rule; the
+.ids path calls upstream's spans; the first token's logprob is drawn in
+Lanes.prefillPart. With 0032 the keep-alive ping and the route's types sit
+side by side, and the ping loop calls commit(tokens, scored); with 0036 the
+token route passes its cached prompt tokens to noteRequest, as the text path
+does. NoGone.check is pub, as prepare_gate (0023) requires.
 
 Audit fixes in chat.zig: a failed allocation in the mailbox or the reader no
 longer drops a round silently (a token-only reply ends with OutOfMemory; the
@@ -34,10 +37,11 @@ stream, instead of a closed connection; a whole reply that cannot be
 serialized, or whose logprobs cannot be built, is one of them.
 zig fmt applied.
 
-Checked with Zig 0.17.0 on x86_64, CPU-only harness (zig/tests/server):
-build.sh builds fake_serve and tensorfold-native; zig_test.sh 119/119 and 90/90;
-token_route_smoke.py against fake_serve 34/35, the same as before the rebase
-(logprobs content fails on both with the fake engine).
+Checked with Zig 0.17.0 on x86_64: zig build test 23/23 steps (529 tests on
+the series alone; with the route the steps whose binaries changed ran again,
+471, the rest cached); zig/tests/server: build.sh builds fake_serve and
+tensorfold-native; zig_test.sh 129/129 and 96/96; token_route_smoke.py against
+fake_serve 34/35, as on 629c524 (logprobs content fails with the fake engine).
 ---
  zig/src/core/engine_api.zig              |   13 +
  zig/src/core/lane_host.zig               |    7 +-
@@ -53,11 +57,11 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  zig/src/families/dsv41/text.zig          |   27 +-
  zig/src/native/cuda.zig                  |   12 +-
  zig/src/server/auth.zig                  |    1 +
- zig/src/server/chat.zig                  |  661 +++++++++++--
+ zig/src/server/chat.zig                  |  665 +++++++++++--
  zig/src/server/generate.zig              |  656 +++++++++++++
  zig/src/server/generate_test.zig         | 1098 ++++++++++++++++++++++
  zig/src/server/metrics.zig               |   29 +
- zig/src/server/prompt.zig                |   25 +-
+ zig/src/server/prompt.zig                |   29 +-
  zig/src/server/prompt_test.zig           |  144 +++
  zig/src/server/root.zig                  |    4 +
  zig/src/server/routes.zig                |    8 +
@@ -71,7 +75,7 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  zig/tests/server/fake_serve.zig          |    2 +-
  zig/tests/server/fixtures/scripts.json   |   92 +-
  zig/tests/server/token_route_smoke.py    |  207 ++++
- 32 files changed, 3372 insertions(+), 105 deletions(-)
+ 32 files changed, 3377 insertions(+), 108 deletions(-)
  create mode 100644 zig/src/server/generate.zig
  create mode 100644 zig/src/server/generate_test.zig
  create mode 100644 zig/src/server/prompt_test.zig
@@ -79,7 +83,7 @@ token_route_smoke.py against fake_serve 34/35, the same as before the rebase
  create mode 100755 zig/tests/server/token_route_smoke.py
 
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
-index 2a50f6f9..eeaf0a09 100644
+index 3fdd8c26..685c349d 100644
 --- a/zig/src/core/engine_api.zig
 +++ b/zig/src/core/engine_api.zig
 @@ -12,6 +12,10 @@ pub const Sampling = lanes.Sampling;
@@ -93,7 +97,7 @@ index 2a50f6f9..eeaf0a09 100644
  /// The request's stop strings, checked on the engine's thread after each committed token (the server decodes the tail).
  pub const Stop = struct {
      ctx: *anyopaque,
-@@ -69,6 +73,8 @@ pub const Request = struct {
+@@ -68,6 +72,8 @@ pub const Request = struct {
      cache_media: []const prompt_cache.Media = &.{},
      max_tokens: u32,
      sampling: ?Sampling = null,
@@ -102,7 +106,7 @@ index 2a50f6f9..eeaf0a09 100644
      /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
      eos: []const u32 = &.{},
      stop: ?Stop = null,
-@@ -118,6 +124,11 @@ pub const Event = union(enum) {
+@@ -122,6 +128,11 @@ pub const Event = union(enum) {
      prefilled: u32,
      /// Tokens committed for this request, in order; valid only during the call.
      tokens: []const u32,
@@ -114,7 +118,7 @@ index 2a50f6f9..eeaf0a09 100644
      /// The reply ended; nothing follows. ``message`` says why a failed reply failed.
      finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "" },
  };
-@@ -152,6 +163,8 @@ pub const Info = struct {
+@@ -158,6 +169,8 @@ pub const Info = struct {
      efforts: []const Effort = &.{},
      /// A vision family's image input; null: the server refuses images.
      vision: ?Vision = null,
@@ -124,10 +128,10 @@ index 2a50f6f9..eeaf0a09 100644
  
  /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 3367d54f..beceee04 100644
+index a90d26a5..e2c73bae 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -442,6 +442,10 @@ pub const LaneHost = struct {
+@@ -440,6 +440,10 @@ pub const LaneHost = struct {
              h.noteDecoded(emitted.len - job.delivered);
              job.delivered = emitted.len;
          }
@@ -138,7 +142,7 @@ index 3367d54f..beceee04 100644
      }
  
      /// Sends a stream's new tokens; true once it has finished (its job freed).
-@@ -611,6 +615,7 @@ pub const LaneHost = struct {
+@@ -620,6 +624,7 @@ pub const LaneHost = struct {
              .max_new = r.max_tokens,
              .eos = r.eos,
              .sampling = r.sampling,
@@ -146,7 +150,7 @@ index 3367d54f..beceee04 100644
              .drafts = r.drafts,
              .proposer = job.proposer.proposer(),
              .stop_check = if (r.stop) |s| .{ .ptr = s.ctx, .check = s.check } else null,
-@@ -743,7 +748,7 @@ pub const LaneHost = struct {
+@@ -762,7 +767,7 @@ pub const LaneHost = struct {
      fn loneFits(h: *LaneHost, job: *Job) bool {
          const r = job.request;
          const lone = h.lone orelse return false;
@@ -156,7 +160,7 @@ index 3367d54f..beceee04 100644
          defer h.unlock();
          return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0 and h.waitingCount() == 0;
 diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
-index 963ba7e4..8ff33cfa 100644
+index 060971dd..fb87c37c 100644
 --- a/zig/src/core/lane_host_reuse_test.zig
 +++ b/zig/src/core/lane_host_reuse_test.zig
 @@ -52,6 +52,7 @@ test "a lane host resumes a conversation from its kept prompt state and reports
@@ -175,21 +179,21 @@ index 963ba7e4..8ff33cfa 100644
                  .finished => |f| b.done = f.reason,
              }
          }
-@@ -240,6 +242,7 @@ test "a turn with a picture resumes its conversation's kept state, and a differe
+@@ -241,6 +243,7 @@ test "a prompt with an image resumes when its image is the same, and not past th
              switch (e.*) {
                  .prefilled => |c| b.cached = c,
-                 .tokens => {},
+                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
 +                .scored => {},
                  .finished => |f| b.done = f.reason,
              }
          }
 diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
-index 061a8711..dd0002da 100644
+index a8706236..f52f2792 100644
 --- a/zig/src/core/lane_host_test.zig
 +++ b/zig/src/core/lane_host_test.zig
-@@ -213,3 +213,65 @@ test "after a long prompt pass, a stream near its max_tokens ends before the nex
-     // the first request (64 tokens: within finish_left) ended before the second's first token
-     try std.testing.expect(seq.a_done.? < seq.b_first.?);
+@@ -507,3 +507,65 @@ test "a short prompt refused for room as it cuts in waits in the queue and then
+         try std.testing.expectEqual(@as(usize, 12), order.len);
+     }
  }
 +
 +test "a lane host emits scored when the family leaves logprobs, and none without them" {
@@ -254,22 +258,22 @@ index 061a8711..dd0002da 100644
 +    try std.testing.expectEqual(@as(usize, 0), without.scored);
 +}
 diff --git a/zig/src/core/lane_host_tier_test.zig b/zig/src/core/lane_host_tier_test.zig
-index 8f85688a..a1243afe 100644
+index 8f85688a..3729a249 100644
 --- a/zig/src/core/lane_host_tier_test.zig
 +++ b/zig/src/core/lane_host_tier_test.zig
 @@ -28,6 +28,7 @@ pub const Box = struct {
          switch (e.*) {
              .prefilled => |c| b.cached = c,
              .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
-+            .scored => unreachable, // neither test asks for logprobs: a scored event here is a bug
++            .scored => {},
              .finished => |f| b.done = f.reason,
          }
      }
 diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
-index a70dd298..98abe957 100644
+index 030743f8..a8a937f6 100644
 --- a/zig/src/core/lanes/engine.zig
 +++ b/zig/src/core/lanes/engine.zig
-@@ -112,8 +112,8 @@ pub const Engine = struct {
+@@ -169,8 +169,8 @@ pub const Engine = struct {
              try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
              s.dropHeld(e.gpa);
              s.next = .{ .count = d };
@@ -280,7 +284,7 @@ index a70dd298..98abe957 100644
          }
          const value = try e.readFeed(feed);
          if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
-@@ -181,7 +181,7 @@ pub const Engine = struct {
+@@ -240,7 +240,7 @@ pub const Engine = struct {
              try e.roundStreams(chosen);
          } else {
              for (live.items) |s| {
@@ -289,7 +293,7 @@ index a70dd298..98abe957 100644
                  s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
              }
          }
-@@ -254,7 +254,7 @@ pub const Engine = struct {
+@@ -313,7 +313,7 @@ pub const Engine = struct {
          const tokens = try win.tokens(e, windows[0], out[0]);
          const parents = try win.rowParents(e, windows[0]);
          const o = try e.conclude(s, plan, out[0].sampled, tokens, parents, windows[0].positions);
@@ -299,7 +303,7 @@ index a70dd298..98abe957 100644
          if (e.cfg.family_mtp and s.drafts) {
              if (early and o.cut == null) {
 diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
-index 5608c38c..f754e24b 100644
+index 294a21cd..16ae79d8 100644
 --- a/zig/src/core/lanes/fake.zig
 +++ b/zig/src/core/lanes/fake.zig
 @@ -3,6 +3,7 @@ const std = @import("std");
@@ -310,15 +314,15 @@ index 5608c38c..f754e24b 100644
  const Sampling = @import("sampling.zig").Sampling;
  const keyBits = @import("sampling.zig").keyBits;
  const accept = @import("accept.zig");
-@@ -23,6 +24,7 @@ const Lane = struct {
-     held: std.ArrayList(u32) = .empty, // drafts for the next round
+@@ -24,6 +25,7 @@ const Lane = struct {
      base: usize = 0, // the history length before the last verify
      rows: std.ArrayList(u32) = .empty, // the last verify's row tokens
+     pieces: usize = 0, // the prompt pass's chunks run so far (prefill_part)
 +    row_lp: std.ArrayList(Logprob) = .empty, // each row's logprob, kept until keep selects the rows that stay
  };
  
  pub const Fake = struct {
-@@ -52,6 +54,7 @@ pub const Fake = struct {
+@@ -53,6 +55,7 @@ pub const Fake = struct {
          l.history.deinit(gpa);
          l.held.deinit(gpa);
          l.rows.deinit(gpa);
@@ -326,7 +330,7 @@ index 5608c38c..f754e24b 100644
      }
  
      pub fn backend(x: *Fake) be.Backend {
-@@ -146,7 +149,9 @@ pub const Fake = struct {
+@@ -167,7 +170,9 @@ pub const Fake = struct {
  
      fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {
          const x = self(ptr);
@@ -337,7 +341,7 @@ index 5608c38c..f754e24b 100644
      }
  
      fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
-@@ -167,6 +172,7 @@ pub const Fake = struct {
+@@ -188,6 +193,7 @@ pub const Fake = struct {
              const l = x.lane(w.stream);
              l.base = l.history.items.len;
              l.rows.clearRetainingCapacity();
@@ -345,7 +349,7 @@ index 5608c38c..f754e24b 100644
              try l.rows.append(x.gpa, w.pending);
              try l.rows.appendSlice(x.gpa, l.held.items[0..w.held]);
              try l.rows.appendSlice(x.gpa, w.tokens);
-@@ -183,6 +189,7 @@ pub const Fake = struct {
+@@ -204,6 +210,7 @@ pub const Fake = struct {
                  try l.history.appendSlice(x.gpa, path.items);
                  if (w.positions[r] != l.history.items.len) return error.PositionMismatch;
                  o.sampled[r] = x.targetNext(l.history.items, w.stream.sampling, w.positions[r]);
@@ -353,7 +357,7 @@ index 5608c38c..f754e24b 100644
              }
              l.history.shrinkRetainingCapacity(l.base);
              try l.history.appendSlice(x.gpa, l.rows.items); // a chain keeps every row unless rolled back
-@@ -194,7 +201,14 @@ pub const Fake = struct {
+@@ -215,7 +222,14 @@ pub const Fake = struct {
          for (windows, paths) |w, path| {
              const l = x.lane(w.stream);
              l.history.shrinkRetainingCapacity(l.base);
@@ -447,22 +451,22 @@ index 2e17c40c..3cbe451e 100644
      pub fn dropRoundState(s: *Stream, gpa: Allocator) void {
          if (s.depth) |*d| d.deinit(gpa);
 diff --git a/zig/src/core/prompt_cache_media_test.zig b/zig/src/core/prompt_cache_media_test.zig
-index d7f9147e..f7789e17 100644
+index d7f9147e..be3312d9 100644
 --- a/zig/src/core/prompt_cache_media_test.zig
 +++ b/zig/src/core/prompt_cache_media_test.zig
 @@ -53,6 +53,7 @@ const Box = struct {
          switch (e.*) {
              .prefilled => |c| b.cached = c,
              .tokens => {},
-+            .scored => unreachable, // neither test asks for logprobs: a scored event here is a bug
++            .scored => {},
              .finished => |f| b.done = f.reason,
          }
      }
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index e2e341e8..5f98b9c3 100644
+index eaab37f8..ed069161 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
-@@ -397,6 +397,8 @@ const Lane = struct {
+@@ -398,6 +398,8 @@ const Lane = struct {
      held: [draft.max_block]u32 = undefined,
      confs: [draft.max_block]f32 = undefined,
      nheld: usize = 0,
@@ -471,10 +475,10 @@ index e2e341e8..5f98b9c3 100644
  };
  
  extern "c" fn exp(x: f64) f64;
-@@ -951,6 +953,13 @@ pub const Lanes = struct {
+@@ -844,6 +846,13 @@ pub const Lanes = struct {
              std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
          }
-         const token = try draw(logits, len, s.sampling);
+         const token = try draw(logits, done.len, s.sampling);
 +        if (s.logprobs > 0) {
 +            var buf: sampling.LogprobBuf = .{};
 +            const lp = sampling.logprobsOf(logits, token, @intCast(s.logprobs), &buf);
@@ -483,9 +487,9 @@ index e2e341e8..5f98b9c3 100644
 +            try s.appendScored(self.gpa, .{ .token = lp.token, .logprob = lp.logprob, .rank = lp.rank, .top = top_buf[0..lp.top.len] });
 +        }
          self.streams.getPtr(s).?.first = self.take(token);
+         return true;
      }
- 
-@@ -1001,7 +1010,15 @@ pub const Lanes = struct {
+@@ -1062,7 +1071,15 @@ pub const Lanes = struct {
              };
          }
          const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
@@ -502,7 +506,7 @@ index e2e341e8..5f98b9c3 100644
          if (m.ringFailed()) return error.RingFailed; // (robustness: a graph's collect gave up on a dead peer's flags)
          const t3 = m.now();
          defer if (self.prof) |*p| {
-@@ -1016,9 +1033,18 @@ pub const Lanes = struct {
+@@ -1077,9 +1094,18 @@ pub const Lanes = struct {
          };
          const V = m.vocab;
          for (windows, out, 0..) |w, *o, k| {
@@ -523,7 +527,7 @@ index e2e341e8..5f98b9c3 100644
              @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
              @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
              l.nheld = 0;
-@@ -1046,10 +1072,17 @@ pub const Lanes = struct {
+@@ -1107,10 +1133,17 @@ pub const Lanes = struct {
  
      /// The caches are positional: the next window starts at the stream's new length and writes over the rows past it.
      fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
@@ -765,10 +769,10 @@ index 8fe1e86c..6c9ba097 100644
      for (efforts) |e| {
          try std.testing.expect(e.value > last and e.value <= 100);
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index 279bfac5..efde4229 100644
+index 555c1ce0..c18da96e 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
-@@ -459,12 +459,20 @@ fn pairExit(_: *anyopaque, code: u8) void {
+@@ -477,12 +477,20 @@ fn pairExit(_: *anyopaque, code: u8) void {
  /// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.
  fn familyEfforts(comptime F: type) []const api.Effort {
      if (!@hasDecl(F, "efforts")) return &.{};
@@ -804,7 +808,7 @@ index 475ae2af..bd6fc2c6 100644
      if (std.mem.startsWith(u8, path, "/responses/")) return true;
      for ([_][]const u8{ "/chat/completions", "/completions", "/decisions", "/models" }) |end| if (std.mem.endsWith(u8, path, end)) return true;
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 69cd0ded..4f685653 100644
+index 8a940e0f..90a38a12 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
 @@ -11,6 +11,7 @@ const prompt_mod = @import("prompt.zig");
@@ -1107,7 +1111,7 @@ index 69cd0ded..4f685653 100644
 +        .max_tokens = request.max_tokens,
 +        .tools = &.{},
 +    };
-+    defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
++    defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
 +    errdefer if (!gen.engine_done) gen.cancel();
 +    gen.loop(gone) catch |e| return e;
 +    return gen.finishTokens(cx, prepared.prompt_len, received, submitted, prepared.thinking, prepared.effort, prepared.sampled, prepared.drafts);
@@ -1198,7 +1202,7 @@ index 69cd0ded..4f685653 100644
          var landed: usize = 0;
          for (chunk) |t| {
              if (g.reason != null) break;
-@@ -428,6 +624,92 @@ const Generation = struct {
+@@ -431,6 +627,92 @@ const Generation = struct {
          }
      }
  
@@ -1291,7 +1295,7 @@ index 69cd0ded..4f685653 100644
      fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
          sink.call(sink.ctx, delta) catch {
              g.cancel();
-@@ -457,20 +739,47 @@ const Generation = struct {
+@@ -460,20 +742,47 @@ const Generation = struct {
          while (true) {
              m.mutex.lockUncancelable(m.io);
              var chunk: ?[]u32 = null;
@@ -1342,7 +1346,7 @@ index 69cd0ded..4f685653 100644
                  return;
              }
              if (gone.check()) {
-@@ -478,10 +787,12 @@ const Generation = struct {
+@@ -481,10 +790,12 @@ const Generation = struct {
                  return error.Cancelled;
              }
              const tokens = chunk orelse {
@@ -1357,7 +1361,7 @@ index 69cd0ded..4f685653 100644
                              g.cancel();
                              return error.Cancelled;
                          };
-@@ -490,54 +801,17 @@ const Generation = struct {
+@@ -493,11 +804,68 @@ const Generation = struct {
                  };
                  continue;
              };
@@ -1368,58 +1372,44 @@ index 69cd0ded..4f685653 100644
          }
      }
  
--    fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, submitted: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
 +    /// The ``tensorfold`` object of a reply: runtime counters shared by the text and token replies.
 +    fn runtimeObject(g: *Generation, received: i96, submitted: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Allocator.Error!Value {
-         const a = g.a;
-         const m = g.box;
--        if (!g.engine_done) g.drain();
--        const reason: []const u8 = g.reason orelse switch (m.reason) {
--            .stop => "stop",
--            .length => "length",
--            .cancelled => "cancelled",
--            .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
--        };
-         const finished_ns = nowNs(g.srv.io);
--        const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
--        const raw = try g.srv.text.decode(a, content_tokens);
--        const visible = g.stops.visible(raw, false);
--        // closed before the think split, so a call ending an unclosed think block is the answer
--        const close = try g.closeCall(visible);
--        const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
--        var content: []const u8 = text;
--        var reasoning: ?[]const u8 = null;
--        if (g.thinking) {
--            const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
--            const r = reply_text.pyStrip(split.reasoning);
--            reasoning = if (r.len > 0) r else null;
--            content = split.answer;
--        } else {
--            const h = reply_text.parseHarmony(text);
--            content = h.content;
--            reasoning = h.reasoning;
--        }
--        if (g.sink) |sink| {
--            const thought = g.streamed_reasoning.text.items;
--            if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
--                try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
--            const shown = if (g.calls != null) try reply_text.hideToolCalls(a, content, true) else content;
--            const sent = g.streamed.text.items;
--            if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
--            if (g.calls) |*c| if (close.len > 0) {
--                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
--                var out: std.ArrayList(Value) = .empty;
--                try c.feed(if (g.thinking) content else text, &out);
--                for (out.items) |d| try g.emit(sink, d);
--            };
--        }
-         const prefilled = m.prefilled_ns;
-         const total = seconds(finished_ns - submitted);
-         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
-@@ -571,6 +845,13 @@ const Generation = struct {
-             try loop_field.put(a, "period", try json.intValue(a, period));
-             try runtime.put(a, "loop", .{ .object = loop_field });
-         }
++        const a = g.a;
++        const m = g.box;
++        const finished_ns = nowNs(g.srv.io);
++        const prefilled = m.prefilled_ns;
++        const total = seconds(finished_ns - submitted);
++        const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
++        const decode_tokens = g.collected.items.len -| 1;
++        const runtime = try json.newObject(a);
++        try runtime.put(a, "enable_thinking", .{ .bool = thinking });
++        try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = "none" } else if (effort) |e| .{ .string = e } else .null);
++        try runtime.put(a, "engine", .{ .string = g.srv.info.name });
++        try runtime.put(a, "tokens_per_second", .{ .float = if (decode_s > 0) @as(f64, @floatFromInt(decode_tokens)) / decode_s else 0 });
++        try runtime.put(a, "seconds", .{ .float = @max(0, total) });
++        try runtime.put(a, "prefill_seconds", if (m.stats.prefill_seconds) |p| .{ .float = p } else .null);
++        const widths = try a.alloc(Value, m.widths.len);
++        for (m.widths, widths) |w, *slot| slot.* = try json.intValue(a, w);
++        try runtime.put(a, "prefill_widths", .{ .array = widths });
++        const raised = try a.alloc(Value, m.raised.len);
++        for (m.raised, raised) |r, *slot| slot.* = .{ .bool = r };
++        try runtime.put(a, "prefill_raised", .{ .array = raised });
++        try runtime.put(a, "time_to_first_token", if (g.first_ns) |t| .{ .float = seconds(t - received) } else .null);
++        try runtime.put(a, "sampling", .{ .string = if (exact) "exact" else "greedy" });
++        try runtime.put(a, "drafts", .{ .bool = drafts });
++        const sha = tokenSha(g.collected.items);
++        try runtime.put(a, "token_sha", .{ .string = try a.dupe(u8, &sha) });
++        if (g.token_ids) {
++            const got = try a.alloc(Value, g.collected.items.len);
++            for (g.collected.items, got) |t, *slot| slot.* = try json.intValue(a, t);
++            try runtime.put(a, "token_ids", .{ .array = got });
++        }
++        try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
++        if (m.stats.loop_period) |period| {
++            const loop_field = try json.newObject(a);
++            try loop_field.put(a, "period", try json.intValue(a, period));
++            try runtime.put(a, "loop", .{ .object = loop_field });
++        }
 +        return .{ .object = runtime };
 +    }
 +
@@ -1427,64 +1417,79 @@ index 69cd0ded..4f685653 100644
 +    fn specObject(g: *Generation) Allocator.Error!Value {
 +        const a = g.a;
 +        const m = g.box;
-         const s = m.stats;
-         const spec = try json.newObject(a);
-         try spec.put(a, "rounds", try json.intValue(a, s.rounds));
-@@ -579,6 +860,53 @@ const Generation = struct {
-         try spec.put(a, "acceptance_rate", .{ .float = if (s.drafted > 0) @as(f64, @floatFromInt(s.accepted)) / @as(f64, @floatFromInt(s.drafted)) else 0 });
-         try spec.put(a, "tokens_per_round", .{ .float = if (s.rounds > 0) @as(f64, @floatFromInt(g.collected.items.len)) / @as(f64, @floatFromInt(s.rounds)) else 0 });
-         if (m.telemetry.len > 0) if ((try json.parse(a, m.telemetry)) == .ok) try spec.put(a, "proposer", (try json.parse(a, m.telemetry)).ok);
++        const s = m.stats;
++        const spec = try json.newObject(a);
++        try spec.put(a, "rounds", try json.intValue(a, s.rounds));
++        try spec.put(a, "drafted", try json.intValue(a, s.drafted));
++        try spec.put(a, "accepted", try json.intValue(a, s.accepted));
++        try spec.put(a, "acceptance_rate", .{ .float = if (s.drafted > 0) @as(f64, @floatFromInt(s.accepted)) / @as(f64, @floatFromInt(s.drafted)) else 0 });
++        try spec.put(a, "tokens_per_round", .{ .float = if (s.rounds > 0) @as(f64, @floatFromInt(g.collected.items.len)) / @as(f64, @floatFromInt(s.rounds)) else 0 });
++        if (m.telemetry.len > 0) if ((try json.parse(a, m.telemetry)) == .ok) try spec.put(a, "proposer", (try json.parse(a, m.telemetry)).ok);
 +        return .{ .object = spec };
 +    }
 +
-+    fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, submitted: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
-+        const a = g.a;
-+        const m = g.box;
-+        if (!g.engine_done) g.drain();
-+        const reason: []const u8 = g.reason orelse switch (m.reason) {
-+            .stop => "stop",
-+            .length => "length",
-+            .cancelled => "cancelled",
-+            .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
-+        };
-+        const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
-+        const raw = try g.srv.text.decode(a, content_tokens);
-+        const visible = g.stops.visible(raw, false);
-+        // closed before the think split, so a call ending an unclosed think block is the answer
-+        const close = try g.closeCall(visible);
-+        const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
-+        var content: []const u8 = text;
-+        var reasoning: ?[]const u8 = null;
-+        if (g.thinking) {
-+            const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
-+            const r = reply_text.pyStrip(split.reasoning);
-+            reasoning = if (r.len > 0) r else null;
-+            content = split.answer;
-+        } else {
-+            const h = reply_text.parseHarmony(text);
-+            content = h.content;
-+            reasoning = h.reasoning;
-+        }
-+        if (g.sink) |sink| {
-+            const thought = g.streamed_reasoning.text.items;
-+            if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
-+                try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-+            const shown = if (g.calls != null) try reply_text.hideToolCalls(a, content, true) else content;
-+            const sent = g.streamed.text.items;
-+            if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
-+            if (g.calls) |*c| if (close.len > 0) {
-+                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
-+                var out: std.ArrayList(Value) = .empty;
-+                try c.feed(if (g.thinking) content else text, &out);
-+                for (out.items) |d| try g.emit(sink, d);
-+            };
-+        }
+     fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, submitted: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
+         const a = g.a;
+         const m = g.box;
+@@ -508,7 +876,6 @@ const Generation = struct {
+             .cancelled => "cancelled",
+             .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
+         };
+-        const finished_ns = nowNs(g.srv.io);
+         const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
+         const raw = try g.srv.text.decode(a, content_tokens);
+         const visible = g.stops.visible(raw, false);
+@@ -546,47 +913,8 @@ const Generation = struct {
+                 for (out.items) |d| try g.emit(sink, d);
+             };
+         }
+-        const prefilled = m.prefilled_ns;
+-        const total = seconds(finished_ns - submitted);
+-        const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
+-        const decode_tokens = g.collected.items.len -| 1;
+-        const runtime = try json.newObject(a);
+-        try runtime.put(a, "enable_thinking", .{ .bool = thinking });
+-        try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = "none" } else if (effort) |e| .{ .string = e } else .null);
+-        try runtime.put(a, "engine", .{ .string = g.srv.info.name });
+-        try runtime.put(a, "tokens_per_second", .{ .float = if (decode_s > 0) @as(f64, @floatFromInt(decode_tokens)) / decode_s else 0 });
+-        try runtime.put(a, "seconds", .{ .float = @max(0, total) });
+-        try runtime.put(a, "prefill_seconds", if (m.stats.prefill_seconds) |p| .{ .float = p } else .null);
+-        const widths = try a.alloc(Value, m.widths.len);
+-        for (m.widths, widths) |w, *slot| slot.* = try json.intValue(a, w);
+-        try runtime.put(a, "prefill_widths", .{ .array = widths });
+-        const raised = try a.alloc(Value, m.raised.len);
+-        for (m.raised, raised) |r, *slot| slot.* = .{ .bool = r };
+-        try runtime.put(a, "prefill_raised", .{ .array = raised });
+-        try runtime.put(a, "time_to_first_token", if (g.first_ns) |t| .{ .float = seconds(t - received) } else .null);
+-        try runtime.put(a, "sampling", .{ .string = if (exact) "exact" else "greedy" });
+-        try runtime.put(a, "drafts", .{ .bool = drafts });
+-        const sha = tokenSha(g.collected.items);
+-        try runtime.put(a, "token_sha", .{ .string = try a.dupe(u8, &sha) });
+-        if (g.token_ids) {
+-            const got = try a.alloc(Value, g.collected.items.len);
+-            for (g.collected.items, got) |t, *slot| slot.* = try json.intValue(a, t);
+-            try runtime.put(a, "token_ids", .{ .array = got });
+-        }
+-        try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
+-        if (m.stats.loop_period) |period| {
+-            const loop_field = try json.newObject(a);
+-            try loop_field.put(a, "period", try json.intValue(a, period));
+-            try runtime.put(a, "loop", .{ .object = loop_field });
+-        }
+-        const s = m.stats;
+-        const spec = try json.newObject(a);
+-        try spec.put(a, "rounds", try json.intValue(a, s.rounds));
+-        try spec.put(a, "drafted", try json.intValue(a, s.drafted));
+-        try spec.put(a, "accepted", try json.intValue(a, s.accepted));
+-        try spec.put(a, "acceptance_rate", .{ .float = if (s.drafted > 0) @as(f64, @floatFromInt(s.accepted)) / @as(f64, @floatFromInt(s.drafted)) else 0 });
+-        try spec.put(a, "tokens_per_round", .{ .float = if (s.rounds > 0) @as(f64, @floatFromInt(g.collected.items.len)) / @as(f64, @floatFromInt(s.rounds)) else 0 });
+-        if (m.telemetry.len > 0) if ((try json.parse(a, m.telemetry)) == .ok) try spec.put(a, "proposer", (try json.parse(a, m.telemetry)).ok);
 +        const runtime = try g.runtimeObject(received, submitted, thinking, effort, exact, drafts);
 +        const spec = try g.specObject();
          const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
          const reply: Reply = .{
              .content = content,
-@@ -590,16 +918,49 @@ const Generation = struct {
+@@ -598,16 +926,49 @@ const Generation = struct {
              .cached_tokens = m.cached orelse 0,
              .completion_tokens = g.collected.items.len,
              .reasoning_tokens = reply_text.reasoningCount(g.collected.items, think_end),
@@ -1538,7 +1543,7 @@ index 69cd0ded..4f685653 100644
  };
  
  /// The request's stop strings as the engine checks them after each token: the newest tokens' text holds one.
-@@ -644,3 +1005,163 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
+@@ -652,3 +1013,163 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
      @memcpy(&out, &hex);
      return out;
  }
@@ -3469,18 +3474,18 @@ index 00000000..6e3521f6
 +    try std.testing.expect(std.mem.indexOf(u8, out, "-inf") == null);
 +}
 diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
-index 8dcdc1cd..40332943 100644
+index 064410be..d190dfff 100644
 --- a/zig/src/server/metrics.zig
 +++ b/zig/src/server/metrics.zig
-@@ -47,6 +47,7 @@ pub const Metrics = struct {
+@@ -48,6 +48,7 @@ pub const Metrics = struct {
      prefill: Histogram = .{},
      tpot: TpotHistogram = .{},
      requests: std.ArrayList(struct { key: []const u8, status: u16, count: u64 }) = .empty,
 +    token_route: std.ArrayList(struct { result: []const u8, count: u64 }) = .empty,
  
-     pub fn note(m: *Metrics, io: std.Io, prompt: usize, generation: usize, drafted: u64, accepted: u64, rounds: u64, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
+     pub fn note(m: *Metrics, io: std.Io, prompt: usize, cached: usize, generation: usize, drafted: u64, accepted: u64, rounds: u64, latency: f64, ttft: ?f64, decode: ?f64, prefill: ?f64, tpot: ?f64) void {
          m.mutex.lockUncancelable(io);
-@@ -80,6 +81,30 @@ pub const Metrics = struct {
+@@ -92,6 +93,30 @@ pub const Metrics = struct {
          m.requests.append(m.gpa, .{ .key = owned, .status = status, .count = 1 }) catch m.gpa.free(owned);
      }
  
@@ -3511,7 +3516,7 @@ index 8dcdc1cd..40332943 100644
      pub fn disconnected(m: *Metrics, io: std.Io) void {
          m.mutex.lockUncancelable(io);
          defer m.mutex.unlock(io);
-@@ -109,6 +134,10 @@ pub const Metrics = struct {
+@@ -121,6 +146,10 @@ pub const Metrics = struct {
              try family(w, "requests_total", "counter", "HTTP replies by API key label and status.");
              for (requests) |r| try w.print("{s}requests_total{{key=\"{s}\",status=\"{d}\"}} {d}\n", .{ prefix, r.key, r.status, r.count });
          }
@@ -3523,19 +3528,22 @@ index 8dcdc1cd..40332943 100644
          try gauge(w, "requests_waiting", "gauge", "Requests queued or held until a lane is free.", status.waiting);
          try gauge(w, "generation_tokens_running", "gauge", "Generated tokens held by live streams.", status.generation_tokens);
 diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
-index 976cc3a3..6deb858a 100644
+index cfd6ad47..acb7f186 100644
 --- a/zig/src/server/prompt.zig
 +++ b/zig/src/server/prompt.zig
-@@ -12,7 +12,7 @@ const Cx = errors.Cx;
+@@ -12,8 +12,9 @@ const Cx = errors.Cx;
  
- /// `key`: with images, the prompt cache's ids for the prompt (see `spans`); empty without. `media`: with `key`, each
- /// image's span and full payload digest (the durable tier's identity of it; the key's ids derive from the digest).
--pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, key: []const u32 = &.{}, media: []const api.prompt_cache.Media = &.{} };
-+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, system_len: usize = 0, images: []const api.Image = &.{}, key: []const u32 = &.{}, media: []const api.prompt_cache.Media = &.{}, shared_prefixes: []const u32 = &.{} };
+ /// With images, `cache_key` is what the prompt cache matches: the ids with each image span spelled by its digest.
+ /// `media`: with it, each image's span and full payload digest (the durable tier's identity of it; the key's ids derive
+-/// from the digest, prompt_cache.pictureId).
+-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, media: []const api.prompt_cache.Media = &.{} };
++/// from the digest, prompt_cache.pictureId). `system_len` and `shared_prefixes` feed the token route's response
++/// metadata (0030).
++pub const Rendered = struct { ids: []const u32, history_len: usize = 0, system_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{}, shared_prefixes: []const u32 = &.{}, media: []const api.prompt_cache.Media = &.{} };
  
  pub const isTitle = messages_mod.isTitleRequest;
  
-@@ -45,15 +45,25 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
+@@ -46,15 +47,26 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
  }
  
  /// A request's prompt: raw text or ids for a completion, else the chat template's, with its history length.
@@ -3549,12 +3557,13 @@ index 976cc3a3..6deb858a 100644
 -        .ids => |ids| return .{ .ids = ids },
 +        .ids => |ids| {
 +            if (input.images.len == 0) return .{ .ids = ids, .history_len = if (input.history_len) |h| h else 0, .shared_prefixes = input.shared_prefixes };
-+            var r = try spans(srv, cx, ids, input.images, if (input.history_len) |h| h else 0);
-+            // TF_DS_IMAGE_CACHE=0: pictures keep nothing and resume nothing, as before (no key: the cache refuses such a request)
-+            if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) {
-+                r.key = &.{};
++            var r = try spans(srv, cx, ids, if (input.history_len) |h| h else 0, input.images);
++            // TF_DS_IMAGE_CACHE=0: pictures keep nothing and resume nothing (no key: LaneHost.cacheable refuses the request)
++            if (!api.prompt_cache.imageCacheOn(if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| std.mem.span(v) else null)) {
++                r.cache_key = &.{};
++                r.media = &.{};
 +                r.history_len = 0;
-+            };
++            }
 +            r.shared_prefixes = input.shared_prefixes;
 +            return r;
 +        },
@@ -3564,7 +3573,7 @@ index 976cc3a3..6deb858a 100644
      const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
      var history_len: usize = 0;
      if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
-@@ -69,7 +79,12 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+@@ -69,7 +81,12 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
          }
          return r;
      }
@@ -3729,7 +3738,7 @@ index 00000000..33ebe3d5
 +    };
 +}
 diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
-index 86285acc..51d89637 100644
+index 01b4bf7c..bdda644a 100644
 --- a/zig/src/server/root.zig
 +++ b/zig/src/server/root.zig
 @@ -36,6 +36,10 @@ test {
@@ -3741,8 +3750,8 @@ index 86285acc..51d89637 100644
 +    _ = @import("generate_test.zig");
 +    _ = @import("tokens_test.zig");
      _ = @import("late_system_test.zig");
+     _ = @import("status_totals_test.zig");
      _ = @import("effort_values_test.zig");
-     _ = @import("compact_test.zig");
 diff --git a/zig/src/server/routes.zig b/zig/src/server/routes.zig
 index 95002c5b..4145b67a 100644
 --- a/zig/src/server/routes.zig
@@ -3782,7 +3791,7 @@ index e3e3333b..f082add0 100644
          .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
          .compact_keep = args.compact_keep,
 diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
-index 62701b52..379f9c19 100644
+index 5cc87769..6e0d7427 100644
 --- a/zig/src/server/server.zig
 +++ b/zig/src/server/server.zig
 @@ -47,6 +47,8 @@ pub const Config = struct {
@@ -3803,7 +3812,7 @@ index 62701b52..379f9c19 100644
      }
  
 diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
-index 19360c64..f8dddcaa 100644
+index 013ccd48..4289ec5e 100644
 --- a/zig/src/server/status_routes.zig
 +++ b/zig/src/server/status_routes.zig
 @@ -26,6 +26,10 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
@@ -3816,7 +3825,7 @@ index 19360c64..f8dddcaa 100644
 +    try o.put(a, "features", .{ .object = features });
      try o.put(a, "max_batch_size", try json.intValue(a, srv.info.lanes));
      try o.put(a, "warming", .{ .bool = status.warming });
-     const memory = try json.newObject(a);
+     try putTotals(a, o, srv.metrics.totals(srv.io), srv.info.prompt_cache);
 diff --git a/zig/src/server/tokens.zig b/zig/src/server/tokens.zig
 index b62cba27..c5ae8b6f 100644
 --- a/zig/src/server/tokens.zig
