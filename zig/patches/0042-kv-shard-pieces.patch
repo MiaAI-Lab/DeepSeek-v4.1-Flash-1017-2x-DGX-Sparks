@@ -1,0 +1,167 @@
+# dsv41: with KV sharding (TF_DS_KV_SHARD=1) a prompt pass runs in pieces, so TF_FILL_CHUNKS, TF_FILL_CUT_IN and the
+# rest work with KV_SHARD=1 and a short prompt cuts in between a long one's pieces. Before, Lanes.prefillPart ran every
+# pass whole under sharding: a short request waited for a cold long prompt to finish, and TF_FILL_CHUNKS still turned
+# 0005's interleave off.
+# - Nothing in the parts' planner (0015, 0018) needs a pass whole. Between two pieces a pass is where it is between two
+#   chunks when 0005's interleave runs rounds there, which it already does under sharding: its extent and part stay (the
+#   planner moves decoding streams only), and its borrowed twins are pinned only while a chunk runs (setPartial). A
+#   placement between two pieces may give the twins back (twins_revoked); the owner keeps every row, so the pass goes
+#   on with a plain view and fetches (Caches.twinned).
+# - What a cut-in changes is the fill. Its fill_begin binds its own twins' view on both ranks; the paused pass's
+#   fill_resume made only the plain view again (Model.fillBegin) and left the planner's fill on the cut-in, so the
+#   cut-in's first decode round, which gives its twins back, would make a view at the cut-in's extent on the paused
+#   pass's slot. The resume now binds the paused pass's twins as the planner holds them (kv_lanes fillBegin), on rank 0
+#   and on the follower at the fill_resume frame, as fill_begin does; given back meanwhile, the plain view stands.
+# - Tests (kv_lanes.zig): a cut-in placed between two pieces with twins of its own, the paused pass's twins bound again
+#   on both ranks as it resumes, before and after the cut-in's first decode round; a cut-in whose placement takes the
+#   pass's twins back, after which the pass resumes plain with no bind on either rank.
+# No switch of its own: without TF_FILL_* (or with KV_SHARD=0) nothing changes.
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/zig/src/families/dsv41/kv_lanes.zig b/zig/src/families/dsv41/kv_lanes.zig
+index 72a0d5be5128a9a77cc924fbaf3f3fe72cbbe9d3..e87c1b288828fcef69607e8bf0045534a4e413a0 100644
+--- a/zig/src/families/dsv41/kv_lanes.zig
++++ b/zig/src/families/dsv41/kv_lanes.zig
+@@ -1353,6 +1353,103 @@ test "twins taken back between chunks unbind the fill's view on both ranks" {
+     try testing.expectEqual(@as(u64, 1), p.kv.planner.counters.twins_revoked);
+ }
+ 
++test "a pass in pieces: a short prompt cuts in with its own twins, and the paused pass binds its twins again as it resumes" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{});
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    // the long pass (slot 0) in part 0, its twin in part 1, its first piece run
++    const a = try p.kv.admit(1, 1, 0, 8 * C, null, false);
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    try testing.expect(p.kv.planner.hasTwins(a.id));
++    const a_twin = p.dev1.twins.items[0].local.?;
++    try testing.expect(a_twin >= half);
++    // between two pieces (not pinned) a short prompt (slot 1) is placed in the emptier part 1 and borrows part 0:
++    // the long pass keeps its twins, the cut-in's fill binds its own (rank 0 its local twin, rank 1 the owner)
++    const b = try p.kv.admit(2, 2, 1, 4 * C, null, false);
++    try testing.expectEqual(@as(u8, 1), b.part);
++    try testing.expect(p.kv.planner.hasTwins(a.id) and p.kv.planner.hasTwins(b.id));
++    try p.kv.fillBegin(b.id, b.base);
++    try p.fol.fillBegin(1, b.base);
++    try testing.expect(p.dev0.twins.items[1].on and p.dev0.twins.items[1].local.? < half);
++    try testing.expect(p.dev1.twins.items[1].on and p.dev1.twins.items[1].local == null);
++    // the cut-in ran whole; the long pass resumes (lanes.fillResume, the follower's fill_resume) before the cut-in's
++    // first decode round: its own twins' view on both ranks again
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    try testing.expectEqual(@as(usize, 3), p.dev0.twins.items.len);
++    try testing.expectEqual(@as(usize, 3), p.dev1.twins.items.len);
++    try testing.expect(p.dev0.twins.items[2].on and p.dev0.twins.items[2].local == null);
++    try testing.expect(p.dev1.twins.items[2].on and p.dev1.twins.items[2].local.? == a_twin);
++    // the cut-in's first decode round gives its twins back with the pass as both ranks' fill: no bind (were the
++    // cut-in still the fill, its unbind would make a view at the cut-in's extent on the pass's slot)
++    try p.kv.decodeStart(b.id);
++    try testing.expect(!p.kv.planner.hasTwins(b.id) and p.kv.planner.hasTwins(a.id));
++    try testing.expectEqual(@as(usize, 3), p.dev0.twins.items.len);
++    try testing.expectEqual(@as(usize, 3), p.dev1.twins.items.len);
++    try p.same();
++    try p.kv.release(b.id);
++    try p.kv.release(a.id);
++    try p.same();
++}
++
++test "a pass in pieces resumes with its twins after a cut-in that decoded first" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{});
++    defer p.deinit();
++    const a = try p.kv.admit(1, 1, 0, 8 * C, null, false);
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    const a_twin = p.dev1.twins.items[0].local.?;
++    const b = try p.kv.admit(2, 2, 1, 4 * C, null, false);
++    try p.kv.fillBegin(b.id, b.base);
++    try p.fol.fillBegin(1, b.base);
++    // the live streams' rounds ran before the next piece: the cut-in's twins go back while it is both ranks' fill
++    try p.kv.decodeStart(b.id);
++    try testing.expect(!p.dev0.twins.items[2].on and !p.dev1.twins.items[2].on);
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    try testing.expectEqual(@as(usize, 4), p.dev0.twins.items.len);
++    try testing.expectEqual(@as(usize, 4), p.dev1.twins.items.len);
++    try testing.expect(p.dev0.twins.items[3].on and p.dev0.twins.items[3].local == null);
++    try testing.expect(p.dev1.twins.items[3].on and p.dev1.twins.items[3].local.? == a_twin);
++    try p.same();
++    try p.kv.release(b.id);
++    try p.kv.release(a.id);
++    try p.same();
++}
++
++test "a pass in pieces whose twins a cut-in's placement took back resumes plain on both ranks" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{});
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    const a = try p.kv.admit(1, 1, 0, 8 * C, null, false);
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    // the cut-in needs all of part 1, the long pass's twin rows too: revoked, both views plain at that frame
++    const b = try p.kv.admit(2, 2, 1, half, null, false);
++    try testing.expectEqual(@as(u8, 1), b.part);
++    try testing.expect(!p.kv.planner.hasTwins(a.id) and !p.kv.planner.hasTwins(b.id));
++    try testing.expectEqual(@as(u64, 1), p.kv.planner.counters.twins_revoked);
++    try testing.expectEqual(@as(usize, 2), p.dev0.twins.items.len);
++    try testing.expectEqual(@as(usize, 2), p.dev1.twins.items.len);
++    try testing.expect(!p.dev0.twins.items[1].on and !p.dev1.twins.items[1].on);
++    try p.kv.fillBegin(b.id, b.base);
++    try p.fol.fillBegin(1, b.base);
++    try p.kv.decodeStart(b.id);
++    // resumed: no twins to bind, so no bind at all (Model.fillBegin's plain view stands: the chunks fetch)
++    try p.kv.fillBegin(a.id, a.base);
++    try p.fol.fillBegin(0, a.base);
++    try testing.expectEqual(@as(usize, 2), p.dev0.twins.items.len);
++    try testing.expectEqual(@as(usize, 2), p.dev1.twins.items.len);
++    try p.same();
++    try p.kv.release(b.id);
++    try p.kv.release(a.id);
++    try p.same();
++}
++
+ test "a request that would wait moves the cheapest decoding stream to the other part; the lanes hear it" {
+     const gpa = testing.allocator;
+     const p = try Pair.init(gpa, sharded, .{ .twins = false });
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index eaab37f86951d896705207aa4e470cae433be5a7..dcb8c874c95685eb0b48e833b81c1c6a7ecf22aa 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -773,10 +773,11 @@ pub const Lanes = struct {
+         return of(ptr).prefillPart(s, chunks);
+     }
+ 
+-    fn prefillPart(self: *Lanes, s: *lanes.Stream, pieces: usize) !bool {
++    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
+         const m = self.m;
+-        // TF_DS_KV_SHARD binds a pass's parts and twins for the whole pass: it runs whole (no pieces, no cut-ins)
+-        const chunks = if (self.kv != null) std.math.maxInt(usize) else pieces;
++        // TF_DS_KV_SHARD: a pass in pieces keeps its extent and part between them (the planner moves decoding streams
++        // only); its twins are pinned only while a chunk runs, so a placement between two pieces may give them back
++        // (the pass then fetches: Caches.twinned), and a pass a prompt cut into binds them again as it resumes
+         const t0 = m.now();
+         defer if (self.prof) |*p| {
+             p.prefill += m.now() - t0;
+@@ -858,6 +859,9 @@ pub const Lanes = struct {
+             try self.flush();
+         }
+         try self.m.fillBegin(f.slot, l.base);
++        // TF_DS_KV_SHARD: the cut-in's fill bound its own twins' view; the paused pass's comes back as the planner holds
++        // it now (given back meanwhile: plain, as Model.fillBegin left it), on the follower at the same frame
++        if (f.part) |id| try self.kv.?.fillBegin(id, l.base);
+         self.fill = f;
+         self.paused = null;
+     }
+@@ -1874,7 +1878,9 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+                 const base = try r.int(u64);
+                 if (slot >= max_streams) return error.BadSlot;
+                 fill_base = @intCast(base); // the paused pass's extent, for the spill tier's bumps (not a new prompt: no bumpSlot)
+-                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
++                if (m.fillBegin(slot, @intCast(base))) {
++                    if (kvf) |k| try k.fillBegin(slot, @intCast(base)); // (its twins' view again, as rank 0 binds it at its resume)
++                } else |err| refused(err);
+                 m.fill_seq = seqs[slot].items;
+             },
+             .fill_chunk => {
