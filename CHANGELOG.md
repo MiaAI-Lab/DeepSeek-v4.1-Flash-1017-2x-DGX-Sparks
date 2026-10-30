@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `zig/patches/0039-structured-output.patch` (always on, issue #22): structured output on DeepSeek-V4.1 with drafts on.
+  Rank 0 keeps a reply inside its request's grammar for `response_format` `json_object` and `json_schema`, `guided_json`,
+  `structured_outputs` `json` and `choice`, `guided_choice` and Anthropic `output_config.format`, and a `json_schema` may
+  bound its numbers with `minimum`, `maximum`, `exclusiveMinimum` and `exclusiveMaximum`. Stock answered each of these
+  with HTTP 400. The rules follow xgrammar 0.2.8 (strict mode). A keyword the engine cannot enforce gets HTTP 400 before
+  any header, with its location, and `regex` and EBNF stay HTTP 400. On a pair, replies without a grammar kept their
+  token hashes (`tools/exact.py` IDENTICAL 31/31), and a `json_object` or `json_schema` reply had one token hash
+  drafted, with `"draft": false` and 4 at once. By **[nuk3s](https://github.com/nuk3s)**.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
