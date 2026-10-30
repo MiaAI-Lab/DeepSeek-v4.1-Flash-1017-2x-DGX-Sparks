@@ -124,8 +124,10 @@ The served tokenizer's image-token spelling is given by `GATEWAY_IMAGE_TOKEN`; t
   thinking prompt faithfully.
 - Grammar-constrained decoding (`guided_json`, `guided_regex`, `guided_choice`, `grammar`, `structured_outputs`) falls
   back; `json_object`/`json_schema`/`regex` are written into the prompt without a grammar.
-- Patch 0039 serves `logprobs` / `top_logprobs` on the token route. They fall back only if the running engine's health
-  reports `logprobs: false` (for example, an engine without that patch).
+- Patch 0039 has the token route's `logprobs` / `top_logprobs`, but they are on only for an engine whose host reports
+  them, and the CUDA host does not yet: its `/health` says `logprobs: false`, so the gateway sends such a request to the
+  engine unchanged (the fallback). The test harness's fake engine reports them with `TF_FAKE_LOGPROBS=1`; the path has
+  not run on a pair.
 - The image token count is the API's own estimate; the engine's prompt length can differ by the tokenizer's special
   tokens. The comparator reports both.
 - `n > 1` is not converted; it falls back.
@@ -137,8 +139,9 @@ The served tokenizer's image-token spelling is given by `GATEWAY_IMAGE_TOKEN`; t
 **What changes for a client.** The model names are the served name, `DeepSeek-V4.1-Flash` and `deepseek-flash`.
 Thinking, `reasoning_effort`, `max_tokens` / `max_completion_tokens`, the API's sampling policy and stop sequences are
 handled on the API side; the engine's own `top_k` and `min_p` still apply. Grammar/structured output, `thinking_budget`,
-`previous_response_id` and other Zig-only fields use the fallback until the engine serves them. The token route supports
-`logprobs`; the gateway falls back only when engine health says that support is unavailable. Images are fetched and
+`previous_response_id` and other Zig-only fields use the fallback until the engine serves them. `logprobs` go the token
+route only when the engine's `/health` reports them; the CUDA host does not yet, so they use the fallback (see Known
+limits). Images are fetched and
 counted by the gateway, with private destinations rejected by default. The gateway's `/health` reports the engine's
 health and is 200 only while the engine is 200.
 
@@ -179,7 +182,8 @@ token route off; the engine image is the same. To return to an engine without pa
 
 With the recipe: `API_GATEWAY=1` in `scripts/local.sh`, then `./start.sh` (or `./start.sh restart`). `scripts/prepare.sh`
 builds `GATEWAY_IMAGE` from `gateway/Dockerfile`; `start.sh` starts it after the engine answers, waits for `/health` and
-runs both smoke tests. `./stop.sh` removes the gateway first and saves its log. The gateway's container carries a
+runs both smoke tests (with `FOREGROUND=1` it attaches once the gateway is healthy and skips them, as it skips the smoke
+test without the gateway). `./stop.sh` removes the gateway first and saves its log. The gateway's container carries a
 digest of its settings (`tf.recipe.gateway`): with the ranks already up, `./start.sh` starts a stopped gateway again,
 and asks for `./start.sh restart` when the gateway is gone or was started with other settings. With `FOREGROUND=1` a
 gateway that exits is started again; if that fails the server stops with a failure, so the supervisor restarts it.

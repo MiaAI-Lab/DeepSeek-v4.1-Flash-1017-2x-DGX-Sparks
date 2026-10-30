@@ -138,8 +138,9 @@ difference is the derived engine image tag, which changes when 0039 enters `zig/
 then listens on `127.0.0.1:ENGINE_PORT` (default 8887) with `TENSORFOLD_TOKEN_ROUTE=1`, and the gateway listens on
 `HOST:PORT` (default `0.0.0.0:8888`). `scripts/prepare.sh` builds the gateway image from `gateway/Dockerfile` when the
 image for that folder's hash is missing; it is a separate, CPU-only image. `start.sh` waits for the engine, starts the
-gateway, waits for `/health`, runs the smoke test through the gateway and a second one against the engine's own API, and
-`stop.sh` removes the gateway first, saving its log.
+gateway, waits for `/health`, runs the smoke test through the gateway and a second one against the engine's own API
+(with `FOREGROUND=1` it attaches once the gateway is healthy and skips both, as it skips the smoke test without the
+gateway), and `stop.sh` removes the gateway first, saving its log.
 
 Authentication, admission and memory limits, the settings, the fallback, the known limits and the parity battery are in
 [docs/api-gateway.md](docs/api-gateway.md); the gateway's own flags in [gateway/README.md](gateway/README.md).

@@ -35,13 +35,23 @@ failed allocation (parsing, preparing, generating or building the reply) is a
 500 (a constant body, so it needs no allocation), or an error event in a
 stream, instead of a closed connection; a whole reply that cannot be
 serialized, or whose logprobs cannot be built, is one of them.
+On the rebase audit: the native path computes the system prefix and its
+cache cuts for prompts with pictures again (the route had moved them into
+prompt.prepare after the pictures' early return; the server measured them for
+every prompt before); prompt ids' shared_prefixes move past the image spans
+before them, as history_len does; /health reports features.logprobs from the
+engine's info instead of false (the CUDA host does not report them yet, so
+the route refuses them there and a gateway falls back); a reply's finish time
+is taken where its end is known, before its text is decoded, as before the
+route; the image-placeholder test checks both mismatches; the smoke test's
+logprobs check follows TF_FAKE_LOGPROBS (35/35 with and without).
 zig fmt applied.
 
 Checked with Zig 0.17.0 on x86_64: zig build test 23/23 steps (529 tests on
 the series alone; with the route the steps whose binaries changed ran again,
 471, the rest cached); zig/tests/server: build.sh builds fake_serve and
-tensorfold-native; zig_test.sh 129/129 and 96/96; token_route_smoke.py against
-fake_serve 34/35, as on 629c524 (logprobs content fails with the fake engine).
+tensorfold-native; zig_test.sh 130/130 and 96/96; token_route_smoke.py against
+fake_serve 35/35 with TF_FAKE_LOGPROBS=0 and with 1.
 ---
  zig/src/core/engine_api.zig              |   13 +
  zig/src/core/lane_host.zig               |    7 +-
@@ -61,8 +71,8 @@ fake_serve 34/35, as on 629c524 (logprobs content fails with the fake engine).
  zig/src/server/generate.zig              |  656 +++++++++++++
  zig/src/server/generate_test.zig         | 1098 ++++++++++++++++++++++
  zig/src/server/metrics.zig               |   29 +
- zig/src/server/prompt.zig                |   29 +-
- zig/src/server/prompt_test.zig           |  144 +++
+ zig/src/server/prompt.zig                |   51 +-
+ zig/src/server/prompt_test.zig           |  162 ++++
  zig/src/server/root.zig                  |    4 +
  zig/src/server/routes.zig                |    8 +
  zig/src/server/serve.zig                 |    1 +
@@ -74,8 +84,8 @@ fake_serve 34/35, as on 629c524 (logprobs content fails with the fake engine).
  zig/tests/server/fake_engine.zig         |   32 +-
  zig/tests/server/fake_serve.zig          |    2 +-
  zig/tests/server/fixtures/scripts.json   |   92 +-
- zig/tests/server/token_route_smoke.py    |  207 ++++
- 32 files changed, 3377 insertions(+), 108 deletions(-)
+ zig/tests/server/token_route_smoke.py    |  211 +++++
+ 32 files changed, 3418 insertions(+), 111 deletions(-)
  create mode 100644 zig/src/server/generate.zig
  create mode 100644 zig/src/server/generate_test.zig
  create mode 100644 zig/src/server/prompt_test.zig
@@ -808,7 +818,7 @@ index 475ae2af..bd6fc2c6 100644
      if (std.mem.startsWith(u8, path, "/responses/")) return true;
      for ([_][]const u8{ "/chat/completions", "/completions", "/decisions", "/models" }) |end| if (std.mem.endsWith(u8, path, end)) return true;
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 8a940e0f..90a38a12 100644
+index 8a940e0f..9f742053 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
 @@ -11,6 +11,7 @@ const prompt_mod = @import("prompt.zig");
@@ -1373,10 +1383,10 @@ index 8a940e0f..90a38a12 100644
      }
  
 +    /// The ``tensorfold`` object of a reply: runtime counters shared by the text and token replies.
-+    fn runtimeObject(g: *Generation, received: i96, submitted: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Allocator.Error!Value {
++    /// ``finished_ns``: taken where the reply's end is known, before its text is decoded and parsed (the decode time).
++    fn runtimeObject(g: *Generation, received: i96, submitted: i96, finished_ns: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Allocator.Error!Value {
 +        const a = g.a;
 +        const m = g.box;
-+        const finished_ns = nowNs(g.srv.io);
 +        const prefilled = m.prefilled_ns;
 +        const total = seconds(finished_ns - submitted);
 +        const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
@@ -1431,15 +1441,7 @@ index 8a940e0f..90a38a12 100644
      fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, submitted: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
          const a = g.a;
          const m = g.box;
-@@ -508,7 +876,6 @@ const Generation = struct {
-             .cancelled => "cancelled",
-             .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
-         };
--        const finished_ns = nowNs(g.srv.io);
-         const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
-         const raw = try g.srv.text.decode(a, content_tokens);
-         const visible = g.stops.visible(raw, false);
-@@ -546,47 +913,8 @@ const Generation = struct {
+@@ -546,47 +914,8 @@ const Generation = struct {
                  for (out.items) |d| try g.emit(sink, d);
              };
          }
@@ -1484,12 +1486,12 @@ index 8a940e0f..90a38a12 100644
 -        try spec.put(a, "acceptance_rate", .{ .float = if (s.drafted > 0) @as(f64, @floatFromInt(s.accepted)) / @as(f64, @floatFromInt(s.drafted)) else 0 });
 -        try spec.put(a, "tokens_per_round", .{ .float = if (s.rounds > 0) @as(f64, @floatFromInt(g.collected.items.len)) / @as(f64, @floatFromInt(s.rounds)) else 0 });
 -        if (m.telemetry.len > 0) if ((try json.parse(a, m.telemetry)) == .ok) try spec.put(a, "proposer", (try json.parse(a, m.telemetry)).ok);
-+        const runtime = try g.runtimeObject(received, submitted, thinking, effort, exact, drafts);
++        const runtime = try g.runtimeObject(received, submitted, finished_ns, thinking, effort, exact, drafts);
 +        const spec = try g.specObject();
          const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
          const reply: Reply = .{
              .content = content,
-@@ -598,16 +926,49 @@ const Generation = struct {
+@@ -598,16 +927,50 @@ const Generation = struct {
              .cached_tokens = m.cached orelse 0,
              .completion_tokens = g.collected.items.len,
              .reasoning_tokens = reply_text.reasoningCount(g.collected.items, think_end),
@@ -1520,8 +1522,9 @@ index 8a940e0f..90a38a12 100644
 +            .cancelled => "cancelled",
 +            .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
 +        };
++        const finished_ns = nowNs(g.srv.io);
 +        // the reply is tokens only (no think split), but the request's thinking and effort are what it ran with
-+        const runtime = try g.runtimeObject(received, submitted, thinking, effort, exact, drafts);
++        const runtime = try g.runtimeObject(received, submitted, finished_ns, thinking, effort, exact, drafts);
 +        const spec = try g.specObject();
 +        const scored = try dupeScored(a, m.scored.items[0..@min(m.scored.items.len, g.collected.items.len)]);
 +        const sha = tokenSha(g.collected.items);
@@ -1543,7 +1546,7 @@ index 8a940e0f..90a38a12 100644
  };
  
  /// The request's stop strings as the engine checks them after each token: the newest tokens' text holds one.
-@@ -652,3 +1013,163 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
+@@ -652,3 +1015,163 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
      @memcpy(&out, &hex);
      return out;
  }
@@ -3528,7 +3531,7 @@ index 064410be..d190dfff 100644
          try gauge(w, "requests_waiting", "gauge", "Requests queued or held until a lane is free.", status.waiting);
          try gauge(w, "generation_tokens_running", "gauge", "Generated tokens held by live streams.", status.generation_tokens);
 diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
-index cfd6ad47..acb7f186 100644
+index cfd6ad47..72c7c186 100644
 --- a/zig/src/server/prompt.zig
 +++ b/zig/src/server/prompt.zig
 @@ -12,8 +12,9 @@ const Cx = errors.Cx;
@@ -3543,7 +3546,7 @@ index cfd6ad47..acb7f186 100644
  
  pub const isTitle = messages_mod.isTitleRequest;
  
-@@ -46,15 +47,26 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
+@@ -46,41 +47,68 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
  }
  
  /// A request's prompt: raw text or ids for a completion, else the chat template's, with its history length.
@@ -3557,14 +3560,14 @@ index cfd6ad47..acb7f186 100644
 -        .ids => |ids| return .{ .ids = ids },
 +        .ids => |ids| {
 +            if (input.images.len == 0) return .{ .ids = ids, .history_len = if (input.history_len) |h| h else 0, .shared_prefixes = input.shared_prefixes };
-+            var r = try spans(srv, cx, ids, if (input.history_len) |h| h else 0, input.images);
++            // the caller's shared_prefixes count each picture as its one placeholder: spans moves them as it moves history_len
++            var r = try spans(srv, cx, ids, if (input.history_len) |h| h else 0, input.images, input.shared_prefixes);
 +            // TF_DS_IMAGE_CACHE=0: pictures keep nothing and resume nothing (no key: LaneHost.cacheable refuses the request)
 +            if (!api.prompt_cache.imageCacheOn(if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| std.mem.span(v) else null)) {
 +                r.cache_key = &.{};
 +                r.media = &.{};
 +                r.history_len = 0;
 +            }
-+            r.shared_prefixes = input.shared_prefixes;
 +            return r;
 +        },
      };
@@ -3573,26 +3576,72 @@ index cfd6ad47..acb7f186 100644
      const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
      var history_len: usize = 0;
      if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
-@@ -69,7 +81,12 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
+     if (input.images.len > 0) {
+-        var r = try spans(srv, cx, prompt, history_len, input.images);
++        var r = try spans(srv, cx, prompt, history_len, input.images, &.{});
+         // TF_DS_IMAGE_CACHE=0: pictures keep nothing and resume nothing (no key: LaneHost.cacheable refuses the request)
+         if (!api.prompt_cache.imageCacheOn(if (std.c.getenv("TF_DS_IMAGE_CACHE")) |v| std.mem.span(v) else null)) {
+             r.cache_key = &.{};
+             r.media = &.{};
+             r.history_len = 0;
          }
++        // the system prefix and its cuts on the expanded ids, as the server measured them before the token route
++        r.system_len = systemPrefixLen(srv, cx, input.messages, input.tools, r.ids, thinking, effort);
++        r.shared_prefixes = try systemCuts(cx, r.system_len);
          return r;
      }
 -    return .{ .ids = prompt, .history_len = history_len };
 +    const system_len = systemPrefixLen(srv, cx, input.messages, input.tools, prompt, thinking, effort);
++    return .{ .ids = prompt, .history_len = history_len, .system_len = system_len, .shared_prefixes = try systemCuts(cx, system_len) };
++}
++
++/// The prompt cache's cuts in a system prefix of `system_len` tokens: 2048 and 512 before its end and its end, each at
++/// least 512 tokens in.
++fn systemCuts(cx: *Cx, system_len: usize) error{OutOfMemory}![]const u32 {
 +    var shared: std.ArrayList(u32) = .empty;
 +    if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
 +        if (cut >= 512) try shared.append(cx.a, @intCast(cut));
 +    };
-+    return .{ .ids = prompt, .history_len = history_len, .system_len = system_len, .shared_prefixes = shared.items };
++    return shared.items;
  }
  
  /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
+-/// the payload the engine reads), the images in prompt order.
+-fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []const []const u8) errors.Refused!Rendered {
++/// the payload the engine reads), the images in prompt order. `history_len` and each of `cuts` (positions in `ids`, a
++/// picture one placeholder) move past the spans that precede them.
++fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []const []const u8, cuts: []const u32) errors.Refused!Rendered {
+     const vision = srv.info.vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
+     var out: std.ArrayList(u32) = .empty;
+     var key: std.ArrayList(u32) = .empty;
+     var placed: std.ArrayList(api.Image) = .empty;
+     var history_extra: usize = 0;
+     var media: std.ArrayList(api.prompt_cache.Media) = .empty;
++    const moved = try cx.a.dupe(u32, cuts);
+     for (ids, 0..) |id, i| {
+         if (id != vision.token) {
+             try out.append(cx.a, id);
+@@ -102,9 +130,12 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []
+         try media.append(cx.a, .{ .start = @intCast(out.items.len - prep.tokens), .len = prep.tokens, .digest = digest });
+         try spellImage(cx.a, &key, &digest, prep.tokens);
+         if (i < history_len) history_extra += prep.tokens - 1;
++        for (cuts, moved) |c, *m| if (i < c) {
++            m.* += prep.tokens - 1;
++        };
+     }
+     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
+-    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .media = media.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
++    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .media = media.items, .history_len = if (history_len > 0) history_len + history_extra else 0, .shared_prefixes = moved };
+ }
+ 
+ /// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's SHA-256
 diff --git a/zig/src/server/prompt_test.zig b/zig/src/server/prompt_test.zig
 new file mode 100644
-index 00000000..33ebe3d5
+index 00000000..3915588a
 --- /dev/null
 +++ b/zig/src/server/prompt_test.zig
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,162 @@
 +//! T005: prompt ids with image placeholders expand through a vision family's prepare, and history_len comes from the request.
 +const std = @import("std");
 +const api = @import("engine_api");
@@ -3724,18 +3773,36 @@ index 00000000..33ebe3d5
 +    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
 +    defer arena.deinit();
 +    var cx: Cx = .{ .a = arena.allocator() };
-+    const many = prompt.prepare(srv, &cx, try request(arena.allocator(), &.{ 10, 999, 11, 999, 12, 999 }, &.{ "a", "b" }, null), false, null, true) catch |e| {
-+        try std.testing.expectEqual(error.Refused, e);
-+        try std.testing.expectEqualStrings("image input: the prompt holds more image placeholders than images", cx.message);
-+        return;
-+    };
-+    _ = many;
++    // each mismatch on its own: both must be refused, with their own message
++    try std.testing.expectError(error.Refused, prompt.prepare(srv, &cx, try request(arena.allocator(), &.{ 10, 999, 11, 999, 12, 999 }, &.{ "a", "b" }, null), false, null, true));
++    try std.testing.expectEqualStrings("image input: the prompt holds more image placeholders than images", cx.message);
 +    cx.message = "";
-+    _ = prompt.prepare(srv, &cx, try request(arena.allocator(), &.{ 10, 999, 11 }, &.{ "a", "b" }, null), false, null, true) catch |e| {
-+        try std.testing.expectEqual(error.Refused, e);
-+        try std.testing.expectEqualStrings("image input: the prompt holds fewer image placeholders than images", cx.message);
-+        return;
-+    };
++    try std.testing.expectError(error.Refused, prompt.prepare(srv, &cx, try request(arena.allocator(), &.{ 10, 999, 11 }, &.{ "a", "b" }, null), false, null, true));
++    try std.testing.expectEqualStrings("image input: the prompt holds fewer image placeholders than images", cx.message);
++}
++
++test "prompt ids' shared_prefixes move past the image spans before them, as history_len does" {
++    var text: TestText = .{};
++    const vision: Vision = .{};
++    var engine: VisionEngine = .{ .v = vision };
++    var srv = try Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    var input = try request(arena.allocator(), &.{ 10, 999, 11, 999, 12 }, &.{ "a", "b" }, 2);
++    // a cut before the first picture, one after it, one after both, the end; each picture goes from one id to three
++    input.shared_prefixes = &.{ 1, 2, 4, 5 };
++    const r = try prompt.prepare(srv, &cx, input, false, null, true);
++    try std.testing.expectEqualSlices(u32, &.{ 1, 4, 8, 9 }, r.shared_prefixes);
++    try std.testing.expectEqual(@as(usize, 4), r.history_len);
++    // the caller's cuts are not changed in place
++    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 4, 5 }, input.shared_prefixes);
 +}
 diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
 index 01b4bf7c..bdda644a 100644
@@ -3812,7 +3879,7 @@ index 5cc87769..6e0d7427 100644
      }
  
 diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
-index 013ccd48..4289ec5e 100644
+index 013ccd48..24790427 100644
 --- a/zig/src/server/status_routes.zig
 +++ b/zig/src/server/status_routes.zig
 @@ -26,6 +26,10 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
@@ -3821,7 +3888,7 @@ index 013ccd48..4289ec5e 100644
      try o.put(a, "model_ids", .{ .array = ids });
 +    try o.put(a, "token_route", .{ .bool = srv.config.token_route });
 +    const features = try json.newObject(a);
-+    try features.put(a, "logprobs", .{ .bool = false });
++    try features.put(a, "logprobs", .{ .bool = srv.info.logprobs });
 +    try o.put(a, "features", .{ .object = features });
      try o.put(a, "max_batch_size", try json.intValue(a, srv.info.lanes));
      try o.put(a, "warming", .{ .bool = status.warming });
@@ -4216,10 +4283,10 @@ index 40ba014f..9e96bb74 100644
 +}
 diff --git a/zig/tests/server/token_route_smoke.py b/zig/tests/server/token_route_smoke.py
 new file mode 100755
-index 00000000..d597e53b
+index 00000000..0fa8bbde
 --- /dev/null
 +++ b/zig/tests/server/token_route_smoke.py
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,211 @@
 +#!/usr/bin/env python3
 +"""Smoke checks for POST /inference/v1/generate against a running fake_serve.
 +
@@ -4395,7 +4462,11 @@ index 00000000..d597e53b
 +    status, body = post("/inference/v1/generate", {"token_ids": ids, "sampling_params": {"max_tokens": 10, "logprobs": 1}, "return_token_ids": True})
 +    obj = json.loads(body) if status == 200 else {}
 +    content = (obj.get("choices") or [{}])[0].get("logprobs") or {}
-+    check("logprobs content", status == 200 and len(content.get("content", [])) == len((obj.get("choices") or [{}])[0].get("token_ids", [])))
++    if os.environ.get("TF_FAKE_LOGPROBS") == "1":
++        check("logprobs content", status == 200 and len(content.get("content", [])) == len((obj.get("choices") or [{}])[0].get("token_ids", [])))
++    else:
++        # the fake engine reports logprobs only with TF_FAKE_LOGPROBS=1 (as /health says): without, the route refuses them
++        check("logprobs refused without engine support", status == 400, str(status))
 +
 +    # non-stream return_token_ids.
 +    ids = tokenize("@script=rounds3")

@@ -162,7 +162,7 @@ running_gateway() { [[ "$(docker inspect -f '{{.State.Running}}' ds41-gateway 2>
 gateway_identity() {
   local name
   { for name in $(compgen -v GATEWAY_); do
-      case "$name" in GATEWAY_RUN | GATEWAY_ARGS | GATEWAY_LISTEN | GATEWAY_MODEL_DIR) continue ;; esac
+      case "$name" in GATEWAY_RUN | GATEWAY_ARGS | GATEWAY_LISTEN | GATEWAY_TOKENIZER) continue ;; esac
       printf '%s=%s\n' "$name" "${!name}"
     done
     printf '%s\n' "$HOST" "$PORT" "$ENGINE_PORT" "$SERVED_NAME" "$CONTEXT" "$THINKING" "$REASONING_EFFORT" "$API_KEY" \
@@ -294,6 +294,10 @@ if (( ! DRY )); then
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   worker 1 "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"
   if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"; fi
+  # with the gateway the engine listens on ENGINE_PORT too (loopback): an occupied one would fail only after the ranks load
+  if [[ "$API_GATEWAY" == 1 ]] && ss -ltn "sport = :$ENGINE_PORT" 2>/dev/null | grep -q LISTEN; then
+    die "ENGINE_PORT $ENGINE_PORT is already in use: $(ss -ltnp "sport = :$ENGINE_PORT" 2>/dev/null | tail -n +2)"
+  fi
   # memory: a rank that takes all of a Spark's memory freezes the machine, so refuse to start on one that cannot hold it.
   # Counted as the engine's startup budget counts it (0119): MemAvailable plus the pages parked on the per-CPU free
   # lists (scripts/memavail.sh). Right after an image build or copy those drain for a minute or two: wait up to
@@ -414,18 +418,24 @@ if [[ "$THINKING" == 1 ]]; then GATEWAY_ARGS+=(--default-thinking); else GATEWAY
 if [[ "$GATEWAY_BLOCK_PRIVATE_URLS" == 1 ]]; then GATEWAY_ARGS+=(--block-private-urls); else GATEWAY_ARGS+=(--block-private-urls=false); fi
 if [[ "$GATEWAY_API_SAMPLING" == 1 ]]; then GATEWAY_ARGS+=(--api-sampling); else GATEWAY_ARGS+=(--api-sampling=false); fi
 [[ "$API_KEY" != 1 ]] || GATEWAY_ARGS+=(--require-key --api-key-file /run/secrets/key)
-# The served folder may hold relative links (checkpoint/tokenizer.json -> ../...); the gateway needs the resolved
-# file. Resolve it explicitly so a missing path is a message, not a silent exit under `set -e`.
-# A dry run prints the commands without touching the filesystem: prepare.sh may not have downloaded the model yet.
-GATEWAY_MODEL_DIR=$DATA_DIR/model
+# The gateway reads one file of the served folder, its tokenizer. prepare.sh fills the folder with relative links into the
+# HF cache (tokenizer.json -> ../hub/.../snapshots/REV/tokenizer.json -> ../../blobs/HASH), which a mount of the folder
+# would leave dangling inside the container: the file the links end at is mounted itself. A dry run prints the commands
+# without touching the filesystem (prepare.sh may not have downloaded the model yet).
+gateway_tokenizer() {
+  local file
+  file=$(readlink -f "$1/tokenizer.json" 2>/dev/null) || return 1
+  [[ -f "$file" && -r "$file" ]] || return 1
+  printf '%s\n' "$file"
+}
+GATEWAY_TOKENIZER=$DATA_DIR/model/tokenizer.json
 if [[ "$DRY" != 1 && "$API_GATEWAY" == 1 ]]; then   # only the gateway reads it
-  GATEWAY_MODEL_DIR=$(readlink -f "$DATA_DIR/model" 2>/dev/null || true)
-  [[ -n "$GATEWAY_MODEL_DIR" ]] || GATEWAY_MODEL_DIR=$DATA_DIR/model
-  [[ -d "$GATEWAY_MODEL_DIR" ]] || die "the served folder $GATEWAY_MODEL_DIR does not exist: prepare.sh downloads the model there"
+  GATEWAY_TOKENIZER=$(gateway_tokenizer "$DATA_DIR/model") ||
+    die "$DATA_DIR/model/tokenizer.json does not lead to a readable file: prepare.sh links the served folder there"
 fi
 GATEWAY_RUN=(docker run -d --name ds41-gateway --network host --memory "$GATEWAY_MEMORY" --cpus "$GATEWAY_CPUS"
              --restart on-failure:3 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges
-             -v "$GATEWAY_MODEL_DIR:/served:ro")
+             -v "$GATEWAY_TOKENIZER:/served/tokenizer.json:ro")
 # The key file is mode 600 and belongs to the user running this script (api_key_ensure, and the smoke test reads it), so
 # with a key the gateway runs as that uid:gid instead of the image's ds41 (10001), which could not read it; never as root
 # (refused above). With Docker's userns-remap the uid inside is not the host's and the key stays unreadable: not supported.

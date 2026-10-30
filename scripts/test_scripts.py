@@ -183,6 +183,27 @@ class StopSh(ScriptTest):
         for h in ["head", "w1"]:
             self.assertEqual(self.left(h), [], h)
 
+    def test_gateway_is_removed_first_with_the_ranks(self):
+        self.all_up()
+        self.containers("head", NAME, "ds41-gateway")
+        code, out = self.run_script(["stop.sh"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("Stopped and removed the gateway", out)
+        for h in ["head", "w1"]:
+            self.assertEqual(self.left(h), [], h)
+
+    def test_gateway_that_cannot_be_removed_still_stops_the_ranks(self):
+        # the gateway is stuck, not the ranks: both ranks stop, the gateway stays, and stop.sh exits 1
+        self.all_up()
+        self.containers("head", NAME, "ds41-gateway")
+        (self.sim / "hosts" / "head" / "stuck").write_text("ds41-gateway\n")
+        code, out = self.run_script(["stop.sh"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("could not remove ds41-gateway", out)
+        self.assertEqual(self.left("head"), ["ds41-gateway"])
+        self.assertEqual(self.left("w1"), [])
+        self.assertNoTraceback(out)
+
     def test_nothing_to_stop_exits_zero(self):
         code, out = self.run_script(["stop.sh"])
         self.assertEqual(code, 0, out)

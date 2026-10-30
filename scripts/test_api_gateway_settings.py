@@ -168,7 +168,7 @@ class ApiGatewaySettingsTest(unittest.TestCase):
         )
         # The gateway carries the digest of its settings, which a later start compares.
         self.assertRegex(out, r"docker run -d --name ds41-gateway --label tf\.recipe\.gateway=[0-9a-f]{16} --network host")
-        self.assertIn("-v /tmp/ds41-home/.cache/huggingface/tensorfold-dsv41/45ee5d0f/model:/served:ro", out)
+        self.assertIn("-v /tmp/ds41-home/.cache/huggingface/tensorfold-dsv41/45ee5d0f/model/tokenizer.json:/served/tokenizer.json:ro", out)
         self.assertIn("-v /tmp/ds41-home/.local/state/dsv41-tensorfold/api-key:/run/secrets/key:ro", out)
         self.assertIn("-e API_KEY_FILE=/run/secrets/key", out)
         self.assertIn("--cap-drop ALL --security-opt no-new-privileges", out)
@@ -476,6 +476,37 @@ API_GATEWAY=1 API_URL=http://127.0.0.1:8888 CONTAINER_NAME=rank STATE_DIR={tmp} 
             self.assertEqual(before, identity(API_KEY="1", API_KEY_FILE=str(key)))
             key.write_text("new-key\n")
             self.assertNotEqual(before, identity(API_KEY="1", API_KEY_FILE=str(key)))
+
+
+    def test_gateway_tokenizer_mounts_the_file_the_links_end_at(self):
+        """prepare.sh's served folder links into the HF cache; the gateway gets the file at the end of the links."""
+        import tempfile
+
+        text = (ROOT / "start.sh").read_text()
+        function = re.search(r"^gateway_tokenizer\(\) \{.*?^\}", text, re.S | re.M).group(0)
+        with tempfile.TemporaryDirectory(prefix="ds41-served-") as tmp:
+            tmp = Path(tmp)
+            blob = tmp / "hub" / "blobs" / "abc123"
+            blob.parent.mkdir(parents=True)
+            blob.write_text("{}")
+            snap = tmp / "hub" / "snapshots" / "rev"
+            snap.mkdir(parents=True)
+            (snap / "tokenizer.json").symlink_to("../../blobs/abc123")
+            served = tmp / "data" / "model"
+            served.mkdir(parents=True)
+            (served / "tokenizer.json").symlink_to("../../hub/snapshots/rev/tokenizer.json")
+
+            def resolve(folder):
+                return subprocess.run(["bash", "-c", function + f'\ngateway_tokenizer "{folder}"'],
+                                      capture_output=True, text=True)
+
+            result = resolve(served)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(blob.resolve()))
+            # a link that leads nowhere, or no tokenizer at all: an error, not a mount of a dangling path
+            blob.unlink()
+            self.assertEqual(resolve(served).returncode, 1)
+            self.assertEqual(resolve(tmp / "nowhere").returncode, 1)
 
 
 if __name__ == "__main__":
