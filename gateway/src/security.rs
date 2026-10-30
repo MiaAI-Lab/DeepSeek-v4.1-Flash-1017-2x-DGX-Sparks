@@ -81,6 +81,8 @@ impl fmt::Debug for ApiKeys {
 
 /// Authenticate, then asynchronously queue for an admission slot. `GET /health` is
 /// deliberately outside both checks so liveness probes remain available under load.
+/// `GET /v1/models` and `GET /metrics` are authenticated but take no slot: they are cheap
+/// reads, and behind long generations they waited 8-19 s, so monitors saw the server as down.
 pub async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if request.method() == Method::GET && request.uri().path() == "/health" {
         return next.run(request).await;
@@ -92,6 +94,10 @@ pub async fn guard(State(state): State<AppState>, request: Request, next: Next) 
             "missing or invalid API key",
             "authentication_error",
         ));
+    }
+
+    if request.method() == Method::GET && is_cheap_read(request.uri().path()) {
+        return next.run(request).await;
     }
 
     let permit = match Arc::clone(&state.semaphore).acquire_owned().await {
@@ -211,6 +217,11 @@ fn bearer_key(value: &str) -> Option<&str> {
 fn error_response(error: ApiError) -> Response {
     let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(error.body)).into_response()
+}
+
+/// Reads that answer from the engine's state at once and never generate: outside the admission limit.
+fn is_cheap_read(path: &str) -> bool {
+    matches!(path, "/v1/models" | "/metrics")
 }
 
 fn hold_permit(response: Response, permit: OwnedSemaphorePermit) -> Response {
