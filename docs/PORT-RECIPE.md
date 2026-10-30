@@ -109,7 +109,7 @@ used, so its kept states stay its own.
 
 Engine knobs without a recipe setting reach both ranks as they are when exported, as `TENSORFOLD_*` and `TF_DS_*`
 always did: `start.sh` also passes `TF_SPILL_*` (rank 0's lane host: `TF_SPILL_LOAD_MS` 40, `TF_SPILL_LOAD_WAIT_MS`
-30000).
+30000, which with `zig/patches/0040` also bounds a restore's wait for room in the pool).
 
 `STOP_TIMEOUT` defaults to `SPILL_FLUSH_MS` rounded up to seconds plus 30 (90 s at the engine's default 60000; 30
 before) when `SPILL_GIB` is on, or when the running container was started with the tier, so a clean stop can write what

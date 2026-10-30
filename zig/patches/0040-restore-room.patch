@@ -1,0 +1,995 @@
+From aeef05db4ee076127614c3eb80c66f38fd699b43 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:08:55 +0000
+Subject: [PATCH] dsv41: a restore or a resume the pool has no room for waits
+ for room instead of a prefill from 0
+
+With the spill tier on (SPILL_GIB), a disk restore that the KV pool could not place while streams ran started no
+read: rank 0 logged "reading 565248 kept tokens from disk did not start (ContextFull); prefilling" and ran the prompt
+from 0. With KV sharding on (KV_SHARD=1), a memory hit that its part could not keep was dropped the same way: "the
+kept state of 567296 tokens at 1452032 was not resumed (no room in its part); the prompt runs from 0". A prompt pass
+in the same place gets its room: kept states give theirs, a live stream moves to the other part, or the pass waits at
+the queue's front until a stream ends. On a pair serving agent traffic, one conversation of about 600K tokens ran from
+0 fourteen times in 36 hours this way (4 restores, 10 hits), a fifth of the prompt tokens computed in that time.
+
+A restore and a resume now get room in the same ways:
+
+- lane_host (SPILL_GIB, with KV_SHARD on or off): a restore refused with ContextFull while streams run goes back to
+  the queue's front as a refused prompt pass does (full_wait, full_retry_ns) and asks for the restore again at its
+  next admission. It waits TF_SPILL_LOAD_WAIT_MS (30 s) at most from its first refusal, then it is admitted on what
+  memory holds, as before. The bound matters because the restore needs room in its point's recorded part, while a
+  prefill from 0 may take any part. With no stream active it is admitted at once, as before. A waiter cancelled at
+  the queue's front releases full_wait at once. New counters restores_room_waits and restores_room_wait_expired
+  (tensorfold:prompt_cache_* on /metrics), and one log line a request for each.
+- parts, kv_lanes (KV_SHARD=1): when evictions in a restore's part cannot free its rows, planRestore moves one live
+  stream out of that part (planRelocate, with its guards and its choice), and Kv.restore runs the move and plans
+  again, as Kv.place does for an admission.
+- parts (KV_SHARD=1 with carries on, the default): a hit that would be dropped resumes in place instead. The kept
+  states over its tail give their room, one live stream there moves to the other part, or the request waits for the
+  streams there on lanes' held_wait_ns clock (10 s); then the hit is dropped as before. Only for states of carry_min
+  tokens or more, inside the part, never over held, pinned or read rows, and never while a live stream holds the
+  state itself.
+
+A request that waits for room holds the queue, as a waiting prompt pass does: nothing behind it is admitted until it
+fits, a second passes and it asks again, or its bound (30 s for a restore, 10 s for a hit) runs out. No switch.
+
+Tests: four host tests in lane_host_robust_test.zig, each also run with the prompt pass in pieces and cut-ins
+(fill_chunks 1, cut_in 8192); two in kv_lanes.zig (rank 0's and the follower's planners agree, the move's transfer
+runs on both); an "11 room" section in parts.zig with three new mutants (hit_drops_for_room, hit_no_wait,
+restore_no_relocate), each killed by its own check. "9 twin: its rows are no room" makes its live stream unmovable
+(moving it would make the room now), and the "10 random pools" sweep checks the new outcome (carry off drops the hit,
+carry on keeps it) under "11 room". The pieces runs turn the service fence's debug panic off: on this base the run
+loop asks for parked work's service while a pass stands between two pieces, and the fence refuses it (a release
+build counts and skips it).
+---
+ zig/src/core/engine_api.zig             |   7 +-
+ zig/src/core/lane_host.zig              |  47 ++++-
+ zig/src/core/lane_host_robust_test.zig  | 224 +++++++++++++++++++++
+ zig/src/core/prompt_cache_fake_tier.zig |   6 +-
+ zig/src/families/dsv41/kv_lanes.zig     | 108 ++++++++--
+ zig/src/families/dsv41/lanes.zig        |   5 +-
+ zig/src/families/dsv41/parts.zig        | 250 ++++++++++++++++++++++--
+ 7 files changed, 612 insertions(+), 35 deletions(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 3fdd8c2..0bd41ab 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -204,7 +204,8 @@ pub const Spill = struct {
+     turns: u32 = 4,
+     /// TF_SPILL_LOAD_MS: one service's budget for every restore together, then staged writes (at least 1).
+     load_ms: u32 = 40,
+-    /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore before it is admitted without it.
++    /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore, or at the queue's front for the pool's room
++    /// for one, before it is admitted without it.
+     load_wait_ms: u32 = 30_000,
+     /// TF_SPILL_DEFER_MS: how long a request whose restore the tier refused for capacity (restores or read slots in
+     /// flight) waits to ask again before it is admitted on what memory holds (0: at once).
+@@ -258,6 +259,8 @@ pub const CacheStats = struct {
+     restore_wait_max_ns: u64 = 0,
+     restores_deferred: u64 = 0,
+     restores_deferred_expired: u64 = 0,
++    restores_room_waits: u64 = 0,
++    restores_room_wait_expired: u64 = 0,
+     writes_enqueued: u64 = 0,
+     shared_promoted: u64 = 0,
+     flushes: u64 = 0,
+@@ -303,6 +306,8 @@ pub const CacheStats = struct {
+         .restore_wait_max_ns = "The longest wait for a disk restore, in nanoseconds.",
+         .restores_deferred = "Requests whose disk restore was refused for capacity (restores or read slots in flight) and retried shortly instead of prefilling.",
+         .restores_deferred_expired = "Of them, requests admitted on what memory holds after TF_SPILL_DEFER_MS without the restore starting.",
++        .restores_room_waits = "Requests whose disk restore the KV pool had no room for while streams ran, and that waited for room as a prompt pass does instead of prefilling.",
++        .restores_room_wait_expired = "Of them, requests admitted on what memory holds after TF_SPILL_LOAD_WAIT_MS without room for the restore.",
+         .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
+         .shared_promoted = "Disk points promoted to shared prefixes.",
+         .flushes = "Clean-shutdown flushes of the disk tier.",
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index a90d26a..460bca1 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -12,7 +12,10 @@
+ //!   process exits with a distinct code for its supervisor to restart both ranks; a deadline thread enforces the exit
+ //!   even when a round is blocked on a dead peer.
+ //! - Restores the tier refuses for capacity are deferred briefly and asked again (bounded), keeping the best memory
+-//!   state meanwhile, instead of a prefill from 0 (`restores_deferred`).
++//!   state meanwhile, instead of a prefill from 0 (`restores_deferred`). A restore the backend's KV pool has no room
++//!   for while streams run (error.ContextFull) waits as a prompt pass refused for room waits, at the queue's front
++//!   until a stream ends, and asks again (`restores_room_waits`), load_wait_ns at most: then it is admitted on what
++//!   memory holds, as before (`restores_room_wait_expired`).
+ //! - The service fence: parked work's service and the lone driver's pump never run inside a round, inside a prompt
+ //!   pass except between its chunks (Stream.between), or while the backend reports a CUDA graph capture (`quiet`).
+ const std = @import("std");
+@@ -197,6 +200,8 @@ pub const LaneHost = struct {
+         computed_tokens: u64 = 0, // and computed
+         restores_deferred: u64 = 0, // requests whose restore was refused for capacity and asked again
+         restores_deferred_expired: u64 = 0, // of them, admitted on memory at defer_ns
++        restores_room_waits: u64 = 0, // requests whose restore the pool had no room for while streams ran: they waited
++        restores_room_wait_expired: u64 = 0, // of them, admitted on memory at load_wait_ns
+     };
+ 
+     const Job = struct {
+@@ -216,6 +221,7 @@ pub const LaneHost = struct {
+         kept0: u64 = 0, // the store's kept count when the job looked it up
+         tried_disk: bool = false, // it waited for a restore once: a later lookup takes what memory has
+         deferred_since: ?i96 = null, // its restore was first refused for capacity then (asked again until defer_ns)
++        room_since: ?i96 = null, // its restore first found no room in the pool then (asked again until load_wait_ns)
+         join: pc.Join = .{}, // its conversation (0111)
+         parent: ?u64 = null, // the durable point its pass resumes from, and where
+         fork: u32 = 0,
+@@ -499,6 +505,9 @@ pub const LaneHost = struct {
+         var unloaded: std.ArrayList(*pc.Restore) = .empty; // restores a cancelled job waited for
+         for (ids) |id| {
+             for (h.queued.items, 0..) |job, i| if (job.id == id) {
++                // the queue's front waits for room (requeue, waitRoom: full_wait holds every admission meanwhile);
++                // cancelled, nothing waits for it any more
++                if (i == 0) h.full_wait = null;
+                 dropped.append(h.gpa, h.queued.orderedRemove(i)) catch {};
+                 break;
+             };
+@@ -1111,6 +1120,7 @@ pub const LaneHost = struct {
+                 } else |err| {
+                     const left = store.find(key, r.chunks); // (the room may have evicted probe.memory: never read it now)
+                     if (h.deferRestore(job, p, left, err, now)) return true;
++                    if (h.waitRoom(job, p, err, now)) return true;
+                     if (left) |e| {
+                         note("reading {d} kept tokens from disk did not start ({s}); resuming the {d} memory holds", .{ p.at, @errorName(err), e.at });
+                     } else note("reading {d} kept tokens from disk did not start ({s}); prefilling", .{ p.at, @errorName(err) });
+@@ -1120,6 +1130,39 @@ pub const LaneHost = struct {
+         return false;
+     }
+ 
++    /// A restore of `p` the backend's KV pool has no room for (`err` error.ContextFull: its destination needs rows the
++    /// live streams hold) while streams run waits as a prompt pass refused for room waits (requeue): back at the queue's
++    /// front, holding no lane, admitted again once fewer streams are active or after full_retry_ns, when it asks for
++    /// the restore again; true then. The wait holds the queue, so it is bounded as a parked restore is: load_wait_ns
++    /// (TF_SPILL_LOAD_WAIT_MS) from its first refusal it stops (`restores_room_wait_expired`). The room it waits for
++    /// is in the point's recorded part only, while a prefill may take any part. With no stream active nothing would
++    /// free the room, or once the bound passed: false, and it is admitted on what memory holds, as before.
++    fn waitRoom(h: *LaneHost, job: *Job, p: pc.Point, err: anyerror, now: i96) bool {
++        const active = h.core.activeCount();
++        if (err != error.ContextFull or active == 0) return false;
++        const first = job.room_since orelse now;
++        if (now - first >= h.tier.load_wait_ns) {
++            h.host_counts.restores_room_wait_expired += 1;
++            note("reading {d} kept tokens from disk waited {d} ms for room in the pool ({d} streams hold it); it waits no longer", .{ p.at, @divTrunc(now - first, std.time.ns_per_ms), active });
++            return false;
++        }
++        h.lock();
++        h.queued.insert(h.gpa, 0, job) catch {
++            h.unlock();
++            return false;
++        };
++        h.full_wait = active;
++        h.full_retry = @min(now + full_retry_ns, first + h.tier.load_wait_ns);
++        h.unlock();
++        job.tried_disk = false; // (it asks for the restore again at its next admission)
++        if (job.room_since == null) {
++            job.room_since = first;
++            h.host_counts.restores_room_waits += 1;
++            note("reading {d} kept tokens from disk waits for room in the pool ({d} streams hold it)", .{ p.at, active });
++        }
++        return true;
++    }
++
+     /// A restore of `p` the tier or the budget refused with `err`: when that may change shortly (Store.deferrable)
+     /// and the point saves at least defer_min tokens over `have` (the best memory state), `job` waits on the deferred
+     /// list (holding no lane) and asks again every defer_retry_ns or when a restore in flight ends, defer_ns at most
+@@ -1537,6 +1580,8 @@ pub const LaneHost = struct {
+         t.restore_wait_max_ns = hc.restore_wait_max_ns;
+         t.restores_deferred = hc.restores_deferred;
+         t.restores_deferred_expired = hc.restores_deferred_expired;
++        t.restores_room_waits = hc.restores_room_waits;
++        t.restores_room_wait_expired = hc.restores_room_wait_expired;
+         t.cached_tokens = hc.cached_tokens;
+         t.computed_tokens = hc.computed_tokens;
+         t.parked = h.loading.items.len + h.deferred.items.len;
+diff --git a/zig/src/core/lane_host_robust_test.zig b/zig/src/core/lane_host_robust_test.zig
+index edd7ebb..d059522 100644
+--- a/zig/src/core/lane_host_robust_test.zig
++++ b/zig/src/core/lane_host_robust_test.zig
+@@ -108,6 +108,230 @@ test "with the deferral off a refused restore resumes what memory holds at once"
+     try std.testing.expectEqual(@as(u64, 1), r.tier.refused);
+ }
+ 
++/// The engine's prompt pass in pieces with cut-ins (TF_FILL_CHUNKS=1, TF_FILL_CUT_IN=8192; fbbc971's
++/// prefill_part): a pass of the fake's 3 chunks runs one a piece, and a short prompt cuts in between them. The service
++/// fence refuses parked work's service while a pass stands between its pieces (LaneHost.filling), and the run loop
++/// asks for it there; that refusal is counted and skipped as in a release build, not this patch's to change.
++fn pieces(r: *Rig) void {
++    r.core.fill_chunks = 1;
++    r.core.cut_in = 8192;
++    r.target.prefill_chunks = 3;
++    r.host.fence_panic = false;
++}
++
++/// The fake tier's refusal for the pool's room (dsv41: error.ContextFull while streams hold it): only while a stream
++/// of the rig's core is active.
++const Live = struct {
++    fn check(ctx: *anyopaque) bool {
++        const core: *lanes.Engine = @ptrCast(@alignCast(ctx));
++        return core.activeCount() > 0;
++    }
++};
++
++fn cachedNow(b: *Box) ?u32 {
++    b.mutex.lockUncancelable(io);
++    defer b.mutex.unlock(io);
++    return b.cached;
++}
++
++fn roomWaits(pre: ?*const fn (*Rig) void) !void {
++    const r = try Rig.createWith(.{ .load_ms = 5 }, pre);
++    defer r.destroy();
++    const e = r.host.engine();
++    const along = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
++    var a: Box = .{};
++    defer a.deinit();
++    const areq: Request = .{ .prompt = &along, .max_tokens = 100000 };
++    try e.submit(1, &areq, a.sink());
++    while (a.count() == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    r.tier.refuse_if = .{ .ctx = &r.core, .check = Live.check };
++    r.tier.refuse_err = error.ContextFull;
++    r.tier.refuse = 1 << 20;
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try e.submit(2, &req, b.sink());
++    // refused while the stream decodes: asked again (at most each second, or when a stream ends), never prefilled
++    var asked = false;
++    for (0..5000) |_| {
++        if (@atomicLoad(u64, &r.tier.refused, .monotonic) >= 2) {
++            asked = true;
++            break;
++        }
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    try std.testing.expect(asked);
++    try std.testing.expect(b.finished() == null and cachedNow(&b) == null);
++    try std.testing.expect(a.finished() == null);
++    try std.testing.expectEqual(@as(u64, 1), r.stats().restores_room_waits);
++    e.cancel(1); // the stream ends: its room is free, the restore starts
++    try std.testing.expectEqual(Reason.cancelled, a.wait());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached);
++    try b.exact(&t2);
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 1), s.disk_hits_committed);
++    try std.testing.expectEqual(@as(u64, 1), s.restores_room_waits); // once a request, however often it asked
++    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred);
++    try std.testing.expectEqual(@as(u64, 0), s.parked);
++}
++
++test "a restore the pool has no room for while a stream decodes waits as a prompt pass does, then resumes its point exactly" {
++    try roomWaits(null);
++}
++
++test "a restore the pool has no room for while a stream decodes waits as a prompt pass does, then resumes its point exactly (prompt pass in pieces, cut-ins)" {
++    try roomWaits(pieces);
++}
++
++fn roomIdle(pre: ?*const fn (*Rig) void) !void {
++    const r = try Rig.createWith(.{ .load_ms = 5 }, pre);
++    defer r.destroy();
++    try shortThenPoint(r);
++    r.tier.refuse = 1;
++    r.tier.refuse_err = error.ContextFull;
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(2, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 4), b.cached);
++    try b.exact(&t2);
++    try std.testing.expectEqual(@as(u64, 0), r.stats().restores_room_waits);
++    try std.testing.expectEqual(@as(u64, 1), r.tier.refused);
++}
++
++test "with no stream active a restore the pool has no room for resumes what memory holds at once, as before" {
++    try roomIdle(null);
++}
++
++test "with no stream active a restore the pool has no room for resumes what memory holds at once, as before (prompt pass in pieces, cut-ins)" {
++    try roomIdle(pieces);
++}
++
++fn roomCancel(pre: ?*const fn (*Rig) void) !void {
++    const r = try Rig.createWith(.{ .load_ms = 5 }, pre);
++    defer r.destroy();
++    const e = r.host.engine();
++    const along = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
++    var a: Box = .{};
++    defer a.deinit();
++    const areq: Request = .{ .prompt = &along, .max_tokens = 100000 };
++    try e.submit(1, &areq, a.sink());
++    errdefer {
++        e.cancel(1);
++        _ = a.wait();
++    }
++    while (a.count() == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    r.tier.refuse_if = .{ .ctx = &r.core, .check = Live.check };
++    r.tier.refuse_err = error.ContextFull;
++    r.tier.refuse = 1 << 20;
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try e.submit(2, &req, b.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restores_room_waits == 1;
++        }
++    }.ok);
++    e.cancel(2);
++    try std.testing.expectEqual(Reason.cancelled, b.wait());
++    // the cancelled waiter no longer holds the queue (full_wait) for what is left of its retry second
++    r.host.mutex.lockUncancelable(io);
++    const holds = r.host.full_wait != null;
++    r.host.mutex.unlock(io);
++    try std.testing.expect(!holds);
++    const n = a.count();
++    var grew = false;
++    for (0..5000) |_| {
++        if (a.count() > n + 16) {
++            grew = true;
++            break;
++        }
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    try std.testing.expect(grew and a.finished() == null);
++    e.cancel(1);
++    try std.testing.expectEqual(Reason.cancelled, a.wait());
++    try std.testing.expectEqual(@as(u64, 0), r.stats().disk_hits_committed);
++}
++
++test "a request waiting for room for its restore is cancelled from the queue; the stream that held the room goes on" {
++    try roomCancel(null);
++}
++
++test "a request waiting for room for its restore is cancelled from the queue; the stream that held the room goes on (prompt pass in pieces, cut-ins)" {
++    try roomCancel(pieces);
++}
++
++fn roomBound(pre: ?*const fn (*Rig) void) !void {
++    const r = try Rig.createWith(.{ .load_ms = 5, .load_wait_ms = 300 }, pre);
++    defer r.destroy();
++    const e = r.host.engine();
++    const along = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4, 4, 4 };
++    var a: Box = .{};
++    defer a.deinit();
++    const areq: Request = .{ .prompt = &along, .max_tokens = 100000 };
++    try e.submit(1, &areq, a.sink());
++    errdefer {
++        e.cancel(1);
++        _ = a.wait();
++    }
++    while (a.count() == 0) std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    r.tier.refuse_if = .{ .ctx = &r.core, .check = Live.check };
++    r.tier.refuse_err = error.ContextFull;
++    r.tier.refuse = 1 << 20;
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try e.submit(2, &req, b.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restores_room_waits == 1;
++        }
++    }.ok);
++    // a short request with no kept state, behind the waiting restore
++    const other = [_]u32{ 2, 3, 5, 7, 1, 1 };
++    var c: Box = .{};
++    defer c.deinit();
++    const creq: Request = .{ .prompt = &other, .max_tokens = 3 };
++    try e.submit(3, &creq, c.sink());
++    var served = false; // (without the bound both wait until stream 1 ends, which here is never)
++    for (0..10000) |_| {
++        if (b.finished() != null and c.finished() != null) {
++            served = true;
++            break;
++        }
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    try std.testing.expect(served);
++    try std.testing.expect(a.finished() == null); // served while the stream that held the room still decodes
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(u32, 0), b.cached orelse 0); // (no memory state: it prefilled from 0, as before)
++    try b.exact(&t2);
++    try std.testing.expectEqual(Reason.length, c.wait());
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 1), s.restores_room_waits);
++    try std.testing.expectEqual(@as(u64, 1), s.restores_room_wait_expired);
++    try std.testing.expectEqual(@as(u64, 0), s.disk_hits_committed);
++    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred); // (ContextFull is no capacity refusal: never deferred)
++    e.cancel(1);
++    try std.testing.expectEqual(Reason.cancelled, a.wait());
++    try std.testing.expectEqual(@as(u64, 0), r.stats().parked);
++}
++
++test "a restore waiting for room stops at TF_SPILL_LOAD_WAIT_MS: it prefills, and the request behind it is served while the stream decodes" {
++    try roomBound(null);
++}
++
++test "a restore waiting for room stops at TF_SPILL_LOAD_WAIT_MS: it prefills, and the request behind it is served while the stream decodes (prompt pass in pieces, cut-ins)" {
++    try roomBound(pieces);
++}
++
+ test "a refusal that waiting cannot cure is not deferred; a deferred request cancelled leaves every list once" {
+     const r = try Rig.create(.{ .load_ms = 5 });
+     defer r.destroy();
+diff --git a/zig/src/core/prompt_cache_fake_tier.zig b/zig/src/core/prompt_cache_fake_tier.zig
+index 094d83c..83f7b0f 100644
+--- a/zig/src/core/prompt_cache_fake_tier.zig
++++ b/zig/src/core/prompt_cache_fake_tier.zig
+@@ -27,6 +27,9 @@ pub const FakeTier = struct {
+     /// dsv41's TooManyRestores, the store's TooMany/NoSlot); `refused` counts them.
+     refuse: u32 = 0,
+     refuse_err: anyerror = error.TooManyRestores,
++    /// With `refuse`: a begin is refused only while this answers true (dsv41's pool: no room while streams hold it,
++    /// error.ContextFull); null: every begin while `refuse` lasts.
++    refuse_if: ?Check = null,
+     refused: u64 = 0,
+     begins: u64 = 0,
+     /// The next `full` asks of Tier.VTable.full answer true (the tier at its cap before any room is made; `fulls`
+@@ -58,6 +61,7 @@ pub const FakeTier = struct {
+     pub const Pt = struct { id: u64, key: []u32, at: u32, group: u64, shared: bool, bytes: []u8, parent: ?u64, fork: u32, size: u64, lineage: []pc.Fork = &.{} };
+     pub const Pending = struct { id: u64, key: []u32, at: u32, group: u64, shared: bool, saved: pc.Saved, parent: ?u64, fork: u32, size: u64, lineage: []pc.Fork };
+     const Job = struct { id: u64, point: u64, left: u32, fail: ?anyerror };
++    pub const Check = struct { ctx: *anyopaque, check: *const fn (ctx: *anyopaque) bool };
+ 
+     pub fn deinit(t: *FakeTier) void {
+         for (t.points.items) |p| {
+@@ -148,7 +152,7 @@ pub const FakeTier = struct {
+         t.lock();
+         defer t.unlock();
+         t.begins += 1;
+-        if (t.refuse > 0) {
++        if (t.refuse > 0 and (if (t.refuse_if) |c| c.check(c.ctx) else true)) {
+             t.refuse -= 1;
+             t.refused += 1;
+             return t.refuse_err;
+diff --git a/zig/src/families/dsv41/kv_lanes.zig b/zig/src/families/dsv41/kv_lanes.zig
+index 72a0d5b..e906068 100644
+--- a/zig/src/families/dsv41/kv_lanes.zig
++++ b/zig/src/families/dsv41/kv_lanes.zig
+@@ -554,7 +554,7 @@ pub const Kv = struct {
+     /// lanes.prefillFn's placement (shard-parts.md's six steps): plan; `full` applied (its refusals counted once a
+     /// request) and error.ContextFull; `relocate` applied, sent, its move run and finished, then planned again;
+     /// `placed` applied, sent, its ops acted on in order. `source`: the kept state it resumes from (lanes checked it
+-    /// usable), `patient`: held(source) and lanes' wait clock still runs.
++    /// usable), `patient`: lanes' wait clock (held_wait_ns) still runs for source.
+     pub fn admit(kv: *Kv, key: usize, tag: u64, slot: u32, size: usize, source: ?u64, patient: bool) !Admitted {
+         try kv.start();
+         const id = try kv.idFor(key, tag);
+@@ -615,25 +615,41 @@ pub const Kv = struct {
+     /// A spill restore's destination (lanes.spillReserve, TF_DS_KV_SHARD with the spill tier): a hold of `want` rows
+     /// in `part` (the point's recorded part: its owner holds the codes there) when that fits without staling a kept
+     /// state, else of `min` (the point's rows) staling there only (planRestore's evictions, its stage ops first), applied,
+-    /// sent and acted on. The hold, `id` (the restore's Snap), is invisible until `restored` or `unhold`.
+-    /// error.ContextFull, nothing changed or sent, when the part has no room at all.
++    /// sent and acted on. The hold, `id` (the restore's Snap), is invisible until `restored` or `unhold`. A part that
++    /// evictions cannot free has a live stream moved away first when that frees it (planRestore's `relocate`: applied,
++    /// sent, its move run and finished, then planned again), max_relocations at most, as `place` does for an admission.
++    /// error.ContextFull, nothing more changed or sent, when the part still has no room.
+     pub fn restore(kv: *Kv, id: u64, want: usize, min: usize, part: u8) !struct { base: usize, size: usize } {
+         try kv.start();
+         if (min == 0 or want < min) return error.BadSize;
+-        var size = @min(want, kv.planner.part_rows);
+-        var plan = try kv.planner.planRestore(kv.gpa, id, size, part);
+-        defer plan.deinit(kv.gpa);
+-        if (size > min and (plan.status != .placed or staling(&plan))) {
+-            plan.deinit(kv.gpa);
+-            plan = .{};
+-            size = min;
+-            plan = try kv.planner.planRestore(kv.gpa, id, size, part);
++        var relocations: usize = 0;
++        while (true) {
++            var size = @min(want, kv.planner.part_rows);
++            var plan = try kv.planner.planRestore(kv.gpa, id, size, part);
++            defer plan.deinit(kv.gpa);
++            if (size > min and (plan.status != .placed or staling(&plan))) {
++                plan.deinit(kv.gpa);
++                plan = .{};
++                size = min;
++                plan = try kv.planner.planRestore(kv.gpa, id, size, part);
++            }
++            switch (plan.status) {
++                .full => return error.ContextFull,
++                .relocate => {
++                    if (relocations == max_relocations) return error.ContextFull;
++                    relocations += 1;
++                    const sent = try kv.applyPlan(&plan);
++                    _ = try kv.runOps(plan.ops.items, sent);
++                    kv.counts.relocations += 1;
++                },
++                .placed => {
++                    const sent = try kv.applyPlan(&plan);
++                    errdefer if (!kv.ended()) kv.unhold(id) catch |err| std.log.warn("dsv41: a failed restore kept its part's hold: {s}", .{@errorName(err)});
++                    _ = try kv.runOps(plan.ops.items, sent);
++                    return .{ .base = plan.base, .size = size };
++                },
++            }
+         }
+-        if (plan.status != .placed) return error.ContextFull;
+-        const sent = try kv.applyPlan(&plan);
+-        errdefer if (!kv.ended()) kv.unhold(id) catch |err| std.log.warn("dsv41: a failed restore kept its part's hold: {s}", .{@errorName(err)});
+-        _ = try kv.runOps(plan.ops.items, sent);
+-        return .{ .base = plan.base, .size = size };
+     }
+ 
+     fn staling(plan: *const parts.Plan) bool {
+@@ -1608,6 +1624,66 @@ test "spill + shard: a restore holds rows in the recorded part on both ranks, fa
+     try p.kv.release(c.id);
+ }
+ 
++test "spill + shard: a restore whose part only a live move frees moves the decoding stream away first on both ranks, then holds" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{ .twins = false });
++    defer p.deinit();
++    const half = sharded.cap / 2;
++    // part 0: x (14 blocks at 0, 18 free); part 1: z (10 blocks, 22 free). A 20-block restore into part 0 fits only
++    // with x gone, and part 1 has room for x and its headroom.
++    const x = try p.kv.admit(1, 1, 0, 14 * C, null, false);
++    const z = try p.kv.admit(2, 2, 1, 10 * C, null, false);
++    try testing.expectEqual(@as(u8, 0), x.part);
++    try testing.expectEqual(@as(u8, 1), z.part);
++    try p.kv.decodeStart(x.id);
++    try p.kv.decodeStart(z.id);
++    try p.kv.round(&.{ .{ .id = x.id, .valid = C + 5 }, .{ .id = z.id, .valid = 3 * C } });
++    const r = try p.kv.restore(910, 20 * C, 20 * C, 0);
++    try p.same();
++    try testing.expectEqual(@as(u64, 1), p.kv.counts.relocations);
++    try testing.expectEqualSlices(u64, &.{x.id}, p.lanes0.moved.items);
++    try testing.expectEqual(@as(usize, 1), p.dev0.copies.items.len);
++    try testing.expectEqualSlices([3]usize, p.dev0.copies.items, p.dev1.copies.items);
++    try testing.expectEqual(@as(u8, 1), p.kv.planner.lives.items[p.kv.planner.liveIndex(x.id).?].part);
++    try testing.expect(r.base + r.size <= half and r.size == 20 * C);
++    try testing.expect(p.kv.planner.holds.items.len == 1 and p.fol.planner.?.holds.items.len == 1);
++    try p.kv.unhold(910);
++    try p.same();
++    for ([_]u64{ x.id, z.id }) |id| try p.kv.release(id);
++}
++
++test "a hit whose resume in place one live stream blocks moves that stream away on both ranks, then resumes in place" {
++    const gpa = testing.allocator;
++    const p = try Pair.init(gpa, sharded, .{ .twins = false });
++    defer p.deinit();
++    // part 0: kept state 700 (12 blocks at 0, its extent 14), then x (8 blocks) at 14, in the tail a 22-block resume
++    // in place needs; part 1: z2 (20 blocks, 12 free): room for x and its headroom, not for the hit (no carry), and a
++    // copy in part 0 would need the hit's own room (it would be dropped, its prompt run from 0)
++    const y = try p.kv.admit(1, 1, 0, 14 * C, null, false);
++    try testing.expectEqual(@as(u8, 0), y.part);
++    try p.kv.keep(700, y.id, 12 * C);
++    const z = try p.kv.admit(2, 2, 1, 26 * C, null, false);
++    try p.kv.release(y.id);
++    const x = try p.kv.admit(3, 3, 2, 8 * C, null, false);
++    try testing.expect(x.part == 0 and x.base == 14 * C);
++    try p.kv.release(z.id);
++    const z2 = try p.kv.admit(4, 4, 1, 20 * C, null, false);
++    try testing.expectEqual(@as(u8, 1), z2.part);
++    try p.kv.decodeStart(x.id);
++    try p.kv.decodeStart(z2.id);
++    try p.kv.round(&.{ .{ .id = x.id, .valid = 2 * C }, .{ .id = z2.id, .valid = 3 * C } });
++    const w = try p.kv.admit(5, 5, 3, 22 * C, 700, false);
++    try p.same();
++    try testing.expect(w.resumed and w.mode == .in_place and w.part == 0 and w.base == 0 and !w.dropped);
++    try testing.expectEqual(@as(u64, 1), p.kv.counts.relocations);
++    try testing.expectEqualSlices(u64, &.{x.id}, p.lanes0.moved.items);
++    try testing.expectEqualSlices([3]usize, p.dev0.copies.items, p.dev1.copies.items);
++    try testing.expectEqual(@as(u8, 1), p.kv.planner.lives.items[p.kv.planner.liveIndex(x.id).?].part);
++    try testing.expect(!p.kv.planner.keptAt(700).?.stale);
++    for ([_]u64{ x.id, z2.id, w.id }) |id| try p.kv.release(id);
++    try p.same();
++}
++
+ test "random traffic: rank 0's and the follower's planners never differ, every op list replays" {
+     const gpa = testing.allocator;
+     var prng = std.Random.DefaultPrng.init(0x0118);
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index eaab37f..d99017c 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -695,8 +695,9 @@ pub const Lanes = struct {
+             const sn: *Snap = @ptrCast(@alignCast(p));
+             if (self.usable(sn, len)) src = sn else s.reuse_failed = true;
+         }
+-        // (lanes owns the clock: patient only when a live stream holds the state, as placeKept asks)
+-        const waits = if (src) |sn| k.planner.held(sn.id) and self.patient(sn) else false;
++        // (lanes owns the clock, held_wait_ns from the first wait: the planner waits on it for a live stream that holds
++        // the state, as placeKept does, and for the streams over a hit's tail, planRoom)
++        const waits = if (src) |sn| self.patient(sn) else false;
+         self.kvPending();
+         const a = try k.admit(@intFromPtr(s), std.hash.Wyhash.hash(0, s.id), @intCast(slot), size, if (src) |sn| sn.id else null, waits);
+         if (src) |sn| {
+diff --git a/zig/src/families/dsv41/parts.zig b/zig/src/families/dsv41/parts.zig
+index 5bd7240..c0c5eb2 100644
+--- a/zig/src/families/dsv41/parts.zig
++++ b/zig/src/families/dsv41/parts.zig
+@@ -175,7 +175,7 @@ pub const Request = struct {
+     slot: u32,
+     size: usize, // the reservation: alignForward(len + max_new + round_rows + 2, chunk_rows)
+     source: ?u64 = null, // the kept state it resumes from (lanes checked usable())
+-    patient: bool = false, // held(source) and lanes' held_wait clock still runs (lanes.patient)
++    patient: bool = false, // lanes' held_wait clock still runs for source (lanes.patient); acted on only by a wait for a live stream: one that holds source, or those over a hit's tail (planRoom)
+     twins: bool = true, // a fresh prompt may borrow twins
+ };
+ 
+@@ -260,6 +260,9 @@ pub const Mutant = enum {
+     cheapest_ignored,
+     flight_source_unprotected,
+     move_end_unclamped,
++    hit_drops_for_room,
++    hit_no_wait,
++    restore_no_relocate,
+ };
+ 
+ pub const Config = struct {
+@@ -735,13 +738,14 @@ pub const Planner = struct {
+ 
+     /// Evicting the oldest kept states of part q until `size` fits there: the base, the victims (appended) and the cost
+     /// (the newest victim's place in the kept order, plus one; 0 when none is needed). Null when even all leave too little.
+-    fn evictCost(self: *const Planner, gpa: Allocator, q: u8, size: usize, protect: ?usize, stale: []const bool, victims: *std.ArrayList(usize)) !?struct { base: usize, cost: usize } {
++    /// `gone`: as if that live stream had moved away (planRelocate's test for a restore).
++    fn evictCost(self: *const Planner, gpa: Allocator, q: u8, size: usize, protect: ?usize, stale: []const bool, victims: *std.ArrayList(usize), gone: ?u64) !?struct { base: usize, cost: usize } {
+         const local = try gpa.dupe(bool, stale);
+         defer gpa.free(local);
+         const mark = victims.items.len;
+         var cost: usize = 0;
+         while (true) {
+-            if (try self.placeSoftIn(gpa, q, size, .{ .twins_free = true }, local)) |b| return .{ .base = b, .cost = cost };
++            if (try self.placeSoftIn(gpa, q, size, .{ .twins_free = true, .gone = gone }, local)) |b| return .{ .base = b, .cost = cost };
+             const v = self.victim(q, local, protect) orelse {
+                 victims.shrinkRetainingCapacity(mark);
+                 return null;
+@@ -762,7 +766,7 @@ pub const Planner = struct {
+             const q: u8 = @intCast(qi);
+             if (q == skip) continue;
+             scratch.clearRetainingCapacity();
+-            const r = try self.evictCost(gpa, q, size, protect, stale, &scratch) orelse continue;
++            const r = try self.evictCost(gpa, q, size, protect, stale, &scratch, null) orelse continue;
+             const better = if (best) |b| (if (self.mut(.cheapest_ignored)) false else r.cost < b.cost) else true;
+             if (better) {
+                 const v = try gpa.dupe(usize, scratch.items);
+@@ -971,9 +975,44 @@ pub const Planner = struct {
+             plan.status = .full;
+             return .full;
+         }
++        if (try self.planRoom(gpa, req, si, e, stale, victims)) |o| return o;
+         return .fresh;
+     }
+ 
++    /// A hit that its part cannot keep and that no other part takes (it would be dropped: its prompt runs from 0) gets
++    /// the room of its resume in place the way a prompt pass gets room: the kept states over its tail give theirs (as
++    /// victims do), one live stream there moves to another part (planRelocate), or the request waits for the live
++    /// streams there to end (lanes' error.ContextFull: the host tries it again when a stream ends, as for a prompt pass
++    /// no part can hold) while `patient` (lanes' held_wait_ns clock, the bound of the other wait for a live stream).
++    /// Only with carries on, for a state of carry_min tokens or more (a smaller one is cheaper to prefill again), in
++    /// place inside its part, with nothing pinned, held for a restore or read by a transfer there, and no live stream
++    /// over its own rows (that wait is simPlaceKept's). Null: dropped as before.
++    fn planRoom(self: *const Planner, gpa: Allocator, req: Request, si: usize, e: *Emit, stale: []bool, victims: *std.ArrayList(usize)) !?HitOutcome {
++        if (!self.carrying() or self.mut(.hit_drops_for_room)) return null;
++        const sn = self.kept.items[si];
++        const a = sn.base + sn.at;
++        const b = sn.base + req.size;
++        if (sn.at < carry_min or b > self.partEnd(sn.part)) return null;
++        if (self.clashLive(sn.base, a, null) or self.clashHolds(sn.base, b) or self.clashPinned(sn.base, b) or self.clashReading(a, b, si)) return null;
++        @memset(stale, false); // (the simulated victims of the copy and the carry are not this plan's)
++        victims.clearRetainingCapacity();
++        var blockers: usize = 0;
++        for (self.lives.items) |l| blockers += @intFromBool(a < l.base + l.size and l.base < b);
++        if (blockers == 0) {
++            try self.emitPlaced(gpa, e, req, victims, stale, .{ .part = sn.part, .base = sn.base, .stale_from = a, .except = si, .twins_free = true, .transfer = .{ .@"resume" = .{ .kept = sn.id, .gen = sn.gen, .stream = req.stream } } });
++            e.plan.mode = .in_place;
++            e.plan.source = sn.id;
++            return .placed;
++        }
++        if (blockers == 1 and try self.planRelocate(gpa, req.stream, .{ .span = .{ .part = sn.part, .a = a, .b = b } }, e, stale)) {
++            e.plan.status = .relocate;
++            return .wait;
++        }
++        if (self.mut(.hit_no_wait) or !req.patient) return null; // (the wait ran out: dropped as before)
++        e.plan.status = .full;
++        return .wait;
++    }
++
+     fn hitCopy(self: *const Planner, gpa: Allocator, e: *Emit, req: Request, si: usize, r: Sim, victims: *std.ArrayList(usize), stale: []bool) !HitOutcome {
+         const sn = self.kept.items[si];
+         const b = r.base.?;
+@@ -1015,7 +1054,7 @@ pub const Planner = struct {
+         }
+         plan.status = .full;
+         if (self.sharded()) {
+-            if (try self.planRelocate(gpa, req, e, stale)) {
++            if (try self.planRelocate(gpa, req.stream, .{ .any = req.size }, e, stale)) {
+                 plan.status = .relocate;
+                 return;
+             }
+@@ -1122,11 +1161,36 @@ pub const Planner = struct {
+         }
+     }
+ 
+-    /// A request no part has room for would wait: move one live stream whole to a part with room for it (and a
+-    /// block of headroom a stream there plus one), the cheapest whose leaving lets the request in without evicting, if
+-    /// it may move (nothing pins it, not within relocate_hold rounds of its last move, not back where it came from,
+-    /// not out of a part another stream just entered). One move a plan.
+-    fn planRelocate(self: *const Planner, gpa: Allocator, req: Request, e: *Emit, stale: []const bool) !bool {
++    /// What a live move must make room for: `size` rows in some part without evicting (an admission no part has room
++    /// for), `size` rows in a spill restore's recorded part evicting there as planRestore does, or rows [a, b) of a part
++    /// clear of live streams (a hit's resume in place, planRoom).
++    const Need = union(enum) {
++        any: usize,
++        restore: struct { part: u8, size: usize },
++        span: struct { part: u8, a: usize, b: usize },
++    };
++
++    /// Whether `l` leaving part p gives `need` its room.
++    fn lets(self: *const Planner, gpa: Allocator, need: Need, p: u8, l: Live, stale: []const bool) !bool {
++        switch (need) {
++            .any => |size| return try self.placeSoftIn(gpa, p, size, .{ .gone = l.stream }, stale) != null,
++            .restore => |r| {
++                if (p != r.part) return false;
++                var scratch: std.ArrayList(usize) = .empty;
++                defer scratch.deinit(gpa);
++                return try self.evictCost(gpa, p, r.size, null, stale, &scratch, l.stream) != null;
++            },
++            .span => |x| return p == x.part and x.a < l.base + l.size and l.base < x.b and !self.clashLive(x.a, x.b, l.stream),
++        }
++    }
++
++    /// A request no part has room for would wait (or a restore its part has no room for, or a hit's resume in place a
++    /// live stream stands in the way of, `need`): move one live stream whole to a part with room for it (and a
++    /// block of headroom a stream there plus one), the cheapest whose leaving gives `need` its room (an admission's:
++    /// without evicting), if it may move (nothing pins it, not within relocate_hold rounds of its last move, not back
++    /// where it came from, not out of a part another stream just entered). One move a plan. `stream`: the request's
++    /// own, never moved.
++    fn planRelocate(self: *const Planner, gpa: Allocator, stream: u64, need: Need, e: *Emit, stale: []const bool) !bool {
+         if (!self.carrying()) return false;
+         const plan = e.plan;
+         const hold = self.holdRounds();
+@@ -1137,8 +1201,8 @@ pub const Planner = struct {
+             const p: u8 = @intCast(pi);
+             if (!self.mut(.no_entered_guard) and self.ticks - self.entered[pi] < hold) continue;
+             for (self.lives.items, 0..) |l, li| {
+-                if (l.part != p or l.stream == req.stream) continue;
+-                if (try self.placeSoftIn(gpa, p, req.size, .{ .gone = l.stream }, stale) == null) continue;
++                if (l.part != p or l.stream == stream) continue;
++                if (!try self.lets(gpa, need, p, l, stale)) continue;
+                 wanted = true;
+                 if (self.pinsMove(l)) |w| {
+                     if (pin == null) pin = w;
+@@ -1180,7 +1244,10 @@ pub const Planner = struct {
+     }
+ 
+     /// A spill restore's destination in the part its point was written from (GLM: back into the recorded half),
+-    /// evicting there only; kept invisible (a hold) until restoredOp or unholdOp.
++    /// evicting there only; kept invisible (a hold) until restoredOp or unholdOp. A part no eviction makes the room in
++    /// has one live stream moved away when that gives the room (`relocate`: apply it, run the move, finish it, then
++    /// plan the restore again), as an admission no part can hold has; else `full` (lanes' error.ContextFull: the host
++    /// asks again when a stream ends).
+     pub fn planRestore(self: *const Planner, gpa: Allocator, id: u64, size: usize, part: u8) !Plan {
+         if (part >= self.cfg.parts) return error.BadPart;
+         if (size == 0 or size % chunk_rows != 0 or size > self.part_rows) return error.BadSize;
+@@ -1195,7 +1262,11 @@ pub const Planner = struct {
+         defer victims.deinit(gpa);
+         var found = try self.placeSoftIn(gpa, part, size, .{}, stale);
+         if (found == null) {
+-            const r = try self.evictCost(gpa, part, size, null, stale, &victims) orelse {
++            const r = try self.evictCost(gpa, part, size, null, stale, &victims, null) orelse {
++                if (self.sharded() and !self.mut(.restore_no_relocate) and try self.planRelocate(gpa, 0, .{ .restore = .{ .part = part, .size = size } }, &e, stale)) {
++                    plan.status = .relocate;
++                    return plan;
++                }
+                 plan.no_part = self.sharded();
+                 return plan;
+             };
+@@ -1779,6 +1850,13 @@ fn rq(stream: u64, size: usize, source: ?u64) Request {
+     return .{ .stream = stream, .slot = @intCast(stream), .size = size, .source = source };
+ }
+ 
++/// rq while lanes' wait clock still runs for the source (lanes.patient).
++fn rqp(stream: u64, size: usize, source: ?u64) Request {
++    var r = rq(stream, size, source);
++    r.patient = true;
++    return r;
++}
++
+ fn count(p: *const Plan, tag: std.meta.Tag(Op)) usize {
+     var n: usize = 0;
+     for (p.ops.items) |o| n += @intFromBool(o == tag);
+@@ -2015,6 +2093,7 @@ fn secTwins(t: *T) !void {
+         f.lv(1).partial = true;
+         try f.twin(1, P + 8 * C, 8 * C);
+         try f.live(2, P + 24 * C, 8 * C);
++        f.lv(2).decoding = false; // (not movable: moving it would make the room, 11 room)
+         var p = try f.pl.planRestore(t.gpa, 9, 12 * C, 1);
+         defer p.deinit(t.gpa);
+         t.check("9 twin: its rows are no room; none found, no op", p.status == .full and p.ops.items.len == 0);
+@@ -2710,6 +2789,7 @@ fn secInvariants(t: *T) !void {
+     var carried: usize = 0;
+     var kinds = [_]usize{ 0, 0, 0, 0 };
+     var same: usize = 0;
++    var roomed: usize = 0;
+     for (0..700) |seed| {
+         for ([_]bool{ false, true }) |heavy| {
+             var pa: std.Random.DefaultPrng = .init(seed);
+@@ -2733,6 +2813,16 @@ fn secInvariants(t: *T) !void {
+                 if (on.part == k.part or a.pl.pinsKept(si) != null or k.at < carry_min) miss(t, &bad, 1, seed);
+                 if (!(off.status != .placed or off.dropped or count(&off, .stale) > 0)) miss(t, &bad, 2, seed);
+                 if (on.why.? != .rescued and count(&on, .stale) > 0) miss(t, &bad, 3, seed);
++            } else if (off.dropped and !on.dropped) {
++                // 11 room: where carry off drops the hit, carry on makes its resume in place room instead (in place
++                // now, a live stream moved first, or a wait), never for a state under carry_min
++                roomed += 1;
++                const k = a.pl.kept.items[a.pl.keptIndex(req.source.?).?];
++                if (k.at < carry_min) miss(t, &bad, 8, seed);
++                if (on.status == .placed and !(on.mode == .in_place and on.base == k.base and on.part == k.part and on.source.? == k.id)) miss(t, &bad, 9, seed);
++                if (on.status == .relocate and count(&on, .move) != 1) miss(t, &bad, 10, seed);
++                if (on.status == .full and on.ops.items.len != 0) miss(t, &bad, 11, seed);
++                if (on.status == .full and !req.patient) miss(t, &bad, 12, seed); // (the wait runs on lanes' clock)
+             } else {
+                 const st = if (on.status == .relocate) Status.full else on.status;
+                 if (st != off.status or on.mode != off.mode or on.part != off.part or on.base != off.base or on.dropped != off.dropped) {
+@@ -2748,6 +2838,7 @@ fn secInvariants(t: *T) !void {
+     }
+     t.check("10 random pools: a carry only where carry off evicted, dropped the hit or waited; else the same plan; never pinned or small; pressure/others/paused evict nothing", bad == 0);
+     t.check("10 random pools: the carry happens in every kind (the sweep reaches them)", carried > 40 and kinds[@intFromEnum(Reason.rescued)] >= 3 and kinds[@intFromEnum(Reason.pressure)] >= 3 and kinds[@intFromEnum(Reason.paused)] >= 1 and same > 200);
++    t.check("11 room: random pools reach the room rule (where carry off drops the hit)", roomed > 20);
+ }
+ 
+ fn secTwoRanks(t: *T) !void {
+@@ -3339,6 +3430,133 @@ fn secLifetimes(t: *T) !void {
+     }
+ }
+ 
++// 11: room for a resume or a restore, made the way an admission makes it ----------------------------------------------
++
++/// Part 0: hit 7 (10C kept at 8C: a 14C reservation in place needs [8C, 22C)), a live stream (4C) at 20C in its tail,
++/// `live3` (4C at 28C) when set; part 1: a live stream of 22C (10C free: room for the 4C one and its headroom, not
++/// for the hit and its headroom). With 7 gone a fresh 14C fits at 0: the hit was dropped and its prompt ran from 0.
++fn roomLayout(t: *T, at: usize, tail_live: bool, live3: bool) !Fx {
++    const P = 32 * C;
++    var f = try Fx.init(t, 2, P);
++    errdefer f.deinit();
++    try f.kept(7, 8 * C, at, 8 * C + at);
++    if (tail_live) try f.live(1, 20 * C, 4 * C);
++    if (live3) try f.live(3, 28 * C, 4 * C);
++    try f.live(2, P, 22 * C);
++    return f;
++}
++
++fn moveOf(p: *const Plan) ?@FieldType(Op, "move") {
++    for (p.ops.items) |o| if (o == .move) return o.move;
++    return null;
++}
++
++fn secRoom(t: *T) !void {
++    const P = 32 * C;
++    {
++        var f = try roomLayout(t, 10 * C, true, false);
++        defer f.deinit();
++        var p = try f.plan(rq(50, 14 * C, 7));
++        defer p.deinit(t.gpa);
++        const mv = moveOf(&p);
++        t.check("11 room: a live stream in a hit's tail moves to the other part; the hit is not dropped", p.status == .relocate and !p.dropped and count(&p, .move) == 1 and mv != null and mv.?.stream == 1 and mv.?.dst_part == 1 and count(&p, .stale) == 0);
++        if (p.status == .relocate) {
++            try f.apply(&p);
++            _ = try f.pl.finish(1, true);
++            var q = try f.plan(rq(50, 14 * C, 7));
++            defer q.deinit(t.gpa);
++            t.check("11 room: then the hit resumes in place, nothing staled", q.status == .placed and q.mode == .in_place and q.base == 8 * C and q.source == 7 and !q.dropped and count(&q, .stale) == 0);
++        }
++    }
++    {
++        var f = try roomLayout(t, 10 * C, true, false);
++        defer f.deinit();
++        f.lv(1).decoding = false; // (its prompt pass ended, no decode round yet: not movable)
++        var p = try f.plan(rqp(50, 14 * C, 7));
++        defer p.deinit(t.gpa);
++        t.check("11 room: a stream in a hit's tail that cannot move yet is waited for (full), the hit kept", p.status == .full and !p.dropped and p.ops.items.len == 0 and !f.kp(7).stale);
++        var o = try f.plan(rq(50, 14 * C, 7));
++        defer o.deinit(t.gpa);
++        t.check("11 room: once the wait's clock ran out (not patient) the hit is dropped as before", o.dropped and o.mode == .fresh and count(&o, .move) == 0);
++        if (p.status == .full) {
++            try f.apply(&p);
++            t.check("11 room: the wait counts the carry's refusal once and no no_part", f.pl.counters.no_part == 0 and f.pl.counters.refusals(.no_target) == 1);
++            f.lv(1).decoding = true;
++            var q = try f.plan(rqp(50, 14 * C, 7));
++            defer q.deinit(t.gpa);
++            t.check("11 room: asked again once it decodes, it moves", q.status == .relocate and count(&q, .move) == 1);
++        }
++    }
++    {
++        var f = try roomLayout(t, 10 * C, true, false);
++        defer f.deinit();
++        try f.live(4, 18 * C, 2 * C); // (a second stream in the tail: one move does not clear it)
++        var p = try f.plan(rqp(50, 14 * C, 7));
++        defer p.deinit(t.gpa);
++        t.check("11 room: two streams in the tail: no move, it waits for them", p.status == .full and !p.dropped and count(&p, .move) == 0);
++    }
++    {
++        // another conversation's kept state in the tail; a third stream leaves no room for a copy
++        var f = try roomLayout(t, 10 * C, false, true);
++        defer f.deinit();
++        try f.kept(9, 18 * C, 4 * C, 22 * C);
++        var p = try f.plan(rq(50, 14 * C, 7));
++        defer p.deinit(t.gpa);
++        t.check("11 room: kept states in a hit's tail give their room: it resumes in place", p.status == .placed and p.mode == .in_place and p.base == 8 * C and !p.dropped and staledAre(&p, &.{9}));
++    }
++    {
++        var f = try roomLayout(t, 1024, true, false);
++        defer f.deinit();
++        var p = try f.plan(rq(50, 14 * C, 7));
++        defer p.deinit(t.gpa);
++        t.check("11 room: a hit under carry_min is dropped as before (cheaper to recompute)", p.dropped and count(&p, .move) == 0);
++    }
++    {
++        var f = try Fx.initCfg(t, .{ .cap = 2 * P, .parts = 2, .carry = false });
++        defer f.deinit();
++        try f.kept(7, 8 * C, 10 * C, 18 * C);
++        try f.kept(9, 18 * C, 4 * C, 22 * C);
++        try f.live(3, 28 * C, 4 * C);
++        try f.live(2, P, 22 * C);
++        var p = try f.plan(rq(50, 14 * C, 7));
++        defer p.deinit(t.gpa);
++        t.check("11 room: carry off: the hit is dropped as before", p.dropped and p.mode == .fresh);
++    }
++    {
++        // a restore: part 0's evictions leave 18C at most, live stream 1 (4C at 10C) splits it; part 1 is empty
++        var f = try Fx.init(t, 2, P);
++        defer f.deinit();
++        try f.live(1, 10 * C, 4 * C);
++        try f.kept(30, 20 * C, 4 * C, 24 * C);
++        var p = try f.pl.planRestore(t.gpa, 900, 20 * C, 0);
++        defer p.deinit(t.gpa);
++        const mv = moveOf(&p);
++        t.check("11 room: a restore its part's evictions cannot free has a live stream moved away first", p.status == .relocate and p.restore and count(&p, .move) == 1 and mv != null and mv.?.stream == 1 and mv.?.dst_part == 1 and count(&p, .hold) == 0);
++        if (p.status == .relocate) {
++            try f.apply(&p);
++            _ = try f.pl.finish(1, true);
++            var q = try f.pl.planRestore(t.gpa, 900, 20 * C, 0);
++            defer q.deinit(t.gpa);
++            t.check("11 room: then the restore holds rows in its part, staling nobody", q.status == .placed and q.base == 0 and count(&q, .hold) == 1 and count(&q, .stale) == 0);
++        }
++    }
++    {
++        var f = try Fx.init(t, 2, P);
++        defer f.deinit();
++        try f.live(1, 10 * C, 4 * C);
++        f.lv(1).decoding = false;
++        var p = try f.pl.planRestore(t.gpa, 900, 20 * C, 0);
++        defer p.deinit(t.gpa);
++        t.check("11 room: a restore no live stream may make room for is full, nothing planned", p.status == .full and p.ops.items.len == 0);
++        var u = try Fx.init(t, 1, P);
++        defer u.deinit();
++        try u.live(1, 10 * C, 4 * C);
++        var r = try u.pl.planRestore(t.gpa, 900, 20 * C, 0);
++        defer r.deinit(t.gpa);
++        t.check("11 room: one part: a restore never moves a stream", r.status == .full and r.ops.items.len == 0);
++    }
++}
++
+ const sections = .{
+     .{ "1-8 parts", secParts },
+     .{ "9 twins", secTwins },
+@@ -3352,6 +3570,7 @@ const sections = .{
+     .{ "10 relocate", secRelocate },
+     .{ "10 thrash", secThrash },
+     .{ "10 spill", secSpill },
++    .{ "11 room", secRoom },
+     .{ "misc", secMisc },
+     .{ "lifetimes", secLifetimes },
+ };
+@@ -3421,6 +3640,9 @@ fn killer(m: Mutant) []const u8 {
+         .cheapest_ignored => "1 mirrored: the part whose newest needed victim is oldest",
+         .flight_source_unprotected => "life source: an in-flight carry's source is no victim",
+         .move_end_unclamped => "life end random: after random moves",
++        .hit_drops_for_room => "11 room: kept states in a hit's tail give their room",
++        .hit_no_wait => "11 room: a stream in a hit's tail that cannot move yet is waited for",
++        .restore_no_relocate => "11 room: a restore its part's evictions cannot free",
+     };
+ }
+ 
+-- 
+2.56.0
+
