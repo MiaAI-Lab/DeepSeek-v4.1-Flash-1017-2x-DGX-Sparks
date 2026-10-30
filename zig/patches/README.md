@@ -40,6 +40,7 @@ them there the same way.
 | `0036-metrics-cached-prompt-tokens.patch` | none (always on) | **on** | `/metrics` adds `prompt_tokens_cached_total` (and vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`), `/health` adds `prompt_tokens_total`, `cached_tokens_total` and `generation_tokens_total` from the same totals, and `/v1/models` names `max_model_len`: the prompt tokens restored from kept prompt states are no longer visible only per reply (issue #58) |
 | `0037-rendezvous-ports-early.patch` | `TF_DS_CONNECT_S` (both ranks; seconds, default 300) | **on** | rank 0 opens its follower's port before its weights load and takes the connection afterwards, so a worker that finishes loading first waits in the port's backlog instead of exiting with `ConnectFailed` once its 300 s retry window ends |
 | `0038-aligned-index-views.patch` | none (always on) | **on** | the prompt pass's index row blocks are a multiple of 16 rows and a replay cut's positions start on a 16-byte boundary, the alignment the kit's index kernels were captured for (an odd block size had no matching kernel variant: `MissingTritonVariant`); not run on a pair, compare replies with `tools/exact.py` |
+| `0042-kv-shard-pieces.patch` | none (needs `TF_FILL_*` and `KV_SHARD=1`) | **on** | with KV sharding a prompt pass runs in pieces too, so `TF_FILL_CHUNKS`, `TF_FILL_CUT_IN` and the rest work with `KV_SHARD=1` (before, every sharded pass ran whole: a short request waited for a cold long prompt, and `TF_FILL_CHUNKS` still turned `0005`'s interleave off). A pass keeps its extent and part between its pieces; one a short prompt cut into binds its borrowed twins again as it resumes, on both ranks. Without `TF_FILL_*` nothing changes. **By Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)** |
 
 
 **Rebase onto `fbbc971` (28-oct-2026, eleata).** The pin moved from `629c524` to `fbbc971` (the `deepseek-v41-zig` tip of
@@ -50,7 +51,7 @@ the payload's SHA-256, which is what `0021`'s durable tier checks, and `LaneHost
 with pictures and no content key never touches the cache), so `TF_DS_IMAGE_CACHE=0` still works. The engine's prompt pass
 in pieces (`TF_FILL_CHUNKS`, `TF_FILL_ROUNDS`, `TF_FILL_FIRST`, `TF_FILL_CUT_IN`, read by rank 0's server; `start.sh` now
 passes `TF_FILL_*`) is merged through the series: the spill tier's bumps and the KV parts follow its `Lanes.prefillPart`, a
-pass with `TF_DS_KV_SHARD=1` runs whole, the pair-broken monitor covers its pieces, and its `fill_resume` frame is kind 12
+pass with `TF_DS_KV_SHARD=1` runs whole (in pieces since `0042`), the pair-broken monitor covers its pieces, and its `fill_resume` frame is kind 12
 (11 stays unused). Each changed patch says what changed in a "Rebased onto TensorFold fbbc971" line of its header;
 `0030`-`0033` apply unchanged. Checked: every patch passes `git apply --check` in order on a clean `fbbc971` checkout;
 `zig build test` (engine host tests) and `zig/tests/server/zig_test.sh` (server) pass on x86_64 with Zig 0.17.0; the
