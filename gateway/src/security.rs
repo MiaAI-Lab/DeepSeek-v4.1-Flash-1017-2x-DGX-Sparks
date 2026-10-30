@@ -97,7 +97,10 @@ pub async fn guard(State(state): State<AppState>, request: Request, next: Next) 
     }
 
     if request.method() == Method::GET && is_cheap_read(request.uri().path()) {
-        return next.run(request).await;
+        // Outside the limit, no body is read: a GET's body means nothing, and buffered here (the proxy hop takes up
+        // to 64 MiB, without the admitted requests' timeout) one per open connection would add up to gigabytes.
+        let (parts, _body) = request.into_parts();
+        return next.run(Request::from_parts(parts, Body::empty())).await;
     }
 
     let permit = match Arc::clone(&state.semaphore).acquire_owned().await {

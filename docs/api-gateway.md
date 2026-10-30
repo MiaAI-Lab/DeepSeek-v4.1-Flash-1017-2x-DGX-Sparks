@@ -34,6 +34,8 @@ API open, as the native recipe does by default.
 
 `GATEWAY_MAX_CONCURRENT` (default 3) admits that many requests and queues the rest instead of rejecting them at the cap.
 A permit covers the whole response body, including an SSE stream, and is released on completion or client cancellation.
+`GET /v1/models` and `GET /metrics` take no permit (they are cheap reads of the engine's state; behind long generations
+they waited 8-19 s): they still need the key when one is required, and any body they carry is dropped unread.
 The default comes from measured peaks of the release binary at the recipe's 1M-token context (three runs each, fresh
 process; median and range). Encoding a prompt keeps memory for every byte of it and more for every token: about 120
 bytes a byte for ordinary text, and up to about 360 at one token a byte (digits and punctuation such as `1,1,1`), the

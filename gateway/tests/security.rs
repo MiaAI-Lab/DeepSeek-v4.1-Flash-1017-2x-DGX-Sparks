@@ -933,3 +933,62 @@ async fn a_client_that_stops_reading_a_stream_is_closed_and_gives_its_permit_bac
     assert!(!permit_back_within(&permits, Duration::from_secs(2)).await);
     drop(stalled);
 }
+
+#[tokio::test]
+async fn cheap_reads_take_no_admission_slot_but_still_need_the_key_and_carry_no_body() {
+    // An engine that answers every route and records the size of the body it received.
+    let received = Arc::new(AtomicUsize::new(usize::MAX));
+    let handler = |State(received): State<Arc<AtomicUsize>>, request: Request| async move {
+        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        received.store(body.len(), Ordering::SeqCst);
+        Json(json!({"data": [], "ok": true})).into_response()
+    };
+    let engine = serve(
+        Router::new()
+            .fallback(any(handler))
+            .with_state(Arc::clone(&received)),
+    )
+    .await;
+    // Every admission slot is taken, as by long generations.
+    let semaphore = Arc::new(Semaphore::new(1));
+    let _held = Arc::clone(&semaphore).acquire_owned().await.expect("slot");
+    let url = spawn_gateway(&engine, secured_config(), Arc::clone(&semaphore)).await;
+    let client = reqwest::Client::new();
+    for path in ["/v1/models", "/metrics"] {
+        // Still authenticated.
+        let response = client
+            .get(format!("{url}{path}"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(response.status(), 401, "{path}");
+        // With the key: answered at once, though no slot is free.
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .get(format!("{url}{path}"))
+                .bearer_auth(KEY)
+                .body(vec![b'x'; 1024 * 1024])
+                .send(),
+        )
+        .await
+        .expect("answered without a slot")
+        .expect("request");
+        assert_eq!(response.status(), 200, "{path}");
+        // The 1 MiB body was dropped before the proxy hop.
+        assert_eq!(received.load(Ordering::SeqCst), 0, "{path}");
+    }
+    // Control: a generation still waits for a slot.
+    let pending = tokio::time::timeout(
+        Duration::from_millis(500),
+        client
+            .post(format!("{url}/v1/chat/completions"))
+            .bearer_auth(KEY)
+            .json(&chat_body())
+            .send(),
+    )
+    .await;
+    assert!(pending.is_err(), "a generation was served without a slot");
+}
