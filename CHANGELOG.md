@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `zig/patches/0040-restore-room.patch` (on with `SPILL_GIB` or `KV_SHARD=1`, no switch): a disk restore or a memory
+  resume that the KV pool has no room for while other streams run now gets its room the way a prompt pass does, instead
+  of the prompt running from 0. A restore refused with `ContextFull` goes back to the queue's front and asks again, for
+  `TF_SPILL_LOAD_WAIT_MS` (30 s) at most, then takes what memory holds as before; `/metrics` counts
+  `prompt_cache_restores_room_waits` and `prompt_cache_restores_room_wait_expired`. With `KV_SHARD=1` a restore whose
+  part no eviction frees moves one live stream to the other part first, and, with carries on (the default), a hit its
+  part cannot keep resumes in place (the kept states over its tail give their room, one live stream moves, or it waits
+  up to 10 s) instead of being dropped. While it waits, the request holds the queue as a waiting prompt pass does.
+  Before it, one conversation of about 600K tokens ran from 0 fourteen times in 36 hours on a pair (4 restores, 10
+  hits). Host tests in `lane_host_robust_test.zig` (each also with the prompt pass in pieces and cut-ins),
+  `kv_lanes.zig` and `parts.zig` ("11 room", three mutants). By **[nuk3s](https://github.com/nuk3s)**.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
