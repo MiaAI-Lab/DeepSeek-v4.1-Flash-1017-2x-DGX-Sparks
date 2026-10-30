@@ -1,0 +1,94 @@
+{
+ "id": "chat-tool-results-desorden",
+ "protocol": "chat",
+ "tags": [
+  "tools"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Dos consultas"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_00_aaaaaaaaaaaaaaaaaaaa",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\":\"París\"}"
+      }
+     },
+     {
+      "id": "call_01_bbbbbbbbbbbbbbbbbbbb",
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "arguments": "{\"city\":\"París\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_01_bbbbbbbbbbbbbbbbbbbb",
+    "content": "14:05"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_00_aaaaaaaaaaaaaaaaaaaa",
+    "content": "18"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather by city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_time",
+     "description": "Time by city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "render": {
+   "class": "herramientas",
+   "note": "el gateway y el template del Zig difieren en las líneas antes de ## Tools"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

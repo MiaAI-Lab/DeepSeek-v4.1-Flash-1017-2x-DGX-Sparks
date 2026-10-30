@@ -1,0 +1,24 @@
+{
+ "id": "chat-n-2",
+ "protocol": "chat",
+ "tags": [
+  "errores",
+  "fallback"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "n": 2
+ },
+ "expect": {
+  "render": "fallback",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true,
+ "nota": "el gateway E4 no detecta n!=1 como fallback; el recipe puede ignorarlo"
+}

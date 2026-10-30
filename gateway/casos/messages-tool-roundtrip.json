@@ -1,0 +1,69 @@
+{
+ "id": "messages-tool-roundtrip",
+ "protocol": "messages",
+ "tags": [
+  "tools"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Consulta"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "tool_use",
+      "id": "toolu_01",
+      "name": "get_weather",
+      "input": {
+       "city": "París"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_01",
+      "content": "18"
+     }
+    ]
+   }
+  ],
+  "tools": [
+   {
+    "name": "get_weather",
+    "description": "Weather",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  ],
+  "thinking": {
+   "type": "disabled"
+  }
+ },
+ "expect": {
+  "render": {
+   "class": "herramientas",
+   "note": "el gateway agrega líneas en blanco antes de ## Tools; el Zig no"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

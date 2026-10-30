@@ -1,0 +1,48 @@
+{
+ "id": "chat-tools-required",
+ "protocol": "chat",
+ "tags": [
+  "tools"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "¿Qué tiempo hace en París?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather by city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "tool_choice": "required",
+  "thinking": {
+   "type": "disabled"
+  }
+ },
+ "expect": {
+  "render": {
+   "class": "herramientas",
+   "note": "el gateway agrega líneas en blanco antes de ## Tools; el Zig no"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

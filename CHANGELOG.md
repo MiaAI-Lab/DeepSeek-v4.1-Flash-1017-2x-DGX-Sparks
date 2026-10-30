@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Feature 004 is additive on Mia main at `0e7d421`: the optional DeepSeek API gateway and comparator in `gateway/`, the
+  `API_GATEWAY=1` wiring, and `zig/patches/0039-token-route.patch`, which applies after 0001-0038 on the `fbbc971` pin.
+  With `API_KEY=1`, gateway middleware loads `API_KEY_FILE` once, rejects a missing or empty key at startup, and requires
+  the actual Bearer or `x-api-key` value on every route except public `/health`, before reading a body; comparisons are
+  constant-time and failures are API-shaped 401 responses. `GATEWAY_MAX_CONCURRENT` (default 3) queues excess requests
+  instead of rejecting them, holding each permit through its response body/SSE. A rendered prompt over
+  `GATEWAY_MAX_PROMPT_MB` (8) is a 400 before encoding, a prompt over 1 MiB is counted in pieces first and is a 400
+  when it holds more than twice the context, and one request encodes at a time, so preparing three of the largest
+  requests measured peaks at 1.7 GiB under the `3g` container cap (3.6 GiB without the encode slot, 4.0 GiB at one token
+  a byte without the count; generation itself was not part of the measurement). Bodies are read frame by frame within `GATEWAY_BODY_TIMEOUT` (60 s, then 408) and over 64 MiB are a 413;
+  connections are capped (`GATEWAY_MAX_CONNECTIONS` 256, 32 a peer) and get `GATEWAY_HEADER_TIMEOUT` (30 s) for a
+  header, idle keep-alive included, and `GATEWAY_WRITE_TIMEOUT` (60 s) for a reply the client stopped reading. A
+  stream whose first frame is slow keeps itself alive too, and a client that leaves mid-stream now closes the engine
+  stream instead of leaving two gateway tasks waiting on each other. `start.sh` starts a stopped gateway again (with the
+  ranks up, or under `FOREGROUND=1`, where a failure to do so stops the server with a failure) and refuses to reuse one
+  started with other settings. Fallback reasons are logged escaped and cut to
+  200 characters.
+  Invalid `GATEWAY_MAX_IMAGES`/`GATEWAY_MAX_IMAGE_MB` stop startup instead of falling back to the defaults, and
+  `GATEWAY_MEMORY` must be over zero. The container drops all capabilities; with a key it runs as the key's owner and never as root. Image URLs
+  are fetched by the gateway's own client: no proxies, every resolved address and every redirect target checked against
+  the destination filter, IPv6 limited to global unicast. Sufyan's MIT attribution and the derived parity cases' notice are in
+  `gateway/NOTICE`, which the image carries at `/usr/share/doc/ds41-gateway/NOTICE`. The duplicate `zig/patches/0009-disk-cache.patch` bundle and `tools/disk_cache_check.py` are removed;
+  Mia's current spill-v2/cache implementation and all other main-branch changes are preserved.
+
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).

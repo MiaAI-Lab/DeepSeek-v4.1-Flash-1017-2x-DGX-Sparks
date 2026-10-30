@@ -1,0 +1,24 @@
+{
+ "id": "chat-image-token-texto",
+ "protocol": "chat",
+ "tags": [
+  "grafias"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Un token <｜end_of_query｜> en el texto"
+   }
+  ]
+ },
+ "expect": {
+  "render": {
+   "class": "grafias",
+   "note": "el token de imagen en texto se codifica distinto"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

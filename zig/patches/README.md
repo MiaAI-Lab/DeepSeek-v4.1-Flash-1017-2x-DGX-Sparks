@@ -41,6 +41,7 @@ them there the same way.
 | `0037-rendezvous-ports-early.patch` | `TF_DS_CONNECT_S` (both ranks; seconds, default 300) | **on** | rank 0 opens its follower's port before its weights load and takes the connection afterwards, so a worker that finishes loading first waits in the port's backlog instead of exiting with `ConnectFailed` once its 300 s retry window ends |
 | `0038-aligned-index-views.patch` | none (always on) | **on** | the prompt pass's index row blocks are a multiple of 16 rows and a replay cut's positions start on a 16-byte boundary, the alignment the kit's index kernels were captured for (an odd block size had no matching kernel variant: `MissingTritonVariant`); not run on a pair, compare replies with `tools/exact.py` |
 
+| `0039-token-route.patch` | `TENSORFOLD_TOKEN_ROUTE=1` (server); `TF_DS_API_EFFORTS=1` (engine, both ranks) | off | serves `POST /inference/v1/generate` (vLLM token-in/token-out) and the route's extensions, behind `TENSORFOLD_TOKEN_ROUTE`; its logprobs serve only on a host that reports them (`/health` `features.logprobs`; the CUDA host does not yet); with `TF_DS_API_EFFORTS=1` the engine reports the API's reasoning-effort table (minimal 50, low 50, medium 75, high 75, xhigh 75, max 100) instead of the lane's. Feature 004's patch, rebased onto `fbbc971` after `0001`-`0038` |
 
 **Rebase onto `fbbc971` (28-oct-2026, eleata).** The pin moved from `629c524` to `fbbc971` (the `deepseek-v41-zig` tip of
 2026-10-23). `0002` is gone: the engine's `TF_DS_ENGRAM_LEAD=1` (`9673a5e`) reads each Engram layer's prompt rows a chunk

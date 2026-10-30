@@ -123,6 +123,28 @@ Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after t
 - [The engine](docs/zig-engine.md), [systemd](docs/systemd.md), [Hermes Agent](docs/hermes-agent.md), [fork deploys](docs/FORK-DEPLOY.md)
 - [Engine patches](zig/patches/README.md), [CHANGELOG](CHANGELOG.md), [CREDITS](CREDITS.md)
 
+## DeepSeek API parity (gateway)
+
+`gateway/` is `ds41-gateway`, a Rust front end for DeepSeek's API in front of TensorFold's token-in/token-out route.
+It converts Chat Completions, Messages and Responses requests with DeepSeek's `deepseek-recipe` 0.2.0 library, renders
+and encodes the prompt, calls `POST /inference/v1/generate` on the engine, and turns the token stream back into the
+API's body or SSE. Requests that the conversion cannot represent faithfully, and fields only the Zig server knows, go to
+the engine unchanged with `x-ds41-gateway: fallback` and one log line with the reason; `GATEWAY_STRICT=1` returns the
+API's 400 instead. The engine's other routes (`/v1/models`, `/tokenize`, `/metrics`, `/health`, ...) are proxied as they
+are. The gateway is off by default: with `API_GATEWAY=0` (the default) the recipe behaves as before; the only output
+difference is the derived engine image tag, which changes when 0039 enters `zig/patches/`.
+
+**Turn it on.** Put `API_GATEWAY=1` in `scripts/local.sh` and run `./start.sh` (or `./start.sh restart`). The engine
+then listens on `127.0.0.1:ENGINE_PORT` (default 8887) with `TENSORFOLD_TOKEN_ROUTE=1`, and the gateway listens on
+`HOST:PORT` (default `0.0.0.0:8888`). `scripts/prepare.sh` builds the gateway image from `gateway/Dockerfile` when the
+image for that folder's hash is missing; it is a separate, CPU-only image. `start.sh` waits for the engine, starts the
+gateway, waits for `/health`, runs the smoke test through the gateway and a second one against the engine's own API
+(with `FOREGROUND=1` it attaches once the gateway is healthy and skips both, as it skips the smoke test without the
+gateway), and `stop.sh` removes the gateway first, saving its log.
+
+Authentication, admission and memory limits, the settings, the fallback, the known limits and the parity battery are in
+[docs/api-gateway.md](docs/api-gateway.md); the gateway's own flags in [gateway/README.md](gateway/README.md).
+
 ## Repository layout
 
 ```

@@ -5,7 +5,7 @@
 #   1. preflight: docker and the GPU on both Sparks, key-based ssh, the link between them
 #   2. the engine image on this Spark (zig/Dockerfile: BertholomusAI's TensorFold fork at TF_REF plus zig/patches, and
 #      the inputs' tools of the fork's four-node branch at INPUTS_REF, on BASE_IMAGE), then on the worker
-#      (docker save | docker load: only what it lacks is stored)
+#      (docker save | docker load: only what it lacks is stored); with API_GATEWAY=1 also the gateway image here
 #   3. the checkpoint into HF_CACHE (~196 GiB, resumable), at its pinned revision, and Engram's two tables, the base
 #      model's shards 47 and 48 (~203 GB) with its index and config, at theirs
 #   4. the kernel kit: BertholomusAI's kit/ at KIT_REF, its RoPE tables and image routing bias made from the checkpoint,
@@ -101,6 +101,19 @@ if [[ "$(worker_image_ident 1 "$IMAGE")" != "$ident" ]]; then
   [[ "$(worker_image_ident 1 "$IMAGE")" == "$ident" ]] || die "$(worker_host 1)'s $IMAGE differs from this Spark's"
 fi
 log "Image $IMAGE identical on both Sparks"
+
+# 2b. the gateway image (API_GATEWAY=1): a separate image, built here only, no GPU and no Python. The tag carries a hash
+# of gateway/, so a changed gateway rebuilds; an existing image of that hash is left alone.
+if [[ "$API_GATEWAY" == 1 ]]; then
+  [[ -f gateway/Dockerfile ]] || die "gateway/Dockerfile is missing (API_GATEWAY=1 needs the gateway/)"
+  if docker image inspect "$GATEWAY_IMAGE" >/dev/null 2>&1; then
+    log "Gateway image $GATEWAY_IMAGE already built (hash $(gateway_hash))"
+  else
+    log "Building $GATEWAY_IMAGE (Rust 1.97, no GPU, no Python; context gateway/)"
+    docker build -f gateway/Dockerfile -t "$GATEWAY_IMAGE" --build-arg GATEWAY_HASH="$(gateway_hash)" gateway/ ||
+      die "could not build the gateway image $GATEWAY_IMAGE"
+  fi
+fi
 
 # ---------------------------------------------------------------- 3. the checkpoint and Engram's tables
 command -v hf >/dev/null || die "the Hugging Face CLI ('hf') is not installed on this Spark: pip install -U huggingface_hub"

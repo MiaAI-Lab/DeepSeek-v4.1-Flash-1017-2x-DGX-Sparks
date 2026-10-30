@@ -1,0 +1,38 @@
+{
+ "id": "chat-tools-sin-argumentos",
+ "protocol": "chat",
+ "tags": [
+  "tools"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "¿Qué tiempo hace en París?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "ping",
+     "description": "Ping",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "tool_choice": "auto"
+ },
+ "expect": {
+  "render": {
+   "class": "herramientas",
+   "note": "el gateway y el template del Zig difieren en las líneas antes de ## Tools"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

@@ -1,0 +1,33 @@
+{
+ "id": "messages-clear-thinking-20251015-all",
+ "protocol": "messages",
+ "tags": [
+  "thinking"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "thinking": {
+   "type": "disabled"
+  },
+  "context_management": {
+   "edits": [
+    {
+     "type": "clear_thinking_20251015",
+     "keep": "all"
+    }
+   ]
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true,
+ "nota": "MiaAI-Lab PR #71: the clear_thinking edit a coding client sends mid-conversation; the cloud accepts both dates and both keep values."
+}

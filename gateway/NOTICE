@@ -1,0 +1,34 @@
+ds41-gateway: third-party attribution
+
+Sufyan's reference vLLM gateway
+  DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark
+  https://github.com/sfxnz/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark
+  Author: Sufyan (@sfxnz), https://github.com/sfxnz
+
+The token-route/fallback design and invariants follow Sufyan's (@sfxnz) gateway in that repository. The parity cases
+in gateway/casos and gateway/src/paridad are derived from Sufyan's tests/api_eval.py and tools/api_eval_fixtures.py in
+it. Those cases, here and in the image's /casos, carry the following MIT License notice; the gateway's original code
+remains Apache-2.0 under the repository's LICENSE. The ds41-gateway image carries this file at
+/usr/share/doc/ds41-gateway/NOTICE.
+
+MIT License
+
+Copyright (c) Sufyan (@sfxnz) and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

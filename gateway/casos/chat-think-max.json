@@ -1,0 +1,26 @@
+{
+ "id": "chat-think-max",
+ "protocol": "chat",
+ "tags": [
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "thinking": {
+   "type": "enabled"
+  },
+  "reasoning_effort": "max"
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

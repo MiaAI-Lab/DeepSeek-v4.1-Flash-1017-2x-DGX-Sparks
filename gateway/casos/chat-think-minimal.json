@@ -1,0 +1,29 @@
+{
+ "id": "chat-think-minimal",
+ "protocol": "chat",
+ "tags": [
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "thinking": {
+   "type": "enabled"
+  },
+  "reasoning_effort": "minimal"
+ },
+ "expect": {
+  "render": {
+    "class": "esfuerzo",
+    "note": "la plantilla del Zig asigna 25 a minimal; la API 50"
+   },
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

@@ -1,0 +1,74 @@
+{
+ "id": "chat-tools-think-turno2",
+ "protocol": "chat",
+ "tags": [
+  "tools",
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "¿Qué tiempo hace en París?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Voy a consultar.",
+    "tool_calls": [
+     {
+      "id": "call_00_abcdefghijklmnopqrst0000",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\":\"París\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_00_abcdefghijklmnopqrst0000",
+    "content": "{\"temperature_c\": 18}"
+   },
+   {
+    "role": "user",
+    "content": "¿Y mañana?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather by city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "thinking": {
+   "type": "enabled"
+  },
+  "reasoning_effort": "high"
+ },
+ "expect": {
+  "render": {
+   "class": "herramientas",
+   "note": "el gateway y el template del Zig difieren en las líneas antes de ## Tools"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

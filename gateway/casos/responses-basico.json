@@ -1,0 +1,23 @@
+{
+ "id": "responses-basico",
+ "protocol": "responses",
+ "tags": [
+  "basico"
+ ],
+ "body": {
+  "input": "Hola @script=plain",
+  "reasoning": {
+   "effort": "none"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": {
+   "invariants": true,
+   "same_ids": true
+  }
+ },
+ "greedy": true,
+ "nota": "el guion del fake_serve deja <|im_end|> y un evento de error; el invariante estricto lo marca"
+}

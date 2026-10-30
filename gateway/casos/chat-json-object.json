@@ -1,0 +1,27 @@
+{
+ "id": "chat-json-object",
+ "protocol": "chat",
+ "tags": [
+  "formato"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Devuelve JSON"
+   }
+  ],
+  "response_format": {
+   "type": "json_object"
+  }
+ },
+ "expect": {
+  "render": {
+   "class": "formato",
+   "note": "el Zig /tokenize no renderiza response_format"
+  },
+  "cache": "different-by-design",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

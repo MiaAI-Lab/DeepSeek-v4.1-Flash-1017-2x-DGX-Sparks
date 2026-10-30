@@ -1,0 +1,49 @@
+{
+ "id": "chat-tools-required-think",
+ "protocol": "chat",
+ "tags": [
+  "errores",
+  "tools",
+  "thinking",
+  "fallback"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Consulta"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather by city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "tool_choice": "required",
+  "thinking": {
+   "type": "enabled"
+  }
+ },
+ "expect": {
+  "render": "fallback",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true,
+ "nota": "el recipe exige thinking off con tool_choice required; el proxy es E5"
+}

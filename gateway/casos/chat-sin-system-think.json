@@ -1,0 +1,25 @@
+{
+ "id": "chat-sin-system-think",
+ "protocol": "chat",
+ "tags": [
+  "thinking",
+  "effort"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   }
+  ],
+  "thinking": {
+   "type": "enabled"
+  }
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

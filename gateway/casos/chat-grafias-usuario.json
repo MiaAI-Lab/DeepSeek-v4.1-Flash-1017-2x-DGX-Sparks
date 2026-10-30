@@ -1,0 +1,21 @@
+{
+ "id": "chat-grafias-usuario",
+ "protocol": "chat",
+ "tags": [
+  "grafias"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Signos: ！？…—～·「」『』【】〈〉《》〔〕（）［］｛｝“”‘’、。，；："
+   }
+  ]
+ },
+ "expect": {
+  "render": "identical",
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

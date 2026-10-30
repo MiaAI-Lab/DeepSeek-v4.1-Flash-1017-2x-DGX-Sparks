@@ -98,6 +98,19 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   two ranks' launch commands in `start.sh` are BertholomusAI's, from their recipe's README ("Run it (v0.6.0, the Zig
   engine)").
 
+## API front end and comparator
+
+- **[DeepSeek](https://github.com/deepseek-ai)**: the `deepseek-recipe` Rust library (MIT), the API front end's
+  conversion and prompt rendering, used as it is; the copy of the 1017 tokenizer under `static/tokenizers/v41` is used
+  only in the tests.
+- **[Sufyan (@sfxnz)](https://github.com/sfxnz)**: the reference vLLM gateway
+  [`DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark`](https://github.com/sfxnz/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark)
+  (MIT): the design of the gateway over the token-in route, its fallback, its invariants and the parity cases derived from
+  `tests/api_eval.py` and `tools/api_eval_fixtures.py`. The attribution and MIT notice are in `gateway/NOTICE`.
+- **[vLLM](https://github.com/vllm-project/vllm)** (Apache-2.0): the `/inference/v1/generate` token-in/token-out contract
+  between the gateway and the engine.
+- **eleata**: the gateway and the comparator in `gateway/` were written for this recipe (Apache-2.0).
+
 ## Scripts
 
 - The scripts' structure, the layered settings (`scripts/config.sh`), the node discovery and NFS volumes

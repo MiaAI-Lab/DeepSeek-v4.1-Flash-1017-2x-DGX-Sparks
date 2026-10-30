@@ -51,5 +51,11 @@ GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
   code by webzone, Alexbob0, john, Eduardo Florencio and Steve Darlow (see CREDITS.md). scripts/memguard.sh, bench.py and
   smoke.py are written for this project.
 
+Sufyan's reference vLLM gateway and derived parity cases
+  https://github.com/sfxnz/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw-vLLM-2x-DGX-Spark
+  By Sufyan (@sfxnz, https://github.com/sfxnz). MIT License. The gateway's token-route/fallback design, invariants and
+  cases derived from tests/api_eval.py and tools/api_eval_fixtures.py keep this attribution. The full MIT notice is in
+  gateway/NOTICE and is included in the gateway image.
+
 NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
   The image's base, under NVIDIA's container license and its components' own licenses.

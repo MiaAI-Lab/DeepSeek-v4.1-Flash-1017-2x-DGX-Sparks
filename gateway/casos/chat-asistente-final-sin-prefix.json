@@ -1,0 +1,28 @@
+{
+ "id": "chat-asistente-final-sin-prefix",
+ "protocol": "chat",
+ "tags": [
+  "multi"
+ ],
+ "body": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hola"
+   },
+   {
+    "role": "assistant",
+    "content": "Hola"
+   }
+  ]
+ },
+ "expect": {
+  "render": {
+   "class": "largo",
+   "note": "el gateway termina con un salto de línea que el Zig no"
+  },
+  "cache": "equivalent",
+  "e2e": "n/a"
+ },
+ "greedy": true
+}

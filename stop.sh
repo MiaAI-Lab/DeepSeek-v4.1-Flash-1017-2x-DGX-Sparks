@@ -19,6 +19,37 @@ cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
 source ./scripts/nodes.sh
 
+# The requests still running, asked on PORT before anything stops (with the gateway, it is the one on PORT and its
+# /health carries the engine's).
+if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; then
+  api_host="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && api_host=127.0.0.1
+  [[ "$api_host" == *:* ]] && api_host="[$api_host]"
+  busy=$(curl -s --max-time 3 "http://$api_host:$PORT/health" 2>/dev/null |
+         python3 -c 'import json,sys; d = json.load(sys.stdin); print((d.get("live") or {}).get("connections", d.get("requests_running", 0)))' 2>/dev/null || echo 0)
+  (( busy == 0 )) || warn "$busy request(s) still running will be cut off"
+fi
+
+# The gateway first: it is the API clients hold, and its log says why it stopped. With API_GATEWAY=0 and no gateway
+# container this block prints nothing, as before. One that cannot be removed does not keep the ranks from stopping:
+# stop.sh goes on and exits 1 at the end.
+gateway_left=0
+gateway=0; docker ps -a --format '{{.Names}}' | grep -qx ds41-gateway && gateway=1
+if (( gateway )); then
+  if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    log "DRY_RUN=1: would stop and remove ds41-gateway first (up to ${STOP_TIMEOUT:-30}s); nothing is stopped"
+    printf '[dry-run] gateway here:\n  docker stop -t %s ds41-gateway; (its log saved to %s); docker rm -f ds41-gateway\n' "${STOP_TIMEOUT:-30}" "$LOG_DIR"
+  else
+    docker stop -t "${STOP_TIMEOUT:-30}" ds41-gateway >/dev/null 2>&1 || true
+    saved=$(save_log "$LOG_DIR" gateway ds41-gateway "$LOG_KEEP") || warn "could not save the gateway's log to $LOG_DIR"
+    if docker rm -f ds41-gateway >/dev/null 2>&1; then
+      log "Stopped and removed the gateway${saved:+; its log: $saved}"
+    else
+      warn "could not remove ds41-gateway: stopping the ranks anyway"
+      gateway_left=1
+    fi
+  fi
+fi
+
 # Where the containers are: here (rank 0) and on the workers (rank i on worker i). A Spark whose containers could
 # not be listed (ssh or docker ps failed) may still run its rank: unknown=1, and stop.sh fails (exit 1).
 unknown=0
@@ -56,7 +87,7 @@ if (( here == 0 && any == 0 )); then
   [[ "${DRY_RUN:-0}" == 1 ]] || memguard_stop
   if (( nw <= 1 )); then log "No container named $CONTAINER_NAME on either Spark: nothing to stop"
   else log "No container named $CONTAINER_NAME on any Spark: nothing to stop"; fi
-  exit 0
+  exit "$gateway_left"
 fi
 if (( nw <= 1 )); then
   where="on both Sparks"; (( any )) || where="here"; (( here )) || where="on the worker"
@@ -66,13 +97,6 @@ else
   where=$(paste -sd, <<<"$where" | sed 's/,/, /g')
 fi
 
-if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; then
-  api_host="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && api_host=127.0.0.1
-  [[ "$api_host" == *:* ]] && api_host="[$api_host]"
-  busy=$(curl -s --max-time 3 "http://$api_host:$PORT/health" 2>/dev/null |
-         python3 -c 'import json,sys; d = json.load(sys.stdin); print((d.get("live") or {}).get("connections", d.get("requests_running", 0)))' 2>/dev/null || echo 0)
-  (( busy == 0 )) || warn "$busy request(s) still running will be cut off"
-fi
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   log "DRY_RUN=1: would stop and remove $CONTAINER_NAME $where (up to ${STOP_TIMEOUT:-30}s); nothing is stopped"
   if (( here )); then printf '[dry-run] rank 0 here:\n  docker stop -t %s %s; (its log saved to %s); docker rm -f %s\n' "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" "$LOG_DIR" "$CONTAINER_NAME"; fi
@@ -109,6 +133,6 @@ for i in $workers; do if (( there[i] )); then stop_worker "$i" & wpids+=($!); fi
 if (( here )); then stop_here; fi
 failed=0
 for p in "${wpids[@]}"; do wait "$p" || failed=1; done
-(( failed == 0 && unknown == 0 )) || exit 1            # a warning above said what is left
+(( failed == 0 && unknown == 0 && gateway_left == 0 )) || exit 1   # a warning above said what is left
 [[ "${DRY_RUN:-0}" == 1 ]] || memguard_stop            # the memory guards (start.sh starts them) have nothing left to watch
 log "Stopped and removed $CONTAINER_NAME $where; its GPU memory is free again"
