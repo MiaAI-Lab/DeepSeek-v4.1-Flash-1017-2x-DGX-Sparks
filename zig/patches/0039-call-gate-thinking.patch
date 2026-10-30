@@ -1,0 +1,53 @@
+From: markyu0401 <markyu0401@users.noreply.github.com> Mon Sep 17 00:00:00 2001
+From: markyu0401 <markyu0401@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 21:40:00 -0400
+Subject: [PATCH] dsv41 server: a thinking request does not take the call gate
+
+`tool_choice: "required"` (or a named function) on a thinking request opens its reasoning with a stray token: on the
+current image (`tensorfold-dsv41:exl3-tp2-7d71dcdf7f2f`, engine `fbbc971` + this series) the first token of the reply
+is the backend's per-request draw handle, not the drawn token — `return_token_ids` shows it climbing by exactly one per
+request (506, 607, ... 1109 over 600 requests), independent of the prompt (278, 293 and a random-nonce prompt all
+continue the same run), and past 1024 (so it is not the `drawn` ring's index either). `tool_choice: "auto"` on the same
+prompt returns the real token (128822 for the `Say hello.` prompt), and `required` with `enable_thinking: false` returns
+the gate's opener (id 30, `<`) every time. Drafts on and off make no difference (`draft: false` still shows it), and
+`/v1/tokenize` returns identical ids for `auto` and `required`, so the prompt and the sampling are the same: the gate's
+first-token path, not the prompt, is what differs.
+
+Issue #80 has the same symptom on the older image (its counter is the same handle). Until that path is fixed, a thinking
+request does not take the gate: the model opens the call itself after its think block — `tool_choice: "auto"` returns the
+same `finish_reason: "tool_calls"` call on the same request — and its reasoning is clean. A reply that starts outside a
+think block keeps the gate, which is where it already works (the opener is forced, id 30).
+
+What changes: a request with `tool_choice: "required"` or a named function **and** thinking on no longer sets
+`request.call`, so the engine runs it as `auto`. Its reply is the model's own: a tool call when the model makes one, text
+otherwise. `auto`, `none`, absent `tool_choice`, and every non-thinking `required`/named request are unchanged.
+
+Verified on a pair (`tensorfold-dsv41:exl3-tp2-b8825cd47726`, built from this patch after `0038`; `./start.sh restart`
+exit 0, health `warming: false`, both Sparks on the same image): six one-token `required` + thinking requests return
+128822, the id `auto` returns, where the old image returned 1130, 1131, ...; `required` + `enable_thinking: false` still
+returns the opener (id 30) six times; and a `required` reply on `What is 17 times 23? Think it through step by step, then
+call get_time.` has clean reasoning (`We need answer 17*23 step by step ...`), the right answer (391) and
+`finish_reason: "tool_calls"` with `get_time` — the same ids, reasoning and content as the `auto` reply. `auto` and the
+non-thinking paths return the same ids as before, and the patch touches no sampler or round-loop code, so drafted and
+plain replies are unaffected. The patch applies with `git apply` after `0038` on a clean `TF_REF`.
+---
+ zig/src/server/server.zig | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 5cc8776..c41a3b3 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -166,7 +166,11 @@ pub const Server = struct {
+     pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
+         _ = prompt_ids;
+         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
+-        if (has_tools and required) {
++        // A thinking request does not take the call gate: the gate's first-token path commits the backend's handle
++        // instead of the draw (issue #80), so its reasoning opens with a stray token. The model opens the call itself
++        // after the think block — tool_choice "auto" returns the same call — and the gate stays for a reply that starts
++        // outside one.
++        if (has_tools and required and !thinking) {
+             const form = try srv.callForm(cx);
+             const opener = if (form) |fm| oneToken(srv, cx.a, fm.opener) else null;
+             if (opener == null) return cx.refuse("tool_choice \"required\" or a named function needs a chat template that marks tool calls (<tool_call> or <|tool_call>), and this one does not: send \"auto\"");
