@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `zig/patches/0042-kv-shard-pieces.patch` (no switch of its own): with `KV_SHARD=1` a prompt pass runs in pieces, so
+  `TF_FILL_CHUNKS`, `TF_FILL_CUT_IN` and the rest work with KV sharding. Before, `Lanes.prefillPart` ran every sharded
+  pass whole: a short request waited for a cold long prompt (25.7 s for one sent 8 s into a 70K-token prompt; 0.37-0.5 s
+  with `0042` and `TF_FILL_CHUNKS=1 TF_FILL_CUT_IN=8192`, the long reply's tokens unchanged), and
+  `TF_FILL_CHUNKS` still turned `0005`'s interleave off. A pass keeps its extent and part between its pieces; its
+  borrowed twins are pinned only while a chunk runs, so a placement between two pieces may give them back (the pass
+  then fetches). A pass a short prompt cut into binds its twins again as it resumes, on rank 0 and on the follower at
+  the `fill_resume` frame: before, the planner's fill stayed the cut-in's, and the cut-in's first decode round would
+  have re-made the view at the cut-in's extent on the paused pass's slot. Without `TF_FILL_*` nothing changes. By
+  **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)**.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
