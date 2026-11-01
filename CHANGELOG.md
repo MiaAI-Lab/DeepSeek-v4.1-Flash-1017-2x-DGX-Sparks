@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `zig/patches/0043-picture-resume-skip.patch` (always on, issue #90): a prompt pass that resumes a kept state no longer runs
+  the vision tower for, or sends rank 1 the rows of, the pictures wholly before the kept state's end. Since the pin
+  moved to `fbbc971`, every turn of a conversation that carries pictures re-ran the tower on all of them and sent all
+  their rows across, ~5.5 s per request on a pair regardless of the prompt's length, although those rows are never read
+  (embedding, image routing and the Engram mask only touch the spans that overlap the chunk being computed). `0021`
+  skipped them on the `629c524` pin (`pictureNeedsRows`); the rebase onto `fbbc971` kept the helper and its test but
+  lost the call in `fillOpen`, which this restores. Pictures that straddle the resume point, and passes that do not
+  resume, are handled as before.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).

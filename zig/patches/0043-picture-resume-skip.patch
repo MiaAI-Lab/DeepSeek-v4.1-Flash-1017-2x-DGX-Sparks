@@ -1,0 +1,50 @@
+From 02d4403a9631becc9bc16eb54b3d1ad70dae1c4f Mon Sep 17 00:00:00 2001
+From: laidick <laidick@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 21:24:22 +0800
+Subject: [PATCH] dsv41: a resumed prompt pass skips the pictures its kept
+ state already holds
+
+A prompt with pictures resumes a kept state (the cache keys a picture's positions by its payload's SHA-256), but
+fillOpen runs the vision tower for every picture of the prompt and sends all their rows to rank 1 (fill_images),
+the ones wholly before the resume point included. Those rows are never read: embedSpans, routeSpans and the Engram
+mask only touch the spans that overlap the chunk being computed, and a resumed pass computes from the kept state's
+end. So every turn of a conversation that carries pictures pays the tower and the transfer for all of them again,
+~5.5 s per request on a pair whatever the prompt's length (issue #90).
+
+0021 had the skip on the 629c524 pin: fillOpen marked each picture with markPicture and continued past it when
+!pictureNeedsRows(img.at, img.tokens, resume_at). The rebase onto fbbc971 (b478ccc) kept both helpers and their
+test, but the call site went back to the engine's inline marking with no skip, so pictureNeedsRows is only reached
+from its test. This restores the call site as 0021 had it. resume_at is the end of the kept state the pass
+restores (pp.kept with KV_SHARD=1, s.reuse.saved otherwise), read after the stale check that drops it, so the
+skipped rows are exactly the rows the restore brings back. Pictures that straddle the resume point, and every
+picture of a pass that does not resume, get their rows as before.
+---
+ zig/src/families/dsv41/lanes.zig | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index eaab37f8..beade53f 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -937,12 +937,13 @@ pub const Lanes = struct {
+             const image_id = m.cfg.image_token orelse return error.NoVision;
+             const row_bytes = m.cfg.hidden * 2;
+             var at_row: usize = 0;
++            // a resumed pass starts at the kept state's end: a picture wholly before it is already in the state (its
++            // positions stay dead in the sequence for Engram's n-grams, but it needs no rows, no run of the tower and no
++            // fill_images frame; pictureNeedsRows)
++            const resume_at: usize = if (kept) |sn| sn.at else 0;
+             for (s.images) |img| {
+-                if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
+-                for (seq.items[img.at..][0..img.tokens]) |*q| {
+-                    if (q.* != @as(i64, image_id)) return error.BadImageSpan;
+-                    q.* = -1;
+-                }
++                try markPicture(seq.items, img.at, img.tokens, image_id);
++                if (!pictureNeedsRows(img.at, img.tokens, resume_at)) continue;
+                 if (img.rows) {
+                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
+                     try rows.appendSlice(gpa, img.bytes);
+-- 
+2.47.1
+
