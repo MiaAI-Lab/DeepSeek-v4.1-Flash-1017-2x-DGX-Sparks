@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- `zig/patches/0044-step-ahead.patch` and `STEP_AHEAD` (off by default): when a reply ends and nothing else runs or waits,
+  rank 0 reads the reply ahead while the client runs its tools, so an agent's next request resumes past its own previous
+  reply. #66's patch rebased onto `fbbc971` and `0001`-`0038`, with the review fixes from #66 (a finished job leaves
+  `admitted` before it is freed, also with the switch off; a pass counts waiting requests and never parks), and off while
+  `TF_FILL_CHUNKS` is set. Supersedes #66.
 
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
