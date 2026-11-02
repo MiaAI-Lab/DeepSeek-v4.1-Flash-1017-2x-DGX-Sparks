@@ -6,6 +6,8 @@
   it computes past the kept state it resumes fit `TF_FILL_CUT_IN`, not its whole length; a turn of a 300K-token conversation with 1.5K
   new tokens now cuts in. A prompt with pictures cuts in when every picture is inside that kept state (no tower run, no rows: the
   `pictureNeedsRows` test). Unchanged: one cut-in at a time, none into a pass with pictures, and a prompt that needs picture rows waits.
+  The bound stays hard: if the kept state is gone when the pass opens (stale, or no room to move it), dsv41's `fillOpen` refuses the
+  cut-in (`error.FillBusy`) before anything changes, and it waits for the pass in pieces as a long prompt does (it used to be dropped).
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
