@@ -18,6 +18,12 @@ What was checked on a pair of Sparks, and how it was measured. The headline deco
   result, image, a 21,875-token prompt, 8 of 8 concurrent replies equal to their solo runs); two 30K-token cold prompts at once
   with short requests arriving during both (1.2-3.5 s each) and a client leaving mid-prompt leave the pair healthy; a short
   request sent 8 s into a 70K-token cold prompt takes 3.84 s (26 s without the `TF_FILL_*` switches).
+- On the pair, with `tensorfold-dsv41:exl3-tp2-9d0f4a04af7f` (2 November 2026, engine `fbbc971` and the 34 patches with `0046`, 24.9 GB,
+  the recipe's default settings): `tools/claims/0046-server-get-delete-body-discard.sh` exits 0. On `7d71dcdf7f2f` it exits 1: the request
+  after a body-carrying `GET` answers `501 Unsupported method ('probe=0044&scanner=1GET')`. The replies of the 39 prompts of
+  `tools/exact.py` are identical to those of `7d71dcdf7f2f`, recorded the same day with the same settings; `tools/smoke.py` passes, and so
+  does `tools/validate.py` (its video check skipped: no PyAV where it ran). After the load, 6.3 GiB was available on the head and 8.0 GiB on
+  the worker. Chunked and malformed bodies were not tried, replies were not compared with `DRAFTS=0`, and speed was not re-measured.
 - `tf-dsv41-rank-cache` plans the TP=2 split: run on a copy of the real headers (tensor bytes left out) of an earlier 43-shard
   2.9 bpw EXL3 checkpoint with the same tensor widths, it gives each rank 143,770 entries and 98.9 GiB, the ~98 GiB a
   Spark the weights need. (Not re-run on the 39-shard checkpoint.)
