@@ -1,0 +1,62 @@
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 015136a0b..e3653cfeb 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -165,6 +165,14 @@ pub const Rule = struct {
+         return best;
+     }
+ 
++    /// A stream's first drafts after its prompt: with node probabilities the head's full depth, as `headDepth` asks
++    /// every later round (no round of the stream is measured yet, and the learned tables are empty after boot: the
++    /// first request after boot would otherwise draft shallower than the same request warm).
++    pub fn openDepth(r: *Rule, who: Who) !i64 {
++        if (r.node_probabilities) return @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
++        return r.depth(who);
++    }
++
+     /// One draft after `wait` plain rounds in a row; each probe doubles the wait until drafting wins again.
+     fn probePlain(r: *Rule, st: *State) bool {
+         st.plain = (st.plain orelse 0) + 1;
+@@ -269,3 +277,29 @@ test "depth picks the most tokens a ms and probes deeper" {
+     const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
+     try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+ }
++
++test "the first drafts after a prompt take the head's depth with node probabilities, measured rounds or not" {
++    const gpa = std.testing.allocator;
++    var fc: Table = .{};
++    defer fc.deinit(gpa);
++    const served = [_]f64{ 25.72, 28.72, 31.72, 33.38, 34.29, 35.17 };
++    for (served, 1..) |ms, w| try fc.put(gpa, @intCast(w), ms);
++    const shared: Table = .{};
++    const prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6 };
++    for ([_]bool{ true, false }) |node| {
++        var rule: Rule = .{ .gpa = gpa, .prior = &prior, .most_drafts = 5, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 3.5, .plain_guard = false, .node_probabilities = node, .batch_rows = 16 };
++        defer rule.deinit();
++        var st: ?State = null;
++        defer if (st) |*s| s.deinit(gpa);
++        const who: Who = .{ .state = &st, .draft_room = 160, .finished = false, .forced = false };
++        const cold = try rule.openDepth(who); // nothing measured: the table plus a step a draft
++        for (1..6) |d| try rule.observeCost(@intCast(d), served[d], false, who); // warm: measured rounds by drafts
++        const warm = try rule.openDepth(who);
++        if (node) {
++            try std.testing.expectEqual(@as(i64, 5), cold);
++            try std.testing.expectEqual(@as(i64, 5), warm);
++        } else {
++            try std.testing.expectEqual(@as(i64, 5), warm);
++        }
++    }
++}
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 030743f8c..22c56905a 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -164,7 +164,7 @@ pub const Engine = struct {
+         var asked: ?u32 = null;
+         if (e.cfg.family_mtp and s.drafts) {
+             // the head reads the prompt's last row and the first token, and drafts the one after it
+-            const d: u32 = if (s.gate != null and s.force.items.len > 0) 0 else @intCast(try e.rule.depth(win.who(s)));
++            const d: u32 = if (s.gate != null and s.force.items.len > 0) 0 else @intCast(try e.rule.openDepth(win.who(s)));
+             asked = d;
+             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
+             s.dropHeld(e.gpa);

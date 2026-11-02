@@ -39,6 +39,7 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   connection cannot hand those bytes to the next request) was authored by **Christopher A. Williamson** ([cawilliamson](https://github.com/cawilliamson)) in
   [pull request #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37) of the 4-Spark recipe, where it is `0044`
   (commit [`0430154`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37/commits/0430154e85ed00702a76989f7ba83282eb3eefd8)); carried as sent, renumbered.
+- **`zig/patches/0049-first-draft-depth.patch`** (a stream's first drafts after its prompt take the head's depth) was authored by **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) in [pull request #104](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/104), ported from his own engine line onto the pinned engine.
 - **`tools/claims/0046-server-get-delete-body-discard.sh`** (checks that patch on a running server) was written by **Hector Isaza**
   ([hecisaza](https://github.com/hecisaza)) with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit), in
   [hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold)
