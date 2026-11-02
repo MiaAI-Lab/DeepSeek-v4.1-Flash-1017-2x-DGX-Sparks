@@ -1,0 +1,2023 @@
+From 2b35d81dd5a528784c9bcdfab3cfbc42dcf25f87 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 11:03:09 +0000
+Subject: [PATCH] server: DeepSeek-V4.1 DSML tool calls stream as they decode
+
+The chat stream, and the /v1/messages and /v1/responses streams made from it, sent a DSML call only at the end of
+the reply: commit gave the call streamer only tool_parse.beforeDsml(answer), and openai.stream sent the parsed calls
+whole at the finish. Measured on a pair, 2026-10-31, one Write call: through LiteLLM's /v1/messages its 869
+characters of arguments came as one input_json_delta after 4.1 s without an event (the engine's own /v1/messages:
+885 characters in one delta after 7.2 s). A vLLM server with another model (Qwen3.6) sent its Write call through the
+same gateway as 59 deltas over 1.6 s. LiteLLM makes input_json_delta from the OpenAI arguments deltas, and an agent
+client's live token counter adds characters/4 for each delta, so the counter stopped during every tool call and
+jumped at its end.
+- tool_stream.Dsml (Streamer.feedDsml): commit gives it the answer each round, never the reasoning. It makes each
+  search that tool_parse.dsml41Calls makes on the finished reply, on the text so far, and a search whose closer has
+  not come yet waits. A call's header (index, id, type, name, empty arguments) goes out when its invoke name is whole
+  and the parse takes the invoke: an offered tool under its offered spelling, any other tool under the model's name
+  (fbbc971 returns such calls). A string value goes out as JSON-escaped pieces while it decodes. A tail that can begin
+  its closer, or a character that is not whole, waits. Any other value goes out when its parameter closes, as the
+  parse writes it (json.parseText, the raw text as a string when that fails, compact). The escape is per byte (ascii
+  off), so the pieces join to the parse's text byte for byte. The streamer stays off for the reply when another call
+  form comes before a block.
+- A block's first call streams live. Its closing brace waits for the block's closer. When the block makes a second
+  call, the first call's brace and every later delta of the block wait in a queue, and the block's closer sends them
+  in order. The parse takes no call from a block that never closes, so a block cut short leaves only its first call,
+  open: no whole call goes out for a block the parse rejects. The later calls of a block go out at its closer.
+- chat.commit ends a block under way (Streamer.feedDsmlBlock) before it sends the round's prose. A text delta between
+  a call's header and its last piece ends that call for a client (LiteLLM's /v1/messages stream, /v1/responses), so
+  the prose that follows a block in the same round now goes out after the block's last delta. chat.finish does the
+  same before the prose tail.
+- The streamer turns off for the reply when a text does not extend the text it read (its positions then do not hold
+  there), when thinking is off and the answer holds "<|channel|>" (the finish then reads Harmony channels out of the
+  text), and when the finish's content does not start with the text it read (Dsml.verify). The finish then follows
+  the parse.
+- openai.Run.settle: at the finish the sent calls (Dsml.streamed: the calls whose header went out) are checked against
+  the parse. When they are the parse's first calls (the same names, the same arguments byte for byte, each closed),
+  nothing goes out twice, and the parse's other calls (another call form after the blocks) go out under the next
+  indexes. Otherwise the parse dropped or changed what went out: nothing more of the calls goes out, no brace closes a
+  call the parse rejects, the content continues to the parse's content, and a warning line is logged. The finish
+  reason is the parse's in all cases.
+- A reply that ends inside a block (max_tokens, a stop string, the end token, a block without its closer) ends as
+  the whole reply reports it: finish_reason length or stop, the content with the block's text, no tool_calls. Its
+  open call stays open (an unclosed JSON prefix, as vLLM and the Anthropic API stream a cut call). A repeated
+  parameter goes out twice; last-wins JSON readers get the parse's object. A value that holds an invoke's closer
+  stops its call's pieces.
+- chat.finish gives the whole answer to the streamer once more after a stream sent a DSML call, for what the last
+  tokens held back. After DSML calls went out, an XML call that the end token left open goes out once, from settle,
+  under the next index (the XML streamer's finish feed sent it under index 0, over the first DSML call).
+No switch. Unchanged: requests without tools, whole (non-stream) replies, the one-call policy
+(parallel_tool_calls false drops call deltas and sends its call at the finish, as before), XML calls, the V4 spelling.
+Tests: dsml_stream_test.zig drives real DeepSeek-V4.1 token sequences (testdata/dsml_stream.json: a trimmed copy of
+the tokenizer with the cases' tokens under their real ids) through the chat route and the Messages route: a long
+Write, an Edit, two calls, an unoffered tool, DSML in the reasoning and quoted in text, a call cut by max_tokens, a call
+form after a block. Byte-token route tests cover the corner cases: a Harmony marker in a value (cut by max_tokens, a
+stop string, the end token), prose in the round that closes a block (one and two blocks, six round patterns), a block
+cut in its second invoke, and an XML call after a block. The stream reader checks the order: each header once and in
+order, the pieces after their header, and no text between a call's header and its last piece. Joined pieces equal
+the whole reply's arguments. Streams without tools, without a call, or with the one-call policy match
+testdata/dsml_stream_golden.json (recorded without this patch) event for event. tool_stream.zig feeds the parser's
+corner cases at six split points. dsml_fuzz_test.zig feeds 14,000 random replies at random split points: well-formed
+ones stream the parse's calls byte for byte, and in every one (odd markup, closers inside values, cut anywhere) each
+whole streamed call is one of the parse's, in order. Without the code change 10 of the 14 route tests fail (the golden,
+quoted-DSML, Harmony-block and prose-order tests pass). zig_test.sh 113/113 and 95/95 (91 and 95 before);
+test_lanes.sh 44/44. Only rank 0's tensorfold-native changes (rank 1's tf-dsv41-lanes does not import the server).
+---
+ zig/src/server/chat.zig                       |  38 +-
+ zig/src/server/dsml_fuzz_test.zig             | 183 +++++
+ zig/src/server/dsml_stream_test.zig           | 757 ++++++++++++++++++
+ zig/src/server/openai.zig                     |  34 +-
+ zig/src/server/root.zig                       |   2 +
+ zig/src/server/testdata/dsml_stream.json      |  14 +
+ .../server/testdata/dsml_stream_golden.json   | 136 ++++
+ zig/src/server/tool_parse.zig                 |  14 +-
+ zig/src/server/tool_stream.zig                | 614 +++++++++++++-
+ 9 files changed, 1781 insertions(+), 11 deletions(-)
+ create mode 100644 zig/src/server/dsml_fuzz_test.zig
+ create mode 100644 zig/src/server/dsml_stream_test.zig
+ create mode 100644 zig/src/server/testdata/dsml_stream.json
+ create mode 100644 zig/src/server/testdata/dsml_stream_golden.json
+
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 8a940e0f..7dacd78a 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -52,6 +52,8 @@ pub const Reply = struct {
+     stop_sequence: ?[]const u8,
+     reasoning: ?[]const u8,
+     tool_calls_streamed: bool,
++    /// The DSML calls a stream sent as they decoded, for the finish to check against the parse.
++    streamed_calls: []const tool_stream.SentCall = &.{},
+     finish_reason: []const u8,
+     prompt_tokens: usize,
+     cached_tokens: usize,
+@@ -419,6 +421,18 @@ const Generation = struct {
+         const vis = if (g.calls != null and g.streamed.text.items.len == 0 and
+             reply_text.pyStrip(visible_content).len == 0) "" else visible_content;
+         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
++        if (g.calls) |*c| {
++            // thinking off, the finish reads Harmony channels out of a text that holds their marker, so its parse no
++            // longer reads this answer: the DSML streamer stops, and the finish follows the parse
++            if (!g.thinking and std.mem.indexOf(u8, answer, "<|channel|>") != null) c.dsml.off = true;
++            // a block under way ends before this round's prose, which can only come after it: a text delta between a
++            // call's header and its last piece ends that call for a client (LiteLLM's Messages stream, /v1/responses)
++            if (c.dsml.midCall()) {
++                var early: std.ArrayList(Value) = .empty;
++                try c.feedDsmlBlock(answer, &early);
++                for (early.items) |d| try g.emit(sink, d);
++            }
++        }
+         const delta = g.streamed.after(vis, !copied);
+         if (delta.len > 0) {
+             try g.streamed.set(g.a, vis, delta);
+@@ -427,6 +441,7 @@ const Generation = struct {
+         if (g.calls) |*c| {
+             var out: std.ArrayList(Value) = .empty;
+             try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
++            try c.feedDsml(answer, &out); // DeepSeek-V4.1's DSML calls as they decode, never the reasoning
+             for (out.items) |d| try g.emit(sink, d);
+         }
+     }
+@@ -538,13 +553,31 @@ const Generation = struct {
+                 if (parsed.calls != null) shown = "";
+             }
+             const sent = g.streamed.text.items;
++            if (g.calls) |*c| if (c.dsml.sent.items.len > 0) {
++                // the parse reads `content`: the streamer goes on only where that extends the answer it read (thinking
++                // off, the Harmony split can give another text), and a block under way ends before the prose tail
++                c.dsml.verify(content);
++                if (c.dsml.midCall()) {
++                    var early: std.ArrayList(Value) = .empty;
++                    try c.feedDsmlBlock(content, &early);
++                    for (early.items) |d| try g.emit(sink, d);
++                }
++            };
+             if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
+-            if (g.calls) |*c| if (close.len > 0) {
+-                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
++            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0) {
++                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas (after
++                // DSML calls went out, the finish's check sends such a call under the next index instead)
+                 var out: std.ArrayList(Value) = .empty;
+                 try c.feed(if (g.thinking) content else text, &out);
+                 for (out.items) |d| try g.emit(sink, d);
+             };
++            if (g.calls) |*c| if (c.dsml.sent.items.len > 0) {
++                // a stream that sent DSML calls reads the whole answer once more: what its last tokens held back (a stop
++                // string's start, a split character) ends the calls they began, as the parse reads them
++                var out: std.ArrayList(Value) = .empty;
++                try c.feedDsml(content, &out);
++                for (out.items) |d| try g.emit(sink, d);
++            };
+         }
+         const prefilled = m.prefilled_ns;
+         const total = seconds(finished_ns - submitted);
+@@ -593,6 +626,7 @@ const Generation = struct {
+             .stop_sequence = g.stops.matched(raw),
+             .reasoning = reasoning,
+             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
++            .streamed_calls = if (g.calls) |*c| c.dsml.streamed() else &.{},
+             .finish_reason = reason,
+             .prompt_tokens = prompt_len,
+             .cached_tokens = m.cached orelse 0,
+diff --git a/zig/src/server/dsml_fuzz_test.zig b/zig/src/server/dsml_fuzz_test.zig
+new file mode 100644
+index 00000000..cfc7b43f
+--- /dev/null
++++ b/zig/src/server/dsml_fuzz_test.zig
+@@ -0,0 +1,183 @@
++//! Random DeepSeek-V4.1 replies fed to tool_stream's DSML streamer at random split points, against
++//! tool_parse.parse of the same text. Well-formed replies stream the parse's calls byte for byte. In every reply (odd
++//! markup, closers inside values, replies cut anywhere) each call the stream completed (its brace went out, its pieces
++//! did not stop) is one of the parse's calls, in order: no whole call goes out for a block the parse rejects. A repeated
++//! parameter goes out twice, so there the check reads the arguments as JSON with the last value kept.
++const std = @import("std");
++const json = @import("json.zig");
++const tool_parse = @import("tool_parse.zig");
++const tool_stream = @import("tool_stream.zig");
++const Value = json.Value;
++const Allocator = std.mem.Allocator;
++
++const D = "\u{ff5c}DSML\u{ff5c}";
++const tools_text =
++    \\[{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number"}}}}},
++    \\{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}}}]
++;
++
++const bits = [_][]const u8{ "ls -la", "a\"b", "back\\slash", "\n", "\r\n", "\t", "\x01", "\x7f", "\u{6d77}", "\u{1f30a}", "\u{1f469}\u{200d}\u{1f4bb}", "</" ++ D ++ " par", "</" ++ D ++ " parameter", "</" ++ D, "</", "<", "\"", "}", "{", "\\u0041", " ", "string=\"true\"", "<" ++ D ++ " parameter name=\"x\" string=\"true\">", "<" ++ D ++ " invoke name=\"Bash\">", "<" ++ D ++ " calls>", "</" ++ D ++ " invo", "</" ++ D ++ " cal", "\u{ff5c}", "<|channel|", "<tool_call" };
++const closers = [_][]const u8{ "</" ++ D ++ " invoke>", "</" ++ D ++ " calls>", "</" ++ D ++ " parameter>" };
++const json_values = [_][]const u8{ "5", " 120000 ", "{\"a\":[1,2]}", "true", "null", "NaN", "1e5", "-0", "1.0", "\"str\"", "not json", "", "[1, 2 ,3]", "{\"k\": \"v\\n\"}", "\"\\u00e9\"", "12345678901234567890" };
++const names = [_][]const u8{ "Bash", " bash ", "Write", "Unknown", "", "  ", "WRITE" };
++const params = [_][]const u8{ "command", "timeout", "content", "file_path", "x", "\u{6d77}", "a\\b" };
++const flags = [_][]const u8{ " string=\"true\"", " string=\"false\"", "", " string=\"maybe\"", " string=\"true\" x" };
++
++const Mode = struct { closers: bool = false, malformed: bool = false, cut: bool = false };
++
++const Gen = struct {
++    r: std.Random,
++    a: Allocator,
++    m: Mode,
++    out: std.ArrayList(u8) = .empty,
++    repeated: bool = false,
++    used: [params.len]bool = @splat(false),
++
++    fn add(g: *Gen, s: []const u8) !void {
++        try g.out.appendSlice(g.a, s);
++    }
++    fn chance(g: *Gen, p: f32) bool {
++        return g.r.float(f32) < p;
++    }
++    fn pick(g: *Gen, comptime T: type, list: []const T, n: usize) T {
++        return list[g.r.uintLessThan(usize, @min(n, list.len))];
++    }
++    fn param(g: *Gen) !void {
++        try g.add("<" ++ D ++ " parameter name=\"");
++        const i = g.r.uintLessThan(usize, params.len);
++        if (g.used[i]) g.repeated = true;
++        g.used[i] = true;
++        try g.add(params[i]);
++        if (!(g.m.malformed and g.chance(0.05))) try g.add("\"");
++        const flag = g.pick([]const u8, &flags, if (g.m.malformed) flags.len else 3);
++        try g.add(flag);
++        try g.add(">");
++        if (std.mem.eql(u8, flag, " string=\"false\"")) {
++            try g.add(g.pick([]const u8, &json_values, json_values.len));
++        } else for (0..g.r.uintLessThan(usize, 6)) |_| {
++            try g.add(if (g.m.closers and g.chance(0.04)) g.pick([]const u8, &closers, closers.len) else g.pick([]const u8, &bits, bits.len));
++        }
++        if (!(g.m.malformed and g.chance(0.08))) try g.add("</" ++ D ++ " parameter>");
++        if (g.chance(0.8)) try g.add("\n");
++    }
++    fn invoke(g: *Gen) !void {
++        g.used = @splat(false);
++        try g.add("<" ++ D ++ " invoke name=\"");
++        try g.add(g.pick([]const u8, &names, if (g.m.malformed) names.len else 4));
++        try g.add(if (g.m.malformed and g.chance(0.05)) "\" x=\"1\">\n" else "\">\n");
++        for (0..g.r.uintLessThan(usize, 4)) |_| try g.param();
++        if (!(g.m.malformed and g.chance(0.08))) try g.add("</" ++ D ++ " invoke>");
++        try g.add("\n");
++    }
++    fn block(g: *Gen) !void {
++        try g.add(if (g.chance(0.8)) "\n\n<" ++ D ++ " calls>\n" else "<" ++ D ++ " calls>");
++        for (0..1 + g.r.uintLessThan(usize, 3)) |_| try g.invoke();
++        if (!(g.m.malformed and g.chance(0.1))) try g.add("</" ++ D ++ " calls>");
++    }
++    fn reply(g: *Gen) ![]const u8 {
++        if (g.chance(0.5)) try g.add("Running it.");
++        if (g.m.malformed and g.chance(0.05)) try g.add("Use `<" ++ D ++ " calls>` like:");
++        try g.block();
++        if (g.chance(0.15)) {
++            try g.add("\nThen.");
++            try g.block();
++        }
++        if (g.chance(0.1)) try g.add("\ntrailing");
++        var text = g.out.items;
++        if (g.m.cut and g.r.boolean()) {
++            var cut = g.r.uintLessThan(usize, text.len + 1);
++            while (cut < text.len and text[cut] & 0xc0 == 0x80) cut += 1;
++            text = text[0..cut];
++        }
++        return text;
++    }
++};
++
++/// The text fed as it grows by 1 to 12 bytes (kept to whole characters), then whole; the deltas' shape checked: each
++/// header once and in order, pieces for the newest call (a held call's brace for the one before it), valid UTF-8,
++/// joined to the streamer's record.
++fn feed(a: Allocator, tools: []const Value, text: []const u8, r: std.Random) !tool_stream.Streamer {
++    var s = try tool_stream.Streamer.init(a, tools);
++    var out: std.ArrayList(Value) = .empty;
++    var end: usize = 0;
++    while (end < text.len) {
++        end = @min(text.len, end + 1 + r.uintLessThan(usize, 12));
++        while (end < text.len and text[end] & 0xc0 == 0x80) end += 1;
++        try s.feedDsml(text[0..end], &out);
++    }
++    try s.feedDsml(text, &out);
++    var joined: std.ArrayList(std.ArrayList(u8)) = .empty;
++    for (out.items) |d| for (d.get("tool_calls").?.array) |one| {
++        const index: usize = @intCast(one.get("index").?.int64().?);
++        const piece = one.get("function").?.strField("arguments").?;
++        try std.testing.expect(std.unicode.utf8ValidateSlice(piece));
++        if (one.get("id") != null) {
++            try std.testing.expectEqual(joined.items.len, index);
++            try joined.append(a, .empty);
++            continue;
++        }
++        try std.testing.expect(index + 1 == joined.items.len or index + 2 == joined.items.len);
++        try joined.items[index].appendSlice(a, piece);
++    };
++    try std.testing.expectEqual(s.dsml.streamed().len, joined.items.len);
++    for (s.dsml.streamed(), joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
++    return s;
++}
++
++fn arguments(v: Value) []const u8 {
++    return v.get("function").?.strField("arguments").?;
++}
++
++/// The same arguments for a client: the same bytes, or the same JSON with a repeated key's last value kept (both
++/// holding NaN, which the parse writes bare and a JSON reader refuses, counts as the same).
++fn sameArguments(a: Allocator, parsed: []const u8, sent: []const u8) Allocator.Error!bool {
++    if (std.mem.eql(u8, parsed, sent)) return true;
++    if (std.mem.indexOf(u8, parsed, "NaN") != null and std.mem.indexOf(u8, sent, "NaN") != null) return true;
++    const x = try json.parseText(a, parsed);
++    const y = try json.parseText(a, sent);
++    return x == .ok and y == .ok and json.equal(x.ok, y.ok);
++}
++
++fn run(seed: u64, count: usize, m: Mode) !void {
++    var prng = std.Random.DefaultPrng.init(seed);
++    const r = prng.random();
++    for (0..count) |_| {
++        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++        defer arena.deinit();
++        const a = arena.allocator();
++        const tools = (try json.parse(a, tools_text)).ok.array;
++        var g: Gen = .{ .r = r, .a = a, .m = m };
++        const text = try g.reply();
++        const s = try feed(a, tools, text, r);
++        const parsed = (try tool_parse.parse(a, text, tools, null)).calls orelse &.{};
++        const sent = s.dsml.streamed();
++        if (!m.closers and !m.malformed and !m.cut and !g.repeated) {
++            try std.testing.expectEqual(parsed.len, sent.len);
++            for (parsed, sent) |p, *c| try std.testing.expect(c.same(p));
++            continue;
++        }
++        // every whole call the client got is the parse's, in order
++        var at: usize = 0;
++        for (sent) |c| {
++            if (c.held or !c.closed) continue;
++            while (at < parsed.len) : (at += 1) {
++                const p = parsed[at];
++                if (std.mem.eql(u8, p.get("function").?.strField("name").?, c.name) and try sameArguments(a, arguments(p), c.arguments.items)) break;
++            } else {
++                std.debug.print("a whole streamed call the parse does not return: {s} {s} in {f}\n", .{ c.name, c.arguments.items, std.zig.fmtString(text) });
++                return error.WholeCallNotParsed;
++            }
++            at += 1;
++        }
++    }
++}
++
++test "random well-formed DSML replies stream the parse's calls byte for byte at random splits" {
++    try run(1, 4000, .{});
++}
++
++test "random replies with odd markup, closers inside values, or a cut anywhere send no whole call the parse does not return" {
++    try run(2, 3000, .{ .malformed = true });
++    try run(3, 3000, .{ .closers = true });
++    try run(4, 4000, .{ .closers = true, .malformed = true, .cut = true });
++}
+diff --git a/zig/src/server/dsml_stream_test.zig b/zig/src/server/dsml_stream_test.zig
+new file mode 100644
+index 00000000..5af05cb5
+--- /dev/null
++++ b/zig/src/server/dsml_stream_test.zig
+@@ -0,0 +1,757 @@
++//! DeepSeek-V4.1's DSML tool calls stream as they decode. Real token sequences (the DeepSeek-V4.1
++//! tokenizer, testdata/dsml_stream.json) run through the chat route and the Messages route with a CPU fake engine. Each
++//! stream's argument pieces join to the whole reply's arguments byte for byte, in order, sent once; a stream without
++//! tools, or with the one-call policy, is the same as before the patch event for event (testdata/dsml_stream_golden.json,
++//! recorded without the patch).
++const std = @import("std");
++const builtin = @import("builtin");
++const api = @import("engine_api");
++const tokenizer = @import("tokenizer");
++const server = @import("root.zig");
++const json = server.json;
++const model_text = @import("model_text.zig");
++const openai = @import("openai.zig");
++const anthropic = @import("anthropic.zig");
++const Conn = @import("http_conn.zig").Conn;
++const Allocator = std.mem.Allocator;
++
++const fixture_text = @embedFile("testdata/dsml_stream.json");
++const golden_text = @embedFile("testdata/dsml_stream_golden.json");
++
++/// The fixture's tokenizer (only the cases' tokens, under their real ids) behind the server's text seam; the
++/// rendered prompt is a placeholder the fake engine does not read.
++const FixtureText = struct {
++    tok: tokenizer.Tokenizer,
++    eos: [1]u32,
++
++    fn text(t: *FixtureText) model_text.Text {
++        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
++    }
++
++    fn self(ctx: *anyopaque) *FixtureText {
++        return @ptrCast(@alignCast(ctx));
++    }
++
++    fn encode(_: *anyopaque, a: Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
++        const ids = try a.alloc(u32, input.len);
++        for (input, ids) |byte, *id| id.* = byte;
++        return ids;
++    }
++
++    fn decode(ctx: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
++        return self(ctx).tok.decode(a, ids, false) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else a.dupe(u8, "\u{fffd}");
++    }
++
++    fn tokenId(ctx: *anyopaque, piece: []const u8) ?u32 {
++        return self(ctx).tok.specialTokenId(piece);
++    }
++
++    fn tokenString(ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error![]u8 {
++        return a.dupe(u8, self(ctx).tok.id_to_token.get(id) orelse "");
++    }
++
++    fn vocabSize(_: *anyopaque) u32 {
++        return 129280;
++    }
++
++    fn eosIds(ctx: *anyopaque) []const u32 {
++        return &self(ctx).eos;
++    }
++
++    fn render(_: *anyopaque, a: Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error![]u8 {
++        return a.dupe(u8, "prompt");
++    }
++
++    fn templateSource(_: *anyopaque) []const u8 {
++        return "";
++    }
++};
++
++/// An engine that answers with a case's ids in rounds of `pattern` tokens (cycled), as a drafting engine commits them,
++/// and ends as the ids end: with their end token, or at the length (a reply cut by max_tokens).
++const ScriptEngine = struct {
++    ids: []const u32,
++    pattern: []const usize,
++    cut: bool,
++
++    fn engine(e: *ScriptEngine) api.Engine {
++        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++
++    fn info(_: *anyopaque) api.Info {
++        return .{ .context_window = 1 << 20 };
++    }
++
++    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const e: *ScriptEngine = @ptrCast(@alignCast(ctx));
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        var pos: usize = 0;
++        var round: usize = 0;
++        while (pos < e.ids.len) : (round += 1) {
++            const end = @min(e.ids.len, pos + e.pattern[round % e.pattern.len]);
++            sink.event(sink.ctx, id, &.{ .tokens = e.ids[pos..end] });
++            pos = end;
++        }
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = if (e.cut) .length else .stop } });
++    }
++
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++/// What the route sent: each stream event's JSON, or the whole reply.
++const Seen = struct {
++    a: Allocator,
++    events: std.ArrayList([]const u8) = .empty,
++    done: bool = false,
++    whole: ?json.Value = null,
++
++    fn out(s: *Seen) openai.Out {
++        return .{ .ctx = s, .vt = &.{ .open = open, .event = event, .reply = reply } };
++    }
++
++    fn open(_: *anyopaque) error{Closed}!void {}
++
++    fn event(ctx: *anyopaque, payload: ?json.Value) error{Closed}!void {
++        const s: *Seen = @ptrCast(@alignCast(ctx));
++        const p = payload orelse {
++            s.done = true;
++            return;
++        };
++        s.events.append(s.a, json.stringify(s.a, p, .{}) catch return error.Closed) catch return error.Closed;
++    }
++
++    fn reply(ctx: *anyopaque, _: u16, payload: json.Value) void {
++        const s: *Seen = @ptrCast(@alignCast(ctx));
++        s.whole = payload;
++    }
++};
++
++const Fixture = struct {
++    tok: tokenizer.Tokenizer,
++    eos: u32,
++    cases: json.Value,
++
++    fn load(a: Allocator) !Fixture {
++        const root = (try json.parse(a, fixture_text)).ok;
++        const tok = try tokenizer.parse(std.testing.allocator, try json.stringify(a, root.get("tokenizer").?, .{ .ascii = false }));
++        return .{ .tok = tok, .eos = @intCast(root.get("eos").?.int64().?), .cases = root.get("cases").? };
++    }
++
++    fn ids(f: *const Fixture, a: Allocator, name: []const u8) ![]u32 {
++        for (f.cases.array) |c| if (std.mem.eql(u8, c.get("name").?.string, name)) {
++            const list = c.get("ids").?.array;
++            const out = try a.alloc(u32, list.len);
++            for (list, out) |v, *o| o.* = @intCast(v.int64().?);
++            return out;
++        };
++        return error.NoSuchCase;
++    }
++};
++
++/// A coding agent's tools as an OpenAI client offers them (WebFetch is not offered).
++const tools_json =
++    \\[{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}},
++    \\{"type":"function","function":{"name":"Edit","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}}}}},
++    \\{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"},"timeout":{"type":"number"}}}}},
++    \\{"type":"function","function":{"name":"TodoWrite","parameters":{"type":"object","properties":{"todos":{"type":"array"}}}}},
++    \\{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}}}}}]
++;
++
++const Ask = struct {
++    case: []const u8,
++    stream: bool = true,
++    tools: bool = true,
++    single: bool = false, // parallel_tool_calls: false
++    pattern: []const usize = &.{ 3, 1, 4, 1, 5, 2 },
++};
++
++/// One request of `ask` through the chat route (or `messages`'s raw Messages body through the Messages route).
++fn chatRun(a: Allocator, f: *Fixture, ask: Ask) !Seen {
++    const ids = try f.ids(a, ask.case);
++    const cut = std.mem.eql(u8, ask.case, "cut");
++    var text: FixtureText = .{ .tok = f.tok, .eos = .{f.eos} };
++    var backend: ScriptEngine = .{ .ids = ids, .pattern = ask.pattern, .cut = cut };
++    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = true,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    const max = if (cut) ids.len else 4096;
++    const body = try std.fmt.allocPrint(a, "{{\"model\":\"test-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],\"stream\":{s},\"max_tokens\":{d}{s}{s}}}", .{
++        if (ask.stream) "true" else "false",
++        max,
++        if (ask.tools) ",\"tools\":" ++ tools_json else "",
++        if (ask.single) ",\"parallel_tool_calls\":false" else "",
++    });
++    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++    var seen: Seen = .{ .a = a };
++    openai.run(srv, a, seen.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
++    return seen;
++}
++
++const Call = struct { id: []const u8, name: []const u8, arguments: std.ArrayList(u8) = .empty, pieces: usize = 0 };
++
++/// A chat stream read as a client reads it, its order checked on the way: the role first, each call's header (index,
++/// id, type, name, empty arguments) once and in index order, its pieces after it and before the next header, no text
++/// between a call's header and its last piece (LiteLLM's Messages stream ends a tool_use block at a text delta), valid
++/// UTF-8 each, and nothing after the chunk that carries the finish reason.
++const Read = struct {
++    content: std.ArrayList(u8) = .empty,
++    reasoning: std.ArrayList(u8) = .empty,
++    calls: std.ArrayList(Call) = .empty,
++    finish: ?[]const u8 = null,
++
++    fn of(a: Allocator, seen: *const Seen) !Read {
++        var r: Read = .{};
++        try std.testing.expect(seen.done);
++        var role = false;
++        var text_after_header = false; // text came after the newest call's header
++        for (seen.events.items) |text| {
++            const ev = (try json.parse(a, text)).ok;
++            const choices = ev.get("choices") orelse continue;
++            if (choices.array.len == 0) continue; // a usage chunk
++            try std.testing.expect(r.finish == null); // nothing after the finish
++            const choice = choices.array[0];
++            if (choice.get("finish_reason")) |fr| if (fr == .string) {
++                r.finish = fr.string;
++            };
++            const delta = choice.get("delta") orelse continue;
++            if (delta.get("role")) |_| role = true;
++            const said = delta.strField("content") orelse "";
++            const thought = delta.strField("reasoning_content") orelse "";
++            if (said.len > 0 or thought.len > 0 or delta.get("tool_calls") != null) try std.testing.expect(role);
++            try r.content.appendSlice(a, said);
++            try r.reasoning.appendSlice(a, thought);
++            if (r.calls.items.len > 0 and (said.len > 0 or thought.len > 0)) text_after_header = true;
++            const tc = delta.get("tool_calls") orelse continue;
++            if (r.finish != null) return error.CallsWithTheFinish;
++            for (tc.array) |one| {
++                const index: usize = @intCast(one.get("index").?.int64().?);
++                const function = one.get("function").?;
++                const piece = function.strField("arguments").?;
++                try std.testing.expect(std.unicode.utf8ValidateSlice(piece));
++                if (one.get("id")) |id| {
++                    try std.testing.expectEqual(r.calls.items.len, index); // a new call, in order, once
++                    try std.testing.expectEqualStrings("function", one.strField("type").?);
++                    try std.testing.expectEqualStrings("", piece);
++                    try r.calls.append(a, .{ .id = id.string, .name = function.strField("name").? });
++                    text_after_header = false;
++                    continue;
++                }
++                try std.testing.expectEqual(r.calls.items.len -| 1, index); // pieces only for the call being written
++                if (text_after_header) return error.PieceAfterText; // a client ended this call at that text
++                const c = &r.calls.items[index];
++                try c.arguments.appendSlice(a, piece);
++                c.pieces += 1;
++            }
++        }
++        return r;
++    }
++};
++
++/// The whole reply's message: content (null as ""), reasoning, calls and finish reason.
++fn wholeMessage(seen: *const Seen) struct { content: []const u8, reasoning: []const u8, calls: []const json.Value, finish: []const u8 } {
++    const choice = seen.whole.?.get("choices").?.array[0];
++    const message = choice.get("message").?;
++    return .{
++        .content = message.strField("content") orelse "",
++        .reasoning = message.strField("reasoning_content") orelse "",
++        .calls = if (message.get("tool_calls")) |c| c.array else &.{},
++        .finish = choice.strField("finish_reason").?,
++    };
++}
++
++/// The stream of `case` at each round pattern against the whole reply: the same calls, names and arguments byte for byte,
++/// call i's arguments in at least `min_pieces[i]` pieces; the same content, reasoning and finish reason.
++fn expectStreamed(case: []const u8, min_pieces: []const usize) !void {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f = try Fixture.load(a);
++    defer f.tok.deinit();
++    const whole_seen = try chatRun(a, &f, .{ .case = case, .stream = false });
++    const whole = wholeMessage(&whole_seen);
++    try std.testing.expect(whole.calls.len > 0);
++    try std.testing.expectEqualStrings("tool_calls", whole.finish);
++    for ([_][]const usize{ &.{1}, &.{ 3, 1, 4, 1, 5, 2 }, &.{64} }) |pattern| {
++        const seen = try chatRun(a, &f, .{ .case = case, .pattern = pattern });
++        const r = try Read.of(a, &seen);
++        try std.testing.expectEqualStrings(whole.finish, r.finish.?);
++        try std.testing.expectEqualStrings(whole.content, r.content.items);
++        try std.testing.expectEqualStrings(whole.reasoning, r.reasoning.items);
++        try std.testing.expectEqual(whole.calls.len, r.calls.items.len);
++        for (whole.calls, r.calls.items, min_pieces) |w, s, least| {
++            const function = w.get("function").?;
++            try std.testing.expectEqualStrings(function.strField("name").?, s.name);
++            try std.testing.expectEqualStrings(function.strField("arguments").?, s.arguments.items);
++            if (pattern.len > 1 or pattern[0] == 1) try std.testing.expect(s.pieces >= least);
++        }
++    }
++}
++
++test "a long Write streams its arguments as they decode, the parse's bytes joined (quotes, backslashes, CRLF, split characters)" {
++    try expectStreamed("write", &.{40});
++}
++
++test "an Edit streams its strings and sends its boolean when the parameter closes, as the parse writes it" {
++    try expectStreamed("edit", &.{6});
++}
++
++test "two calls stream one after the other: a Bash command with a number, then a TodoWrite whose array the parse re-writes" {
++    // the TodoWrite array goes out whole as its parameter closes, then the call's brace: two pieces
++    try expectStreamed("two_calls", &.{ 6, 2 });
++}
++
++test "a call to a tool the request did not offer streams as the parse returns it, under its own name" {
++    try expectStreamed("unoffered", &.{ 4, 4 });
++}
++
++test "DSML written in the reasoning, or quoted in the answer, is no call: no tool delta, the same content" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f = try Fixture.load(a);
++    defer f.tok.deinit();
++    const whole = wholeMessage(&try chatRun(a, &f, .{ .case = "quoted", .stream = false }));
++    try std.testing.expectEqual(@as(usize, 0), whole.calls.len);
++    try std.testing.expectEqualStrings("stop", whole.finish);
++    const r = try Read.of(a, &try chatRun(a, &f, .{ .case = "quoted", .pattern = &.{1} }));
++    try std.testing.expectEqual(@as(usize, 0), r.calls.items.len);
++    try std.testing.expectEqualStrings(whole.finish, r.finish.?);
++    try std.testing.expectEqualStrings(whole.content, r.content.items);
++    try std.testing.expectEqualStrings(whole.reasoning, r.reasoning.items);
++}
++
++test "a call cut by max_tokens ends as the whole reply reports it: length, its content, no brace for the open call" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f = try Fixture.load(a);
++    defer f.tok.deinit();
++    const whole = wholeMessage(&try chatRun(a, &f, .{ .case = "cut", .stream = false }));
++    try std.testing.expectEqual(@as(usize, 0), whole.calls.len); // the parse rejects a block without its closer
++    try std.testing.expectEqualStrings("length", whole.finish);
++    const full = wholeMessage(&try chatRun(a, &f, .{ .case = "write", .stream = false })).calls[0].get("function").?.strField("arguments").?;
++    for ([_][]const usize{ &.{1}, &.{ 3, 1, 4, 1, 5, 2 } }) |pattern| {
++        const r = try Read.of(a, &try chatRun(a, &f, .{ .case = "cut", .pattern = pattern }));
++        try std.testing.expectEqualStrings("length", r.finish.?);
++        try std.testing.expectEqualStrings(whole.content, r.content.items);
++        // the call the reply began went out as it decoded and stays open: a prefix of the whole call's arguments
++        try std.testing.expectEqual(@as(usize, 1), r.calls.items.len);
++        const sent = r.calls.items[0].arguments.items;
++        try std.testing.expect(sent.len > 100 and sent.len < full.len and std.mem.startsWith(u8, full, sent));
++        try std.testing.expect((try json.parse(a, sent)) == .err);
++    }
++}
++
++/// A stream event without what changes between runs: the reply's id and time, its runtime block, the call ids.
++fn normal(a: Allocator, text: []const u8) ![]const u8 {
++    const v = (try json.parse(a, text)).ok;
++    for ([_][]const u8{ "id", "created", "tensorfold", "speculative" }) |k| _ = v.object.orderedRemove(k);
++    if (v.get("choices")) |cs| for (cs.array) |c| if (c.get("delta")) |d| if (d.get("tool_calls")) |tc| for (tc.array) |one| {
++        if (one.get("id") != null) try one.object.put(a, "id", .{ .string = "call_X" });
++    };
++    return json.stringify(a, v, .{});
++}
++
++/// The streams the patch must leave as they were: no tools (a reply with DSML in it, and one with DSML only quoted),
++/// tools without a call, and the one-call policy (its calls go out when the reply ends).
++pub const golden_asks = [_]struct { key: []const u8, ask: Ask }{
++    .{ .key = "no_tools_write", .ask = .{ .case = "write", .tools = false, .pattern = &.{ 29, 61 } } },
++    .{ .key = "no_tools_two_calls", .ask = .{ .case = "two_calls", .tools = false, .pattern = &.{ 7, 13 } } },
++    .{ .key = "no_tools_quoted", .ask = .{ .case = "quoted", .tools = false } },
++    .{ .key = "tools_quoted", .ask = .{ .case = "quoted" } },
++    .{ .key = "single_unoffered", .ask = .{ .case = "unoffered", .single = true } },
++    .{ .key = "single_two_calls_by_token", .ask = .{ .case = "two_calls", .single = true, .pattern = &.{1} } },
++};
++
++/// The golden file's text: each golden ask's normalized events (how testdata/dsml_stream_golden.json was recorded).
++pub fn goldenJson(a: Allocator) ![]const u8 {
++    var f = try Fixture.load(a);
++    defer f.tok.deinit();
++    const o = try json.newObject(a);
++    for (golden_asks) |g| {
++        const seen = try chatRun(a, &f, g.ask);
++        const list = try a.alloc(json.Value, seen.events.items.len);
++        for (seen.events.items, list) |e, *slot| slot.* = .{ .string = try normal(a, e) };
++        try o.put(a, g.key, .{ .array = list });
++    }
++    return json.stringify(a, .{ .object = o }, .{ .ascii = true });
++}
++
++test "without tools, without a call, or with the one-call policy, a stream is event for event what it was before the patch" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f = try Fixture.load(a);
++    defer f.tok.deinit();
++    const golden = (try json.parse(a, golden_text)).ok;
++    for (golden_asks) |g| {
++        const want = golden.get(g.key).?.array;
++        const seen = try chatRun(a, &f, g.ask);
++        try std.testing.expect(seen.done);
++        try std.testing.expectEqual(want.len, seen.events.items.len);
++        for (want, seen.events.items) |w, e| try std.testing.expectEqualStrings(w.string, try normal(a, e));
++    }
++}
++
++/// Drains a socket into `out` until its other end closes.
++fn drain(fd: std.posix.fd_t, out: *std.ArrayList(u8)) void {
++    var buf: [65536]u8 = undefined;
++    while (true) {
++        const n = std.posix.read(fd, &buf) catch return;
++        if (n == 0) return;
++        out.appendSlice(std.heap.page_allocator, buf[0..n]) catch return;
++    }
++}
++
++/// `body` (a Messages request) through the engine's /v1/messages route, as a client reads its bytes.
++fn messagesRun(a: Allocator, f: *Fixture, case: []const u8, body: []const u8) ![]const u8 {
++    const ids = try f.ids(a, case);
++    var text: FixtureText = .{ .tok = f.tok, .eos = .{f.eos} };
++    var backend: ScriptEngine = .{ .ids = ids, .pattern = &.{ 3, 1, 4, 1, 5, 2 }, .cut = false };
++    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = true,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    const linux = std.os.linux;
++    var fds: [2]i32 = undefined;
++    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SocketPair;
++    var got: std.ArrayList(u8) = .empty;
++    defer got.deinit(std.heap.page_allocator);
++    const reader = try std.Thread.spawn(.{}, drain, .{ fds[1], &got });
++    var headers = [_]@import("http_conn.zig").Header{.{ .name = "Content-Length", .value = try std.fmt.allocPrint(a, "{d}", .{body.len}) }};
++    var conn: Conn = .{ .fd = fds[0], .peer = "", .buf = try a.dupe(u8, body), .end = body.len, .gpa = a, .headers = &headers, .path = "/v1/messages", .method = "POST", .version = "HTTP/1.1" };
++    anthropic.post(srv, &conn, a);
++    _ = std.posix.system.close(fds[0]);
++    reader.join();
++    _ = std.posix.system.close(fds[1]);
++    return a.dupe(u8, got.items);
++}
++
++test "the engine's Messages route streams a DSML call as input_json_delta pieces that join to the chat reply's arguments" {
++    if (builtin.os.tag != .linux) return error.SkipZigTest;
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f = try Fixture.load(a);
++    defer f.tok.deinit();
++    const want = wholeMessage(&try chatRun(a, &f, .{ .case = "two_calls", .stream = false })).calls;
++    const tools =
++        \\"tools":[{"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"},"timeout":{"type":"number"}}}},
++        \\{"name":"TodoWrite","input_schema":{"type":"object","properties":{"todos":{"type":"array"}}}}]
++    ;
++    const body = "{\"model\":\"test-model\",\"max_tokens\":4096,\"stream\":true,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}," ++ tools ++ ",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}";
++    const bytes = try messagesRun(a, &f, "two_calls", body);
++    const head = std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse return error.NoHead;
++    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200"));
++    // the tool_use blocks in order, each one's partial_json pieces joined
++    var names: std.ArrayList([]const u8) = .empty;
++    var joined: std.ArrayList(std.ArrayList(u8)) = .empty;
++    var pieces: std.ArrayList(usize) = .empty;
++    var blocks: std.AutoHashMapUnmanaged(i64, usize) = .empty;
++    var stop: []const u8 = "";
++    var frames = std.mem.splitSequence(u8, bytes[head + 4 ..], "\n\n");
++    while (frames.next()) |frame| {
++        const at = std.mem.indexOf(u8, frame, "data: ") orelse continue;
++        const ev = (try json.parse(a, frame[at + 6 ..])).ok;
++        const kind = ev.strField("type") orelse continue;
++        if (std.mem.eql(u8, kind, "content_block_start")) {
++            const cb = ev.get("content_block").?;
++            if (!std.mem.eql(u8, cb.strField("type").?, "tool_use")) continue;
++            try blocks.put(a, ev.get("index").?.int64().?, names.items.len);
++            try names.append(a, cb.strField("name").?);
++            try joined.append(a, .empty);
++            try pieces.append(a, 0);
++        } else if (std.mem.eql(u8, kind, "content_block_delta")) {
++            const d = ev.get("delta").?;
++            if (!std.mem.eql(u8, d.strField("type").?, "input_json_delta")) continue;
++            const i = blocks.get(ev.get("index").?.int64().?).?;
++            try joined.items[i].appendSlice(a, d.strField("partial_json").?);
++            pieces.items[i] += 1;
++        } else if (std.mem.eql(u8, kind, "message_delta")) stop = ev.get("delta").?.strField("stop_reason").?;
++    }
++    try std.testing.expectEqualStrings("tool_use", stop);
++    try std.testing.expectEqual(want.len, names.items.len);
++    for (want, names.items, joined.items, pieces.items, [_]usize{ 6, 2 }) |w, name, j, n, least| {
++        try std.testing.expectEqualStrings(w.get("function").?.strField("name").?, name);
++        try std.testing.expectEqualStrings(w.get("function").?.strField("arguments").?, j.items);
++        try std.testing.expect(n >= least);
++    }
++}
++
++/// Bytes as tokens, for replies the fixture does not hold; with `eos`, id 256 is the end token.
++const ByteText = struct {
++    eos: bool = false,
++
++    fn text(t: *ByteText) model_text.Text {
++        return .{ .ctx = t, .vtable = &.{ .encode = FixtureText.encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = FixtureText.render, .template_source = FixtureText.templateSource } };
++    }
++
++    /// The bytes, a character cut short at the end as U+FFFD (the text seam's contract, as the real decoder keeps it).
++    fn decode(_: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
++        const out = try a.alloc(u8, ids.len);
++        for (ids, out) |id, *b| b.* = @intCast(id);
++        var back: usize = 0;
++        while (back < @min(4, out.len)) {
++            back += 1;
++            const lead = out[out.len - back];
++            if (lead & 0xc0 == 0x80) continue;
++            const n = std.unicode.utf8ByteSequenceLength(lead) catch break;
++            if (n > back) return std.mem.concat(a, u8, &.{ out[0 .. out.len - back], "\u{fffd}" });
++            break;
++        }
++        return out;
++    }
++
++    fn tokenId(_: *anyopaque, _: []const u8) ?u32 {
++        return null;
++    }
++
++    fn tokenString(_: *anyopaque, a: Allocator, id: u32) Allocator.Error![]u8 {
++        return std.fmt.allocPrint(a, "{d}", .{id});
++    }
++
++    fn vocabSize(_: *anyopaque) u32 {
++        return 257;
++    }
++
++    fn eosIds(ctx: *anyopaque) []const u32 {
++        const t: *ByteText = @ptrCast(@alignCast(ctx));
++        return if (t.eos) &.{256} else &.{};
++    }
++};
++
++/// `answer` (no thinking) through the chat route with the tools above, whole or streamed in rounds of 5 bytes.
++fn bytesRun(a: Allocator, answer: []const u8, stream: bool) !Seen {
++    const ids = try a.alloc(u32, answer.len);
++    for (answer, ids) |b, *id| id.* = b;
++    var text: ByteText = .{};
++    var backend: ScriptEngine = .{ .ids = ids, .pattern = &.{5}, .cut = false };
++    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    const body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":", if (stream) "true" else "false", ",\"max_tokens\":4096,\"tools\":" ++ tools_json ++ "}" });
++    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++    var seen: Seen = .{ .a = a };
++    openai.run(srv, a, seen.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
++    return seen;
++}
++
++test "a call in another form after the DSML block goes out when the reply ends, under the next index" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const answer = "Listing it.\n\n<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"Bash\">\n<" ++ D ++ " parameter name=\"command\" string=\"true\">ls -la \"/tmp\"</" ++ D ++
++        " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>\n<tool_call>{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/etc/hosts\"}}</tool_call>";
++    const whole = wholeMessage(&try bytesRun(a, answer, false));
++    try std.testing.expectEqual(@as(usize, 2), whole.calls.len);
++    const r = try Read.of(a, &try bytesRun(a, answer, true));
++    try std.testing.expectEqualStrings(whole.finish, r.finish.?);
++    // the stream shows the newline between the two forms as prose, the whole reply strips it (as before the patch)
++    try std.testing.expectEqualStrings(whole.content, @import("reply_text.zig").pyStrip(r.content.items));
++    try std.testing.expectEqual(@as(usize, 2), r.calls.items.len);
++    for (whole.calls, r.calls.items) |w, s| {
++        try std.testing.expectEqualStrings(w.get("function").?.strField("name").?, s.name);
++        try std.testing.expectEqualStrings(w.get("function").?.strField("arguments").?, s.arguments.items);
++    }
++    try std.testing.expect(r.calls.items[0].pieces >= 3); // the DSML call as it decoded
++    try std.testing.expectEqual(@as(usize, 1), r.calls.items[1].pieces); // the other one whole, at the end
++}
++
++/// How `bytesAsk` runs a reply: its rounds, thinking off, cut by max_tokens at its end, its end token, a stop string.
++const Bytes = struct { pattern: []const usize = &.{5}, stream: bool = true, cut: bool = false, eos: bool = false, stop: ?[]const u8 = null };
++
++/// `answer` (no thinking) through the chat route with the tools above, as `o` says.
++fn bytesAsk(a: Allocator, answer: []const u8, o: Bytes) !Seen {
++    const ids = try a.alloc(u32, answer.len + @intFromBool(o.eos));
++    for (answer, ids[0..answer.len]) |b, *id| id.* = b;
++    if (o.eos) ids[answer.len] = 256;
++    var text: ByteText = .{ .eos = o.eos };
++    var backend: ScriptEngine = .{ .ids = ids, .pattern = o.pattern, .cut = o.cut };
++    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = false,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    const stop = if (o.stop) |st| try std.fmt.allocPrint(a, ",\"stop\":[{s}]", .{try json.quote(a, st, .{})}) else "";
++    const body = try std.fmt.allocPrint(a, "{{\"model\":\"test-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],\"stream\":{s},\"max_tokens\":{d}{s},\"tools\":{s}}}", .{
++        if (o.stream) "true" else "false", if (o.cut) answer.len else 4096, stop, tools_json,
++    });
++    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++    var seen: Seen = .{ .a = a };
++    openai.run(srv, a, seen.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
++    return seen;
++}
++
++const BD = "\u{ff5c}DSML\u{ff5c}";
++const b_open = "\n\n<" ++ BD ++ " calls>\n";
++const b_close = "</" ++ BD ++ " calls>";
++
++fn bInvoke(comptime name: []const u8, comptime params: []const u8) []const u8 {
++    return "<" ++ BD ++ " invoke name=\"" ++ name ++ "\">\n" ++ params ++ "</" ++ BD ++ " invoke>\n";
++}
++
++fn bParam(comptime name: []const u8, comptime value: []const u8) []const u8 {
++    return "<" ++ BD ++ " parameter name=\"" ++ name ++ "\" string=\"true\">" ++ value ++ "</" ++ BD ++ " parameter>\n";
++}
++
++/// A stream that ends inside a block (the cases below) against the whole reply: the same finish reason and content,
++/// no call in the whole reply, and in the stream `open` headers whose arguments are not JSON (a client cannot read
++/// them as a whole call). Returns the stream as read.
++fn expectCutBlock(a: Allocator, answer: []const u8, o: Bytes, open: usize) !Read {
++    var whole_o = o;
++    whole_o.stream = false;
++    const whole = wholeMessage(&try bytesAsk(a, answer, whole_o));
++    try std.testing.expectEqual(@as(usize, 0), whole.calls.len);
++    const r = try Read.of(a, &try bytesAsk(a, answer, o));
++    try std.testing.expectEqualStrings(whole.finish, r.finish.?);
++    try std.testing.expectEqualStrings(whole.content, r.content.items);
++    try std.testing.expectEqual(open, r.calls.items.len);
++    for (r.calls.items) |c| try std.testing.expect((try json.parse(a, c.arguments.items)) == .err);
++    return r;
++}
++
++test "thinking off, a Harmony marker in a string value and the reply cut inside it: no read past the text, the call stays open" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // the finish reads Harmony channels out of this text (content ""), so its parse no longer reads the streamed answer
++    const answer = "Searching." ++ b_open ++ "<" ++ BD ++ " invoke name=\"Bash\">\n<" ++ BD ++ " parameter name=\"command\" string=\"true\">grep -n '<|channel|>' zig/src/server/reply_text.zig and some more words that the cut ends";
++    const whole = wholeMessage(&try bytesAsk(a, answer, .{ .cut = true, .stream = false }));
++    try std.testing.expectEqualStrings("length", whole.finish);
++    try std.testing.expectEqualStrings("", whole.content);
++    for ([_][]const usize{ &.{1}, &.{5}, &.{ 3, 4 } }) |p| {
++        const r = try Read.of(a, &try bytesAsk(a, answer, .{ .cut = true, .pattern = p }));
++        try std.testing.expectEqualStrings("length", r.finish.?);
++        // the prose before the block streamed before the marker came, as without the patch
++        try std.testing.expectEqualStrings("Searching.", r.content.items);
++        try std.testing.expectEqual(@as(usize, 1), r.calls.items.len);
++        try std.testing.expect(std.mem.startsWith(u8, "{\"command\":\"grep -n '<|channel|>'", r.calls.items[0].arguments.items));
++        try std.testing.expect((try json.parse(a, r.calls.items[0].arguments.items)) == .err);
++    }
++    // a stop string and an end token inside the value end the same way
++    const stopped = try Read.of(a, &try bytesAsk(a, answer ++ " STOPHERE more", .{ .stop = "STOPHERE" }));
++    try std.testing.expectEqualStrings("stop", stopped.finish.?);
++    try std.testing.expect(stopped.calls.items.len == 1 and (try json.parse(a, stopped.calls.items[0].arguments.items)) == .err);
++    const ended = try Read.of(a, &try bytesAsk(a, answer, .{ .eos = true }));
++    try std.testing.expectEqualStrings("stop", ended.finish.?);
++    try std.testing.expect(ended.calls.items.len == 1 and (try json.parse(a, ended.calls.items[0].arguments.items)) == .err);
++}
++
++test "thinking off, a Harmony marker in a whole block: the parse takes no call, and the stream stops at the marker" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const answer = comptime ("Searching." ++ b_open ++ bInvoke("Bash", bParam("command", "grep -n '<|channel|>' zig/src/server/reply_text.zig")) ++ b_close);
++    const whole = wholeMessage(&try bytesAsk(a, answer, .{ .stream = false }));
++    try std.testing.expectEqual(@as(usize, 0), whole.calls.len);
++    try std.testing.expectEqualStrings("stop", whole.finish);
++    for ([_][]const usize{ &.{1}, &.{5}, &.{1 << 20} }) |p| {
++        const r = try Read.of(a, &try bytesAsk(a, answer, .{ .pattern = p }));
++        try std.testing.expectEqualStrings("stop", r.finish.?);
++        // a round that holds the marker turns the streamer off before its call closes: no brace, no whole call
++        try std.testing.expect(r.calls.items.len <= 1);
++        for (r.calls.items) |c| try std.testing.expect((try json.parse(a, c.arguments.items)) == .err);
++    }
++}
++
++test "prose after a block, in the round that closes it, goes out after the call's last piece" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const one = comptime ("Listing." ++ b_open ++ bInvoke("Bash", bParam("command", "ls -la")) ++ b_close ++ " Then I read it.");
++    // two blocks with prose between them and after them, in rounds that hold a closer, prose and the next opener
++    const two = comptime (one ++ b_open ++ bInvoke("Read", bParam("file_path", "/etc/hosts")) ++ b_close ++ " Done.");
++    for ([_][]const u8{ one, two }, [_]usize{ 1, 2 }) |answer, n| {
++        const whole = wholeMessage(&try bytesAsk(a, answer, .{ .stream = false }));
++        try std.testing.expectEqual(n, whole.calls.len);
++        try std.testing.expectEqualStrings("tool_calls", whole.finish);
++        for ([_][]const usize{ &.{1}, &.{5}, &.{16}, &.{ 3, 4 }, &.{ 40, 7 }, &.{1 << 20} }) |p| {
++            const r = try Read.of(a, &try bytesAsk(a, answer, .{ .pattern = p }));
++            try std.testing.expectEqualStrings(whole.finish, r.finish.?);
++            // the stream hides a block's leading blank line with the block (reply_text.calls), as without the patch
++            try std.testing.expectEqualStrings(try std.mem.replaceOwned(u8, a, whole.content, "\n\n", ""), r.content.items);
++            try std.testing.expectEqual(n, r.calls.items.len);
++            for (whole.calls, r.calls.items) |w, s| {
++                try std.testing.expectEqualStrings(w.get("function").?.strField("name").?, s.name);
++                try std.testing.expectEqualStrings(w.get("function").?.strField("arguments").?, s.arguments.items);
++            }
++        }
++    }
++}
++
++test "a block cut in its second invoke sends no whole call: the first call's brace and the second call wait for the block's closer" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const head = comptime ("Two reads." ++ b_open ++ bInvoke("Read", bParam("file_path", "/etc/hosts")) ++ "<" ++ BD ++ " invoke name=\"Write\">\n" ++
++        bParam("file_path", "/tmp/a") ++ "<" ++ BD ++ " parameter name=\"content\" string=\"true\">line one\nline two");
++    // cut by max_tokens, by a stop string, and by the end token: the parse takes no call from the block
++    for ([_]Bytes{ .{ .cut = true }, .{ .cut = true, .pattern = &.{1} }, .{ .cut = true, .pattern = &.{1 << 20} }, .{ .stop = "STOPHERE" }, .{ .eos = true } }) |o| {
++        const answer = if (o.stop != null) head ++ " STOPHERE and more" else head;
++        const r = try expectCutBlock(a, answer, o, 1);
++        // the first call went out as it decoded and stays open; the second never went out
++        try std.testing.expectEqualStrings("Read", r.calls.items[0].name);
++        try std.testing.expectEqualStrings("{\"file_path\":\"/etc/hosts\"", r.calls.items[0].arguments.items);
++    }
++    // the block whole: both calls, the second as the block closes
++    const whole_text = comptime (head ++ "</" ++ BD ++ " parameter>\n</" ++ BD ++ " invoke>\n" ++ b_close);
++    const whole = wholeMessage(&try bytesAsk(a, whole_text, .{ .stream = false }));
++    try std.testing.expectEqual(@as(usize, 2), whole.calls.len);
++    for ([_][]const usize{ &.{1}, &.{5}, &.{ 3, 4 } }) |p| {
++        const r = try Read.of(a, &try bytesAsk(a, whole_text, .{ .pattern = p }));
++        try std.testing.expectEqualStrings("tool_calls", r.finish.?);
++        try std.testing.expectEqual(@as(usize, 2), r.calls.items.len);
++        for (whole.calls, r.calls.items) |w, s| try std.testing.expectEqualStrings(w.get("function").?.strField("arguments").?, s.arguments.items);
++        if (p[0] == 1) try std.testing.expect(r.calls.items[0].pieces >= 5); // the first call streamed
++    }
++    // a whole block, then a second block cut in its second invoke: the first block's call is whole and is the parse's
++    const after = comptime ("First." ++ b_open ++ bInvoke("Bash", bParam("command", "ls")) ++ b_close ++ head["Two reads.".len..]);
++    const w2 = wholeMessage(&try bytesAsk(a, after, .{ .cut = true, .stream = false }));
++    try std.testing.expectEqual(@as(usize, 1), w2.calls.len);
++    const r2 = try Read.of(a, &try bytesAsk(a, after, .{ .cut = true }));
++    try std.testing.expectEqualStrings(w2.finish, r2.finish.?);
++    try std.testing.expectEqualStrings(w2.content, @import("reply_text.zig").pyStrip(r2.content.items));
++    try std.testing.expectEqual(@as(usize, 2), r2.calls.items.len);
++    try std.testing.expectEqualStrings(w2.calls[0].get("function").?.strField("arguments").?, r2.calls.items[0].arguments.items);
++    try std.testing.expect((try json.parse(a, r2.calls.items[1].arguments.items)) == .err);
++}
++
++test "an XML call after a DSML block that the end token leaves open goes out once, under the next index" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const answer = comptime ("Listing it." ++ b_open ++ bInvoke("Bash", bParam("command", "ls")) ++ b_close ++ "\n<tool_call>\n<function=Read>\n<parameter=file_path>\n/etc/hosts\n</parameter>\n");
++    const whole = wholeMessage(&try bytesAsk(a, answer, .{ .eos = true, .stream = false }));
++    try std.testing.expectEqual(@as(usize, 2), whole.calls.len);
++    for ([_][]const usize{ &.{1}, &.{5}, &.{1 << 20} }) |p| {
++        const r = try Read.of(a, &try bytesAsk(a, answer, .{ .eos = true, .pattern = p }));
++        try std.testing.expectEqualStrings(whole.finish, r.finish.?);
++        try std.testing.expectEqual(@as(usize, 2), r.calls.items.len);
++        for (whole.calls, r.calls.items) |w, s| {
++            try std.testing.expectEqualStrings(w.get("function").?.strField("name").?, s.name);
++            try std.testing.expectEqualStrings(w.get("function").?.strField("arguments").?, s.arguments.items);
++        }
++    }
++}
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index fac413f3..c1f50ac7 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -10,6 +10,7 @@ const messages = @import("messages.zig");
+ const tool_specs = @import("tool_specs.zig");
+ const tool_parse = @import("tool_parse.zig");
+ const tool_stream = @import("tool_stream.zig");
++const reply_text = @import("reply_text.zig");
+ const ids = @import("ids.zig");
+ const log = @import("log.zig");
+ const request_log = @import("request_log.zig");
+@@ -439,6 +440,35 @@ const Run = struct {
+         return if (o.count() > 0) Value{ .object = o } else null;
+     }
+ 
++    /// The DSML calls a stream sent as they decoded, checked against the reply's parse. When the sent
++    /// calls are the parse's first ones (same names, the same arguments byte for byte, each closed), the parse's other calls
++    /// (another call form after the blocks) follow under the next indexes. Otherwise the parse dropped or changed what went
++    /// out (the reply ended inside a block, the parse rejects an invoke, a repeated parameter): nothing more of the calls
++    /// goes out, no brace closes what the parse rejects, and the content goes on to the parse's content.
++    fn settle(r: *Run, reply: *const chat.Reply, calls: ?[]Value) Allocator.Error!void {
++        const a = r.a;
++        const sent = reply.streamed_calls;
++        const parsed = calls orelse &.{};
++        var k: usize = 0;
++        while (k < sent.len and k < parsed.len and sent[k].same(parsed[k])) k += 1;
++        if (k == sent.len) {
++            for (try tool_parse.deltas(a, parsed[k..])) |d| {
++                const one = d.get("tool_calls").?.array[0];
++                try one.object.put(a, "index", try json.intValue(a, k + @as(usize, @intCast(one.get("index").?.int64().?))));
++                r.emit(try r.chunk(d, null)) catch return;
++            }
++            return;
++        }
++        log.line("warning: {s}: the streamed tool call {d} is not the reply's parse ({d} sent, {d} parsed); its content follows the parse", .{ r.id, k, sent.len, parsed.len });
++        const shown = reply_text.pyLstrip(r.prose_sent.items);
++        if (!std.mem.startsWith(u8, reply.content, shown)) return;
++        const rest = reply.content[shown.len..];
++        if (reply_text.pyStrip(rest).len == 0) return;
++        r.prose() catch return;
++        try r.prose_sent.appendSlice(a, rest);
++        r.emit(try r.chunk(.{ .string = rest }, null)) catch return;
++    }
++
+     /// The assistant role before the first prose of a tool-using stream.
+     fn prose(r: *Run) error{Closed}!void {
+         if (r.streamed_prose) return;
+@@ -499,7 +529,9 @@ const Run = struct {
+                 r.prose_sent.appendSlice(a, tail) catch return;
+                 r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
+             }
+-            if (calls != null and !reply.tool_calls_streamed) {
++            if (!r.plan.policy.single and reply.streamed_calls.len > 0) {
++                r.settle(&reply, calls) catch return;
++            } else if (calls != null and !reply.tool_calls_streamed) {
+                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+                 const deltas = tool_parse.deltas(a, calls.?) catch return;
+                 for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 01b4bf7c..5dcfccc5 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -22,6 +22,8 @@ test {
+     _ = @import("reply_text.zig");
+     _ = @import("tool_parse.zig");
+     _ = @import("tool_stream.zig");
++    _ = @import("dsml_stream_test.zig");
++    _ = @import("dsml_fuzz_test.zig");
+     _ = @import("tool_params.zig");
+     _ = @import("pyrepr.zig");
+     _ = @import("metrics.zig");
+diff --git a/zig/src/server/testdata/dsml_stream.json b/zig/src/server/testdata/dsml_stream.json
+new file mode 100644
+index 00000000..39c1902e
+--- /dev/null
++++ b/zig/src/server/testdata/dsml_stream.json
+@@ -0,0 +1,14 @@
++{
++ "source": "DeepSeek-V4.1 tokenizer.json sha256 c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b, tokenizers 0.22.2 encode(add_special_tokens=False)",
++ "eos": 1,
++ "think_close": 128822,
++ "cases": [
++  {"name":"write","ids":[671,3967,10059,270,9575,16141,16,342,759,5085,270,4245,418,270,15361,4105,16,128822,43,5922,5085,270,9575,4245,1928,339,30,128825,10699,1018,30,128825,34756,2329,1281,21750,3816,30,128825,10767,2329,1281,8104,17555,4,3418,1281,11476,3320,17,21983,98261,17,33955,17,14553,1576,4,17410,31076,3305,17949,1718,128825,10767,1018,30,128825,10767,2329,1281,9326,4,3418,1281,11476,3320,5,15467,2136,811,86,681,430,11096,271,3158,1359,582,20385,1664,4,305,3001,29,1225,8398,905,633,9,305,260,3618,28,345,19804,24979,62,14599,62,2839,62,8603,38272,201,35,39248,1559,107073,5611,28,874,80,14,260,12826,28,200,1036,14,260,12414,68688,2562,204,201,115011,28,8869,62,85,12,7420,70,46085,3335,62,85,27374,16550,16526,305,260,26639,2562,28,28612,67,3362,764,19,14,223,20,3031,582,68,3362,582,90,28609,91,60676,24355,28,818,2512,1312,1281,90,3320,67,818,291,6546,274,1955,283,1718,2512,32,305,2728,554,260,12721,201,4437,49224,28,223,1880,1576,31236,51345,9227,69292,17793,73369,235,66924,251,3574,102,225,52780,105,46088,23903,122,74475,110,3128,244,235,25283,120,93466,201,2616,16,455,41949,509,223,3600,28,3315,16205,223,19,16,23,292,6787,582,16053,4,874,2121,201,3425,16,455,41949,509,223,3398,28,929,16205,223,21,16,18,292,6787,582,16053,4,874,2121,201,3600,16,455,41949,509,223,3130,28,1602,16205,223,22,16,23,292,6787,582,16053,4,874,2121,201,3663,16,455,41949,509,223,736,28,1449,16205,223,24,16,18,292,6787,582,16053,4,874,2121,201,2642,16,455,41949,509,223,856,28,1810,16205,223,25,16,23,292,6787,582,16053,4,874,2121,201,3398,16,455,41949,509,223,864,28,3180,16205,223,27,16,18,292,6787,582,16053,4,874,2121,201,3315,16,455,41949,509,223,1602,28,2505,16205,223,553,16,23,292,6787,582,16053,4,874,2121,201,3019,16,455,41949,509,223,504,28,3661,16205,223,736,16,18,292,6787,582,16053,4,874,2121,201,3130,16,455,41949,509,223,3600,28,3600,16205,223,907,16,23,292,6787,582,16053,4,874,2121,201,553,16,455,41949,509,223,3398,28,553,16205,223,856,16,18,292,6787,582,16053,4,874,2121,201,779,16,455,41949,509,223,3130,28,1002,16205,223,926,16,23,292,6787,582,16053,4,874,2121,201,736,16,455,41949,509,223,736,28,1173,16205,223,864,16,18,292,6787,582,16053,4,874,2121,201,907,16,455,41949,509,223,856,28,2181,16205,223,511,16,23,292,6787,582,16053,4,874,2121,201,929,16,455,41949,509,223,864,28,2080,16205,223,1602,16,18,292,6787,582,16053,4,874,2121,201,856,16,455,41949,509,223,1602,28,1883,16205,223,1302,16,23,292,6787,582,16053,4,874,2121,201,926,16,455,41949,509,223,504,28,4157,16205,223,1173,16,18,292,6787,582,16053,4,874,2121,201,1002,16,455,41949,509,223,3600,28,3318,16205,223,1069,16,23,292,6787,582,16053,4,874,2121,201,864,16,455,41949,509,223,3398,28,3398,16205,223,1477,16,18,292,6787,582,16053,4,874,2121,201,511,16,455,41949,509,223,3130,28,907,16205,223,1449,16,23,292,6787,582,16053,4,874,2121,201,397,16,455,41949,509,223,736,28,397,16205,223,1059,16,18,292,6787,582,16053,4,874,2121,201,1602,16,455,41949,509,223,856,28,1477,16205,223,2181,16,23,292,6787,582,16053,4,874,2121,201,1302,16,455,41949,509,223,864,28,2012,16205,223,1671,16,18,292,6787,582,16053,4,874,2121,201,1349,16,455,41949,509,223,1602,28,3286,16205,223,2012,16,23,292,6787,582,16053,4,874,2121,201,1173,16,455,41949,509,223,504,28,2170,16205,223,1872,16,18,292,6787,582,16053,4,874,2121,201,55655,35211,1718,128825,10767,1018,1718,128825,34756,1018,1718,128825,10699,32,1]},
++  {"name":"edit","ids":[85903,270,3072,1926,418,270,40530,834,16,128822,8197,342,5922,11284,270,1926,339,30,128825,10699,1018,30,128825,34756,2329,1281,24336,3816,30,128825,10767,2329,1281,8104,17555,4,3418,1281,11476,3320,17,85,31884,38885,55698,52002,16,27801,1718,128825,10767,1018,30,128825,10767,2329,1281,1129,23007,4,3418,1281,11476,3320,41494,5618,438,582,67,7387,68,5493,5562,5618,47827,128825,10767,1018,30,128825,10767,2329,1281,2839,23007,4,3418,1281,11476,3320,41494,5618,438,582,67,22552,68,21390,1915,582,25441,14807,2701,5562,6849,3420,381,100916,20524,26,14,5618,14,582,874,86,30839,1718,128825,10767,1018,30,128825,10767,2329,1281,47836,37665,4,3418,1281,19836,3320,11476,1718,128825,10767,1018,1718,128825,34756,1018,1718,128825,10699,32,1]},
++  {"name":"two_calls","ids":[12386,1257,14,1539,6781,270,1116,16,128822,5718,678,5351,270,4181,305,3676,270,2831,339,30,128825,10699,1018,30,128825,34756,2329,1281,36,1844,3816,30,128825,10767,2329,1281,28381,4,3418,1281,11476,3320,73,15277,565,36975,582,28952,874,89,29284,1698,12477,17,369,2578,565,80,223,397,6546,11818,905,44629,9,1955,1492,33793,17,606,62,4245,16415,1718,128825,10767,1018,30,128825,10767,2329,1281,20855,4,3418,1281,11476,3320,14965,2019,20269,1718,128825,10767,1018,30,128825,10767,2329,1281,8322,606,4,3418,1281,19836,3320,4870,1320,1718,128825,10767,1018,1718,128825,34756,1018,30,128825,34756,2329,1281,68140,21750,3816,30,128825,10767,2329,1281,86,30753,4,3418,1281,19836,3320,61,24313,9326,3362,582,97372,270,42952,1760,582,19027,3362,582,261,20006,4448,1760,582,6615,6484,3362,582,40,67663,270,42952,87928,28612,9326,3362,582,6340,260,1950,86224,1760,582,19027,3362,582,116182,1760,582,6615,6484,3362,582,51166,260,1950,4,37236,1718,128825,10767,1018,1718,128825,34756,1018,1718,128825,10699,32,1]},
++  {"name":"unoffered","ids":[79298,270,4366,14,1539,5085,270,13672,16,128822,79298,288,270,4366,339,30,128825,10699,1018,30,128825,34756,2329,1281,11328,79298,3816,30,128825,10767,2329,1281,7916,4,3418,1281,11476,3320,5395,2272,30357,2193,20922,33,68,31,19,8,69,1281,20,4,1718,128825,10767,1018,30,128825,10767,2329,1281,36132,529,4,3418,1281,11476,3320,101859,1387,582,1805,4,4366,1718,128825,10767,1018,1718,128825,34756,1018,30,128825,34756,2329,1281,21750,3816,30,128825,10767,2329,1281,8104,17555,4,3418,1281,11476,3320,17,33793,2283,395,5259,26887,1718,128825,10767,1018,30,128825,10767,2329,1281,9326,4,3418,1281,11476,3320,5,15239,271,54,14265,201,1718,128825,10767,1018,1718,128825,34756,1018,1718,128825,10699,32,1]},
++  {"name":"quoted","ids":[43,1494,1926,436,1277,566,979,30,128825,10699,1018,30,128825,34756,2329,1281,8158,3816,30,128825,10767,2329,1281,8104,17555,4,3418,1281,11476,3320,17,32445,3625,51407,1718,128825,10767,1018,1718,128825,34756,1018,1718,128825,10699,1018,4146,270,3967,4869,1353,1192,16,128822,3054,1733,260,4245,14,5085,117025,128825,34756,2329,1281,8158,3320,66,418,260,117025,128825,10767,2329,1281,8104,17555,4,3418,1281,11476,3320,66,6352,260,10699,5603,29,342,1687,554,1926,436,2155,16,1]},
++  {"name":"cut","ids":[671,3967,10059,270,9575,16141,16,342,759,5085,270,4245,418,270,15361,4105,16,128822,43,5922,5085,270,9575,4245,1928,339,30,128825,10699,1018,30,128825,34756,2329,1281,21750,3816,30,128825,10767,2329,1281,8104,17555,4,3418,1281,11476,3320,17,21983,98261,17,33955,17,14553,1576,4,17410,31076,3305,17949,1718,128825,10767,1018,30,128825,10767,2329,1281,9326,4,3418,1281,11476,3320,5,15467,2136,811,86,681,430,11096,271,3158,1359,582,20385,1664,4,305,3001,29,1225,8398,905,633,9,305,260,3618,28,345,19804,24979,62,14599,62,2839,62,8603,38272,201,35,39248,1559,107073,5611,28,874,80,14,260,12826,28,200,1036,14,260,12414,68688,2562,204,201,115011,28,8869,62,85,12,7420,70,46085,3335,62,85,27374,16550,16526,305,260,26639,2562,28,28612,67,3362,764,19,14,223,20,3031,582,68,3362,582,90,28609,91,60676,24355,28,818,2512,1312,1281,90,3320,67,818,291,6546,274,1955,283,1718,2512,32,305,2728,554,260,12721,201,4437,49224,28,223,1880,1576,31236,51345,9227,69292,17793,73369,235,66924,251,3574,102,225,52780,105,46088,23903,122,74475,110,3128,244,235,25283,120,93466,201,2616,16,455,41949,509,223,3600,28,3315,16205,223,19,16,23,292,6787,582,16053,4,874,2121,201,3425,16,455,41949,509,223,3398,28,929,16205,223,21,16,18,292,6787,582,16053,4,874,2121,201,3600,16,455,41949,509,223,3130,28,1602,16205,223,22,16,23,292,6787,582,16053,4,874,2121,201,3663,16,455,41949,509,223,736,28,1449,16205,223,24,16,18,292,6787,582,16053,4,874,2121,201,2642,16,455,41949,509,223,856,28,1810,16205,223,25,16,23,292,6787,582,16053,4,874,2121,201,3398,16,455,41949,509,223,864,28,3180,16205,223,27,16,18,292,6787,582,16053,4,874,2121,201,3315,16,455,41949,509,223,1602,28,2505,16205,223,553,16,23,292,6787,582,16053,4,874,2121,201,3019,16,455,41949,509,223,504,28,3661,16205,223,736,16,18,292,6787,582,16053,4,874,2121,201,3130,16,455,41949,509,223,3600,28,3600,16205,223,907,16,23,292,6787,582,16053,4,874,2121,201,553,16,455,41949,509,223,3398,28,553,16205,223,856,16,18,292,6787,582,16053,4,874,2121,201,779,16,455,41949,509,223,3130,28,1002,16205,223,926,16,23]}
++ ],
++ "tokenizer": {"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":1,"content":"<\uff5cend\u2581of\u2581sentence\uff5c>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},{"id":128822,"content":"</think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false},{"id":128825,"content":"\uff5cDSML\uff5c","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"<\uff5cend\u2581of\u2581sentence\uff5c>":1,"\"":4,"#":5,"&":8,"'":9,"*":12,",":14,".":16,"/":17,"0":18,"1":19,"2":20,"3":21,"4":22,"5":23,"6":24,"7":25,"8":26,"9":27,":":28,";":29,"<":30,"=":31,">":32,"?":33,"A":35,"B":36,"F":40,"I":43,"T":54,"[":61,"\\":62,"`":66,"a":67,"b":68,"c":69,"d":70,"g":73,"n":80,"s":85,"t":86,"w":89,"x":90,"y":91,"\u00a6":102,"\u00a9":105,"\u00af":110,"\u00b9":120,"\u00bb":122,"\u0109":200,"\u010a":201,"\u010d":204,"\u0120":223,"\u0122":225,"\u012c":235,"\u0135":244,"\u013c":251,"\u0120a":260,"in":261,"\u0120the":270,"\u010a\u010a":271,"\u0120c":274,"\u0120d":283,"ing":288,"\u0120b":291,"\u0120m":292,"\u0120and":305,".\u010a\u010a":339,"\u0120I":342,"\u0120C":345,"\u0120|":369,"em":381,"um":395,"20":397,"\u0120with":418,"\u00e2\u0122\u013f":430,"\u0120it":436,"\u0120=":438,"\u0120The":455,"00":504,"\u0120at":509,"19":511,"pt":529,"10":553,"\u0120not":554,"\u0120-":565,"\u0120this":566,"\u0120\"":582,"out":606,"ok":633,"The":671,"\u0120me":678,"ide":681,"12":736,"\u0120will":759,"\u0120[":764,"11":779,"\u0120\u00e2\u0122\u013e":811,"\u0120<":818,"\u0120one":834,"15":856,"18":864,"\u0120\\":874,"\u0120'":905,"13":907,"16":926,"14":929,":\u010a\u010a":979,"17":1002,">\u010a":1018,"here":1036,"30":1059,"25":1069,"\u0120work":1116,"old":1129,"24":1173,"\u0120how":1192,"\u0120she":1225,"\u0120first":1257,"\u0120like":1277,"=\"":1281,"22":1302,"\u0120class":1312,"000":1320,"23":1349,"\u0120only":1353,"\u0120said":1359,"ize":1387,"28":1449,"27":1477,"\u0120/":1492,"\u0120could":1494,"\u0120then":1539,"\u0120back":1559,"\u00e3\u0123\u00ae":1576,"21":1602,"'t":1664,"33":1671,"\u0120did":1687,"(\"":1698,"</":1718,"\u0120read":1733,"\",":1760,"the":1805,"35":1810,"ash":1844,"36":1872,"\u00e6\u00b5\u00b7":1880,"45":1883,"\u0120//":1915,"\u0120call":1926,"\u0120now":1928,"\u0120test":1950,"\u0120>":1955,"34":2012,"\u0120function":2019,"38":2080,"\u0120mark":2121,"\u0120\u00e2\u0122\u0136":2136,"\u0120here":2155,"48":2170,"31":2181,".com":2193,"://":2272,"/s":2283,"\u0120name":2329,"49":2505,"div":2512,"\u0120line":2562,"\u0120head":2578,"01":2616,"05":2642,"\"\u010a":2701,"\u0120</":2728,"\u0120plan":2831,"new":2839,"\u0120left":3001,"08":3019,"],":3031,"To":3054,"\u0120old":3072,"\u00f0\u013f":3128,"09":3130,"He":3158,"42":3180,"41":3286,"\".":3305,"07":3315,"59":3318,"\">":3320,"\\.":3335,"\":":3362,"06":3398,"\u0120string":3418,".m":3420,"02":3425,"\u00f0\u0141":3574,"03":3600,"\u0120path":3618,"/h":3625,"56":3661,"04":3663,"\u0120record":3676,"\">\u010a":3816,"\u0120user":3967,"\u0120tool":4105,"But":4146,"52":4157,"\u0120code":4181,"\u0120file":4245,"\u0120page":4366,"Un":4437,"gress":4448,"\u0120asked":4869,"120":4870,"\u0120write":5085,"mary":5259,"\u0120search":5351,"https":5395,"\";\u010a":5493,"\u0109return":5562,"\u0120block":5603,"-n":5611,"\u0120q":5618,"Let":5718,"'ll":5922,"Add":6340,"\u0120inside":6352,"Form":6484,"\u0120&&":6546,"active":6615,"\u0120track":6781,"\u0120\u00e2\u0128\u0134":6787,"\u0120std":6849,"\\\\":7387,"(\\":7420,"url":7916,"file":8104,"Read":8158,"Now":8197,"time":8322,"\u0120wrote":8398,"table":8603,"\u0120^":8869,"\u00ec\u0138\u00b4":9227,"content":9326,"\u0120notes":9575,"\u0120wants":10059,"\u0120calls":10699,"\u0120parameter":10767,"\u0120tables":11096,"\u0120fix":11284,"Web":11328,"true":11476,"\u0120echo":11818,"Search":12386,"\u0120CR":12414,"\u0120src":12477,"\u0120closer":12721,"\u0120tab":12826,"\u0120summary":13672,"BD":14265,"\u00e4\u00bb\u012c\u00e6\u0139\u00a5":14553,"dev":14599,"aped":14807,"Find":14965,"\u0120Summary":15239,"rep":15277,"\u0120Write":15361,"\u0120Notes":15467,"high":16053,"\u0120saved":16141,"\u0120rose":16205,".txt":16415,")$":16526,".*":16550,"\u00e3\u0125\u00a1":17410,"_path":17555,"\u00cc\u0123":17793,"md":17949,"status":19027,":\\":19804,"false":19836,"_pro":20006,"\u0120definitions":20269,"don":20385,"(u":20524,"description":20855,"/a":20922,"\";":21390,"Write":21750,"home":21983,"\\\\\\\\":22552,"_string":23007,"\u00f0\u0141\u0134":23903,"{\"":24313,"Edit":24336,"HTML":24355,"Users":24979,"\u00f0\u013f\u0134":25283,"esc":25441,"\u0120JSON":26639,".md":26887,"+(":27374,"zig":27801,"command":28381,"\\\"":28609,"\u0120{\"":28612,"fn":28952,"\\+":29284,"example":30357,"odos":30753,"\");":30839,"\u00e3\u0125\u00a2":31076,"\u00e8\u00a9\u00a9":31236,"rv":31884,"etc":32445,"tmp":33793,"notes":33955,"\u0120invoke":34756,"\\\u010a":35211,"prom":36132,"rn":36975,"}]":37236,"_all":37665,".csv":38272,"/app":38885,"\u0120literal":39248,"\u0120escaped":40530,"\u0109const":41494,"\u0120tide":41949,"\u0120parser":42952,"done":44629,"+)":46085,"\u00e2\u0122\u012f":46088,";</":47827,"replace":47836,"icode":49224,"Adding":51166,"\u0120\u00ed\u0137\u013e\u00ea\u00b5\u0143":51345,"osts":51407,"/main":52002,"\u0120\u00f0\u0141\u0133":52780,"\u0109end":55655,"/src":55698,"\"}\u010a":60676,"\u00f0\u0141\u0132":66924,"ixing":67663,"Todo":68140,"LF":68688,"\u0120cafe":69292,"\u0120\u00f0\u0141\u012e":73369,"\u0120\u00f0\u013f\u0134":74475,"Fetch":79298,"Replace":85903,"\u0120\u00e2\u013e\u0135":86224,"\"},":87928,"\u00f0\u013f\u0133\u0134":93466,"Fix":97372,"/dev":98261,".trim":100916,"Summar":101859,"slash":107073,"Regex":115011,"pending":116182,"\u0120`<":117025,"</think>":128822,"\uff5cDSML\uff5c":128825},"merges":[]}}
++}
+diff --git a/zig/src/server/testdata/dsml_stream_golden.json b/zig/src/server/testdata/dsml_stream_golden.json
+new file mode 100644
+index 00000000..28c106dc
+--- /dev/null
++++ b/zig/src/server/testdata/dsml_stream_golden.json
+@@ -0,0 +1,136 @@
++{
++ "no_tools_write": [
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"The user wants the notes saved. I will write the file with the Write tool.\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"I'll write the notes file now.\\n\\n<\\uff5cDSML\\uff5c calls\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \">\\n<\\uff5cDSML\\uff5c invoke name=\\\"Write\\\">\\n<\\uff5cDSML\\uff5c parameter name=\\\"file_path\\\" string=\\\"true\\\">/home/dev/notes/\\u4eca\\u65e5\\u306e\\\"\\u30e1\\u30e2\\\".md</\\uff5cDSML\\uff5c parameter>\\n<\\uff5cDSML\\uff5c parameter name=\\\"content\\\" string=\\\"true\\\"># Notes \\u2014 \\u201ctide\\u201d tables\\n\\nHe said \\\"don\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"'t\\\" and left; she wrote 'ok' and a path: C:\\\\Users\\\\dev\\\\new\\\\table.csv\\nA literal backslash\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"-n: \\\\n, a tab:\\there, a CRLF line\\r\\nRegex: ^\\\\s*(\\\\d+)\\\\.\\\\s+(.*)$ and a JSON line: {\\\"a\\\": [1, 2], \\\"b\\\": \\\"x\\\\\\\"y\\\"}\\nHTML: <div class=\\\"x\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"\\\">a < b && c > d</div> and </ not a closer\\nUnicode: \\u6d77\\u306e\\u8a69 \\ud55c\\uad6d\\uc5b4 cafe\\u0301 \\ud83c\\udf0a\\ud83d\\udc1a\\ud83e\\udd80 \\ud83d\\udc69\\u200d\\ud83d\\udcbb \\ud835\\udcaf\\ud835\\udcca\\ud835\\udcb9\\ud835\\udc52\\n01. The tide at 03:07 rose 1.5 m \\u2192 \\\"high\\\" \\\\ mark\\n02. The tide at 06:14 rose 3.0 m \\u2192 \\\"high\\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" \\\\ mark\\n03. The tide at 09:21 rose 4.5 m \\u2192 \\\"high\\\" \\\\ mark\\n04. The tide\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" at 12:28 rose 6.0 m \\u2192 \\\"high\\\" \\\\ mark\\n05. The tide at 15:35 rose 7.5 m \\u2192 \\\"high\\\" \\\\ mark\\n06. The tide at 18:42 rose 9.0 m \\u2192 \\\"high\\\" \\\\ mark\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"\\n07. The tide at 21:49 rose 10.5 m \\u2192 \\\"high\\\" \\\\ mark\\n08. The tide at \"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"00:56 rose 12.0 m \\u2192 \\\"high\\\" \\\\ mark\\n09. The tide at 03:03 rose 13.5 m \\u2192 \\\"high\\\" \\\\ mark\\n10. The tide at 06:10 rose 15.0 m \\u2192 \\\"high\\\" \\\\ mark\\n11\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \". The tide at 09:17 rose 16.5 m \\u2192 \\\"high\\\" \\\\ mark\\n12. The tide at 12:\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"24 rose 18.0 m \\u2192 \\\"high\\\" \\\\ mark\\n13. The tide at 15:31 rose 19.5 m \\u2192 \\\"high\\\" \\\\ mark\\n14. The tide at 18:38 rose 21.0 m \\u2192 \\\"high\\\" \\\\ mark\\n15. The\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" tide at 21:45 rose 22.5 m \\u2192 \\\"high\\\" \\\\ mark\\n16. The tide at 00:52 rose\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" 24.0 m \\u2192 \\\"high\\\" \\\\ mark\\n17. The tide at 03:59 rose 25.5 m \\u2192 \\\"high\\\" \\\\ mark\\n18. The tide at 06:06 rose 27.0 m \\u2192 \\\"high\\\" \\\\ mark\\n19. The tide at\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" 09:13 rose 28.5 m \\u2192 \\\"high\\\" \\\\ mark\\n20. The tide at 12:20 rose 30\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \".0 m \\u2192 \\\"high\\\" \\\\ mark\\n21. The tide at 15:27 rose 31.5 m \\u2192 \\\"high\\\" \\\\ mark\\n22. The tide at 18:34 rose 33.0 m \\u2192 \\\"high\\\" \\\\ mark\\n23. The tide at 21\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \":41 rose 34.5 m \\u2192 \\\"high\\\" \\\\ mark\\n24. The tide at 00:48 rose 36.0\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" m \\u2192 \\\"high\\\" \\\\ mark\\n\\tend\\\\\\n</\\uff5cDSML\\uff5c parameter>\\n</\\uff5cDSML\\uff5c invoke>\\n</\\uff5cDSML\\uff5c calls>\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}], \"exact_mode\": \"exact\", \"usage\": {\"prompt_tokens\": 6, \"completion_tokens\": 772, \"total_tokens\": 778, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 18}}}"
++ ],
++ "no_tools_two_calls": [
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"Search first, then track the work\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \".\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Let me search the code and record the plan.\\n\\n<\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"\\uff5cDSML\\uff5c calls>\\n<\\uff5cDSML\\uff5c invoke name\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"=\\\"Bash\\\">\\n<\\uff5cDSML\\uff5c parameter name=\\\"command\\\" string=\\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"true\\\">grep -rn \\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"fn \\\\w\\\\+(\\\" src/ | head -n 20\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" && echo 'done' > /\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"tmp/out\\\\ file.txt</\\uff5cDSML\\uff5c parameter>\\n<\\uff5cDSML\\uff5c parameter\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" name=\\\"description\\\" string=\\\"true\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"\\\">Find function definitions</\\uff5cDSML\\uff5c parameter>\\n<\\uff5cDSML\\uff5c parameter name=\\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"timeout\\\" string=\\\"false\\\">\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"120000</\\uff5cDSML\\uff5c parameter>\\n</\\uff5cDSML\\uff5c invoke>\\n<\\uff5cDSML\\uff5c invoke\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" name=\\\"TodoWrite\\\">\\n<\\uff5cDSML\\uff5c\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" parameter name=\\\"todos\\\" string=\\\"false\\\">[{\\\"content\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"\\\": \\\"Fix the parser\\\", \\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"status\\\": \\\"in_progress\\\", \\\"activeForm\\\": \\\"F\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"ixing the parser\\\"}, {\\\"content\\\":\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" \\\"Add a test \\u2713\\\", \\\"status\\\": \\\"pending\\\", \\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"activeForm\\\": \\\"Adding a test\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"\\\"}]</\\uff5cDSML\\uff5c parameter>\\n</\\uff5cDSML\\uff5c invoke>\\n</\\uff5cDSML\\uff5c calls\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \">\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}], \"exact_mode\": \"exact\", \"usage\": {\"prompt_tokens\": 6, \"completion_tokens\": 202, \"total_tokens\": 208, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 9}}}"
++ ],
++ "no_tools_quoted": [
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"I could call\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" it\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" like this:\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"\\n\\n<\\uff5cDSML\\uff5c calls>\\n<\\uff5cDSML\\uff5c invoke name=\\\"Read\\\">\\n<\\uff5cDSML\\uff5c parameter name=\\\"file_path\\\" string=\\\"true\\\">/etc/hosts</\\uff5cDSML\\uff5c parameter>\\n</\\uff5cDSML\\uff5c invoke>\\n</\\uff5cDSML\\uff5c calls>\\nBut the user asked only how.\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"To read\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" a\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" file, write `<\\uff5cDSML\\uff5c\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" invoke name\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"=\\\"Read\\\">\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"`\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" with a `<\\uff5cDSML\\uff5c\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" parameter\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" name=\\\"file_path\\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" string=\\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"true\\\">`\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" inside\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" a calls block;\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" I\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" did not call it here\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \".\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}], \"exact_mode\": \"exact\", \"usage\": {\"prompt_tokens\": 6, \"completion_tokens\": 96, \"total_tokens\": 102, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 54}}}"
++ ],
++ "tools_quoted": [
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"I could call\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" it\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" like this:\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"\\n\\n<\\uff5cDSML\\uff5c calls>\\n<\\uff5cDSML\\uff5c invoke name=\\\"Read\\\">\\n<\\uff5cDSML\\uff5c parameter name=\\\"file_path\\\" string=\\\"true\\\">/etc/hosts</\\uff5cDSML\\uff5c parameter>\\n</\\uff5cDSML\\uff5c invoke>\\n</\\uff5cDSML\\uff5c calls>\\nBut the user asked only how.\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"To read\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" a\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" file, write `\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"<\\uff5cDSML\\uff5c invoke name\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"=\\\"Read\\\">\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"`\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" with a `\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"<\\uff5cDSML\\uff5c parameter\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" name=\\\"file_path\\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" string=\\\"\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"true\\\">`\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" inside\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" a calls block;\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" I\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" did not call it here\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \".\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}], \"exact_mode\": \"exact\", \"usage\": {\"prompt_tokens\": 6, \"completion_tokens\": 96, \"total_tokens\": 102, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 54}}}"
++ ],
++ "single_unoffered": [
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"Fetch the page\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \",\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" then write the summary\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \".\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Fetching the page\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \".\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_X\", \"type\": \"function\", \"function\": {\"name\": \"Write\", \"arguments\": \"\"}}]}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"{\\\"file_path\\\":\\\"/tmp/summary.md\\\",\\\"content\\\":\\\"# Summary\\\\n\\\\nTBD\\\\n\\\"}\"}}]}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"exact_mode\": \"exact\", \"usage\": {\"prompt_tokens\": 6, \"completion_tokens\": 141, \"total_tokens\": 147, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 10}}}"
++ ],
++ "single_two_calls_by_token": [
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"Search\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" first\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \",\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" then\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" track\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" the\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" work\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \".\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Let\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" me\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" search\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" the\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" code\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" and\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" record\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" the\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" plan\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \".\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_X\", \"type\": \"function\", \"function\": {\"name\": \"Bash\", \"arguments\": \"\"}}]}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"{\\\"command\\\":\\\"grep -rn \\\\\\\"fn \\\\\\\\w\\\\\\\\+(\\\\\\\" src/ | head -n 20 && echo 'done' > /tmp/out\\\\\\\\ file.txt\\\",\\\"description\\\":\\\"Find function definitions\\\",\\\"timeout\\\":120000}\"}}]}, \"finish_reason\": null}]}",
++  "{\"object\": \"chat.completion.chunk\", \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"exact_mode\": \"exact\", \"usage\": {\"prompt_tokens\": 6, \"completion_tokens\": 202, \"total_tokens\": 208, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 9}}}"
++ ]
++}
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index 5e1d358e..bc7f04fb 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -20,7 +20,7 @@ const Envelope = struct { start: usize, end: usize, payload: []const u8 };
+ 
+ pub const Parsed = struct { content: []const u8, calls: ?[]Value };
+ 
+-const dsml_open = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
++pub const dsml_open = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
+ const dsml_close = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
+ const invoke_open = "<\u{ff5c}DSML\u{ff5c}invoke name=\"";
+ const invoke_close = "</\u{ff5c}DSML\u{ff5c}invoke>";
+@@ -28,12 +28,12 @@ const param_open = "<\u{ff5c}DSML\u{ff5c}parameter name=\"";
+ const param_close = "</\u{ff5c}DSML\u{ff5c}parameter>";
+ // DeepSeek-V4.1's spelling (its chat template's, and the served Python lane's reply_text.py): a space after the marker,
+ // the block named "calls"; read as the lane reads it (dsml41Calls)
+-const dsml41_open = "<\u{ff5c}DSML\u{ff5c} calls>";
+-const dsml41_close = "</\u{ff5c}DSML\u{ff5c} calls>";
+-const invoke41_open = "<\u{ff5c}DSML\u{ff5c} invoke name=\"";
+-const invoke41_close = "</\u{ff5c}DSML\u{ff5c} invoke>";
+-const param41_open = "<\u{ff5c}DSML\u{ff5c} parameter name=\"";
+-const param41_close = "</\u{ff5c}DSML\u{ff5c} parameter>";
++pub const dsml41_open = "<\u{ff5c}DSML\u{ff5c} calls>";
++pub const dsml41_close = "</\u{ff5c}DSML\u{ff5c} calls>";
++pub const invoke41_open = "<\u{ff5c}DSML\u{ff5c} invoke name=\"";
++pub const invoke41_close = "</\u{ff5c}DSML\u{ff5c} invoke>";
++pub const param41_open = "<\u{ff5c}DSML\u{ff5c} parameter name=\"";
++pub const param41_close = "</\u{ff5c}DSML\u{ff5c} parameter>";
+ 
+ fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
+     if (from > hay.len) return null;
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index a02ee06d..a7288e49 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -1,4 +1,4 @@
+-//! Tool calls while they are written: XML calls as argument deltas, and the one-call policy's text filter.
++//! Tool calls while they are written: XML and DSML calls as argument deltas, and the one-call policy's text filter.
+ const std = @import("std");
+ const json = @import("json.zig");
+ const ids = @import("ids.zig");
+@@ -49,9 +49,15 @@ pub const Streamer = struct {
+     held: []const u8 = "",
+     streamed: bool = false,
+     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
++    dsml: Dsml = .{}, // DeepSeek-V4.1's calls (feedDsml)
+ 
+     pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
+         var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
++        // the offered names as tool_parse.parse reads them for a DSML block
++        for (tools) |tool| {
++            const name = try tool_specs.toolName(a, tool);
++            try s.dsml.known.put(a, try std.ascii.allocLowerString(a, name), name);
++        }
+         for (tools) |tool| {
+             if (tool != .object) continue;
+             const spec = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
+@@ -179,6 +185,430 @@ pub const Streamer = struct {
+             }
+         }
+     }
++
++    /// The deltas the reply's ``text`` (its whole answer so far, never the reasoning) adds to its DSML calls.
++    pub fn feedDsml(s: *Streamer, t: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
++        return s.feedDsmlTo(t, out, false);
++    }
++
++    /// ``feedDsml`` that stops at the end of the block it is in: a round's prose after that block goes out after the
++    /// block's last deltas and before the next block's first (``Dsml.midCall``).
++    pub fn feedDsmlBlock(s: *Streamer, t: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
++        return s.feedDsmlTo(t, out, true);
++    }
++
++    fn feedDsmlTo(s: *Streamer, t: []const u8, out: *std.ArrayList(Value), one_block: bool) Allocator.Error!void {
++        const d = &s.dsml;
++        const a = s.a;
++        // the saved positions hold only in a text that extends the one read before; a shorter one turns the streamer
++        // off, and the finish then follows the parse (Dsml.verify checks the whole text once)
++        if (t.len < d.read) d.off = true;
++        if (!d.off and t.len > d.read) {
++            try d.seen.appendSlice(a, t[d.read..]);
++            d.read = t.len;
++        }
++        while (!d.off) {
++            d.bounds(t);
++            switch (d.state) {
++                .outside => {
++                    if (one_block) return;
++                    // envelopes(): the next block from the end of the last, and only one that closes is the parse's
++                    const i = findIn(t, tool_parse.dsml41_open, @max(d.pos, d.from), null);
++                    if (i != .at) {
++                        d.from = @max(d.pos, t.len -| (tool_parse.dsml41_open.len - 1));
++                        return;
++                    }
++                    if ((d.sent.items.len == 0 and s.streamed) or foreignCall(t[d.gap..i.at])) {
++                        d.off = true;
++                        return;
++                    }
++                    d.pos = i.at + tool_parse.dsml41_open.len;
++                    d.block_end = null;
++                    d.block_from = d.pos;
++                    d.block_calls = 0;
++                    d.state = .block;
++                },
++                .block => switch (findIn(t, tool_parse.invoke41_open, d.pos, d.block_end)) {
++                    .wait => return,
++                    .none => {
++                        // the block's closer: every invoke in it is decided, and the calls it held go out
++                        try d.closePending(a, out);
++                        try d.release(a, out);
++                        d.pos = d.block_end.? + tool_parse.dsml41_close.len;
++                        d.gap = d.pos;
++                        d.from = d.pos;
++                        d.state = .outside;
++                    },
++                    .at => |i| {
++                        d.pos = i + 1; // where the parse looks again when this invoke is not one
++                        d.name_start = i + tool_parse.invoke41_open.len;
++                        d.state = .name;
++                    },
++                },
++                .name => switch (findIn(t, "\"", d.name_start, d.block_end)) {
++                    .wait => return,
++                    .none => d.state = .block,
++                    .at => |q| {
++                        if (q == d.name_start) {
++                            d.state = .block;
++                            continue;
++                        }
++                        if (q + 1 >= (d.block_end orelse t.len)) {
++                            if (d.block_end == null) return; // its '>' has not come yet
++                            d.state = .block;
++                            continue;
++                        }
++                        if (t[q + 1] != '>') {
++                            d.state = .block;
++                            continue;
++                        }
++                        d.q = q;
++                        d.end = null;
++                        d.end_pending = true;
++                        d.end_from = q + 2;
++                        d.state = .skip;
++                        d.bounds(t);
++                        if (!d.end_pending and d.end == null) {
++                            d.state = .block; // no closer in its block: the parse takes no call here
++                            continue;
++                        }
++                        const name = reply_text.pyStrip(t[d.name_start..q]);
++                        if (name.len == 0) continue; // the parse reads it, then takes no call: skip to its closer
++                        // the block's first call streams; a later one waits with the first call's brace for the
++                        // block's closer, since the parse takes no call from a block that never closes
++                        d.block_calls += 1;
++                        if (d.block_calls > 1) d.holding = true;
++                        try d.closePending(a, out);
++                        // the parse's name: the offered spelling, else the model's (a copy: the answer's buffer moves)
++                        const called = d.known.get(try std.ascii.allocLowerString(a, name)) orelse try a.dupe(u8, name);
++                        const function = try json.newObject(a);
++                        try function.put(a, "name", .{ .string = called });
++                        try function.put(a, "arguments", .{ .string = "" });
++                        const one = try json.newObject(a);
++                        try one.put(a, "index", try json.intValue(a, d.sent.items.len));
++                        try one.put(a, "id", .{ .string = try ids.make(a, "call_", 24) });
++                        try one.put(a, "type", .{ .string = "function" });
++                        try one.put(a, "function", .{ .object = function });
++                        try d.dest(out).append(a, try wrap(a, .{ .object = one }));
++                        try d.sent.append(a, .{ .name = called });
++                        if (!d.holding) d.released = d.sent.items.len;
++                        d.current = d.sent.items.len - 1;
++                        s.streamed = true;
++                        d.p = q + 2;
++                        d.state = .body;
++                    },
++                },
++                .skip => {
++                    if (d.end_pending) return;
++                    if (d.end) |e| d.pos = e + tool_parse.invoke41_close.len;
++                    d.state = .block;
++                },
++                .body, .key, .string_value, .json_value => if (!d.end_pending and d.end == null) {
++                    // the block closed with this invoke open: the parse drops it and looks again after its opener
++                    d.hold();
++                    d.current = null;
++                    d.state = .block;
++                    continue;
++                } else switch (d.state) {
++                    .body => switch (findIn(t, tool_parse.param41_open, d.p, d.limit())) {
++                        .wait => return,
++                        .none => {
++                            // the invoke's closer: the call is whole, and its brace waits
++                            d.closing = d.current;
++                            d.current = null;
++                            d.pos = d.end.? + tool_parse.invoke41_close.len;
++                            d.state = .block;
++                        },
++                        .at => |ps| {
++                            d.p = ps + 1; // where the parse looks again when this parameter is not one
++                            d.ns = ps + tool_parse.param41_open.len;
++                            d.state = .key;
++                        },
++                    },
++                    .key => switch (findIn(t, "\"", d.ns, d.limit())) {
++                        .wait => return,
++                        .none => d.state = .body,
++                        .at => |nq| {
++                            if (nq == d.ns) {
++                                d.state = .body;
++                                continue;
++                            }
++                            const lim = d.limit() orelse t.len;
++                            var v = nq + 1;
++                            const flag = t[@min(v, lim)..lim];
++                            var json_value = false;
++                            if (std.mem.startsWith(u8, flag, " string=\"true\"")) {
++                                v += " string=\"true\"".len;
++                            } else if (std.mem.startsWith(u8, flag, " string=\"false\"")) {
++                                v += " string=\"false\"".len;
++                                json_value = true;
++                            } else if (d.limit() == null and (std.mem.startsWith(u8, " string=\"true\"", flag) or std.mem.startsWith(u8, " string=\"false\"", flag))) return;
++                            if (v >= lim) {
++                                if (d.limit() == null) return;
++                                d.state = .body;
++                                continue;
++                            }
++                            if (t[v] != '>') {
++                                d.state = .body;
++                                continue;
++                            }
++                            d.nq = nq;
++                            d.v = v + 1;
++                            d.at = v + 1;
++                            if (json_value) {
++                                d.state = .json_value;
++                            } else {
++                                try d.key(a, t[d.ns..nq], ":\"", out);
++                                d.state = .string_value;
++                            }
++                        },
++                    },
++                    .string_value => switch (findIn(t, tool_parse.param41_close, d.at, d.limit())) {
++                        .at => |pe| {
++                            try d.value(a, t[d.at..pe], out);
++                            try d.piece(a, "\"", out);
++                            d.p = pe + tool_parse.param41_close.len;
++                            d.state = .body;
++                        },
++                        .none => {
++                            // the invoke ends inside the value: the parse drops the parameter and reads on from its opener
++                            d.hold();
++                            d.state = .body;
++                        },
++                        .wait => {
++                            const rest = t[d.at..];
++                            const keep = @max(reply_text.partialTag(rest, tool_parse.param41_close), openSequence(rest));
++                            try d.value(a, rest[0 .. rest.len - keep], out);
++                            d.at = t.len - keep;
++                            return;
++                        },
++                    },
++                    .json_value => switch (findIn(t, tool_parse.param41_close, d.at, d.limit())) {
++                        .at => |pe| {
++                            const raw = t[d.v..pe];
++                            const parsed: Value = switch (try json.parseText(a, raw)) {
++                                .ok => |x| x,
++                                .err => .{ .string = raw },
++                            };
++                            const text = try json.stringify(a, parsed, .{ .ascii = false, .compact = true });
++                            try d.key(a, t[d.ns..d.nq], try std.mem.concat(a, u8, &.{ ":", text }), out);
++                            d.p = pe + tool_parse.param41_close.len;
++                            d.state = .body;
++                        },
++                        .none => d.state = .body, // nothing of it went out
++                        .wait => {
++                            d.at = @max(d.v, t.len -| (tool_parse.param41_close.len - 1));
++                            return;
++                        },
++                    },
++                    else => unreachable,
++                },
++            }
++        }
++    }
++};
++
++/// A DSML call a stream sent: its name, the arguments text that went out, and whether it closed.
++pub const SentCall = struct {
++    name: []const u8,
++    arguments: std.ArrayList(u8) = .empty,
++    opened: bool = false, // its "{" went out with the first parameter
++    closed: bool = false, // its closing brace went out: its invoke and its block closed
++    held: bool = false, // its pieces stopped: the parse drops a value or the whole invoke that already went out
++
++    /// The parse's call ``call`` is this one: same name, the same arguments byte for byte, and closed.
++    pub fn same(c: *const SentCall, call: Value) bool {
++        const function = call.get("function") orelse return false;
++        const name = function.strField("name") orelse return false;
++        const args = function.strField("arguments") orelse return false;
++        return c.closed and !c.held and std.mem.eql(u8, name, c.name) and std.mem.eql(u8, args, c.arguments.items);
++    }
++};
++
++/// Where ``needle`` starts in ``t`` at or after ``from`` and before ``limit``: the parse's ``find`` on a slice that ends at
++/// ``limit``. With no limit yet (its closer has not arrived) a miss waits for more text: a complete needle in the text so
++/// far is inside the slice, since no DSML closer can overlap another piece of DSML markup.
++const Found = union(enum) { at: usize, none, wait };
++
++fn findIn(t: []const u8, needle: []const u8, from: usize, limit: ?usize) Found {
++    const hay = t[0..@min(t.len, limit orelse t.len)];
++    if (from <= hay.len) if (std.mem.indexOfPos(u8, hay, from, needle)) |i| return .{ .at = i };
++    return if (limit != null) .none else .wait;
++}
++
++/// Bytes at the end of ``s`` that begin a character the text does not hold whole yet.
++fn openSequence(s: []const u8) usize {
++    var back: usize = 0;
++    while (back < @min(4, s.len)) {
++        back += 1;
++        const b = s[s.len - back];
++        if (b & 0xc0 == 0x80) continue;
++        const n = std.unicode.utf8ByteSequenceLength(b) catch return 0;
++        return if (n > back) back else 0;
++    }
++    return 0;
++}
++
++/// Another call form in the text before a DSML block: tool_parse.parse reads its calls there too, in text order.
++fn foreignCall(text: []const u8) bool {
++    return std.ascii.findIgnoreCase(text, "<tool_call>") != null or std.ascii.findIgnoreCase(text, ":tool_call>") != null or
++        std.mem.indexOf(u8, text, "<|tool_call>") != null or std.mem.indexOf(u8, text, tool_parse.dsml_open) != null;
++}
++
++/// DeepSeek-V4.1's DSML calls as they decode, read the way ``tool_parse.dsml41Calls`` reads the finished reply: each
++/// search is the parse's search, made on the text so far. A header goes out when its invoke name is whole and the parse
++/// would take it; a string value goes out as JSON-escaped pieces while it decodes (a tail that may begin its closer or a
++/// character is held); any other value goes out when its parameter closes, as the parse writes it; a call's closing
++/// brace waits for the next header or for its block's closer.
++pub const Dsml = struct {
++    known: std.StringArrayHashMapUnmanaged([]const u8) = .empty, // tool_parse.parse's offered names, lower-cased
++    sent: std.ArrayList(SentCall) = .empty,
++    off: bool = false, // another call form came first: the reply's calls go out when it ends, as without this patch
++    state: enum { outside, block, name, skip, body, key, string_value, json_value } = .outside,
++    pos: usize = 0, // the parse's next invoke search (outside: its next block search)
++    from: usize = 0, // where a search that waits starts again (the text before it holds no complete needle)
++    gap: usize = 0, // the end of the last block: the text from here to the next one holds no other call form
++    block_end: ?usize = null, // the block's closer, once it is in the text
++    block_from: usize = 0,
++    name_start: usize = 0,
++    q: usize = 0, // the invoke name's closing quote
++    end: ?usize = null, // the invoke's closer (null and not end_pending: the block holds none)
++    end_pending: bool = false,
++    end_from: usize = 0,
++    p: usize = 0, // the parse's next parameter search
++    ns: usize = 0,
++    nq: usize = 0,
++    v: usize = 0, // the value's start
++    at: usize = 0, // the value's bytes before this went out (a string) or hold no closer (any value)
++    current: ?usize = null, // the call whose arguments are going out
++    closing: ?usize = null, // a whole call whose brace waits
++    read: usize = 0, // the length of the text read last
++    seen: std.ArrayList(u8) = .empty, // the text read so far (verify checks the finish's text against it)
++    block_calls: usize = 0, // the calls this block made so far
++    holding: bool = false, // the block made a second call: its deltas wait for the block's closer
++    queue: std.ArrayList(Value) = .empty, // the deltas that wait
++    released: usize = 0, // the calls whose header went out: sent[0..released]
++    late: ?usize = null, // the block's first call, whose brace waits in the queue
++
++    /// A call is under way: its block opened, or its brace waits.
++    pub fn midCall(d: *const Dsml) bool {
++        return !d.off and (d.state != .outside or d.closing != null);
++    }
++
++    /// The calls the client got (their headers went out), for the finish to check against the parse.
++    pub fn streamed(d: *const Dsml) []const SentCall {
++        return d.sent.items[0..d.released];
++    }
++
++    /// The finish's ``text`` must extend the text the stream read, else its positions do not hold there: the streamer
++    /// turns off, and the finish follows the parse.
++    pub fn verify(d: *Dsml, text: []const u8) void {
++        if (!std.mem.startsWith(u8, text, d.seen.items)) d.off = true;
++    }
++
++    fn dest(d: *Dsml, out: *std.ArrayList(Value)) *std.ArrayList(Value) {
++        return if (d.holding) &d.queue else out;
++    }
++
++    /// The block closed: what it held goes out, the first call's brace first.
++    fn release(d: *Dsml, a: Allocator, out: *std.ArrayList(Value)) Allocator.Error!void {
++        if (d.late) |i| {
++            const c = &d.sent.items[i];
++            try c.arguments.appendSlice(a, if (c.opened) "}" else "{}");
++            c.closed = true;
++            d.late = null;
++        }
++        try out.appendSlice(a, d.queue.items);
++        d.queue.clearRetainingCapacity();
++        d.holding = false;
++        d.released = d.sent.items.len;
++    }
++
++    fn limit(d: *const Dsml) ?usize {
++        return if (d.end_pending) null else d.end;
++    }
++
++    /// The block's closer and the invoke's closer, found as soon as they are in the text.
++    fn bounds(d: *Dsml, t: []const u8) void {
++        if (d.state == .outside) return;
++        if (d.block_end == null) {
++            if (d.block_from <= t.len) if (std.mem.indexOfPos(u8, t, d.block_from, tool_parse.dsml41_close)) |i| {
++                d.block_end = i;
++            };
++            if (d.block_end == null) d.block_from = @max(d.block_from, t.len -| (tool_parse.dsml41_close.len - 1));
++        }
++        if (!d.end_pending) return;
++        switch (findIn(t, tool_parse.invoke41_close, d.end_from, d.block_end)) {
++            .at => |i| {
++                d.end = i;
++                d.end_pending = false;
++            },
++            .none => {
++                d.end = null;
++                d.end_pending = false;
++            },
++            .wait => d.end_from = @max(d.end_from, t.len -| (tool_parse.invoke41_close.len - 1)),
++        }
++    }
++
++    fn delta(a: Allocator, index: usize, fragment: []const u8) Allocator.Error!Value {
++        const function = try json.newObject(a);
++        try function.put(a, "arguments", .{ .string = fragment });
++        const one = try json.newObject(a);
++        try one.put(a, "index", try json.intValue(a, index));
++        try one.put(a, "function", .{ .object = function });
++        return wrap(a, .{ .object = one });
++    }
++
++    /// ``fragment`` of the current call's arguments, unless its pieces stopped.
++    fn piece(d: *Dsml, a: Allocator, fragment: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
++        const i = d.current orelse return;
++        const c = &d.sent.items[i];
++        if (c.held or fragment.len == 0) return;
++        try c.arguments.appendSlice(a, fragment);
++        try d.dest(out).append(a, try delta(a, i, fragment));
++    }
++
++    /// A parameter's key, after "{" or ",", then ``after``.
++    fn key(d: *Dsml, a: Allocator, name: []const u8, after: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
++        const i = d.current orelse return;
++        const c = &d.sent.items[i];
++        const quoted = try json.quote(a, name, .{ .ascii = false });
++        try d.piece(a, try std.mem.concat(a, u8, &.{ if (c.opened) "," else "{", quoted, after }), out);
++        c.opened = true;
++    }
++
++    /// The JSON-escaped text of a string value's bytes (escaping is per byte, so pieces join to the whole value's).
++    fn value(d: *Dsml, a: Allocator, bytes: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
++        if (bytes.len == 0) return;
++        const q = try json.quote(a, bytes, .{ .ascii = false });
++        try d.piece(a, q[1 .. q.len - 1], out);
++    }
++
++    /// The brace of the whole call before this one: its invoke closed, and a new header or the block's closer came.
++    fn closePending(d: *Dsml, a: Allocator, out: *std.ArrayList(Value)) Allocator.Error!void {
++        const i = d.closing orelse return;
++        d.closing = null;
++        const c = &d.sent.items[i];
++        if (c.held) return;
++        if (d.holding and i < d.released) {
++            // the block's first call went out: its brace waits with the block's later calls, so a block that never
++            // closes leaves it open, as the parse takes none of the block's calls
++            try d.queue.append(a, try delta(a, i, if (c.opened) "}" else "{}"));
++            d.late = i;
++            return;
++        }
++        const was = d.current;
++        d.current = i;
++        try d.piece(a, if (c.opened) "}" else "{}", out);
++        d.current = was;
++        c.closed = true;
++    }
++
++    /// The current invoke's call stops: the parse drops something that already went out.
++    fn hold(d: *Dsml) void {
++        if (d.current) |i| d.sent.items[i].held = true;
++    }
+ };
+ 
+ /// Bytes of ``rest`` that cannot be the start of a ``tail``-byte closer (Python slices characters).
+@@ -402,3 +832,185 @@ fn sentArguments(a: Allocator, deltas: []const Value) Allocator.Error![]const u8
+     };
+     return out.items;
+ }
++
++// DSML calls as they decode, fed as the answer grows at many split points.
++const D = "\u{ff5c}DSML\u{ff5c}";
++const calls_open = "\n\n<" ++ D ++ " calls>\n";
++const calls_close = "\n</" ++ D ++ " calls>";
++
++fn dsmlInvoke(comptime name: []const u8, comptime body: []const u8) []const u8 {
++    return "<" ++ D ++ " invoke name=\"" ++ name ++ "\">\n" ++ body ++ "</" ++ D ++ " invoke>\n";
++}
++
++fn dsmlParam(comptime name: []const u8, comptime flag: []const u8, comptime value: []const u8) []const u8 {
++    return "<" ++ D ++ " parameter name=\"" ++ name ++ "\"" ++ flag ++ ">" ++ value ++ "</" ++ D ++ " parameter>\n";
++}
++
++const dsml_tools =
++    \\[{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number"}}}}},
++    \\{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}}}]
++;
++
++/// One streamer fed `text` as it grows by `step` bytes (`chars`: kept to whole characters), then once whole, as the
++/// finish feeds it; its deltas checked: each call's header once and in order, then only its own pieces, each valid UTF-8,
++/// joined to what the streamer records as sent.
++fn dsmlFeed(a: Allocator, text: []const u8, step: usize, chars: bool) !Streamer {
++    var s = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
++    var out: std.ArrayList(Value) = .empty;
++    var end: usize = 0;
++    while (end < text.len) {
++        end = @min(text.len, end + step);
++        if (chars) {
++            while (end < text.len and text[end] & 0xc0 == 0x80) end += 1;
++        }
++        try s.feedDsml(text[0..end], &out);
++    }
++    try s.feedDsml(text, &out);
++    var joined: std.ArrayList(std.ArrayList(u8)) = .empty;
++    for (out.items) |d| for (d.get("tool_calls").?.array) |one| {
++        const index: usize = @intCast(one.get("index").?.int64().?);
++        const piece = one.get("function").?.strField("arguments").?;
++        try std.testing.expect(std.unicode.utf8ValidateSlice(piece));
++        if (one.get("id") != null) {
++            try std.testing.expectEqual(joined.items.len, index);
++            try std.testing.expectEqualStrings("", piece);
++            try joined.append(a, .empty);
++            continue;
++        }
++        try std.testing.expectEqual(joined.items.len - 1, index);
++        try joined.items[index].appendSlice(a, piece);
++    };
++    // what went out: the calls whose header went out (a block that never closes holds its later calls)
++    try std.testing.expectEqual(s.dsml.streamed().len, joined.items.len);
++    for (s.dsml.streamed(), joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
++    return s;
++}
++
++const splits = [_]struct { step: usize, chars: bool }{ .{ .step = 1, .chars = false }, .{ .step = 1, .chars = true }, .{ .step = 2, .chars = false }, .{ .step = 3, .chars = true }, .{ .step = 7, .chars = false }, .{ .step = 1 << 20, .chars = true } };
++
++/// At every split the stream sends the parse's calls: the same names, the arguments byte for byte, each closed.
++fn expectDsmlParsed(text: []const u8, calls: usize) !void {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const parsed = (try tool_parse.parse(a, text, (try json.parse(a, dsml_tools)).ok.array, null)).calls orelse &.{};
++    try std.testing.expectEqual(calls, parsed.len);
++    for (splits) |sp| {
++        const s = try dsmlFeed(a, text, sp.step, sp.chars);
++        try std.testing.expectEqual(parsed.len, s.dsml.streamed().len);
++        for (parsed, s.dsml.streamed()) |p, *c| try std.testing.expect(c.same(p));
++    }
++}
++
++test "DSML calls stream as the parse reads them, at every split: escapes, a split character, a name to strip, odd parameters" {
++    try expectDsmlParsed(comptime ("Running it." ++ calls_open ++ dsmlInvoke(" bash ", dsmlParam("command", " string=\"true\"", "printf '%s\\n' \"a\\\\b\" \u{1f30a}\t| tr a-z A-Z") ++
++        dsmlParam("timeout", " string=\"false\"", " 120000 ") ++ dsmlParam("note", "", "no flag: a string") ++ dsmlParam("bad", " string=\"maybe\"", "skipped") ++
++        dsmlParam("n", " string=\"false\"", "not json") ++ dsmlParam("x", " string=\"false\"", "NaN") ++ dsmlParam("empty", " string=\"true\"", "")) ++
++        dsmlInvoke("Write", dsmlParam("file_path", " string=\"true\"", "/tmp/\u{6d77}.md") ++ dsmlParam("content", " string=\"true\"", "a < b </div> </\u{ff5c}DSML\u{ff5c} par\n\u{1f469}\u{200d}\u{1f4bb}\n")) ++ calls_close), 2);
++}
++
++test "DSML calls stream as the parse reads them: an empty name, a bad invoke line, a far quote, a quoted opener, two blocks" {
++    // an invoke whose name strips to nothing is read and skipped; one without its '">' is not an invoke
++    try expectDsmlParsed(comptime (calls_open ++ dsmlInvoke("  ", dsmlParam("command", " string=\"true\"", "ls")) ++ "<" ++ D ++ " invoke name=\"Bash\" x=\"1\">\n" ++
++        dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close), 1);
++    // a parameter name without its quotes: the parse's first quote lies in the next parameter, which it then reads
++    try expectDsmlParsed(comptime (calls_open ++ dsmlInvoke("Bash", "<" ++ D ++ " parameter name=command>ls</" ++ D ++ " parameter>\n" ++
++        dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close), 1);
++    // an opener quoted in prose pairs with the real block's closer: the parse reads the invoke after it
++    try expectDsmlParsed(comptime ("Write `<" ++ D ++ " calls>` blocks, like this one:" ++ calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")) ++ calls_close), 1);
++    // two blocks with text between them, and a call to a tool the request did not offer
++    try expectDsmlParsed(comptime ("First." ++ calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")) ++ calls_close ++ "\nThen." ++
++        calls_open ++ dsmlInvoke("WebFetch", dsmlParam("url", " string=\"true\"", "https://example.com/?q=\"x\"")) ++ calls_close), 2);
++    // DSML markup without its calls block is text
++    try expectDsmlParsed(comptime ("Write " ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")) ++ " inside a block."), 0);
++}
++
++test "a DSML call's brace waits for its block's closer; a block left open sends none" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const whole = comptime (calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls -la")) ++ calls_close);
++    const open = whole[0 .. whole.len - calls_close.len];
++    const s = try dsmlFeed(a, open, 1, true);
++    try std.testing.expectEqualStrings("{\"command\":\"ls -la\"", s.dsml.sent.items[0].arguments.items);
++    try std.testing.expect(!s.dsml.sent.items[0].closed);
++    try std.testing.expect((try tool_parse.parse(a, open, (try json.parse(a, dsml_tools)).ok.array, null)).calls == null);
++    const closed = try dsmlFeed(a, whole, 1, true);
++    try std.testing.expectEqualStrings("{\"command\":\"ls -la\"}", closed.dsml.sent.items[0].arguments.items);
++    try std.testing.expect(closed.dsml.sent.items[0].closed);
++}
++
++test "where the parse drops or changes what already went out, the stream says so: the finish then follows the parse" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, dsml_tools)).ok.array;
++    // a repeated parameter: the parse keeps the first place and the last value; the stream sent both, so its text
++    // differs, and reads back (last value wins) as the parse's object
++    const twice = comptime (calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls") ++ dsmlParam("timeout", " string=\"false\"", "5") ++
++        dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close);
++    const parsed = (try tool_parse.parse(a, twice, tools, null)).calls.?[0];
++    const s = try dsmlFeed(a, twice, 1, true);
++    const c = &s.dsml.sent.items[0];
++    try std.testing.expect(c.closed and !c.same(parsed));
++    try std.testing.expectEqualStrings("{\"command\":\"ls\",\"timeout\":5,\"command\":\"pwd\"}", c.arguments.items);
++    try std.testing.expectEqualStrings(parsed.get("function").?.strField("arguments").?, try json.stringify(a, (try json.parse(a, c.arguments.items)).ok, .{ .ascii = false, .compact = true }));
++    // an invoke the block closes without its own closer: the parse drops it; the stream sent its start and holds it
++    const unclosed = comptime (calls_open ++ "<" ++ D ++ " invoke name=\"Bash\">\n" ++ dsmlParam("command", " string=\"true\"", "ls") ++ calls_close);
++    try std.testing.expect((try tool_parse.parse(a, unclosed, tools, null)).calls == null);
++    const u = try dsmlFeed(a, unclosed, 1, true);
++    try std.testing.expect(u.dsml.sent.items.len == 1 and u.dsml.sent.items[0].held and !u.dsml.sent.items[0].closed);
++    // a value that holds an invoke's closer: the parse ends the invoke there and drops the value
++    const cut = comptime (calls_open ++ dsmlInvoke("Write", dsmlParam("file_path", " string=\"true\"", "/a") ++ "<" ++ D ++ " parameter name=\"content\" string=\"true\">x</" ++ D ++ " invoke>y</" ++ D ++ " parameter>\n") ++ calls_close);
++    const w = (try tool_parse.parse(a, cut, tools, null)).calls.?;
++    try std.testing.expectEqualStrings("{\"file_path\":\"/a\"}", w[0].get("function").?.strField("arguments").?);
++    const v = try dsmlFeed(a, cut, 1, true);
++    try std.testing.expect(v.dsml.sent.items[0].held and !v.dsml.sent.items[0].same(w[0]));
++    // another call form first: the stream leaves every call to the finish, as before
++    const xml = comptime ("<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call>" ++ calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "pwd")) ++ calls_close);
++    const x = try dsmlFeed(a, xml, 3, true);
++    try std.testing.expect(x.dsml.off and x.dsml.sent.items.len == 0);
++}
++
++test "a block's second call and the first call's brace wait for the block's closer; a block cut before it sends no whole call" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, dsml_tools)).ok.array;
++    const first = comptime (calls_open ++ dsmlInvoke("Bash", dsmlParam("command", " string=\"true\"", "ls")));
++    const second = comptime (first ++ dsmlInvoke("Write", dsmlParam("file_path", " string=\"true\"", "/tmp/a") ++ dsmlParam("content", " string=\"true\"", "x")));
++    // cut in the second invoke, at every split: one call went out, open; the parse takes none
++    for ([_]usize{ second.len - 3, second.len - 1, second.len }) |cut| for (splits) |sp| {
++        const s = try dsmlFeed(a, second[0..cut], sp.step, sp.chars);
++        try std.testing.expectEqual(@as(usize, 1), s.dsml.streamed().len);
++        try std.testing.expectEqualStrings("{\"command\":\"ls\"", s.dsml.streamed()[0].arguments.items);
++        try std.testing.expect(!s.dsml.streamed()[0].closed);
++        try std.testing.expect((try tool_parse.parse(a, second[0..cut], tools, null)).calls == null);
++    };
++    // the block's closer releases both, the first call's brace first
++    const s = try dsmlFeed(a, second ++ calls_close, 1, true);
++    try std.testing.expectEqual(@as(usize, 2), s.dsml.streamed().len);
++    for (s.dsml.streamed()) |c| try std.testing.expect(c.closed);
++    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", s.dsml.streamed()[0].arguments.items);
++    try std.testing.expectEqualStrings("{\"file_path\":\"/tmp/a\",\"content\":\"x\"}", s.dsml.streamed()[1].arguments.items);
++}
++
++test "a text that does not extend the one read turns the streamer off instead of reading past its end" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var s = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
++    var out: std.ArrayList(Value) = .empty;
++    const streamed_text = comptime (calls_open ++ "<" ++ D ++ " invoke name=\"Bash\">\n<" ++ D ++ " parameter name=\"command\" string=\"true\">grep -n '<|channel|>' x.zig and more");
++    var end: usize = 0;
++    while (end < streamed_text.len) : (end = @min(streamed_text.len, end + 4)) try s.feedDsml(streamed_text[0..end], &out);
++    try s.feedDsml(streamed_text, &out);
++    // chat.finish, thinking off: content = parseHarmony(text).content, "" here
++    try s.feedDsml("", &out);
++    try std.testing.expect(s.dsml.off);
++    // the finish's check: a longer text with another start
++    var t = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
++    try t.feedDsml(streamed_text[0..40], &out);
++    t.dsml.verify("other text, longer than forty bytes, that does not start with the first");
++    try std.testing.expect(t.dsml.off);
++}
