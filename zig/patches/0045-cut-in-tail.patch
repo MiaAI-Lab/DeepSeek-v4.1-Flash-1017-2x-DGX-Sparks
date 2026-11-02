@@ -1,4 +1,4 @@
-From 200786064c6295bda1aaf3504c590ba289227906 Mon Sep 17 00:00:00 2001
+From 403dce52c7a38131aaa6916173b262bf05c11f38 Mon Sep 17 00:00:00 2001
 From: laidick <laidick@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 14:46:14 +0800
 Subject: [PATCH] dsv41: a prompt cuts in by the tokens it computes, and with
@@ -16,21 +16,39 @@ the cache where a queued request would resume (Store.find, which changes nothing
 none, so a prompt waiting for a restore does not cut in), and Engine.addStream reads the stream's reuse.at. A
 prompt cuts in with pictures when none ends past that point (Engine.picturesPast, the same test as
 pictureNeedsRows). Unchanged: one cut-in at a time, nothing cuts into a pass with pictures, and a prompt that needs
-picture rows waits. If the kept state is gone by the time its pass opens, the cut-in runs from 0 whole, as a long
-prompt that waited would have, and the paused pass resumes after it.
+picture rows waits.
+
+The bound stays hard. Admission trusts the state the cache found, but the backend learns where the pass really
+resumes only as it opens it: the state may have gone stale, or found no room to move to (dsv41 fillOpen, after the
+placement). The engine passes its cut_in to the stream (Stream.cut_in); dsv41's fillOpen refuses the cut-in with
+error.FillBusy there if it would compute more than that, or rows for a picture, before its extent, the kept state's
+end, other states' rows, its sequence, rank 1's fill or a chunk change. The host requeues it at the front marked
+`whole`: it is not tried again between that pass's pieces, and runs once the pass ends, as a long prompt does.
+Before, error.FillBusy from a backend dropped the request.
 ---
- zig/src/core/lane_host.zig            |  13 ++-
+ zig/src/core/lane_host.zig            |  21 +++-
  zig/src/core/lane_host_reuse_test.zig | 146 ++++++++++++++++++++++++++
- zig/src/core/lanes/engine.zig         |  20 +++-
+ zig/src/core/lane_host_test.zig       |  14 ++-
+ zig/src/core/lanes/engine.zig         |  21 +++-
  zig/src/core/lanes/engine_test.zig    |   9 ++
- zig/src/families/dsv41/lanes.zig      |  17 ++-
- 5 files changed, 195 insertions(+), 10 deletions(-)
+ zig/src/core/lanes/fake.zig           |   5 +
+ zig/src/core/lanes/stream.zig         |   4 +
+ zig/src/families/dsv41/lanes.zig      |  29 ++++-
+ 8 files changed, 237 insertions(+), 12 deletions(-)
 
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index a90d26a5..1ac62417 100644
+index a90d26a5..bdddc8cb 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
-@@ -262,6 +262,15 @@ pub const LaneHost = struct {
+@@ -220,6 +220,7 @@ pub const LaneHost = struct {
+         parent: ?u64 = null, // the durable point its pass resumes from, and where
+         fork: u32 = 0,
+         lineage: []pc.Fork = &.{}, // the computation its pass's rows belong to (gpa-owned; Store.passLineage)
++        whole: bool = false, // refused as a cut-in (error.FillBusy: its kept state gone): it waits for the pass in pieces
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+@@ -262,6 +263,15 @@ pub const LaneHost = struct {
          return r.images.len == 0 or r.cache_key.len == r.prompt.len;
      }
  
@@ -46,17 +64,31 @@ index a90d26a5..1ac62417 100644
      /// The pictures' identities the durable tier gets for a request: its `cache_media` only when they name exactly the
      /// spans the engine runs (`images`: the spans its restored rows and tower work are placed by), one for one; anything
      /// else gives none, and the tier then misses and keeps nothing for it (a disk hit must not resume pictures placed
-@@ -563,7 +572,9 @@ pub const LaneHost = struct {
+@@ -563,7 +573,10 @@ pub const LaneHost = struct {
          var at: usize = 0;
          if (h.filling != null) {
              at = for (h.queued.items, 0..) |j, i| {
 -                if (h.core.cutsIn(j.request.prompt.len, j.request.images.len > 0)) break i;
++                if (j.whole) continue;
 +                const r = j.request;
 +                const from = h.resumable(r);
 +                if (h.core.cutsIn(r.prompt.len - from, lanes.Engine.picturesPast(r.images, from))) break i;
              } else {
                  h.unlock();
                  return false;
+@@ -661,6 +674,12 @@ pub const LaneHost = struct {
+             if (e == error.Cancelled) return h.cancel(job);
+             // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
+             if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
++            // refused as a cut-in (its kept state gone as its pass opened): it waits for the pass in pieces, not
++            // tried again between that pass's pieces
++            if (e == error.FillBusy and h.filling != null) {
++                job.whole = true;
++                return h.requeue(job);
++            }
+             h.checkFatal(e);
+             return h.drop(job, h.words(e));
+         };
 diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
 index 060971dd..afb30847 100644
 --- a/zig/src/core/lane_host_reuse_test.zig
@@ -211,8 +243,50 @@ index 060971dd..afb30847 100644
 +    for (seen[first + 1 .. second]) |s| try std.testing.expectEqual(t2.items.len, s[0]);
 +    for (seen[second..]) |s| try std.testing.expect(s[0] != t2.items.len);
 +}
+diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
+index a8706236..4b18c361 100644
+--- a/zig/src/core/lane_host_test.zig
++++ b/zig/src/core/lane_host_test.zig
+@@ -440,14 +440,14 @@ const CutIn = struct {
+     const long = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8 };
+ 
+     /// The long request, then `second`: the chunk order (caller frees), each reply checked as the fake's.
+-    fn run(second: []const u32, opts: struct { cut_in: u32 = 4, refuse_full: usize = 0 }) ![][2]usize {
++    fn run(second: []const u32, opts: struct { cut_in: u32 = 4, refuse_full: usize = 0, refuse_busy: usize = 0 }) ![][2]usize {
+         const gpa = std.testing.allocator;
+         var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+         defer cfg.deinit(gpa);
+         var w: CutIn = .{};
+         defer w.a.deinit(gpa);
+         defer w.b.deinit(gpa);
+-        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w, .refuse_full = opts.refuse_full };
++        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w, .refuse_full = opts.refuse_full, .refuse_busy = opts.refuse_busy };
+         defer target.deinit();
+         var clock: lanes.fake.FixedClock = .{};
+         var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+@@ -467,6 +467,7 @@ const CutIn = struct {
+         w.mutex.unlock(std.testing.io);
+         try w.until(.done);
+         try std.testing.expectEqual(@as(usize, 0), target.refuse_full);
++        try std.testing.expectEqual(@as(usize, 0), target.refuse_busy);
+         for ([_][]const u32{ &long, second }, [_][]const u32{ w.a.items, w.b.items }) |prompt, reply| {
+             var history: std.ArrayList(u32) = .empty;
+             defer history.deinit(gpa);
+@@ -507,3 +508,12 @@ test "a short prompt refused for room as it cuts in waits in the queue and then
+         try std.testing.expectEqual(@as(usize, 12), order.len);
+     }
+ }
++
++test "a cut-in its backend refuses as its pass opens (its kept state gone) waits for the pass in pieces, not tried again" {
++    // a retry between the long pass's pieces would cut in (refuse_busy is spent): the order shows it never was
++    const order = try CutIn.run(&.{ 3, 1, 4 }, .{ .refuse_busy = 1 });
++    defer std.testing.allocator.free(order);
++    try std.testing.expectEqual(@as(usize, 12), order.len);
++    for (order[0..6], 0..) |o, i| try std.testing.expectEqual([2]usize{ CutIn.long.len, i }, o);
++    for (order[6..12], 0..) |o, i| try std.testing.expectEqual([2]usize{ 3, i }, o);
++}
 diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
-index 030743f8..1b1d09d0 100644
+index 030743f8..5a57a581 100644
 --- a/zig/src/core/lanes/engine.zig
 +++ b/zig/src/core/lanes/engine.zig
 @@ -42,7 +42,7 @@ pub const Engine = struct {
@@ -224,17 +298,18 @@ index 030743f8..1b1d09d0 100644
      rounds_since: u32 = 0,
  
      pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
-@@ -95,7 +95,8 @@ pub const Engine = struct {
+@@ -95,7 +95,9 @@ pub const Engine = struct {
          _ = e.arena.reset(.retain_capacity);
          try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
          if (e.filling != null) {
 -            if (!e.cutsIn(s.prompt_len, s.images.len > 0)) return error.FillBusy;
 +            const at = @min(@as(usize, s.reuse.at), s.prompt_len);
 +            if (!e.cutsIn(s.prompt_len - at, picturesPast(s.images, at))) return error.FillBusy;
++            s.cut_in = e.cut_in; // the backend holds it to the bound once it knows where the pass really resumes
              e.backend.prefill(s) catch |err| {
                  if (err == error.Cancelled) e.backend.release(s);
                  return err;
-@@ -115,10 +116,19 @@ pub const Engine = struct {
+@@ -115,10 +117,19 @@ pub const Engine = struct {
          try e.started(s);
      }
  
@@ -274,8 +349,46 @@ index b8dc1351..6c33ca37 100644
 +    try std.testing.expect(Engine.picturesPast(&img, 0)); // a fresh pass
 +    try std.testing.expect(!Engine.picturesPast(&.{}, 0));
 +}
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 294a21cd..4cf9c514 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -41,6 +41,7 @@ pub const Fake = struct {
+     prefill_hook_ctx: ?*anyopaque = null,
+     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
++    refuse_busy: usize = 0, // a cut-in (Stream.cut_in) is refused this many times with error.FillBusy (its state gone)
+ 
+     pub fn deinit(x: *Fake) void {
+         var it = x.lanes.valueIterator();
+@@ -117,6 +118,10 @@ pub const Fake = struct {
+             x.refuse_full -= 1;
+             return error.ContextFull;
+         }
++        if (x.refuse_busy > 0 and s.cut_in > 0) {
++            x.refuse_busy -= 1;
++            return error.FillBusy;
++        }
+         const got = try x.lanes.getOrPut(x.gpa, s);
+         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
+         got.value_ptr.* = .{};
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 2e17c40c..ca297899 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -179,6 +179,10 @@ pub const Stream = struct {
+     /// Prefill interleave (TF_PREFILL_INTERLEAVE_MS): the host's decode rounds for the OTHER live streams, which a
+     /// backend may call between two of this stream's prompt chunks; null: the pass runs whole, as before.
+     between: ?Between = null,
++    /// A cut-in's bound (Engine.cut_in; 0: none): its pass, which runs whole between another's pieces, computes at
++    /// most this many tokens past the state it resumes; a backend that finds the state gone as the pass opens refuses
++    /// it (error.FillBusy) before it runs, and it waits for that pass as a long prompt does.
++    cut_in: u32 = 0,
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+     context: std.ArrayList(u32) = .empty,
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index eaab37f8..755baca5 100644
+index eaab37f8..1e379dfb 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -782,8 +782,9 @@ pub const Lanes = struct {
@@ -290,7 +403,26 @@ index eaab37f8..755baca5 100644
              self.paused = f;
              self.fill = null;
          };
-@@ -2093,18 +2094,26 @@ test "a prefix two conversations share: the second one resuming it in place woul
+@@ -907,6 +908,18 @@ pub const Lanes = struct {
+             } else s.reuse_failed = true;
+         };
+         const base = if (parted) |pp| pp.base else if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
++        // a cut-in (Stream.cut_in) runs whole between another pass's pieces: where it really resumes is known only
++        // now (the state may have gone stale, or found no room to move to), and if it would compute more than its
++        // bound, or rows for a picture, it is refused before its extent, the kept state's end, other states' rows, its
++        // sequence, rank 1's fill or a chunk change (the placement's own moves and evictions stand, as for any pass
++        // that fails past it; a part goes back by the errdefer above)
++        if (s.cut_in > 0) {
++            const resume_at: usize = if (kept) |sn| (if (moved and sn.stale) 0 else sn.at) else 0;
++            if (len - resume_at > s.cut_in or lanes.Engine.picturesPast(s.images, resume_at)) {
++                std.log.info("dsv41: a cut-in of {d} tokens resumes at {d}, not at {d} as admitted; it waits for the pass in pieces", .{ len, resume_at, s.reuse.at });
++                return error.FillBusy;
++            }
++        }
+         if (kept) |sn| {
+             sn.wanted = 0;
+             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
+@@ -2093,18 +2106,26 @@ test "a prefix two conversations share: the second one resuming it in place woul
      try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
  }
  
