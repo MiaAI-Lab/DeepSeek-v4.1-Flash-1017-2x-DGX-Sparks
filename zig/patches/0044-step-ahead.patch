@@ -1,0 +1,688 @@
+# lane_host: step-ahead (TF_DS_STEP_AHEAD=1, rank 0; recipe setting STEP_AHEAD, off by default). When a reply ends and
+# nothing else runs or waits, a background prompt pass reads the reply after its prompt (prompt ++ reply, cut at the last
+# chunk end of the family's grid that leaves its tail) and keeps the state there while the client runs its tools. An
+# agent's next request (prompt ++ reply ++ tool results) then resumes past its own previous reply instead of reading it
+# again. Up to the kept point the pass is that request's own cold pass (the same grid, the same tokens), so replies keep
+# their bits; a reply the client renders back differently resumes where it did before.
+# - A queued pass yields to any arrival, a running one is cancelled by an arrival it is not the prefix of, and a pass never
+#   runs beside another stream. "Nothing else runs or waits" counts the queue and the ready, loading and deferred lists
+#   (waitingCount()), and a pass with anything queued behind it is dropped.
+# - A pass never parks on a disk restore: it resumes from what memory holds, or computes from its start.
+# - deliver(): a finished job leaves `admitted` before finish() frees it, so a submission that walks `admitted` under the
+#   lock never meets a freed job (a use-after-free with the switch off too). Every caller is changed, fbbc971's fillOne
+#   included. The yielded list's room is reserved before a queued pass leaves the queue; the kept count and log line fire
+#   only when keepWith kept the state at the pass's point (else an unkept count and line).
+# - With fbbc971's prompt pass in pieces: step-ahead stays off while TF_FILL_CHUNKS is set (as 0005's interleave rule
+#   does), a pass waits while another pass fills, and a pass that meets ContextFull is dropped, not requeued.
+# Host tests (lane_host.zig, lane_host_reuse_test.zig): a finished job is out of `admitted` at .finished, step-ahead off
+# and on; a queued pass goes when a request waits behind it; a reply's own tokens are read and the next step resumes past
+# them with the same tokens; nothing runs when off, and a refused keep counts as not kept.
+# History: #41 (Coinupbtc, on 629c524), rebased by Braincramps in #66; the #66 review fixes by Hector Isaza (hecisaza);
+# rebased onto fbbc971 and 0001-0038 here. Measurements: in the pull request.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index a90d26a592b79e03bcfe9703c6f3de5a44c6be25..31c180aba19519420e87dcd0f8fdd93548074766 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -76,6 +76,18 @@ pub const LaneHost = struct {
+     interleave_ns: i96 = 0,
+     passing: ?*Job = null, // the job whose prompt pass runs inside addStream (Stream.between's caller)
+     between_err: ?anyerror = null,
++    // step-ahead (TF_DS_STEP_AHEAD=1; 0/unset: off): when a reply ends and nothing else runs or waits, a background
++    // prompt pass reads the reply after its prompt (prompt ++ reply, cut at the last chunk end of the family's grid
++    // that leaves its tail) and keeps the state there. An agent's next step (prompt ++ reply ++ tool results) then
++    // resumes at it instead of at its prompt's last kept chunk end. Up to that point the pass is the next step's own
++    // cold pass (the same grid, the same tokens), so its bytes are the same; it runs while the client runs its tools.
++    // A queued pass yields to any arrival; a running one is cancelled by an arrival it is not the prefix of.
++    ahead_on: bool = false,
++    ahead_grid: ?Grid = null, // the family's chunk rows and the tail its kept states leave before a prompt's end
++    ahead_ids: Id = ahead_id_base,
++    ahead_counts: AheadCounts = .{},
++    ahead_sink: ?Sink = null, // who hears the step-ahead passes (tests); null: no one
++
+     // -- parked requests (0110). The lists are the engine thread's; changes take the lock (status reads their lengths).
+     ready: std.ArrayList(*Job) = .empty, // woken: admitted before the queue, in the order they woke
+     loading: std.ArrayList(Load) = .empty, // each waits for a restore job (several may share one)
+@@ -214,6 +226,7 @@ pub const LaneHost = struct {
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
++        warm: ?*Warm = null, // a step-ahead pass: its own request and tokens, freed with the job
+         tried_disk: bool = false, // it waited for a restore once: a later lookup takes what memory has
+         deferred_since: ?i96 = null, // its restore was first refused for capacity then (asked again until defer_ns)
+         join: pc.Join = .{}, // its conversation (0111)
+@@ -231,7 +244,10 @@ pub const LaneHost = struct {
+             if (!cacheable(r)) return;
+             const pics = r.images.len > 0; // (the tier records each picture's identity and the prompt's model ids)
+             // an image span keyed by its digest (Request.cacheKey)
+-            _ = store.keepWith(r.cacheKey(), at, s, r.chunks, .{ .group = job.join.group, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{}, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
++            const ok = store.keepWith(r.cacheKey(), at, s, r.chunks, .{ .group = job.join.group, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{}, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
++            if (job.warm) |w| if (ok and at == w.at) {
++                w.kept = true; // (the store may refuse it: budget, memory, the backend's save)
++            };
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+@@ -272,12 +288,26 @@ pub const LaneHost = struct {
+         return r.cache_media;
+     }
+ 
++    /// Where a family keeps prompt states: chunk ends of `chunk` rows, at least `tail` tokens before a prompt's end.
++    pub const Grid = struct { chunk: u32, tail: u32 };
++    pub const AheadCounts = struct { queued: u64 = 0, dropped: u64 = 0, ran: u64 = 0, tokens: u64 = 0, unkept: u64 = 0 };
++    const ahead_id_base: Id = 1 << 63; // step-ahead jobs' ids, apart from the server's
++
++    /// A step-ahead pass's request (prompt ++ reply up to its tail past the kept point, one token) and what it resumes.
++    const Warm = struct { request: Request, tokens: []u32, from: u32, at: u32, kept: bool = false };
++
++    /// A step-ahead pass reports to no one.
++    fn aheadQuiet(_: *anyopaque, _: Id, _: *const Event) void {}
++
+     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
+         var enforced = info_;
+         enforced.loop_guard = true;
+         var ms: i96 = 0;
+         if (std.c.getenv("TF_DS_PREFILL_INTERLEAVE_MS")) |v| ms = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms };
++        // step-ahead stays off beside the engine's prompt pass in pieces (TF_FILL_CHUNKS): a pass that fills between rounds is
++        // not one that runs alone (as upstream keeps 0005's interleave off then)
++        const ahead = if (std.c.getenv("TF_DS_STEP_AHEAD")) |v| std.mem.eql(u8, std.mem.span(v), "1") and std.c.getenv("TF_FILL_CHUNKS") == null else false;
++        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms, .ahead_on = ahead };
+     }
+ 
+     /// The tier's switches (before start). Telemetry is published from here on when either is on: a tier on the cache
+@@ -346,12 +376,35 @@ pub const LaneHost = struct {
+         const h = self(ctx);
+         const job = h.gpa.create(Job) catch return error.Busy;
+         job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
++        var yielded: std.ArrayList(*Job) = .empty;
++        defer {
++            for (yielded.items) |w| h.finish(w, .cancelled, ""); // never started: nothing of the engine's to touch
++            yielded.deinit(h.gpa);
++        }
+         h.mutex.lockUncancelable(h.io);
+         defer h.mutex.unlock(h.io);
+         if (h.closing or h.isBroken()) { // (a broken pair admits nothing more: the process restarts)
+             h.gpa.destroy(job);
+             return error.Closed;
+         }
++        // step-ahead passes yield: a queued one goes, a running one is cancelled unless this prompt continues it.
++        // (No room for the list: the queued pass stays, behind this foreground request, and admitOne drops it.)
++        if (h.ahead_on) {
++            if (yielded.ensureTotalCapacity(h.gpa, h.queued.items.len)) |_| {
++                var q: usize = 0;
++                while (q < h.queued.items.len) {
++                    if (h.queued.items[q].warm == null) {
++                        q += 1;
++                        continue;
++                    }
++                    yielded.appendAssumeCapacity(h.queued.orderedRemove(q));
++                    h.ahead_counts.dropped += 1;
++                }
++            } else |_| {}
++            for (h.admitted.items) |a| if (a.warm) |w| if (!std.mem.startsWith(u32, request.prompt, w.tokens[0..w.at])) {
++                h.cancels.append(h.gpa, a.id) catch {};
++            };
++        }
+         // foreground before background, each in arrival order (the Python job queue's priority)
+         var at = h.queued.items.len;
+         if (!request.background) {
+@@ -442,7 +495,8 @@ pub const LaneHost = struct {
+         }
+     }
+ 
+-    /// Sends a stream's new tokens; true once it has finished (its job freed).
++    /// Sends a stream's new tokens; true once it has finished (out of `admitted`, then freed: a submission walks the
++    /// admitted jobs under the lock and must never meet a freed one).
+     fn deliver(h: *LaneHost, job: *Job) bool {
+         h.send(job);
+         if (!job.stream.finished) return false;
+@@ -452,10 +506,62 @@ pub const LaneHost = struct {
+             .@"error" => .failed,
+             else => .stop,
+         };
++        const warm = if (reason == .stop or reason == .length) h.aheadOf(job) else null;
++        h.remove(job);
+         h.finish(job, reason, "");
++        if (warm) |w| h.queueAhead(w);
+         return true;
+     }
+ 
++    /// The step-ahead pass after `job`'s reply: null when off, when the reply moves no kept state a chunk on, or while
++    /// other work is in the engine (it would compete with it).
++    fn aheadOf(h: *LaneHost, job: *Job) ?*Job {
++        if (!h.ahead_on or job.warm != null or !job.started or h.filling != null) return null;
++        const g = h.ahead_grid orelse return null;
++        const store = h.cache orelse return null;
++        const r = job.request;
++        if (r.images.len > 0 or r.cache_key.len != 0 or r.prompt.len < store.rules.min_prompt) return null;
++        const seq = job.stream.context.items; // prompt ++ reply: the next step's prompt starts so
++        if (seq.len < @as(usize, g.chunk) + g.tail) return null;
++        const at = (seq.len - g.tail) / g.chunk * g.chunk;
++        const from: usize = if (store.find(seq[0 .. at + g.tail], &.{})) |e| e.at else 0;
++        if (at <= from) return null;
++        h.lock();
++        const busy = h.closing or h.queued.items.len > 0 or h.admitted.items.len > 1 or h.waitingCount() > 0;
++        h.unlock();
++        if (busy) return null;
++        const w = h.gpa.create(Warm) catch return null;
++        const tokens = h.gpa.dupe(u32, seq[0 .. at + g.tail]) catch {
++            h.gpa.destroy(w);
++            return null;
++        };
++        // one token, no drafts (the pass is all it is for), its history mark the kept point; nothing of the
++        // reply's request (its slices go with it) beyond its sampling, a value
++        w.* = .{ .tokens = tokens, .from = @intCast(from), .at = @intCast(at), .request = .{ .prompt = tokens, .max_tokens = 1, .sampling = r.sampling, .drafts = false, .background = true, .history_len = @intCast(at) } };
++        const wj = h.gpa.create(Job) catch {
++            h.gpa.free(tokens);
++            h.gpa.destroy(w);
++            return null;
++        };
++        h.ahead_ids +%= 1;
++        wj.* = .{ .host = h, .id = h.ahead_ids, .request = &w.request, .sink = h.ahead_sink orelse .{ .ctx = h, .event = aheadQuiet }, .warm = w };
++        return wj;
++    }
++
++    /// Queues a step-ahead pass behind nothing; anything that arrived meanwhile wins and the pass goes.
++    fn queueAhead(h: *LaneHost, job: *Job) void {
++        h.lock();
++        const ok = !h.closing and h.queued.items.len == 0 and h.waitingCount() == 0;
++        if (ok) if (h.queued.append(h.gpa, job)) {
++            h.ahead_counts.queued += 1;
++            h.wake.signal(h.io);
++            h.unlock();
++            return;
++        } else |_| {};
++        h.unlock();
++        h.finish(job, .cancelled, "");
++    }
++
+     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
+         job.reported();
+         h.gpa.free(job.marks);
+@@ -463,10 +569,26 @@ pub const LaneHost = struct {
+         const s = &job.stream;
+         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
++        if (job.warm) |w| {
++            if (job.prefilled) |done| if (reason == .stop or reason == .length) {
++                if (w.kept) {
++                    h.ahead_counts.ran += 1;
++                    h.ahead_counts.tokens += w.at -| s.cached;
++                    if (!@import("builtin").is_test) std.log.info("step-ahead: kept {d} tokens, read {d} after {d} in {d} ms ({d} passes, {d} yielded)", .{ w.at, w.at -| s.cached, s.cached, @divTrunc(done - job.began, std.time.ns_per_ms), h.ahead_counts.ran, h.ahead_counts.dropped });
++                } else {
++                    h.ahead_counts.unkept += 1;
++                    if (!@import("builtin").is_test) std.log.info("step-ahead: a pass to {d} tokens ended, but the cache kept no state there ({d} such passes)", .{ w.at, h.ahead_counts.unkept });
++                }
++            };
++        }
+         if (job.started) {
+             s.deinit(h.gpa);
+             job.proposer.deinit();
+         }
++        if (job.warm) |w| {
++            h.gpa.free(w.tokens);
++            h.gpa.destroy(w);
++        }
+         h.gpa.destroy(job);
+     }
+ 
+@@ -586,7 +708,13 @@ pub const LaneHost = struct {
+         }
+         // a woken (restored) request goes first, but not while a pass fills: then only a queued one that cuts in
+         const job = if (h.filling == null and h.ready.items.len > 0) h.ready.orderedRemove(0) else h.queued.orderedRemove(at);
+-        if (h.parking()) {
++        if (job.warm != null and (h.filling != null or h.admitted.items.len > 0 or h.core.activeCount() > 0 or h.waitingCount() > 0 or h.queued.items.len > 0)) { // a step-ahead pass runs alone, after every request
++            h.ahead_counts.dropped += 1;
++            h.unlock();
++            h.finish(job, .cancelled, "");
++            return true;
++        }
++        if (h.parking() and job.warm == null) { // (a step-ahead pass reads from memory: it never waits on a restore)
+             h.unlock();
+             if (h.park(job)) return true; // waits for a restore, holding no lane
+             h.lock();
+@@ -659,8 +787,9 @@ pub const LaneHost = struct {
+         added catch |e| {
+             if (h.isBroken()) return h.dropBroken(job);
+             if (e == error.Cancelled) return h.cancel(job);
+-            // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
+-            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
++            // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue; a
++            // step-ahead pass is dropped instead
++            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null) and job.warm == null) return h.requeue(job);
+             h.checkFatal(e);
+             return h.drop(job, h.words(e));
+         };
+@@ -676,7 +805,7 @@ pub const LaneHost = struct {
+             h.finish_until = now + finish_ns;
+             h.unlock();
+         }
+-        if (h.deliver(job)) h.remove(job);
++        _ = h.deliver(job);
+         return true;
+     }
+ 
+@@ -720,11 +849,7 @@ pub const LaneHost = struct {
+                         i += 1;
+                         continue;
+                     }
+-                    if (h.deliver(job)) {
+-                        h.lock();
+-                        _ = h.admitted.orderedRemove(i);
+-                        h.unlock();
+-                    } else i += 1;
++                    if (!h.deliver(job)) i += 1;
+                 }
+                 h.noteLive();
+             }
+@@ -762,6 +887,7 @@ pub const LaneHost = struct {
+     fn loneFits(h: *LaneHost, job: *Job) bool {
+         const r = job.request;
+         const lone = h.lone orelse return false;
++        if (job.warm != null) return false;
+         if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
+         h.lock();
+         defer h.unlock();
+@@ -823,7 +949,7 @@ pub const LaneHost = struct {
+             h.send(job);
+             return true;
+         }
+-        if (h.deliver(job)) h.remove(job);
++        _ = h.deliver(job);
+         return true;
+     }
+ 
+@@ -946,7 +1072,7 @@ pub const LaneHost = struct {
+         if (!done) return;
+         h.filling = null;
+         h.prefilled(job, job.began);
+-        if (h.deliver(job)) h.remove(job);
++        _ = h.deliver(job); // (out of `admitted` inside, before it is freed)
+     }
+ 
+     fn run(h: *LaneHost) void {
+@@ -996,11 +1122,7 @@ pub const LaneHost = struct {
+             var i: usize = 0;
+             while (i < h.admitted.items.len) {
+                 const job = h.admitted.items[i];
+-                if (h.deliver(job)) {
+-                    h.lock();
+-                    _ = h.admitted.orderedRemove(i);
+-                    h.unlock();
+-                } else i += 1;
++                if (!h.deliver(job)) i += 1;
+             }
+         }
+     }
+@@ -1373,11 +1495,7 @@ pub const LaneHost = struct {
+             var i: usize = 0;
+             while (i < h.admitted.items.len) {
+                 const job = h.admitted.items[i];
+-                if (h.deliver(job)) {
+-                    h.lock();
+-                    _ = h.admitted.orderedRemove(i);
+-                    h.unlock();
+-                } else i += 1;
++                if (!h.deliver(job)) i += 1;
+             }
+             h.noteLive();
+             return false;
+@@ -1556,6 +1674,75 @@ fn noteErr(comptime fmt: []const u8, args: anytype) void {
+     std.log.err("lane host: " ++ fmt, args);
+ }
+ 
++test "a queued step-ahead pass goes when a request waits behind it (its yield in submit had no room)" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.ahead_on = false; // (init reads TF_DS_STEP_AHEAD)
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: usize = 0,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |x| b.tokens += x.len,
++                .finished => |f| b.done = f.reason,
++                else => {},
++            }
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    // the queue submit leaves when it cannot reserve the yielded list: the pass first, a background request behind
++    // it (ahead_on off here, so submit leaves the queue as it is; the engine thread has not started yet)
++    var wbox: Box = .{};
++    const wj = wj: { // (the queue owns it once appended: the host's finish frees it)
++        const toks = try gpa.dupe(u32, &[_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 });
++        errdefer gpa.free(toks);
++        const w = try gpa.create(LaneHost.Warm);
++        errdefer gpa.destroy(w);
++        w.* = .{ .tokens = toks, .from = 0, .at = 4, .request = .{ .prompt = toks, .max_tokens = 1, .drafts = false, .background = true, .history_len = 4 } };
++        const j = try gpa.create(LaneHost.Job);
++        errdefer gpa.destroy(j);
++        j.* = .{ .host = &host, .id = LaneHost.ahead_id_base + 1, .request = &w.request, .sink = .{ .ctx = &wbox, .event = Box.event }, .warm = w };
++        try host.queued.append(gpa, j);
++        break :wj j;
++    };
++    var bbox: Box = .{};
++    const prompt = [_]u32{ 2, 7, 1, 8, 2, 8 };
++    const bg: Request = .{ .prompt = &prompt, .max_tokens = 3, .background = true };
++    const e = host.engine();
++    try e.submit(1, &bg, .{ .ctx = &bbox, .event = Box.event });
++    try std.testing.expectEqual(@as(usize, 2), host.queued.items.len);
++    try std.testing.expect(host.queued.items[0] == wj);
++    try host.start();
++    var stopped = false; // (a failed check below still joins the engine thread before what it uses goes)
++    defer if (!stopped) host.stop();
++    try std.testing.expectEqual(Reason.cancelled, wbox.wait());
++    try std.testing.expectEqual(Reason.length, bbox.wait());
++    host.stop();
++    stopped = true;
++    try std.testing.expectEqual(@as(usize, 0), wbox.tokens);
++    try std.testing.expectEqual(@as(u64, 1), host.ahead_counts.dropped);
++    try std.testing.expectEqual(@as(u64, 0), host.ahead_counts.ran);
++}
++
+ test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
+     const gpa = std.testing.allocator;
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
+index 060971dd62835ae4179ce5e648f2acacf71c470d..2a51b38471119a2b17abeed0313deb22755d67bb 100644
+--- a/zig/src/core/lane_host_reuse_test.zig
++++ b/zig/src/core/lane_host_reuse_test.zig
+@@ -294,3 +294,225 @@ test "a prompt with an image resumes when its image is the same, and not past th
+     try std.testing.expectEqual(Reason.length, b3.wait());
+     try std.testing.expectEqual(@as(?u32, 0), b3.cached);
+ }
++
++/// A fake snapshot vtable over lanes.fake.Fake (states at any position) and a sink that records one reply.
++const AheadKit = struct {
++    const Snaps = struct {
++        fn bytes(_: *anyopaque, at: u32) u64 {
++            return 64 + 4 * @as(u64, at);
++        }
++        var refuse_at: u32 = 0; // a save at this position fails (0: none)
++        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++            if (at == refuse_at) return error.InjectedFailure;
++            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++            return f.save(@ptrCast(@alignCast(owner.?)), at);
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++            return error.BackendRestores;
++        }
++        fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++            f.drop(saved);
++        }
++    };
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        cached: ?u32 = null,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .prefilled => |c| b.cached = c,
++                .tokens => |t| b.tokens.appendSlice(std.testing.allocator, t) catch {},
++                .finished => |f| b.done = f.reason,
++            }
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++};
++
++test "step-ahead: a reply's own tokens are read while the client works, and its next step resumes past them with the same tokens" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = AheadKit.Snaps.bytes, .save = AheadKit.Snaps.save, .restore = AheadKit.Snaps.restore, .drop = AheadKit.Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++    defer store.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.cache = &store;
++    host.ahead_on = true;
++    host.ahead_grid = .{ .chunk = 4, .tail = 2 };
++    var warm: AheadKit.Box = .{};
++    defer warm.tokens.deinit(gpa);
++    host.ahead_sink = .{ .ctx = &warm, .event = AheadKit.Box.event };
++    try host.start();
++    defer host.stop();
++    const e = host.engine();
++    // step 1: a 10-token prompt kept at its history (8); the reply's 6 tokens make 16, so the pass keeps 12 (16 - 2 down to 4s)
++    const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++    var b1: AheadKit.Box = .{};
++    defer b1.tokens.deinit(gpa);
++    const r1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8 };
++    try e.submit(1, &r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
++    try std.testing.expectEqual(Reason.length, b1.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b1.cached);
++    // the step-ahead pass: one token past a pass that resumed at 8
++    try std.testing.expectEqual(Reason.length, warm.wait());
++    try std.testing.expectEqual(@as(?u32, 8), warm.cached);
++    var found = false;
++    for (store.entries.items) |x| found = found or x.at == 12;
++    try std.testing.expect(found);
++    // step 2: the history, the whole reply, a tool result: resumes at 12, not 8, and reads the history exactly
++    var t2: std.ArrayList(u32) = .empty;
++    defer t2.deinit(gpa);
++    try t2.appendSlice(gpa, &t1);
++    try t2.appendSlice(gpa, b1.tokens.items);
++    try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
++    var b2: AheadKit.Box = .{};
++    defer b2.tokens.deinit(gpa);
++    const r2: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2), .drafts = true };
++    try e.submit(2, &r2, .{ .ctx = &b2, .event = AheadKit.Box.event });
++    try std.testing.expectEqual(Reason.length, b2.wait());
++    try std.testing.expectEqual(@as(?u32, 12), b2.cached);
++    var history: std.ArrayList(u32) = .empty;
++    defer history.deinit(gpa);
++    try history.appendSlice(gpa, t2.items);
++    for (b2.tokens.items) |t| {
++        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++        try history.append(gpa, t);
++    }
++}
++
++test "step-ahead: nothing runs when off, or when the reply moves no kept state a chunk on; on, the same reply warms" {
++    const gpa = std.testing.allocator;
++    // (on, chunk rows, reply tokens, passes): 10 + 6 tokens reach 12 past the kept 8 on a 4-row grid (the positive
++    // test's workload), which only runs a pass when on; 10 + 2 on an 8-row grid reach no chunk end past 8
++    // a store of 100 bytes holds the state at 8 (96 bytes) but never one at 12 (112): the pass runs, nothing is kept
++    // and a backend save that fails at 12: the store tries, refuses, and the pass is not counted as kept
++    const Case = struct { on: bool, chunk: u32, reply: u32, passes: u64, budget: u64 = 1 << 20, kept: u64 = 0, refuse: u32 = 0 };
++    defer AheadKit.Snaps.refuse_at = 0;
++    for ([_]Case{ .{ .on = false, .chunk = 4, .reply = 6, .passes = 0 }, .{ .on = true, .chunk = 8, .reply = 2, .passes = 0 }, .{ .on = true, .chunk = 4, .reply = 6, .passes = 1, .kept = 1 }, .{ .on = true, .chunk = 4, .reply = 6, .passes = 1, .budget = 100 }, .{ .on = true, .chunk = 4, .reply = 6, .passes = 1, .refuse = 12 } }) |k| {
++        AheadKit.Snaps.refuse_at = k.refuse;
++        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        defer cfg.deinit(gpa);
++        var target: lanes.fake.Fake = .{ .gpa = gpa };
++        defer target.deinit();
++        var clock: lanes.fake.FixedClock = .{};
++        var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++        defer core.deinit();
++        var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = AheadKit.Snaps.bytes, .save = AheadKit.Snaps.save, .restore = AheadKit.Snaps.restore, .drop = AheadKit.Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, k.budget);
++        defer store.deinit();
++        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++        host.cache = &store;
++        host.ahead_on = k.on;
++        host.ahead_grid = .{ .chunk = k.chunk, .tail = 2 };
++        var warm: AheadKit.Box = .{};
++        defer warm.tokens.deinit(gpa);
++        host.ahead_sink = .{ .ctx = &warm, .event = AheadKit.Box.event };
++        try host.start();
++        var stopped = false; // (a failed check below still joins the engine thread before what it uses goes)
++        defer if (!stopped) host.stop();
++        const e = host.engine();
++        const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++        var b1: AheadKit.Box = .{};
++        defer b1.tokens.deinit(gpa);
++        const r1: Request = .{ .prompt = &t1, .max_tokens = k.reply, .history_len = 8 };
++        try e.submit(1, &r1, .{ .ctx = &b1, .event = AheadKit.Box.event });
++        try std.testing.expectEqual(Reason.length, b1.wait());
++        if (k.passes > 0) try std.testing.expectEqual(Reason.length, warm.wait());
++        host.stop(); // (the engine thread joined: its counts are final)
++        stopped = true;
++        try std.testing.expectEqual(k.passes, host.ahead_counts.queued);
++        try std.testing.expectEqual(k.kept, host.ahead_counts.ran); // ran counts a state the cache kept at 12
++        try std.testing.expectEqual(k.passes - k.kept, host.ahead_counts.unkept);
++    }
++}
++
++/// A sink that notes whether its job was still among the host's admitted ones when it reported its end (its job is
++/// freed right after: a submission walking `admitted` would meet it freed). It runs on the engine thread, the one
++/// thread that changes `admitted`, so it reads the list without the lock.
++const Detached = struct {
++    host: *LaneHost,
++    box: AheadKit.Box = .{},
++    ends: std.atomic.Value(u32) = .init(0),
++    listed: std.atomic.Value(u32) = .init(0),
++    fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
++        const d: *@This() = @ptrCast(@alignCast(ctx));
++        if (e.* == .finished) {
++            _ = d.ends.fetchAdd(1, .acq_rel);
++            // (a queued pass that yields ends on the submitting thread, never admitted: not looked at)
++            if (e.finished.reason != .cancelled) for (d.host.admitted.items) |j| if (j.id == id) {
++                _ = d.listed.fetchAdd(1, .acq_rel);
++            };
++        }
++        AheadKit.Box.event(&d.box, id, e);
++    }
++};
++
++test "a reply that ends leaves the admitted jobs before it is freed, step-ahead on or off (its pass too)" {
++    const gpa = std.testing.allocator;
++    for ([_]bool{ false, true }) |on| {
++        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        defer cfg.deinit(gpa);
++        var target: lanes.fake.Fake = .{ .gpa = gpa };
++        defer target.deinit();
++        var clock: lanes.fake.FixedClock = .{};
++        var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++        defer core.deinit();
++        var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = AheadKit.Snaps.bytes, .save = AheadKit.Snaps.save, .restore = AheadKit.Snaps.restore, .drop = AheadKit.Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++        defer store.deinit();
++        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++        host.cache = &store;
++        host.ahead_on = on;
++        host.ahead_grid = .{ .chunk = 4, .tail = 2 };
++        var warm: Detached = .{ .host = &host };
++        defer warm.box.tokens.deinit(gpa);
++        host.ahead_sink = .{ .ctx = &warm, .event = Detached.event };
++        try host.start();
++        var stopped = false; // (a failed check below still joins the engine thread before what it uses goes)
++        defer if (!stopped) host.stop();
++        const e = host.engine();
++        const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++        const t2 = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8 };
++        var a: Detached = .{ .host = &host };
++        defer a.box.tokens.deinit(gpa);
++        var b: Detached = .{ .host = &host };
++        defer b.box.tokens.deinit(gpa);
++        // two at once (they end in the same round's delivery), then one alone (its step-ahead pass may follow)
++        const r1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8 };
++        const r2: Request = .{ .prompt = &t2, .max_tokens = 3, .history_len = 8 };
++        try e.submit(1, &r1, .{ .ctx = &a, .event = Detached.event });
++        try e.submit(2, &r2, .{ .ctx = &b, .event = Detached.event });
++        try std.testing.expectEqual(Reason.length, a.box.wait());
++        try std.testing.expectEqual(Reason.length, b.box.wait());
++        var c: Detached = .{ .host = &host };
++        defer c.box.tokens.deinit(gpa);
++        try e.submit(3, &r1, .{ .ctx = &c, .event = Detached.event });
++        try std.testing.expectEqual(Reason.length, c.box.wait());
++        if (on) _ = warm.box.wait();
++        host.stop();
++        stopped = true;
++        for ([_]*Detached{ &a, &b, &c }) |d| {
++            try std.testing.expectEqual(@as(u32, 1), d.ends.load(.acquire));
++            try std.testing.expectEqual(@as(u32, 0), d.listed.load(.acquire));
++        }
++        try std.testing.expectEqual(@as(u32, 0), warm.listed.load(.acquire));
++        try std.testing.expect(!on or warm.ends.load(.acquire) >= 1);
++        try std.testing.expectEqual(on, host.ahead_counts.queued > 0);
++    }
++}
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index a03bbf65f94d5ee85c7158af74b23bca78bc1b7a..fb0c04d28937315f5aa0f7f1131fdc409fb3feec 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -109,6 +109,9 @@ pub const Loaded = struct {
+     snaps: ?Snaps = null,
+     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
+     vision: ?lanes.stream.Vision = null,
++    /// Where the kept states sit: chunk ends of this many rows, at least the window before a prompt's end (the host's
++    /// step-ahead pass cuts its prompt there). (Upstream's `grid` is the chunk alone; this carries the tail too.)
++    ahead_grid: ?[2]u32 = null,
+     /// The single-conversation limit (prompt + reply tokens) when it is not the context asked for: TF_DS_POOL or
+     /// TF_DS_KV_SHARD (a part may hold less than the window); null: the context, as ever.
+     window: ?usize = null,
+@@ -268,7 +271,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
+     const pair: ?Pair = if (pair_mode == .exit) .{ .watch = pairWatch, .abort = pairAbort } else null;
+     if (pair != null) std.log.info("dsv41: a broken rank pair ends this server with status {d} for a restart of both ranks (TF_DS_PAIR_BROKEN=degrade: requests fail one by one instead)", .{api.LaneHost.pair_exit_code});
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn, .ahead_grid = .{ model.chunk_rows, @intCast(st.m.cfg.window) } };
+ }
+ 
+ // -- the broken-pair policy (robustness, docs/port/robustness.md) ------------------------------------------------
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 555c1ce09be93fc4a9c474465ce84599629ef3cd..2306e03fb5e1154245494cc7d2339fcc7376753a 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -163,6 +163,7 @@ const Host = struct {
+     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
+     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
++    ahead_grid: ?[2]u32 = null, // where the family keeps them (chunk rows, tail), for the host's step-ahead pass
+     spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
+     // robustness: the family's broken-pair policy and service fence, handed to the lane host before it starts
+     pair: ?api.LaneHost.PairPolicy = null,
+@@ -213,6 +214,9 @@ const Host = struct {
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
+         if (h.cache) |*store| h.host.cache = store;
++        if (h.cache != null) if (h.ahead_grid) |g| {
++            h.host.ahead_grid = .{ .chunk = g[0], .tail = g[1] };
++        };
+         h.host.kv_parts = h.kv_parts;
+         if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
+         h.host.pair = h.pair;
+@@ -459,6 +463,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+             }
+         }
+     };
++    if (@hasField(@TypeOf(loaded), "ahead_grid")) h.ahead_grid = loaded.ahead_grid;
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
+     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(served), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .call_gates = true, .prompt_cache = h.cache != null }, .{ .ctx = loaded.ctx, .text = F.explain });
