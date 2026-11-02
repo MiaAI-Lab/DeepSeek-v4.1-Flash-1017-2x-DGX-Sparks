@@ -203,6 +203,7 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   Hector Isaza also wrote `tools/claims/0046-server-get-delete-body-discard.sh`, with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit).
 - **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0049-first-draft-depth.patch` (a stream's first drafts after its prompt take the head's depth), in [pull request #104](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/104).
 - **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0050-draft-calibration.patch` (`TF_DS_T25_DRAFT_CAL`, the per-stream draft calibration), in [pull request #105](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/105).
+- **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0051-prompt-rows.patch` (`TF_DS_PROMPT_WINDOW_ROWS` and `TF_DS_PROMPT_GEMM_ROWS`), in [pull request #106](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/106).
 - **Christopher A. Williamson** ([cawilliamson](https://github.com/cawilliamson)) authored `zig/patches/0046-server-get-delete-body-discard.patch`, in
   [pull request #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37) of the 4-Spark recipe (commit
   [`0430154`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37/commits/0430154e85ed00702a76989f7ba83282eb3eefd8)):
