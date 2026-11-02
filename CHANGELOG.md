@@ -45,6 +45,7 @@
   `/v1/messages` (1 and 1 on the image before it), and as 46 through LiteLLM's `/v1/messages`. Requests without tools,
   whole replies and `parallel_tool_calls: false` are unchanged. Route tests with real DeepSeek-V4.1 token sequences (10 of
   14 fail without the patch), a golden stream and a fuzz test of 14,000 replies. By **[nuk3s](https://github.com/nuk3s)**.
+- `zig/patches/0049-first-draft-depth.patch` (always on): a stream's first drafts after its prompt take the head's depth, as every later round does. The learned-cost rule priced them from the load-time table before any round was measured, so the first request after boot drafted 3 where the same request warm drafted 5, and its greedy reply could differ from the warm reply. On a GB10 pair the first greedy reply after boot matched the warm one for all 8 prompts of a fixed set at six consecutive builds after the fix, and for 7 of 8 before it. By **Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo))**, [pull request #104](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/104).
 - `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
   it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
   the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
