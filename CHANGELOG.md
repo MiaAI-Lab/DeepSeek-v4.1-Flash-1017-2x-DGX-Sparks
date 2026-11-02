@@ -35,6 +35,16 @@
   thought at 22 of 22 points with the reasoning in history and at 6 of 22 without it (0 of 9 above 100K). A client's own
   `reasoning_content` wins; a request without an assistant `reasoning` field renders byte for byte as before. Two host
   tests in `messages.zig` fail without the change. By **[nuk3s](https://github.com/nuk3s)**.
+- `zig/patches/0048-stream-tool-calls.patch` (always on): DeepSeek-V4.1's DSML tool calls stream as they decode. The
+  engine sent each call whole when the reply ended, so a client saw nothing while the model wrote it: on a pair, a Write
+  call's 869 characters of arguments came through LiteLLM's `/v1/messages` as one `input_json_delta` after 4.1 s without
+  an event. Now a call's header goes out when its invoke name is whole, string values go out as JSON-escaped pieces while
+  they decode, and other values when their parameter closes. The pieces join to the parsed arguments byte for byte, and
+  the finish checks what went out against the parse and sends nothing twice. On a pair with the patch, a Write call with
+  1,014 characters of arguments streamed as 47 argument deltas on the chat route and 48 `input_json_delta` on
+  `/v1/messages` (1 and 1 on the image before it), and as 46 through LiteLLM's `/v1/messages`. Requests without tools,
+  whole replies and `parallel_tool_calls: false` are unchanged. Route tests with real DeepSeek-V4.1 token sequences (10 of
+  14 fail without the patch), a golden stream and a fuzz test of 14,000 replies. By **[nuk3s](https://github.com/nuk3s)**.
 - `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
   it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
   the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
