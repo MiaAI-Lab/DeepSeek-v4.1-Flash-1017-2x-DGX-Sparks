@@ -144,6 +144,7 @@ tools/exact.py               records a server's replies (token hashes) on a fixe
 tools/smoke.py               a quick correctness check: health, stop strings, streaming, a tool call and its result
 tools/prompt_reuse.py        a conversation resumes from its kept prompt state (from the GLM-5.3-Flash recipe)
 tools/toolcheck.py, needle.py, end_of_turn.py, anthropiccheck.py   single checks, from the GLM-5.3-Flash recipe
+tools/claims/                checks of a patch's promise against a running server
 docs/zig-engine.md           how the pieces fit, and what is not verified
 docs/measurements.md       what was checked and measured on a pair of Sparks
 docs/requirements.md, how-it-works.md, configuration.md, memory-and-safety.md, abliterated.md, spill-and-kv-sharding.md
@@ -199,6 +200,11 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   [`549f473`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/79/commits/549f473d4a5fd2ba39dc6eb666255a18bece098e)):
   an Engram prompt read that fails on one rank ends the pair instead of hanging it, a table shorter than the hasher's row range is
   refused at start, and the Engram readers and the AIO, `Model.open`, `Pool.init` and `Tables.open` failure paths release what they made.
+  Hector Isaza also wrote `tools/claims/0046-server-get-delete-body-discard.sh`, with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit).
+- **Christopher A. Williamson** ([cawilliamson](https://github.com/cawilliamson)) authored `zig/patches/0046-server-get-delete-body-discard.patch`, in
+  [pull request #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37) of the 4-Spark recipe (commit
+  [`0430154`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37/commits/0430154e85ed00702a76989f7ba83282eb3eefd8)):
+  a `GET` or `DELETE` body is read and dropped before its route, so a kept connection cannot hand those bytes to the next request.
 - **eleata** ([eleata](https://github.com/eleata)) authored the engine pin `fbbc971` and the rebase of the patch series onto it, in [#77](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/77).
 - **Maciej Kowalik** ([koniaik](https://github.com/koniaik)) authored `zig/patches/0029` to `0032` (the Anthropic frontend's thinking
   budget, `clear_thinking`, mid-conversation `system` and the stream keep-alive ping), in [#53](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/53), [#71](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/71), [#72](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/72) and [#76](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/76).
