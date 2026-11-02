@@ -55,6 +55,10 @@
   skipped them on the `629c524` pin (`pictureNeedsRows`); the rebase onto `fbbc971` kept the helper and its test but
   lost the call in `fillOpen`, which this restores. Pictures that straddle the resume point, and passes that do not
   resume, are handled as before.
+- `zig/patches/0045-cut-in-tail.patch` (with `TF_FILL_CUT_IN`): a queued prompt cuts in between another pass's pieces when the tokens
+  it computes past the kept state it resumes fit `TF_FILL_CUT_IN`, not its whole length; a turn of a 300K-token conversation with 1.5K
+  new tokens now cuts in. A prompt with pictures cuts in when every picture is inside that kept state (no tower run, no rows: the
+  `pictureNeedsRows` test). Unchanged: one cut-in at a time, none into a pass with pictures, and a prompt that needs picture rows waits.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
