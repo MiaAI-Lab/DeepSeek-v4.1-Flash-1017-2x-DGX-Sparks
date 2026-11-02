@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `zig/patches/0047-replayed-reasoning.patch` (always on): an assistant message's `reasoning` field reaches the chat
+  template as its `reasoning_content`, as vLLM's `chat_utils` reads it. The engine read only `reasoning_content`, and
+  LiteLLM's `hosted_vllm` provider (1.103.4) removes that field from assistant messages and keeps `reasoning`, so a
+  client behind it lost all of its replayed thinking and every history turn rendered as `<think></think>` and the
+  answer. In one 22-turn tool session that grows from 0.6K to 171K tokens (temperature 0, on a pair), the next reply
+  thought at 22 of 22 points with the reasoning in history and at 6 of 22 without it (0 of 9 above 100K). A client's own
+  `reasoning_content` wins; a request without an assistant `reasoning` field renders byte for byte as before. Two host
+  tests in `messages.zig` fail without the change. By **[nuk3s](https://github.com/nuk3s)**.
 - `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
   it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
   the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
