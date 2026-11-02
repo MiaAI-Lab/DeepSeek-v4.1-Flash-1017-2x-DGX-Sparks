@@ -1,0 +1,41 @@
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 821d8fc..7829577 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -269,7 +269,11 @@ pub const TierCounts = struct {
+ /// restore in flight ends. dsv41's spill tier: TooManyRestores (its cap of restores in flight); core/spill's store:
+ /// TooMany (its reads in flight), NoSlot (no staging slot); any tier: Busy.
+ /// error.TierFull: the store's own refusal when the tier reports itself full (Tier.VTable.full) before any room is made.
+-pub const capacity_errors = [_]anyerror{ error.TierFull, error.TooManyRestores, error.TooMany, error.NoSlot, error.Busy };
++// error.CudaInvalidContext: a restore's first allocation can run before any CUDA work has made a
++// context current on that thread (measured on the pair 2026-11-02: the FIRST restore of every process
++// start failed with CUDA_ERROR_INVALID_CONTEXT and the request prefilled, while every later restore in
++// the same process succeeded). Deferring costs one retry; abandoning costs a whole prompt pass.
++pub const capacity_errors = [_]anyerror{ error.TierFull, error.TooManyRestores, error.TooMany, error.NoSlot, error.Busy, error.CudaInvalidContext };
+ 
+ /// The ranks a tier reports counters for (TP ranks; more are not reported).
+ pub const max_ranks = 8;
+diff --git a/zig/src/cuda/driver.zig b/zig/src/cuda/driver.zig
+index 79bc6ec..2c4f559 100644
+--- a/zig/src/cuda/driver.zig
++++ b/zig/src/cuda/driver.zig
+@@ -3,7 +3,7 @@
+ const std = @import("std");
+ const abi = @import("abi.zig");
+ 
+-pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDeviceMemory, NotReady, NotFound, Invalid };
++pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, CudaInvalidContext, OutOfDeviceMemory, NotReady, NotFound, Invalid };
+ 
+ pub const Driver = struct {
+     lib: std.DynLib,
+@@ -55,6 +55,10 @@ pub const Driver = struct {
+         std.log.err("{s}: {s} ({d}) {s}", .{ what, self.errorName(res), res, self.errorText(res) });
+         return switch (res) {
+             2 => error.OutOfDeviceMemory,
++            // CUDA_ERROR_INVALID_CONTEXT: no context is current on the calling thread yet. The first
++            // restore after a process start can hit this before any work has run; it is a state the
++            // caller may retry, not a broken device (201 measured on the pair, 2026-11-02).
++            201 => error.CudaInvalidContext,
+             abi.error_not_found => error.NotFound,
+             else => error.CudaFailed,
+         };
