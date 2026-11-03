@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `zig/patches/0056-server-picture-prepare-scratch.patch` (always on): `spans()` (`zig/src/server/prompt.zig`) prepared every picture
+  of a request in the request's arena, whose frees reclaim almost nothing, so a 1024x650 screenshot kept ~16 MiB until the request ended,
+  for every picture on every turn (the cached prefix's pictures are prepared again for their digests). A scratch arena on the
+  server's allocator now holds one picture's preparation at a time and only the payload is copied out; a refusal's message is
+  copied out first. On a pair, a cold request with 30 screenshots took the head's `MemAvailable` 0.23 GiB under its level
+  just before, against 0.71 GiB without the patch (~16 MiB a picture).
 - `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
   it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
   the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
