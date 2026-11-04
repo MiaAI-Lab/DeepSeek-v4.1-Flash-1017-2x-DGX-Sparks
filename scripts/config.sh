@@ -193,9 +193,9 @@ KIT_SUB="tensorfold-dsv41/kit-${KIT_REF:0:8}"
 NFS_PATH="${NFS_PATH:-$HF_CACHE}"
 NFS_SERVER="${NFS_SERVER:-}"; NFS_SERVER2="${NFS_SERVER2:-}"
 NFS_VOLUME="${NFS_VOLUME:-dsv41-1017-exl3-hf}"
-# On the worker's own disk (paths on the worker, the same on every worker): Engram's tables (a decode round reads ~70 random 4 KiB rows from
-# them; over NFS that took most of a round), and its weight file (~106 GB; written there by prepare.sh from the
-# checkpoint over NFS, so it never crosses the network twice).
+# On the worker's own disk (paths on the worker, the same on every worker): Engram's tables (a decode round reads ~70
+# random 4 KiB rows from them; over NFS that took most of a round), and its weight file (~106 GB; written there by
+# prepare.sh from the checkpoint over NFS, so it never crosses the network twice).
 WORKER_ENGRAM_DIR="${WORKER_ENGRAM_DIR:-\$HOME/.cache/dsv41-tensorfold/engram-${ENGRAM_REVISION:0:8}}"
 WORKER_CACHE_DIR="${WORKER_CACHE_DIR:-\$HOME/.cache/dsv41-tensorfold/rank-cache-${MODEL_REVISION:0:8}}"
 # Keep stock and abliterated weights separate even when the user sets WORKER_CACHE_DIR.
