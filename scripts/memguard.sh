@@ -5,7 +5,7 @@
 #   - MemAvailable under the HARD floor (default 1 GiB) in two samples in a row (0.25 s apart): at once;
 #   - MemAvailable under the (soft) floor for HOLD seconds without once coming back over it (default 4 s): a long prompt's workspace
 #     takes a few GiB for a moment and gives them back, which is not a rank in trouble. A dip that recovers is logged, not killed.
-# Self-contained: start.sh copies it to the worker.
+# Self-contained: start.sh copies it to each worker (both of them at TP=3: every rank's Spark is guarded alike).
 #
 # Usage: memguard.sh start <container> <floor GiB> <log file> <pid file> [hold seconds [hard floor GiB]]
 #                                                       (replaces a guard already running for the pid file)

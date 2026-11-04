@@ -19,8 +19,9 @@
 #   API_KEY=1 ./start.sh restart  # require an API key (generated in $STATE_DIR/api-key, mode 600; see scripts/config.sh)
 #   FOREGROUND=1 ./start.sh       # stay attached to rank 0's log and exit with its code (for systemd Restart=on-failure)
 #   DRY_RUN=1 ./start.sh        # print the link found and both ranks' docker commands, change nothing and start nothing
+#   TP=3 ./start.sh restart     # three Sparks cabled as a triangle (experimental, LakyFx's TP3 engine): docs/tp3.md
 # Extra arguments go to rank 0's `tensorfold-native serve` after the defaults, so they win.
-# Setup: WORKER (an ssh target, key-based) in scripts/local.sh.
+# Setup: WORKER (an ssh target, key-based) in scripts/local.sh; WORKER2 too for TP=3.
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and their notes in scripts/config.sh):
 #   serving  CONTEXT, POOL, PARALLEL, ROUND_ROWS, MAX_TOKENS, THINKING, REASONING_EFFORT, THINKING_BUDGET, TEMPERATURE, TOP_P, TOP_K, DRAFTS,
 #            SERVED_NAME, HOST, PORT, RDMA, RDMA_IDLE_S, RDMA_NAP_US, GRAPHS, GRAPH_CAP, SIDE, PREFETCH, ENGRAM_AIO, REPLAY_FLOOR
@@ -43,6 +44,10 @@
 #            are never extra arguments (refused: rank 1 would not get them)
 #   ranks    TENSORFOLD_*, TF_DS_* and TF_SPILL_* go to both ranks, except values mapped from recipe settings (use POOL, not TF_DS_POOL)
 #            every other exported NCCL_* variable too (values of A-Z a-z 0-9 _ . , : = / - only), RANK1_PROFILE=1|2: rank 1's --profile
+#   TP=3     TP (2 | 3), WORKER2, NFS_SERVER2, WORKER_TP3_DIR, PROMPT_CACHE_GIB; POOL is the pool all requests share
+#            (default 3300000), CONTEXT 401408 and PARALLEL 8 by default; the port's settings, EAQ_V1_1=1 and the
+#            two-Spark engine's GRAPH_CAP, RDMA_IDLE_S, RDMA_NAP_US, PREFILL_INTERLEAVE_MS, TF_DS_CONNECT_S and
+#            HEAD_ENGRAM_DIR are refused (docs/tp3.md)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -80,7 +85,8 @@ for v in EAQ_V1_1 THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FL
 nccl_extra_collect
 check_workers
 need_workers
-port_validate
+# TP=3: LakyFx's engine has none of the ported features; tp3_check refuses them, and the two-Spark engine's settings
+if (( TP == 3 )); then tp3_check; else port_validate; fi
 # the spill tier's directory on each Spark (scripts/port.sh): local disk, yours, outside the export and the model folders,
 # above SPILL_FLOOR_GIB; created when missing (DRY_RUN: not). Checked here, before the flags, the variables and the
 # tf.recipe.port label are made and before a running pair is compared with them: a spill tier that is on by default
@@ -102,6 +108,8 @@ if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking)
 # drafts off on rank 0 as on rank 1 (a follower without the drafter refuses a drafted round)
 [[ "$DRAFTS" == 1 ]] || SERVE+=(--no-drafts)
 [[ "$API_KEY" != 1 ]] || SERVE+=(--api-key-file "$API_KEY_IN_CONTAINER")
+# TP=3: the head's prompt cache (LakyFx's profile: prompt_snapshot_gib_head) and no update check, as its launch.py runs it
+(( TP == 2 )) || SERVE+=(--prompt-cache-gib "$PROMPT_CACHE_GIB" --no-update-check)
 SERVE+=(${PORT_SERVE[@]+"${PORT_SERVE[@]}"})   # the ported features' flags (scripts/port.sh; none with all of them off)
 SERVE+=("$@")
 
@@ -178,7 +186,7 @@ if (( need_prepare )); then
       log "Setup is needed and a server is running: stopping it first (the build needs the memory)"
       ./stop.sh
     fi
-    log "Not ready yet: running scripts/prepare.sh (the first time this builds the image, downloads ~400 GB and writes two ~106 GB weight files)"
+    log "Not ready yet: running scripts/prepare.sh (the first time this builds the image, downloads ~400 GB and writes $( (( TP == 2 )) && echo "two ~106 GB" || echo "three ~72 GB") weight files)"
     ./scripts/prepare.sh
   fi
 else
@@ -203,7 +211,7 @@ fi
 detect_links
 log "Link: rendezvous $MASTER_ADDR:$MASTER_PORT"
 for r in 0 $(worker_ids); do
-  log "  rank $r ($( (( r == 0 )) && echo this node || worker_host "$r")): RoCE ${NODE_HCAS[r]} (GID ${NODE_GID[r]})$( (( r == 0 )) || echo ", NFS from ${LINK_HEAD_ADDR[r]:-?}")"
+  log "  rank $r ($( (( r == 0 )) && echo this node || worker_host "$r")): RoCE ${NODE_HCAS[r]} (GID ${NODE_GID[r]})$( [[ -z "${NODE_MASKS[r]:-}" ]] || echo ", peer masks ${NODE_MASKS[r]}, NCCL ${NODE_NCCL_HCAS[r]} over ${NODE_DEV[r]}")$( (( r == 0 )) || echo ", NFS from ${LINK_HEAD_ADDR[r]:-?}")"
 done
 # the serve flags against what this build of tensorfold-native serves (scripts/zig_flags.py, from the GLM-5.3-Flash recipe):
 # the binary refuses an unsupported flag at start, after the container is up and the old server stopped
@@ -217,14 +225,21 @@ fi
 port_ident_map "$IMAGE"
 port_weights_check
 if (( ! DRY )); then
-  # Preparation's marker cannot detect an export/root change since the last run.
+  # Preparation's marker cannot detect an export/root change since the last run. (TP=3: each rank's own folder.)
   for i in $(worker_ids); do worker_files_check "$i"; done
+  (( TP == 2 )) || tp3_files_check 0
   # stop.sh for any container left, an exited one too: it saves each rank's log before it removes the container, so a
   # restart (./start.sh restart, or a supervisor's start after rank 0 exited) keeps the failed run's last lines
   if any_exists; then ./stop.sh; fi
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   for i in $(worker_ids); do worker "$i" "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"; done
   if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"; fi
+  # TP=3: rank 0 listens for its two followers on MASTER_PORT and the next one
+  if (( TP == 3 )); then
+    for p in "$MASTER_PORT" $((MASTER_PORT + 1)); do
+      if ss -ltn "sport = :$p" 2>/dev/null | grep -q LISTEN; then die "port $p (the ranks' rendezvous, MASTER_PORT) is already in use here"; fi
+    done
+  fi
   # memory: a rank that takes all of a Spark's memory freezes the machine, so refuse to start on one that cannot hold it.
   # Counted as the engine's startup budget counts it (0119): MemAvailable plus the pages parked on the per-CPU free
   # lists (scripts/memavail.sh). Right after an image build or copy those drain for a minute or two: wait up to
@@ -281,6 +296,12 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 [[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")   # zig/patches/0008: both ranks, alike
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
+# TP=3 (docs/tp3.md): LakyFx's launch.py's variables for every rank instead (the TP3 opt-in, the followers' start
+# window, the pool all requests share, the cache and tool-history repairs of its tested profile), with this recipe's
+# replay floor and streams; none of zig/patches' (0005, 0008, 0010), which that engine does not have
+(( ${TP:-2} == 2 )) || ENGINE_ENV=("TF_DS_EXPERIMENTAL_TP3=1" "TF_DS_START_TIMEOUT=1800" "TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL"
+                             "TF_DS_POOL_TOKENS=$POOL" "TF_DS_ROUND_ROWS=$ROUND_ROWS" "TF_DS_CACHE_SHORT_CONTINUATION=1"
+                             "TF_DS_TOOL_SEPARATOR_ROUNDTRIP=1" "TENSORFOLD_NO_UPDATE_CHECK=1" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
 ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
 while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
@@ -290,18 +311,31 @@ RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(por
 [[ -z "$LOG_MAX_SIZE" ]] || RUN_ARGS+=" --log-driver json-file --log-opt max-size=$LOG_MAX_SIZE --log-opt max-file=$LOG_MAX_FILE"
 DATA=/hf/$DATA_SUB
 KIT=/hf/$KIT_SUB/kit
+# What each rank reads: rank 0 under /hf (HF_CACHE), each worker the checkpoint over NFS and its own Engram tables and
+# weight file. TP=3: every rank its own folder (scripts/prepare-tp3.sh: rank 0's under HF_CACHE, each worker's
+# WORKER_TP3_DIR mounted at /tp3), the kit's token map, the model folder LakyFx's engine reads.
+H_CACHE=$DATA/rank-cache; H_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container); H_TOKEN_MAP=$DATA/dsv41_token_map.json
+W_MODEL=$MODEL_ARG; W_CACHE=/rank-cache; W_KIT=$KIT; W_ENGRAM=/engram; W_TOKEN_MAP=$DATA/dsv41_token_map.json
+W_MOUNTS="-v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro"
+if (( TP == 3 )); then
+  KIT=/hf/$TP3_SUB/kit; H_CACHE=/hf/$TP3_SUB/rank-cache; H_ENGRAM=/hf/$TP3_SUB/engram; H_TOKEN_MAP=$KIT/engram-token-map.json
+  W_MODEL=/tp3/model; W_CACHE=/tp3/rank-cache; W_KIT=/tp3/kit; W_ENGRAM=/tp3/engram; W_TOKEN_MAP=/tp3/kit/engram-token-map.json
+  W_MOUNTS="-v $WORKER_TP3_DIR:/tp3:ro"
+fi
 # rank 1 takes the round's settings as flags only (tf-dsv41-lanes reads no TF_DS_GRAPHS & co.): without them it runs
 # every round ungraphed, with no side stream, prefetch or AIO, and rank 0 waits on it each round. Its pool is rank 0's
 # context (or POOL, which scripts/port.sh derives for KV_SHARD=1 when it is empty), and its streams rank 0's (TF_DS_STREAMS): with other values the two ranks wait on each other.
 FOLLOW="--pool ${POOL:-$CONTEXT} --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
-# zig/patches/0033: only with graphs on, so an image from before 0033 still starts with GRAPHS=0 (it refuses the flag)
-[[ "$GRAPHS" == 0 ]] || FOLLOW+=" --graph-cap $GRAPH_CAP"
+# zig/patches/0033: only with graphs on, so an image from before 0033 still starts with GRAPHS=0 (it refuses the flag);
+# never at TP=3 (LakyFx's engine has no graph cap)
+[[ "$GRAPHS" == 0 || "$TP" == 3 ]] || FOLLOW+=" --graph-cap $GRAPH_CAP"
 # A round's context bucket is the next power of two of its depth, capped at the pool (round.zig bucketFor). A pool off
 # the 4,096 grid makes the capped bucket's indexer tile count one the kit captured no _index_score variant for: a prompt
 # past the largest power of two below the pool fails with MissingTritonVariant, and later requests with CudaFailed (901)
-# until a restart (issues #65 and #63: 400,000 and 500,000 failed, 524,288 and 1,048,576 did not).
+# until a restart (issues #65 and #63: 400,000 and 500,000 failed, 524,288 and 1,048,576 did not). Not at TP=3: LakyFx's
+# engine runs its own kit, qualified at its POOL of 3,300,000.
 _cap=${POOL:-$CONTEXT}
-if [[ "$GRAPHS" == 1 ]] && (( _cap % 4096 != 0 )); then
+if [[ "$GRAPHS" == 1 && "$TP" != 3 ]] && (( _cap % 4096 != 0 )); then
   _p2=1024; while (( _p2 * 2 < _cap )); do _p2=$(( _p2 * 2 )); done
   _what="CONTEXT=$CONTEXT"; [[ -z "${POOL:-}" ]] || _what="POOL=$POOL"
   warn "the pool ($_what) is not a multiple of 4096: with GRAPHS=1 a prompt past $_p2 positions can fail with MissingTritonVariant and leave later requests failing with CudaFailed (901) until a restart (issues #65, #63). Use a power of two (524288, 1048576) or a multiple of 4096"
@@ -320,22 +354,26 @@ fi
 step 3 "Launch: container $CONTAINER_NAME, $( (( TP == 2 )) && echo "rank 1 on the worker" || echo "ranks 1 to $((TP - 1)) on the workers"), then rank 0 here"
 # spill files a crashed run left as root go back to their directory's owner (scripts/port.sh; nothing with SPILL_GIB=0)
 (( DRY )) || port_spill_fix_both
-# rank i on worker i, rendezvous at the head's address on that worker's link
+# TP=3: each rank's rails' peer masks for TensorFold's RDMA ring (its four devices, TF_RDMA_DEVICES or --rdma)
+tp3_rdma_env() { (( TP == 3 )) && [[ "$RDMA" != 0 ]] && echo "TF_RDMA_PEER_MASKS=${NODE_MASKS[$1]} TF_RDMA_TRACE=0"; true; }
+# rank i on worker i, rendezvous at the head's address on that worker's link (TP=3: MASTER_ADDR, rendezvous_addr)
 for i in $(worker_ids); do
-  cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache $i $TP ${LINK_HEAD_ADDR[i]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
+  cmd="tf-dsv41-lanes $W_MODEL $W_CACHE $i $TP $(rendezvous_addr "$i") $MASTER_PORT $W_KIT --engram $W_ENGRAM --token-map $W_TOKEN_MAP $FOLLOW"
   [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[i]}"   # this node's RoCE devices
   spill=$(port_spill_args "$i")   # rank i's spill directory (scripts/port.sh; empty, and no extra space, with it off)
   rank_env=(); (( i != 1 )) || rank_env=(${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"})   # RANK1_EXTRA_ENV: rank 1's alone
-  remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill:+$spill }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[i]}" ${PORT_RANK_SHA[i]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[i]}"} ${rank_env[@]+"${rank_env[@]}"}) $(rank_nccl_env "$i") $IMAGE $cmd"
+  read -ra rdma_env <<<"$(tp3_rdma_env "$i")"
+  remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS $W_MOUNTS ${spill:+$spill }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[i]}" ${rdma_env[@]+"${rdma_env[@]}"} ${PORT_RANK_SHA[i]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[i]}"} ${rank_env[@]+"${rank_env[@]}"}) $(rank_nccl_env "$i") $IMAGE $cmd"
   if (( DRY )); then printf '[dry-run] rank %s on %s:\n  %s\n' "$i" "$(worker_host "$i")" "$remote"
   else
     log "Rank $i on $(worker_host "$i"): $cmd"
     worker "$i" "$remote" >/dev/null || die "could not start rank $i on $(worker_host "$i")"
   fi
 done
-ENV0=("TF_TP_WORLD=$TP" "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA/rank-cache" "TF_DS_KIT=$KIT"
-      "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container)" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json"
-      "TF_DS_GRAPHS=$GRAPHS" "TF_DS_GRAPH_CAP=$GRAPH_CAP" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
+ENV0=("TF_TP_WORLD=$TP" "TF_TP_MASTER=$(rendezvous_addr 1)" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$H_CACHE" "TF_DS_KIT=$KIT"
+      "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$H_ENGRAM" "TF_DS_TOKEN_MAP=$H_TOKEN_MAP" "TF_DS_GRAPHS=$GRAPHS")
+(( TP == 3 )) || ENV0+=("TF_DS_GRAPH_CAP=$GRAPH_CAP")   # zig/patches/0033 (not in TP=3's engine)
+ENV0+=("TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
 if (( DRY )); then HEAD_HF=${HEAD_NFS_SERVER:+$HEAD_NFS_VOLUME}; HEAD_HF=${HEAD_HF:-$HF_CACHE}; else HEAD_HF=$(head_hf_mount); fi
 here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro")
 read -ra port0 <<<"$(port_spill_args 0)"; here+=(${port0[@]+"${port0[@]}"})   # rank 0's spill directory (scripts/port.sh)
@@ -343,6 +381,7 @@ if [[ -n "$HEAD_ENGRAM_DIR" ]]; then
   here+=(-v "$HEAD_ENGRAM_DIR:/engram:ro")
 fi
 [[ "$RDMA" == 0 ]] || ENV0+=("TF_RDMA_DEVICES=${NODE_HCAS[0]}")
+read -ra rdma_env <<<"$(tp3_rdma_env 0)"; ENV0+=(${rdma_env[@]+"${rdma_env[@]}"})
 [[ -z "${PORT_RANK_SHA[0]:-}" ]] || ENV0+=("TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[0]}")   # this rank's own weight file's
 if [[ "$API_KEY" == 1 ]]; then here+=(-v "$API_KEY_FILE:$API_KEY_IN_CONTAINER:ro"); fi
 for x in "${ENV0[@]}" "${ENGINE_ENV[@]}"; do here+=(-e "$x"); done
@@ -354,7 +393,7 @@ log "Rank 0 here: ${SERVE[*]}"
 [[ "${FOREGROUND:-0}" != 1 ]] || foreground
 
 # ---------------------------------------------------------------- 4. load
-step 4 "Loading: ~98 GiB of weights on each Spark, then Engram and the caches (a few minutes)"
+step 4 "Loading: ~$( (( TP == 2 )) && echo 98 || echo 67) GiB of weights on each Spark, then Engram and the caches (a few minutes)"
 docker logs -f "$CONTAINER_NAME" 2>&1 | sed -u "s/^/  ${D}│${R} /" &
 LOGS_PID=$!
 trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
@@ -377,7 +416,7 @@ kill $LOGS_PID 2>/dev/null || true
 log "Server answered after $((SECONDS - start))s"
 
 # ---------------------------------------------------------------- 5. smoke test
-step 5 "Smoke test: one chat completion through both ranks"
+step 5 "Smoke test: one chat completion through $( (( TP == 2 )) && echo "both ranks" || echo "all $TP ranks")"
 if smoke=$(curl -s --max-time 300 "${AUTH[@]}" "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
              -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
            python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
