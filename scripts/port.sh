@@ -381,11 +381,11 @@ rank_cache_sha() {
   { printf '%s %s\n' "$st" "$sum" > "$cache.$$" && mv -f -- "$cache.$$" "$cache"; } 2>/dev/null || rm -f -- "$cache.$$" 2>/dev/null
   echo "sha256:$sum"
 }
-# port_weights_check: PORT_RANK_SHA[0] and [i] for each worker i, every Spark at once (start.sh, step 2; DRY_RUN computes
-# nothing and uses a cached digest only). The digest enters the rank's fingerprint and so the store's folder (native-spill-<compat>):
-# a rank that started once with it and once without would open another, empty store and every kept state would be
-# lost. So a real start refuses when either rank's digest cannot be had (the worker's probe is tried twice); only
-# DRY_RUN warns and goes on. Nothing with the tier off or SPILL_WEIGHTS_SHA=0 (which names another store, too).
+# port_weights_check: PORT_RANK_SHA[0] and [i] for each worker i, every Spark at once (start.sh, step 2; DRY_RUN
+# computes nothing and uses a cached digest only). The digest enters the rank's fingerprint and so the store's folder
+# (native-spill-<compat>): a rank that started once with it and once without would open another, empty store and every
+# kept state would be lost. So a real start refuses when any rank's digest cannot be had (a worker's probe is tried
+# twice); only DRY_RUN warns and goes on. Nothing with the tier off or SPILL_WEIGHTS_SHA=0 (which names another store, too).
 declare -a PORT_RANK_SHA=()
 port_weights_probe() {   # port_weights_probe <i> <compute>: worker i's line
   local out
@@ -529,8 +529,9 @@ port_spill_judge() {
   return 0
 }
 
-# port_spill_check: every rank's spill directory (this Spark's, then each worker's), before anything is stopped (start.sh, step 2): created when missing
-# (as you; DRY_RUN=1 creates nothing), on a local disk, outside the export and the model folders, above the floor.
+# port_spill_check: every rank's spill directory (this Spark's, then each worker's), before anything is stopped
+# (start.sh, step 2): created when missing (as you; DRY_RUN=1 creates nothing), on a local disk, outside the export and
+# the model folders, above the floor.
 # The two ranks run with the same settings by construction (port_map); this checks what each Spark has under them.
 # start.sh runs it before port_map and before it compares a running pair's tf.recipe.port label, so a default tier
 # that cannot run is off everywhere it matters: the flags, the variables, the mounts and the label. With SPILL_GIB
