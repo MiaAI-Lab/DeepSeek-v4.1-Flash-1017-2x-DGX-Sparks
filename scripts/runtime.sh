@@ -41,8 +41,9 @@ ctr() {
 }
 
 # runtime_env: CONTAINER_RT and CONTAINER_RT_SUDO as a shell prefix for a command sent to the worker over ssh
-# (worker 1 "$(runtime_env)$(declare -f ctr); ctr ps ...").
-runtime_env() { printf 'CONTAINER_RT=%q CONTAINER_RT_SUDO=%q; ' "$CONTAINER_RT" "$CONTAINER_RT_SUDO"; }
+# (worker 1 "$(runtime_env)$(declare -f ctr); ctr ps ..."). export, not a bare assignment: a plain "VAR=x; cmd" is a
+# shell variable, which the guard that memguard.sh re-execs through setsid would not inherit.
+runtime_env() { printf 'export CONTAINER_RT=%q CONTAINER_RT_SUDO=%q; ' "$CONTAINER_RT" "$CONTAINER_RT_SUDO"; }
 
 # rt_present: the runtime's CLI is installed (start.sh's check; it does not talk to the daemon).
 rt_present() { command -v "$CONTAINER_RT" >/dev/null || die "$CONTAINER_RT is not installed"; }
