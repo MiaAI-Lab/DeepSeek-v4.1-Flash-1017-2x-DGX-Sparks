@@ -16,7 +16,7 @@ only, never a GPU). Standard library, plus LakyFx's preparation tools for `model
   model --tools T CKPT PLAN RECEIPT TEMPLATE ORIG_REV OUT ARM
         OUT: the model folder LakyFx's engine serves at TP=3: CKPT's config.json for three ranks (LakyFx's
         tp3_layout.patch_config: 72 heads in 9 groups and a padded vocabulary, with the arm, the plan's sha256 and its
-        sources, and the base model's revision ORIG_REV), its tokenizer, the recipe's chat template TEMPLATE, and the
+        sources, and the base model's revision ORIG_REV), its tokenizer, the chat template TEMPLATE (LakyFx's qualified one), and the
         vision tower: its 266 BF16 tensors in vision.safetensors, every byte compared with CKPT's (LakyFx's
         vision_export.compare_payload), and their index.
   rope-cut REF KIT POOL HASHES

@@ -5,8 +5,8 @@
 #   4. the checkpoint's own files (hard links), their source manifest and LakyFx's receipt (source_verify.py re-hashes
 #      every shard), and the plan (scripts/tp3_plan.py, checked against LakyFx's TF29 plan)
 #   5. the kit with RoPE tables cut to POOL (LakyFx's make_rope.py at its 10M reference pool, then
-#      scripts/tp3_inputs.py rope-cut) and the model folder (config for three ranks, tokenizer, the recipe's chat
-#      template, the vision tower)
+#      scripts/tp3_inputs.py rope-cut) and the model folder (config for three ranks, tokenizer, LakyFx's qualified chat
+#      template, TP3_TEMPLATE_SHA256, the vision tower)
 #   6. for each rank: its weight file (LakyFx's rank_cache.py, re-read in full by rank_verify.py) and its Engram rows
 #      (LakyFx's prepare_engram.py: a sparse copy of its 8 of the 24 hash columns)
 #   7. each worker's folder (WORKER_TP3_DIR): the kit, the model folder, its Engram rows and its weight file, copied
@@ -22,7 +22,7 @@ STOCK="$(model_cache_dir)/snapshots/$(snapshot_rev)"
 STOCK_C="/hf/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)"
 ESNAP_C=$(engram_in_container)
 # the recipe's Python tools (scripts/) at /recipe, LakyFx's with -E -s (they import their neighbours)
-tp3_py() { in_hf -v "$PWD/scripts:/recipe:ro" -v "$PWD/model:/recipe-model:ro" --entrypoint python3 "$IMAGE" "$@"; }
+tp3_py() { in_hf -v "$PWD/scripts:/recipe:ro" --entrypoint python3 "$IMAGE" "$@"; }
 mkdir -p "$T"
 
 # ---------------------------------------------------------------- 4. (TP=3) the checkpoint's receipt and plan
@@ -93,13 +93,23 @@ if [[ "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["row
     die "the RoPE cut failed"
   rm -rf "$T/kit" && mv "$T/kit.new" "$T/kit"
 fi
-if [[ "$(cat "$T/model/.plan" 2>/dev/null)" != "$psha $(sha256sum model/chat_template.jinja | cut -c1-64)" ]]; then
-  log "The model folder: config for three ranks, tokenizer, the recipe's chat template, the vision tower (every byte compared)"
+# the qualified template (scripts/config.sh, TP3_TEMPLATE_*): one file of LakyFx's model repository, by its sha256
+TPL="$(hub_dir "$TP3_TEMPLATE_ID")/snapshots/$TP3_TEMPLATE_REV/chat_template.jinja"
+TPL_C="/hf/hub/models--${TP3_TEMPLATE_ID//\//--}/snapshots/$TP3_TEMPLATE_REV/chat_template.jinja"
+if [[ "$(sha256sum "$TPL" 2>/dev/null | cut -c1-64)" != "$TP3_TEMPLATE_SHA256" ]]; then
+  log "LakyFx's qualified chat template: $TP3_TEMPLATE_ID @ ${TP3_TEMPLATE_REV:0:8}, chat_template.jinja"
+  hf download "$TP3_TEMPLATE_ID" --revision "$TP3_TEMPLATE_REV" --cache-dir "$HF_CACHE/hub" --include chat_template.jinja >/dev/null ||
+    die "could not download the chat template from $TP3_TEMPLATE_ID"
+  [[ "$(sha256sum "$TPL" | cut -c1-64)" == "$TP3_TEMPLATE_SHA256" ]] || die "$TPL is not LakyFx's qualified template (sha256 $TP3_TEMPLATE_SHA256)"
+fi
+if [[ "$(cat "$T/model/.plan" 2>/dev/null)" != "$psha $TP3_TEMPLATE_SHA256" ]]; then
+  log "The model folder: config for three ranks, tokenizer, LakyFx's qualified chat template, the vision tower (every byte compared)"
   ensure_receipt
   rm -rf "$T/model.new"
-  tp3_py -I /recipe/tp3_inputs.py model --tools $LX/tools "$CK_C" "$T_C/plan.json" "$T_C/receipt.json" /recipe-model/chat_template.jinja \
+  tp3_py -I /recipe/tp3_inputs.py model --tools $LX/tools "$CK_C" "$T_C/plan.json" "$T_C/receipt.json" "$TPL_C" \
     "$(engram_rev)" "$T_C/model.new" "$TP3_ARM" > "$T/model.log" 2>&1 || die "the model folder: $(tail -3 "$T/model.log")"
-  echo "$psha $(sha256sum model/chat_template.jinja | cut -c1-64)" > "$T/model.new/.plan"
+  [[ "$(sha256sum "$T/model.new/chat_template.jinja" | cut -c1-64)" == "$TP3_TEMPLATE_SHA256" ]] || die "the model folder's chat template is not the qualified one"
+  echo "$psha $TP3_TEMPLATE_SHA256" > "$T/model.new/.plan"
   rm -rf "$T/model" && mv "$T/model.new" "$T/model"
 fi
 log "Kit and model folder ready ($(du -sh "$T/kit" | cut -f1), $(du -sh "$T/model" | cut -f1))"

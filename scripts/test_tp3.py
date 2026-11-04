@@ -111,6 +111,7 @@ class Settings(ts.ScriptTest):
         code, three = self.bash("prepared_state", {"TP": "3", "WORKER2": "w2"})
         self.assertIn("tp=3 tp3=14a6d49c7cb99b8ce25f9755541da7e7d57cb1d1 arm=EAQ29", three)
         self.assertIn("rope=3301376", three)
+        self.assertIn("tp3template=7d1356675e429ec4a55cbcc1a6fbeb40615dbeb257aca25b8c3705a42087f33e", three)
         self.assertIn(r"wtp3=\$HOME/.cache/dsv41-tensorfold/tp3-45ee5d0f", three)
 
 

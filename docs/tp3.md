@@ -13,8 +13,16 @@ three Sparks follows **easthambuilds' recipe**
 `7d72d1e`, Apache-2.0), which ran it end to end on three Sparks with its own 3.5 bpw checkpoint: its checkpoint plan,
 topology, RoPE cut and Engram steps are adapted here. What stays this recipe's: the checkpoint
 (`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw` @ `45ee5d0f`), Engram's tables from the base model's shards 47
-and 48, `ABLIT=1`, `model/chat_template.jinja`, and the scripts (`start.sh`, `stop.sh`, `scripts/memguard.sh`, the
-prepared marker, the docker containers).
+and 48, `ABLIT=1`, and the scripts (`start.sh`, `stop.sh`, `scripts/memguard.sh`, the prepared marker, the docker
+containers).
+
+**The chat template at `TP=3` is LakyFx's**, not `model/chat_template.jinja`: its qualified 1017 template (its port of
+DeepSeek's `encoding.py`, sha256 `7d1356675e429ec4a55cbcc1a6fbeb40615dbeb257aca25b8c3705a42087f33e`, the one
+easthambuilds pins as `CHAT_TEMPLATE_SHA256`). The runtime's model-file step checks for exactly that template; the
+checkpoint's own (34,236 bytes, `3e0c2a31...`) and this recipe's (`2ad46996...`) both stopped a TP=3 setup there.
+`scripts/prepare-tp3.sh` downloads it from `LakyFx/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw-TensorFold` (public, MIT) at
+`8621801c`, checks its sha256 and puts it in the model folder (`TP3_TEMPLATE_*` in `scripts/config.sh`). `TP=2` keeps
+serving `model/chat_template.jinja`, unchanged.
 
 ## Setup
 
@@ -51,8 +59,10 @@ The first run builds the TP=3 image on the head (`zig/Dockerfile.tp3`) and copie
   reserve.
 - **Disk:** on the head, the checkpoint (196 GiB) and Engram's tables (~203 GB) as at `TP=2`, then at the peak ~150 GB
   for two weight files and ~140 GB for two ranks' Engram rows (sparse; rank 0's stay, each worker's leave once
-  copied), 5 GB of reference RoPE tables and ~2 GB for the kit and the model folder: ~700 GB in all. `ABLIT=1` adds
-  **~127 GB**: the overlay rewrites `wo_b` of layers 10 to 35, which lie in 24 of the checkpoint's 39 shards. On each
+  copied), 5 GB of reference RoPE tables and ~2 GB for the kit and the model folder: ~700 GB in all. `ABLIT=1` at
+  `TP=3` needs **~127 GB more on the head**, on top of the rank files (~215 GB for all three, of which this recipe
+  holds two at a time before the workers' move to them): the overlay rewrites `wo_b` of layers 10 to 35, which lie in
+  24 of the checkpoint's 39 shards, as new files. On each
   worker, ~145 GB in `WORKER_TP3_DIR` (its weight file, its Engram rows, the kit and the model folder) and the image.
 
 ## Settings
@@ -98,8 +108,9 @@ the downloads, the `ABLIT=1` overlay. Then `scripts/prepare-tp3.sh`:
 5. **Kit and model folder.** LakyFx's `make_rope.py` makes the RoPE tables at its 10,000,000-position reference pool on
    CPU and checks them against its qualified hashes; `scripts/tp3_inputs.py rope-cut` keeps the rows `POOL` needs (for
    3,300,000, 3,301,376 rows, which must equal LakyFx's qualified 3.3M tables). The model folder holds the checkpoint's
-   config for three ranks (LakyFx's `tp3_layout`: 72 heads in 9 groups, a padded vocabulary), the tokenizer, this recipe's
-   chat template and the vision tower (its 266 BF16 tensors, every byte compared with the checkpoint).
+   config for three ranks (LakyFx's `tp3_layout`: 72 heads in 9 groups, a padded vocabulary), the tokenizer, LakyFx's
+   qualified chat template (checked by sha256, above) and the vision tower (its 266 BF16 tensors, every byte compared
+   with the checkpoint).
 6. **Each rank's files.** LakyFx's `rank_cache.py` writes the rank's weight file (`rank<r>of3-EAQ29-<plan>.bin`) and
    `rank_verify.py` re-reads it in full; `prepare_engram.py` cuts the rank's 8 of Engram's 24 hash columns as a sparse
    copy, with its `SOURCE.json`.

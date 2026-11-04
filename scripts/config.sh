@@ -61,6 +61,13 @@ NCCL_LIB_SHA256="${NCCL_LIB_SHA256:-78cb83871792ec57d763d142e4cae26fc754ae284bcc
 # The rank files' and the served config's name for this checkpoint in LakyFx's layout: Mia's EAQ v1 2.9 bpw, cut as
 # LakyFx's TF29 arm (Mia's earlier 2.9 bpw export, which it matches tensor for tensor: scripts/tp3_plan.py checks it).
 TP3_ARM=EAQ29
+# The chat template rank 0 serves at TP=3: LakyFx's qualified 1017 template (its port of DeepSeek's encoding.py, the one
+# its 1.2.0 profile and easthambuilds' recipe pin), not model/chat_template.jinja, which TP=2 keeps serving. LakyFx's
+# model-file step checks it: neither the checkpoint's own template nor this recipe's passes. prepare.sh downloads it from
+# LakyFx's 1017 model repository (public, MIT) at its pinned revision and checks its sha256.
+TP3_TEMPLATE_ID=LakyFx/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw-TensorFold
+TP3_TEMPLATE_REV=8621801c1fc74aece1fa83e67c6ade3fde1e7894
+TP3_TEMPLATE_SHA256=7d1356675e429ec4a55cbcc1a6fbeb40615dbeb257aca25b8c3705a42087f33e
 # The plan scripts/tp3_plan.py writes for the default checkpoint (ABLIT=0), computed from its 39 shards' published
 # headers: prepare.sh refuses another. Not checked for another MODEL_ID or MODEL_REVISION, nor ABLIT=1. Empty: no check.
 TP3_PLAN_FOR=Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw@45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b
@@ -380,7 +387,7 @@ prepared_state() {
   for i in 2 3; do [[ -z "$(worker_host "$i")" ]] || f+=("w$i=$(worker_host "$i")"); done
   for i in 1 2 3; do f+=("nfs$i=$(wval NFS_SERVER "$i")"); done
   # TP=3's own files: another engine, plan and folders, and RoPE tables cut to the pool (only then: TP=2's line is as it was)
-  [[ "$TP" != 3 ]] || f+=("tp=3" "tp3=$TP3_REV" "arm=$TP3_ARM" "wtp3=$WORKER_TP3_DIR" "rope=$(tp3_rope_rows)")
+  [[ "$TP" != 3 ]] || f+=("tp=3" "tp3=$TP3_REV" "arm=$TP3_ARM" "wtp3=$WORKER_TP3_DIR" "rope=$(tp3_rope_rows)" "tp3template=$TP3_TEMPLATE_SHA256")
   (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
 }
 # prepare.sh's last step: computed first and swapped in whole, so a failure leaves the previous marker as it was
