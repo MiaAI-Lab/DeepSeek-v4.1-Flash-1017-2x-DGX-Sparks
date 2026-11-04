@@ -14,6 +14,7 @@
 #      linked, beside model/chat_template.jinja), from the checkpoint, no GPU
 #   6. a read-only NFS volume of this Spark's HF_CACHE on the worker, checked: every file a rank reads, by size
 #   7. on the worker's own disk: Engram's tables, and rank 1's weight file (~106 GB, written there from the NFS volume)
+# Steps 1, 2, 6 and 7 run for each worker of worker_ids (scripts/nodes.sh): the one worker at TP=2.
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch; PULL=0 never pulls a published image. VERIFY_SHA=1 also checks Engram's shards against the sha256 the
 # checkpoint's model card lists (a few minutes of reading 203 GB).
@@ -53,11 +54,15 @@ command -v docker >/dev/null || die "docker is not installed"
 docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon (is your user in the docker group?)"
 nvidia-smi -L >/dev/null 2>&1 || warn "nvidia-smi failed on this node: is the NVIDIA driver working?"
 check_workers
-need_worker 1
-worker 1 'docker info >/dev/null 2>&1' || die "$(worker_host 1) cannot talk to its docker daemon (docker group?)"
-worker 1 'nvidia-smi -L >/dev/null 2>&1' || warn "nvidia-smi failed on $(worker_host 1)"
+for i in $(worker_ids); do
+  need_worker "$i"
+  worker "$i" 'docker info >/dev/null 2>&1' || die "$(worker_host "$i") cannot talk to its docker daemon (docker group?)"
+  worker "$i" 'nvidia-smi -L >/dev/null 2>&1' || warn "nvidia-smi failed on $(worker_host "$i")"
+done
 detect_links
-log "Link: this node $HEAD_ADDR ($HEAD_DEV, RoCE $HEAD_HCAS) <-> $(worker_host 1) $WORKER_ADDR ($WORKER_DEV, RoCE $WORKER_HCAS); NFS from $(nfs_server 1)"
+for i in $(worker_ids); do
+  log "Link: this node ${LINK_HEAD_ADDR[i]:-?} (${NODE_DEV[0]}, RoCE ${NODE_HCAS[0]}) <-> $(worker_host "$i") ${LINK_WORKER_ADDR[i]:-?} (${NODE_DEV[i]}, RoCE ${NODE_HCAS[i]}); NFS from $(nfs_server "$i")"
+done
 
 # ---------------------------------------------------------------- 2. the image
 hash=$(image_hash)
@@ -89,17 +94,18 @@ else
   log "Image $IMAGE already built (hash $hash; --rebuild forces it)"
 fi
 ident=$(image_ident "$IMAGE")
-if [[ "$(worker_image_ident 1 "$IMAGE")" != "$ident" ]]; then
-  if [[ "${PULL:-1}" == 1 ]] && docker image inspect "$prebuilt" >/dev/null 2>&1 && worker 1 docker pull "$prebuilt" >/dev/null 2>&1 &&
-     [[ "$(worker_image_ident 1 "$prebuilt")" == "$ident" ]]; then
-    worker 1 docker tag "$prebuilt" "$IMAGE"
-    log "Using $prebuilt as $IMAGE on $(worker_host 1)"
+for i in $(worker_ids); do
+  [[ "$(worker_image_ident "$i" "$IMAGE")" != "$ident" ]] || continue
+  if [[ "${PULL:-1}" == 1 ]] && docker image inspect "$prebuilt" >/dev/null 2>&1 && worker "$i" docker pull "$prebuilt" >/dev/null 2>&1 &&
+     [[ "$(worker_image_ident "$i" "$prebuilt")" == "$ident" ]]; then
+    worker "$i" docker tag "$prebuilt" "$IMAGE"
+    log "Using $prebuilt as $IMAGE on $(worker_host "$i")"
   else
-    log "Copying $IMAGE to $(worker_host 1) (docker save | docker load; only missing layers are stored)"
-    docker save "$IMAGE" | worker 1 docker load >/dev/null
+    log "Copying $IMAGE to $(worker_host "$i") (docker save | docker load; only missing layers are stored)"
+    docker save "$IMAGE" | worker "$i" docker load >/dev/null
   fi
-  [[ "$(worker_image_ident 1 "$IMAGE")" == "$ident" ]] || die "$(worker_host 1)'s $IMAGE differs from this Spark's"
-fi
+  [[ "$(worker_image_ident "$i" "$IMAGE")" == "$ident" ]] || die "$(worker_host "$i")'s $IMAGE differs from this Spark's"
+done
 log "Image $IMAGE identical on both Sparks"
 
 # ---------------------------------------------------------------- 3. the checkpoint and Engram's tables
@@ -238,12 +244,12 @@ else
   warn "the token map ($tm) differs from the kit's recorded one: the 1017 tokenizer is not the one the kit was recorded with (the map has the config's compressed-vocabulary size, which make_token_map.py checks)"
 fi
 # the weight file the engine looks for: its name carries the index's hash (tf-dsv41-rank-cache --index-only)
-want=$(in_hf --entrypoint bash "$IMAGE" -c "tf-dsv41-rank-cache $SNAP_C /tmp/x 0 2 --index-only | sha256sum | cut -c1-20")
-if [[ -f "$DATA_DIR/rank-cache/rank0of2-$want.bin" ]]; then log "Weight file of rank 0: ready"
+want=$(in_hf --entrypoint bash "$IMAGE" -c "tf-dsv41-rank-cache $SNAP_C /tmp/x 0 $TP --index-only | sha256sum | cut -c1-20")
+if [[ -f "$DATA_DIR/rank-cache/rank0of$TP-$want.bin" ]]; then log "Weight file of rank 0: ready"
 else
-  rm -f "$DATA_DIR/rank-cache/rank0of2-"*.bin "$DATA_DIR/rank-cache/.rank0of2.partial"
+  rm -f "$DATA_DIR/rank-cache/rank0of$TP-"*.bin "$DATA_DIR/rank-cache/.rank0of$TP.partial"
   log "Weight file of rank 0 from the checkpoint (~106 GB, a few minutes)"
-  in_hf --entrypoint tf-dsv41-rank-cache "$IMAGE" "$SNAP_C" "/hf/$DATA_SUB/rank-cache" 0 2 >/dev/null
+  in_hf --entrypoint tf-dsv41-rank-cache "$IMAGE" "$SNAP_C" "/hf/$DATA_SUB/rank-cache" 0 "$TP" >/dev/null
 fi
 # the served folder: every file of the snapshot as a relative link (it resolves under /hf in a container too), and the
 # recipe's chat template
@@ -264,38 +270,42 @@ manifest() {  # the files a rank reads, with their sizes, as paths under HF_CACH
      -path '*/.git' -prune -o -type f -printf '%p %s\n' | LC_ALL=C sort)
 }
 want=$(manifest)
-ensure_nfs_volume 1
-worker_files_check 1
-have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
-[[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
-  die "$(worker_host 1) does not see every file over NFS ($NFS_VOLUME)"; }
-log "Worker ($(worker_host 1)) reads the checkpoint, the kit and rank 0's files over NFS"
+for i in $(worker_ids); do
+  ensure_nfs_volume "$i"
+  worker_files_check "$i"
+  have=$(worker "$i" "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
+  [[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
+    die "$(worker_host "$i") does not see every file over NFS ($NFS_VOLUME)"; }
+  log "Worker ($(worker_host "$i")) reads the checkpoint, the kit and rank 0's files over NFS"
+done
 
-# ---------------------------------------------------------------- 7. the worker's own disk: Engram's tables, rank 1's weight file
+# ---------------------------------------------------------------- 7. each worker's own disk: Engram's tables, rank i's weight file
 SNAP_REL="hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)"
 need=0; for f in "${shards[@]}"; do need=$(( need + $(stat -L -c %s "$ESNAP/$f") )); done
-have=$(worker 1 "d=$WORKER_ENGRAM_DIR; s=0; for f in ${shards[*]}; do [[ -f \$d/\$f ]] && s=\$(( s + \$(stat -L -c %s \$d/\$f) )); done; echo \$s")
-if [[ "$have" == "$need" ]]; then log "Worker: Engram tables on its disk"
-else
-  free=$(worker 1 "mkdir -p $WORKER_ENGRAM_DIR && df -B1 --output=avail $WORKER_ENGRAM_DIR | tail -1")
-  # the ~140 GiB for rank 1's weight file is only needed while that file is not on its disk yet
-  spare=150; worker 1 "find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank1of2-*.bin' 2>/dev/null | grep -q ." && spare=10
-  (( free + have > need + spare * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR), its weight file ~106 GB (unless it is already there), and $spare GiB to spare"
-  log "Worker: copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over NFS, once)"
-  worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
-    die "copying Engram's tables to $(worker_host 1) failed"
-fi
-wwant=$(worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' --entrypoint bash '$IMAGE' -c 'tf-dsv41-rank-cache $SNAP_C /tmp/x 1 2 --index-only | sha256sum | cut -c1-20'")
-if worker 1 "[[ -f $WORKER_CACHE_DIR/rank1of2-$wwant.bin ]]"; then log "Worker: weight file of rank 1 ready"
-else
-  # find, not a glob: the worker's login shell may be zsh, which fails a command whose glob matches nothing
-  worker 1 "mkdir -p $WORKER_CACHE_DIR && find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank1of2-*.bin' -delete && rm -f $WORKER_CACHE_DIR/.rank1of2.partial"
-  free=$(worker 1 "df -B1 --output=avail $WORKER_CACHE_DIR | tail -1")
-  (( free > 130 * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free for rank 1's weight file (WORKER_CACHE_DIR): it needs ~106 GB"
-  log "Worker: weight file of rank 1 from the checkpoint over NFS (~106 GB, a few minutes)"
-  worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' -v $WORKER_CACHE_DIR:/out --entrypoint tf-dsv41-rank-cache '$IMAGE' '$SNAP_C' /out 1 2" >/dev/null ||
-    die "writing rank 1's weight file on $(worker_host 1) failed"
-fi
+for i in $(worker_ids); do
+  have=$(worker "$i" "d=$WORKER_ENGRAM_DIR; s=0; for f in ${shards[*]}; do [[ -f \$d/\$f ]] && s=\$(( s + \$(stat -L -c %s \$d/\$f) )); done; echo \$s")
+  if [[ "$have" == "$need" ]]; then log "Worker: Engram tables on its disk"
+  else
+    free=$(worker "$i" "mkdir -p $WORKER_ENGRAM_DIR && df -B1 --output=avail $WORKER_ENGRAM_DIR | tail -1")
+    # the ~140 GiB for rank i's weight file is only needed while that file is not on its disk yet
+    spare=150; worker "$i" "find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank${i}of$TP-*.bin' 2>/dev/null | grep -q ." && spare=10
+    (( free + have > need + spare * 1024 ** 3 )) || die "$(worker_host "$i") has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR), its weight file ~106 GB (unless it is already there), and $spare GiB to spare"
+    log "Worker: copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over NFS, once)"
+    worker "$i" "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
+      die "copying Engram's tables to $(worker_host "$i") failed"
+  fi
+  wwant=$(worker "$i" "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' --entrypoint bash '$IMAGE' -c 'tf-dsv41-rank-cache $SNAP_C /tmp/x $i $TP --index-only | sha256sum | cut -c1-20'")
+  if worker "$i" "[[ -f $WORKER_CACHE_DIR/rank${i}of$TP-$wwant.bin ]]"; then log "Worker: weight file of rank $i ready"
+  else
+    # find, not a glob: the worker's login shell may be zsh, which fails a command whose glob matches nothing
+    worker "$i" "mkdir -p $WORKER_CACHE_DIR && find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank${i}of$TP-*.bin' -delete && rm -f $WORKER_CACHE_DIR/.rank${i}of$TP.partial"
+    free=$(worker "$i" "df -B1 --output=avail $WORKER_CACHE_DIR | tail -1")
+    (( free > 130 * 1024 ** 3 )) || die "$(worker_host "$i") has $(( free / 1024 ** 3 )) GiB free for rank $i's weight file (WORKER_CACHE_DIR): it needs ~106 GB"
+    log "Worker: weight file of rank $i from the checkpoint over NFS (~106 GB, a few minutes)"
+    worker "$i" "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' -v $WORKER_CACHE_DIR:/out --entrypoint tf-dsv41-rank-cache '$IMAGE' '$SNAP_C' /out $i $TP" >/dev/null ||
+      die "writing rank $i's weight file on $(worker_host "$i") failed"
+  fi
+done
 
 write_prepared_marker || die "cannot record the prepared state (the previous marker is left as it was): see the error above"
 log "Done: both Sparks are ready. Start the server with ./start.sh (port $PORT)."
