@@ -15,6 +15,9 @@
 #   6. a read-only NFS volume of this Spark's HF_CACHE on the worker, checked: every file a rank reads, by size
 #   7. on the worker's own disk: Engram's tables, and rank 1's weight file (~106 GB, written there from the NFS volume)
 # Steps 1, 2, 6 and 7 run for each worker of worker_ids (scripts/nodes.sh): the one worker at TP=2.
+# TP=3 (three Sparks, experimental; docs/tp3.md): steps 1 to 3 as above for both workers (the image from
+# zig/Dockerfile.tp3, LakyFx's TP3 runtime), then scripts/prepare-tp3.sh instead of steps 4 to 7: every rank's kit,
+# model folder, Engram rows and weight file in LakyFx's layout, the workers' copied to their own disk.
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch; PULL=0 never pulls a published image. VERIFY_SHA=1 also checks Engram's shards against the sha256 the
 # checkpoint's model card lists (a few minutes of reading 203 GB).
@@ -35,6 +38,7 @@ for arg in "$@"; do
   esac
 done
 ablit_notice
+tp3_check
 
 # ---------------------------------------------------------------- 1. preflight
 mkdir -p "$STATE_DIR" "$HF_CACHE/hub"
@@ -78,7 +82,20 @@ if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built" != "$hash" ]]; then
     log "No prebuilt image for these pins ($prebuilt): building it locally"
   fi
 fi
-if [[ $REBUILD -eq 1 || "$built" != "$hash" ]]; then
+if [[ $REBUILD -eq 1 || "$built" != "$hash" ]] && (( TP == 3 )); then
+  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || { log "Pulling $BASE_IMAGE"; docker pull "$BASE_IMAGE" >/dev/null; }
+  log "Building $IMAGE (LakyFx's TensorFold TP3 runtime $TP3_TAG ${TP3_REV:0:7}, snapshot ${TP3_SNAPSHOT:0:8}, switchless NCCL 2.30.7, Zig $ZIG_VERSION)"
+  ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
+  trap 'rm -rf -- "$ctx"' EXIT
+  cp zig/Dockerfile.tp3 "$ctx/Dockerfile"
+  nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
+  docker build "${nocache[@]}" -t "$IMAGE" -f "$ctx/Dockerfile" --build-arg BASE_IMAGE="$BASE_IMAGE" \
+    --build-arg TP3_REPO="$TP3_REPO" --build-arg TP3_REV="$TP3_REV" --build-arg TP3_SNAPSHOT="$TP3_SNAPSHOT" \
+    --build-arg NCCL_TGZ_URL="$NCCL_TGZ_URL" --build-arg NCCL_TGZ_SHA256="$NCCL_TGZ_SHA256" --build-arg NCCL_LIB_SHA256="$NCCL_LIB_SHA256" \
+    --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" --build-arg ZIG_MIRRORS="$ZIG_MIRRORS" \
+    --build-arg PATCHES_HASH="$hash" "$ctx"
+  rm -rf -- "$ctx"; trap - EXIT
+elif [[ $REBUILD -eq 1 || "$built" != "$hash" ]]; then
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || { log "Pulling $BASE_IMAGE"; docker pull "$BASE_IMAGE" >/dev/null; }
   log "Building $IMAGE (TensorFold ${TF_REF:0:12} + inputs' tools ${INPUTS_REF:0:12}, $(compgen -G 'zig/patches/*.patch' | wc -l) engine + $(compgen -G 'zig/patches-inputs/*.patch' | wc -l) inputs patches, Zig $ZIG_VERSION; two Zig builds, ~6 min on a Spark)"
   ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
@@ -106,7 +123,7 @@ for i in $(worker_ids); do
   fi
   [[ "$(worker_image_ident "$i" "$IMAGE")" == "$ident" ]] || die "$(worker_host "$i")'s $IMAGE differs from this Spark's"
 done
-log "Image $IMAGE identical on both Sparks"
+log "Image $IMAGE identical on $( (( TP == 2 )) && echo "both Sparks" || echo "all $TP Sparks")"
 
 # ---------------------------------------------------------------- 3. the checkpoint and Engram's tables
 command -v hf >/dev/null || die "the Hugging Face CLI ('hf') is not installed on this Spark: pip install -U huggingface_hub"
@@ -205,6 +222,12 @@ if [[ "$ABLIT" == 1 ]]; then
     stock_dtypes "/hf/$DATA_SUB/checkpoint" || die "could not give the overlay checkpoint its stock dtypes back"
   fi
   SNAP="$DATA_DIR/checkpoint"
+fi
+
+# TP=3: the rest is LakyFx's layout, each rank's files on its own Spark (docs/tp3.md)
+if [[ "$TP" == 3 ]]; then
+  source ./scripts/prepare-tp3.sh
+  exit 0
 fi
 
 # ---------------------------------------------------------------- 4. the kit
