@@ -83,17 +83,36 @@ worker_hf_cache() {
 # ensure_nfs_volume i creates it (or checks the one there names the same export); worker_nfs i <cmd...> runs a command
 # in a throwaway container on worker i with the volume at /hf.
 nfs_server() { local s; s=$(wval NFS_SERVER "$1"); echo "${s:-${LINK_HEAD_ADDR[$1]:-}}"; }
+# The export's server is spelled differently by the two runtimes: Docker puts it in the mount options
+# (device=:/path, o=addr=server,...), podman's local driver wants it in the device (device=server:/path) and a
+# mount.nfs that only sees ":" fails to resolve the server. nfs_volume_args sets NFS_DEVICE / NFS_OPTS for the runtime.
+nfs_volume_args() {
+  local server=$1
+  if [[ "$CONTAINER_RT" == podman ]]; then
+    NFS_DEVICE="$server:$NFS_PATH"
+    NFS_OPTS="nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600"
+  else
+    NFS_DEVICE=":$NFS_PATH"
+    NFS_OPTS="addr=$server,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600"
+  fi
+}
+nfs_volume_matches() {  # <inspect output> <server>
+  local have=$1 server=$2
+  [[ "${have%% *}" == "$NFS_DEVICE" ]] || return 1
+  if [[ "$CONTAINER_RT" == podman ]]; then [[ "$have" == *"nfsvers=4.2"* ]]; else [[ "$have" == *"addr=$server,"* ]]; fi
+}
 ensure_nfs_volume() {
   local i=$1 server have h
   server=$(nfs_server "$i"); h=$(worker_host "$i")
   [[ -n "$server" ]] || die "no NFS server address for $h: set $(wvar NFS_SERVER "$i") to the head's address on that worker's link"
+  nfs_volume_args "$server"
   have=$(worker "$i" "$RT_WORDS volume inspect -f '{{index .Options \"device\"}} {{index .Options \"o\"}}' '$NFS_VOLUME'" 2>/dev/null || true)
   if [[ -z "$have" ]]; then
-    worker "$i" "$RT_WORDS volume create --driver local --opt type=nfs --opt device=':$NFS_PATH' \
-      --opt o='addr=$server,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600' '$NFS_VOLUME'" >/dev/null ||
+    worker "$i" "$RT_WORDS volume create --driver local --opt type=nfs --opt device='$NFS_DEVICE' \
+      --opt o='$NFS_OPTS' '$NFS_VOLUME'" >/dev/null ||
       die "could not create the $CONTAINER_RT volume $NFS_VOLUME on $h"
-  elif [[ "${have%% *}" != ":$NFS_PATH" || "$have" != *"addr=$server,"* ]]; then
-    die "$h's $CONTAINER_RT volume $NFS_VOLUME is ${have%% *} from ${have#* }, not :$NFS_PATH from $server: remove it there ($CONTAINER_RT volume rm $NFS_VOLUME) or set NFS_VOLUME / NFS_PATH / $(wvar NFS_SERVER "$i")"
+  elif ! nfs_volume_matches "$have" "$server"; then
+    die "$h's $CONTAINER_RT volume $NFS_VOLUME is ${have%% *} from ${have#* }, not $NFS_DEVICE from $server: remove it there ($CONTAINER_RT volume rm $NFS_VOLUME) or set NFS_VOLUME / NFS_PATH / $(wvar NFS_SERVER "$i")"
   fi
 }
 worker_nfs() { local i=$1; shift; worker "$i" "$RT_WORDS run --rm --entrypoint '$1' -v '$NFS_VOLUME:/hf:ro' '$IMAGE' $(printf '%q ' "${@:2}")"; }
@@ -335,13 +354,14 @@ detect_links() { detect_link; }
 head_hf_mount() {
   [[ -n "$HEAD_NFS_SERVER" ]] || { echo "$HF_CACHE"; return 0; }
   local have
+  nfs_volume_args "$HEAD_NFS_SERVER"
   have=$(ctr volume inspect -f '{{index .Options "device"}} {{index .Options "o"}}' "$HEAD_NFS_VOLUME" 2>/dev/null || true)
   if [[ -z "$have" ]]; then
-    ctr volume create --driver local --opt type=nfs --opt device=":$NFS_PATH" \
-      --opt o="addr=$HEAD_NFS_SERVER,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600" "$HEAD_NFS_VOLUME" >/dev/null ||
+    ctr volume create --driver local --opt type=nfs --opt device="$NFS_DEVICE" \
+      --opt o="$NFS_OPTS" "$HEAD_NFS_VOLUME" >/dev/null ||
       die "could not create the $CONTAINER_RT volume $HEAD_NFS_VOLUME here"
-  elif [[ "${have%% *}" != ":$NFS_PATH" || "$have" != *"addr=$HEAD_NFS_SERVER,"* ]]; then
-    die "the $CONTAINER_RT volume $HEAD_NFS_VOLUME here is ${have%% *} from ${have#* }, not :$NFS_PATH from $HEAD_NFS_SERVER: remove it ($CONTAINER_RT volume rm $HEAD_NFS_VOLUME) or set HEAD_NFS_VOLUME / HEAD_NFS_SERVER"
+  elif ! nfs_volume_matches "$have" "$HEAD_NFS_SERVER"; then
+    die "the $CONTAINER_RT volume $HEAD_NFS_VOLUME here is ${have%% *} from ${have#* }, not $NFS_DEVICE from $HEAD_NFS_SERVER: remove it ($CONTAINER_RT volume rm $HEAD_NFS_VOLUME) or set HEAD_NFS_VOLUME / HEAD_NFS_SERVER"
   fi
   echo "$HEAD_NFS_VOLUME"
 }

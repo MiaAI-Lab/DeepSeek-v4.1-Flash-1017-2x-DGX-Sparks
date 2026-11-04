@@ -28,7 +28,7 @@ CONTAINER_RT_SUDO=1                 # rootful podman: "sudo -n podman"
 Rootful podman also matches what the recipe did under Docker: the daemon was root, the ranks ran as root, and the
 weight files, Engram copies and spill folders keep the same ownership.
 
-## The three differences
+## The four differences
 
 1. **Builds need the host's network.** Podman's build container has its own network namespace. On a Spark the host
    resolves names through systemd-resolved's `127.0.0.53` stub, which that namespace cannot reach, so the Dockerfile's
@@ -41,6 +41,11 @@ weight files, Engram copies and spill folders keep the same ownership.
 
 3. **No `--shm-size` with `--ipc=host`.** The ranks use `--ipc=host`, so the flag is never passed (Docker only ignores
    it). Podman refuses the combination outright; the recipe does not set it, so nothing changes — but do not add it.
+
+4. **An NFS volume names its server in the device.** Docker takes `--opt device=:/path --opt o=addr=<server>,...`;
+   podman's local driver passes the device straight to `mount.nfs`, which then tries to resolve `:` as a hostname
+   ("Failed to resolve server :"). `nfs_volume_args` writes `--opt device=<server>:/path --opt o=nfsvers=4.2,ro,...`
+   under podman, and `ensure_nfs_volume` / `head_hf_mount` compare against that spelling.
 
 Two more that are not differences but are worth knowing:
 
@@ -105,3 +110,6 @@ curl -s localhost:8888/v1/models
   so the manual commands and the service agree.
 - Rootless podman is not supported for the pair (see above); it works for the image-only helpers (`prepare.sh`'s
   `in_hf` container runs, the kit and token-map steps).
+- A volume made by Docker is not visible to podman (a separate store). The worker's NFS volume is recreated by
+  `prepare.sh`, or by `ensure_nfs_volume 1` with the runtime set; a Docker-made volume with the same name stays in
+  Docker's store and does no harm.
