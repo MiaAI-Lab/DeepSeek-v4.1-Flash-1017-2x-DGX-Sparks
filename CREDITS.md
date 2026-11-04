@@ -110,6 +110,34 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   two ranks' launch commands in `start.sh` are BertholomusAI's, from their recipe's README ("Run it (v0.6.0, the Zig
   engine)").
 
+## Three Sparks (TP=3, experimental)
+
+- **The TP3 runtime** is **LakyFx**'s ([LakyFx](https://github.com/LakyFx)) TensorFold TP3 port for three DGX Sparks,
+  [`LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark`](https://github.com/LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark) (named
+  `deepseek-v41-flash-exl3-tp3-spark` when its tag `v1.2.2TF` was made) at
+  [`14a6d49`](https://github.com/LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark/commit/14a6d49c7cb99b8ce25f9755541da7e7d57cb1d1) (MIT;
+  the TensorFold runtime snapshot `61357deb` it ships keeps its own licenses, Apache-2.0 and those in its `LICENSES/`):
+  the three-rank engine (the padded vocabulary and attention layout, the peer-masked RDMA ring, `TF_DS_EXPERIMENTAL_TP3`),
+  its `extract.py`, the preparation tools `zig/Dockerfile.tp3` keeps and `scripts/prepare-tp3.sh` runs (`rank_cache.py`,
+  `rank_verify.py`, `source_verify.py`, `tp3_layout.py`, `vision_export.py`, `materialize_checkpoint.py`, `make_rope.py`,
+  `prepare_engram.py`, `engram_local.py`), the frozen TF29 plan and native key order `scripts/tp3_plan.py` checks
+  against, the kernel kit, and the TF29 profile and launch environment (`tensorfold/launch.py`) `start.sh` follows at
+  `TP=3`. This recipe runs it as published; it does not change it.
+- **The three-Spark recipe this follows** is **easthambuilds**' ([easthambuilds](https://github.com/easthambuilds))
+  [`DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold`](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold)
+  at `7d72d1e` (Apache-2.0), which ran this runtime end to end on three Sparks with a 1017 EXL3 checkpoint: its
+  `tools/make_plan.py` (adapted as `scripts/tp3_plan.py`), `tools/make_arm.py`, `tools/rope_cut.py` and
+  `tools/engram_source.py` (adapted in `scripts/tp3_inputs.py`), its `scripts/prepare.sh` (the order of
+  `scripts/prepare-tp3.sh`), its `tools/topology.py` (the rail order, peer masks, master and routes of
+  `scripts/nodes.sh`'s `pair_triangle`), the build commands in `zig/Dockerfile.tp3` and the NCCL pin.
+- **The DeepSeek-V4.1 Zig engine** the TP3 port is built on is **BertholomusAI**'s (above), from their fork's
+  DeepSeek branch.
+- **The switchless NCCL 2.30.7 build** is **Alex Ellis / OpenFaaS**'s
+  [`alexellis/switchless-nccl`](https://github.com/alexellis/switchless-nccl) `v0.0.1`, with the patches of
+  [SparkRing](https://github.com/FujitsuPolycom/sparkring), on [NVIDIA NCCL](https://github.com/NVIDIA/nccl).
+- The triangle's discovery in `scripts/nodes.sh` (`node_inventory`, the pairing by subnet) is Mia's AI Lab's
+  [GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold)'s.
+
 ## Scripts
 
 - The scripts' structure, the layered settings (`scripts/config.sh`), the node discovery and NFS volumes

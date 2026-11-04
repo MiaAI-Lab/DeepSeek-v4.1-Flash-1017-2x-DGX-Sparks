@@ -28,6 +28,22 @@ The DeepSeek-V4.1 kernel kit (BertholomusAI's two-node recipe)
   kit/KIT-LICENSES.md lists (Triton: MIT; PyTorch's attention kernel: BSD-3-Clause, on NVIDIA CUTLASS: BSD-3-Clause;
   the EXL3 format of ExLlamaV3 by turboderp: MIT). scripts/prepare.sh fetches it; it is not part of this repository.
 
+LakyFx's TensorFold TP3 runtime (TP=3 only)
+  https://github.com/LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark (commit 14a6d49c7cb99b8ce25f9755541da7e7d57cb1d1, tag
+  v1.2.2TF)
+  By LakyFx. MIT License; the TensorFold runtime snapshot it ships keeps its own licenses (Apache License, Version 2.0,
+  and those its LICENSES/ lists). zig/Dockerfile.tp3 fetches and builds it; it is not part of this repository.
+
+easthambuilds' three-Spark recipe (TP=3 only)
+  https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold (commit 7d72d1e)
+  By easthambuilds. Apache License, Version 2.0. scripts/tp3_plan.py, scripts/tp3_inputs.py and scripts/prepare-tp3.sh
+  are adapted from its tools/make_plan.py, tools/make_arm.py, tools/rope_cut.py, tools/engram_source.py and
+  scripts/prepare.sh; the changes are this project's (each file says what it changed).
+
+Switchless NCCL 2.30.7 (TP=3 only)
+  https://github.com/alexellis/switchless-nccl (release v0.0.1), on NVIDIA NCCL (BSD-3-Clause). zig/Dockerfile.tp3
+  downloads it, checked by sha256; it is not part of this repository.
+
 DeepSeek-V4.1-Flash-1017
   https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
   Copyright (c) 2023 DeepSeek. MIT License. Engram's tables (shards 47 and 48) are downloaded by scripts/prepare.sh,

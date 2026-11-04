@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Three Sparks, experimental (`TP=3`, issue #54).** Three Sparks cabled as a triangle serve the same checkpoint on
+  LakyFx's TensorFold TP3 port (the two-Spark engine runs two or four ranks only): `zig/Dockerfile.tp3` builds it from
+  `LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark` at `14a6d49` (tag `v1.2.2TF`; its `extract.py` checks the runtime
+  snapshot `61357deb`) with Zig 0.17.0 on the same base image, with NCCL 2.30.7 switchless (`alexellis/switchless-nccl`
+  `v0.0.1`, sha256-checked), as easthambuilds' three-Spark recipe runs it. `scripts/nodes.sh` pairs the triangle by
+  subnet (the GLM-5.3 3x recipe's `node_inventory` and pairing): each rank's four rails in port order, its peer masks,
+  its NCCL devices (the first of each cable), the master, the routes each rank needs, printed as the commands that add
+  them when missing. `scripts/prepare-tp3.sh` (from easthambuilds' `prepare.sh`) makes the receipt (a local source
+  manifest, so the `ABLIT=1` checkpoint works too), the plan (`scripts/tp3_plan.py`, checked against LakyFx's TF29 plan:
+  144,286 tensors, none missing or different; pinned for the default checkpoint), the kit with RoPE tables cut to
+  `POOL`, the model folder, each rank's weight file (66.8 GiB) and Engram rows, and copies the workers' over NFS,
+  checked by sha256. `start.sh` launches the workers then rank 0 with LakyFx's variables (`TF_DS_EXPERIMENTAL_TP3=1`,
+  `TF_RDMA_PEER_MASKS`, ...) and the four switchless NCCL settings three Sparks needed. Defaults at `TP=3`: LakyFx's
+  qualified TF29 profile (`POOL` 3300000, `CONTEXT` 401408, `PARALLEL` 8, 16-row rounds, a 1 GiB prompt cache),
+  `MIN_AVAIL_GIB` 80; the spill tier, KV sharding, EAQ v1.1, `GRAPH_CAP`, `RDMA_IDLE_S`, `RDMA_NAP_US`,
+  `PREFILL_INTERLEAVE_MS`, `TF_DS_CONNECT_S` and `HEAD_ENGRAM_DIR` are refused. **Not yet run on three Sparks**
+  ([docs/tp3.md](docs/tp3.md)). At `TP=2` nothing changes: `scripts/test_tp3.py` compares `start.sh` and `stop.sh`
+  with the tree before (`9912367`), and tests the settings, the pairing, the rank commands and starts with fakes;
+  `scripts/test_tp3_inputs.py` tests the Python tools. An `ABLIT=1` shard the overlay leaves as a symbolic link becomes
+  the stock shard's file itself before the dtype step (at either `TP`).
 - The scripts take their workers as a list, so that three Sparks can follow: `scripts/nodes.sh`'s `worker_ids` (the
   GLM-5.3 3x and the 4x recipes' form; the one worker at `TP=2`). Every step that reached worker 1 now takes each
   worker in turn and names the one that fails: `start.sh`'s running-pair check, stops, NFS check, launch, load,

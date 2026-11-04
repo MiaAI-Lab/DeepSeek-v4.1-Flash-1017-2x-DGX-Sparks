@@ -5,6 +5,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 
 | Setting | Default | |
 | --- | --- | --- |
+| `TP`, `WORKER2`, `WORKER_TP3_DIR`, `PROMPT_CACHE_GIB` | `TP=2` | `3`: three Sparks, experimental, with their own defaults and refusals ([docs/tp3.md](tp3.md)) |
 | `EAQ_V1_1` | 0 | `0`: EAQ v1 (the recommended pack); `1`: the experimental EAQ v1.1 mixed pack (27 BF16 indexer/compressor linears; the image's mixed-pack loader handles them) |
 | `MODEL_ID`, `MODEL_REVISION` | `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw` @ `45ee5d0f` | the checkpoint. `EAQ_V1_1=1` selects `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw` @ `aee640e2`; an explicit `MODEL_ID`/`MODEL_REVISION` wins. The Hugging Face cache is keyed by the repo's name and revision: a copy under another name or revision is not found under the default, and `scripts/prepare.sh` would download 196 GiB. It stops when the disk cannot hold that. To keep serving a copy you have, set both to what `~/.cache/huggingface/hub` holds. v1.1's 27 BF16 linears load through the image's mixed-pack loader (`zig/patches/0024` + `zig/patches-inputs/0001`); the load prints `mixed pack: 27 float linears`. An EXL3-only pack (EAQ v1) has no plain entries and takes the old path |
 | `ABLIT` | 0 | `0`: stock Mia EAQ 2.9 bpw; `1`: apply the matching gated Keys overlay; requires your HF token and repository access (see [Abliterated mode](abliterated.md)) |
