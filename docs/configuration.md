@@ -33,6 +33,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `API_KEY` | 0 | `1` makes rank 0 require a key (`Authorization: Bearer`; generated in `$STATE_DIR/api-key`, mode 600). The API is open on the network by default |
 | `HOST`, `PORT`, `SERVED_NAME` | 0.0.0.0, 8888, `DeepSeek-V4.1-Flash-1017` | |
 | `WORKER`, `FABRIC_PEER`, `NFS_*` | | see [Requirements](requirements.md) |
+| `TP`, `WORKER2`, `FABRIC_PEER2`, `NFS_SERVER2` | 2, empty | the worker list: rank i on worker i (`WORKER`, then `WORKER2` with its own `FABRIC_PEER2` and `NFS_SERVER2`). Only `TP=2` is served: `TP=3` is refused before anything is stopped until the links and the launch of three Sparks are done, and a `WORKER2` set at `TP=2` is left alone |
 | `TF_REF`, `INPUTS_REF`, `KIT_REF` | pinned | the engine, the inputs' tools and the kit (changing one rebuilds or re-checks) |
 | `SPILL_GIB`, `SPILL_DIR`, `WORKER_SPILL_DIR`, `SPILL_FLOOR_GIB`, `SPILL_QUOTA_GIB` | 0 (off), beside `HF_CACHE`, `SPILL_DIR`, 50, 0 | spill v2: kept prompt states on each Spark's own NVMe ([Spill v2 and KV sharding](spill-and-kv-sharding.md)) |
 | `KV_SHARD`, `KV_SHARD_DECODE` | 0 (off), empty | KV sharding: the same `POOL` cut into one part a Spark, each Spark keeping only its part's compressed KV (same section) |
