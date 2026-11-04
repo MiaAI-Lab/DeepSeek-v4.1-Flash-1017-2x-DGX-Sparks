@@ -361,14 +361,16 @@ detect_links() {
         self.assertNotEqual(code, 0, out)
         self.assertEqual(self.launched(), [], out)
 
-    def test_tp3_is_refused_before_anything_stops(self):
-        # the scripts take WORKER2, but three Sparks are not served yet (scripts/nodes.sh, check_workers)
+    def test_a_tp_refused_before_anything_stops(self):
+        # TP=4 (scripts/nodes.sh, check_workers), and at TP=3 a setting only the two-Spark engine has (config.sh,
+        # tp3_check): refused before the running ranks are touched
         for h in ["head", "w1", "w2"]:
             self.containers(h, NAME)
-        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "TP": "3", "WORKER2": "w2"})
-        self.assertNotEqual(code, 0, out)
-        self.assertIn("TP=3 (three Sparks) is not served yet", out)
-        self.assertEqual(self.launched(), [], out)
+        for extra, want in [({"TP": "4"}, "TP is 2 (two Sparks) or 3"), ({"TP": "3", "KV_SHARD": "1"}, "which has none of: KV_SHARD=1")]:
+            code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "WORKER2": "w2", **extra})
+            self.assertNotEqual(code, 0, out)
+            self.assertIn(want, out)
+            self.assertEqual(self.launched(), [], out)
         for h in ["head", "w1", "w2"]:
             self.assertEqual(self.left(h), [NAME], h)
 
