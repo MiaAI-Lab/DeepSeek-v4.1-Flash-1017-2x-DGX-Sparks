@@ -228,9 +228,11 @@ if (( ! DRY )); then
       shm=$(du -sm /dev/shm 2>/dev/null | cut -f1); shm=${shm:-0}
       die "only $here_gb GiB memory available here (MemAvailable plus the pages parked on the per-CPU lists), $MIN_AVAIL_GIB GiB needed (the weights plus the engine's reserve): free memory first${shm:+ (/dev/shm holds $shm MiB)}; MIN_AVAIL_GIB=0 skips this check, and a rank that takes all the memory freezes the Spark"
     fi
-    g=$WORKER_GB
-    awk -v a="$g" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a < m)}' &&
-      die "only $g GiB memory available on $(worker_host 1), $MIN_AVAIL_GIB GiB needed: stop other GPU work there (MIN_AVAIL_GIB=0 skips this check)"
+    for i in $(worker_ids); do
+      g=${WORKER_GB[i]}
+      awk -v a="$g" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a < m)}' &&
+        die "only $g GiB memory available on $(worker_host "$i"), $MIN_AVAIL_GIB GiB needed: stop other GPU work there (MIN_AVAIL_GIB=0 skips this check)"
+    done
   fi
   memguard_start
 fi

@@ -356,16 +356,21 @@ mem_available_gib() { local m; m=$(mem_counting 2>/dev/null) && echo "${m%% *}" 
 # (scripts/memavail.sh; start.sh's MIN_AVAIL_GIB check)
 source "${_cfg_root:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/memavail.sh"
 
-# await_memory: sets HERE_GB and WORKER_GB (GiB) to the memory available on this Spark and on worker 1, once both reach
-# MIN_AVAIL_GIB or after MIN_AVAIL_WAIT_S seconds at the latest (returns 1 then; the caller words the refusal). A build or a large
+# await_memory: sets HERE_GB and WORKER_GB[i] (GiB) to the memory available on this Spark and on each worker i, once all
+# reach MIN_AVAIL_GIB or after MIN_AVAIL_WAIT_S seconds at the latest (returns 1 then; the caller words the refusal). A build or a large
 # copy that has just ended leaves page cache that MemAvailable counts only as it is written back (111.6 GiB was read a few
 # seconds after a build, 119 GiB once it settled), so one reading right after it refuses a start the Spark can take.
+declare -a WORKER_GB=()
 await_memory() {
-  local waited=0
+  local waited=0 i ok
   while :; do
     HERE_GB=$(mem_available_gib)
-    WORKER_GB=$(worker 1 "$(declare -f mem_counting mem_available_gib); mem_available_gib" 2>/dev/null || echo 0)
-    awk -v a="$HERE_GB" -v b="$WORKER_GB" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a >= m && b >= m)}' && return 0
+    ok=1; awk -v a="$HERE_GB" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a >= m)}' || ok=0
+    for i in $(worker_ids); do
+      WORKER_GB[i]=$(worker "$i" "$(declare -f mem_counting mem_available_gib); mem_available_gib" 2>/dev/null || echo 0)
+      awk -v a="${WORKER_GB[i]}" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a >= m)}' || ok=0
+    done
+    (( ok )) && return 0
     (( waited < MIN_AVAIL_WAIT_S )) || return 1
     sleep 2
     waited=$((waited + 2))
