@@ -1,0 +1,186 @@
+From: draft <draft@local>
+Subject: [PATCH] server: --drop-reasoning-history renders assistant turns without their reasoning_content
+
+A client that replays each assistant turn's reasoning_content (an agent
+harness in a tool loop; omp does, and cannot be told not to for this
+family) shows the model its own earlier thinking at every step: the
+checkpoint's chat template keeps every turn's reasoning once tools are
+present (drop_thinking is false then, as in the reference). Over a long
+agent run the reasoning drifted into an ever flatter telegram style and
+then into exact repetition; a thinking loop guard ended 16 turns in a row
+and the run died with no report, also after the harness had compacted the
+conversation (the flat reasoning survived the compaction).
+
+Replaying the failed run's requests against the server (3 seeds, 2 points
+of the run): with the turns' reasoning_content 3 of 6 replies looped to
+max_tokens with no tool call; with the field removed 0 of 6 looped and
+every reply made one sensible call.
+
+With --drop-reasoning-history the server removes reasoning_content from
+every assistant message after normalize and before the template renders
+(the template then closes an empty think block, as it does for a turn
+before the last user message without tools). A request without the field
+is not copied. A reply's own reasoning is streamed and returned as before.
+Off by default: the reference behaviour is unchanged unless the flag is
+given.
+
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index b173b15..129607f 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -54,6 +54,7 @@ pub const flags = [_]Flag{
+     .{ .name = "--reasoning-effort", .choices = &.{ "low", "medium", "high", "xhigh" }, .native = true },
+     .{ .name = "--thinking-budget", .native = true },
+     .{ .name = "--loop-guard", .kind = .store_true, .native = true },
++    .{ .name = "--drop-reasoning-history", .kind = .store_true, .native = true },
+     .{ .name = "--no-drafts", .kind = .store_true, .native = true },
+     .{ .name = "--keep-warm", .native = true },
+     .{ .name = "--compact-at", .native = true },
+@@ -135,6 +136,8 @@ pub const Args = struct {
+     reasoning_effort: ?[]const u8 = null,
+     thinking_budget: i64 = 0,
+     loop_guard: bool = false,
++    /// Earlier assistant turns render without their reasoning_content (the template then closes an empty think block).
++    drop_reasoning_history: bool = false,
+     no_drafts: bool = false,
+     keep_warm: i64 = 900, // seconds the idle keepalive runs after the last request ends (0: off)
+     compact_auto: bool = false,
+@@ -240,7 +243,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+     } else if (is(name, "--learn-gib")) {
+         out.learn = true;
+         out.learn_gib = try gib(u, a, name, v);
+-    } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--compact-at")) {
++    } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--drop-reasoning-history")) out.drop_reasoning_history = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--compact-at")) {
+         if (std.mem.eql(u8, v, "auto")) out.compact_auto = true else {
+             const f = try float(u, a, name, v);
+             if (!(f > 0 and f <= 1)) return fail(u, a, "argument --compact-at: expected auto or a fraction in (0, 1]: '{s}'", .{v});
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index 531064b..7738831 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -9,7 +9,7 @@ const serve = @import("serve.zig");
+ const hf_text = @import("hf_text.zig");
+ const checkpoint_cli = @import("checkpoint_cli");
+ 
+-const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
++const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--drop-reasoning-history] [--no-drafts] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
+ 
+ pub fn main(init: std.process.Init) !u8 {
+     const gpa = init.gpa;
+diff --git a/zig/src/server/messages.zig b/zig/src/server/messages.zig
+index 56d1637..097232b 100644
+--- a/zig/src/server/messages.zig
++++ b/zig/src/server/messages.zig
+@@ -332,6 +332,27 @@ fn place(cx: *Cx, out: *std.ArrayList(Value), instructions: *std.ArrayList(*json
+     try out.append(cx.a, .{ .object = item });
+ }
+ 
++/// The messages with no assistant turn carrying ``reasoning_content`` (``--drop-reasoning-history``): a client that
++/// replays each turn's reasoning (an agent harness in a tool loop; DeepSeek-V4.1's template keeps every turn's once tools
++/// are present) otherwise shows the model its own earlier thinking at every step, and a run of a few hundred thousand
++/// tokens drifted into ever flatter, then repeating reasoning. Messages without the field are returned as they are.
++pub fn dropReasoning(cx: *Cx, messages: Value) errors.Refused!Value {
++    var any = false;
++    for (messages.array) |m| if (m == .object and m.get("reasoning_content") != null) {
++        any = true;
++    };
++    if (!any) return messages;
++    const out = try cx.a.alloc(Value, messages.array.len);
++    for (messages.array, 0..) |m, k| {
++        out[k] = m;
++        if (m != .object or m.get("reasoning_content") == null) continue;
++        const copy = try json.copyObject(cx.a, m.object);
++        _ = copy.orderedRemove("reasoning_content");
++        out[k] = .{ .object = copy };
++    }
++    return .{ .array = out };
++}
++
+ /// ``_normalize_tool_call_arguments``: call arguments as objects for templates; bad ones under ``_invalid_arguments``.
+ pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
+     if (messages != .array) return messages;
+@@ -393,6 +414,32 @@ pub fn isTitleRequest(messages: Value, has_tools: bool) bool {
+     return std.ascii.findIgnoreCase(text.string, "title") != null;
+ }
+ 
++test "dropReasoning: every assistant turn loses its reasoning_content, the rest is untouched" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    const messages = (try json.parse(cx.a,
++        \\[{"role": "user", "content": "run it"}, {"role": "assistant", "content": "", "reasoning_content": "the; the; the", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "assistant", "content": "done", "reasoning_content": "fine"}]
++    )).ok;
++    const out = try dropReasoning(&cx, messages);
++    try std.testing.expectEqualStrings(
++        \\[{"role": "user", "content": "run it"}, {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "assistant", "content": "done"}]
++    , try json.stringify(cx.a, out, .{ .ascii = false }));
++    // the request's own messages keep their field (a copy was taken)
++    try std.testing.expect(messages.array[1].get("reasoning_content") != null);
++}
++
++test "dropReasoning: messages without the field come back as they are" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    const messages = (try json.parse(cx.a,
++        \\[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
++    )).ok;
++    const out = try dropReasoning(&cx, messages);
++    try std.testing.expect(out.array.ptr == messages.array.ptr);
++}
++
+ test "a conversation with a user query stays byte-identical under the rule" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 1018123..f741844 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -19,7 +19,8 @@ pub const isTitle = messages_mod.isTitleRequest;
+ 
+ /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
+ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
+-    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool));
++    var normalized = try messages_mod.toolArguments(cx, try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool));
++    if (srv.config.drop_reasoning_history) normalized = try messages_mod.dropReasoning(cx, normalized);
+     var problem: []const u8 = "";
+     const options: model_text.RenderOptions = .{
+         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index e3e3333..8a2ef75 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -110,6 +110,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .reasoning_effort = args.reasoning_effort,
+         .thinking_budget = args.thinking_budget,
+         .loop_guard = args.loop_guard,
++        .drop_reasoning_history = args.drop_reasoning_history,
+         .keep_warm_s = args.keep_warm,
+         .default_sampling = s.sampling,
+         .use_drafts = !args.no_drafts,
+@@ -156,6 +157,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+     });
+     if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
+         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
++    if (args.drop_reasoning_history)
++        log.line("reasoning history dropped (--drop-reasoning-history): assistant turns render without their reasoning_content; a reply's own reasoning is streamed and returned as ever", .{});
+     live.columns_env = env(s, "COLUMNS");
+     var ticker: live.Ticker = .{ .engine = s.engine };
+     const drawing = live.wanted(io, if (env(s, "TENSORFOLD_NO_LIVE")) |v| std.mem.eql(u8, v, "1") else false);
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 5cc8776..07077e2 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -38,6 +38,9 @@ pub const Config = struct {
+     reasoning_effort: ?[]const u8 = null,
+     thinking_budget: i64 = 0,
+     loop_guard: bool = false,
++    /// The chat template sees no assistant turn's reasoning_content: a client that replays every turn's reasoning
++    /// (DeepSeek-V4.1's template keeps it all once tools are present) no longer feeds the model its own earlier thinking.
++    drop_reasoning_history: bool = false,
+     /// Seconds the idle keepalive runs after the last request ends (0: off).
+     keep_warm_s: i64 = 900,
+     dashboard: bool = false,
+-- 
+2.50.1 (Apple Git-155)
+
