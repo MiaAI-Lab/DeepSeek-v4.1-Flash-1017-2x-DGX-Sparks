@@ -123,12 +123,13 @@ worker_files_check 1
     def test_call_sites(self):
         start = (ROOT / "start.sh").read_text()
         self.assertIn("if (( ! DRY )); then\n  # Preparation's marker", start)
-        check = start.index("worker_files_check 1")
+        # every worker's (scripts/nodes.sh's worker_ids), before anything is stopped
+        check = start.index('for i in $(worker_ids); do worker_files_check "$i"; done')
         self.assertLess(start.index("./scripts/prepare.sh\n"), check)
-        self.assertLess(check, start.index("if exists_here || exists_worker 1; then ./stop.sh; fi"))
+        self.assertLess(check, start.index("if any_exists; then ./stop.sh; fi"))
         self.assertLess(check, start.index("# ---------------------------------------------------------------- 3. launch"))
         prepare = (ROOT / "scripts/prepare.sh").read_text()
-        self.assertIn("ensure_nfs_volume 1\nworker_files_check 1\n", prepare)
+        self.assertIn('for i in $(worker_ids); do\n  ensure_nfs_volume "$i"\n  worker_files_check "$i"\n', prepare)
 
 
 if __name__ == "__main__":
