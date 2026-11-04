@@ -1,3 +1,10 @@
+# Sourced by scripts/config.sh; sourced on its own (tests) it loads scripts/runtime.sh itself, for ctr.
+if [[ -z "${RT_WORDS:-}" ]]; then
+  _port_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  [[ ! -r "$_port_dir/runtime.sh" ]] || source "$_port_dir/runtime.sh"
+  unset _port_dir
+fi
+
 # The ported engine features' settings (wojo's GLM patches 0088/0110/0111 spill v2, 0118 KV sharding, 0119 parked
 # pages, carried into the native dsv41 engine as zig/patches/0011-... to 0022-...): their defaults, their checks, and the ONE place
 # they map to the engine's flags and variables (port_map). Sourced by scripts/config.sh after the serving settings;
@@ -325,7 +332,7 @@ port_check_extra() {
 # port_image_label <image> <label>: the label's value, empty when the image or the label is missing
 port_image_label() {
   local v
-  v=$(docker image inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null) || return 0
+  v=$(ctr image inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null) || return 0
   [[ "$v" == '<no value>' ]] || echo "$v"
 }
 # port_model_quant: MODEL_QUANT, else read from MODEL_ID (".../X-EXL3-...-2.9-bpw" -> exl3-2.9bpw)
@@ -658,7 +665,7 @@ spill_fix_owner() {
     : > "$dir/$m" 2>/dev/null || { echo "spill folder $dir: cannot create $m as you: not touched" >&2; return 1; }
   fi
   why=$(spill_fix_target "$dir") || { echo "$why" >&2; return 1; }
-  docker run --rm --network none --read-only --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN \
+  ctr run --rm --network none --read-only --security-opt no-new-privileges --cap-drop ALL --cap-add CHOWN \
     --cap-add DAC_READ_SEARCH --user 0:0 -v "$dir:/spill" --entrypoint find "$img" \
     /spill -xdev -mindepth 1 -uid 0 \( -type f -o -type d \) -exec chown --no-dereference "$(id -u):$(id -g)" {} + >/dev/null
 }
@@ -666,9 +673,9 @@ spill_fix_owner() {
 # (the label only names the folder: spill_fix_target still decides whether it is one start.sh accepted)
 spill_fix_container() {
   local c=$1 dir img
-  dir=$(docker inspect -f '{{index .Config.Labels "tf.recipe.spill"}}' "$c" 2>/dev/null) || return 0
+  dir=$(ctr inspect -f '{{index .Config.Labels "tf.recipe.spill"}}' "$c" 2>/dev/null) || return 0
   [ -n "$dir" ] && [ "$dir" != "<no value>" ] || return 0
-  img=$(docker inspect -f '{{.Image}}' "$c") || return 1
+  img=$(ctr inspect -f '{{.Image}}' "$c") || return 1
   spill_fix_owner "$dir" "$img"
 }
 # port_spill_fix_both: before a start, on both Sparks, once port_spill_check passed (warnings only: the engine runs as

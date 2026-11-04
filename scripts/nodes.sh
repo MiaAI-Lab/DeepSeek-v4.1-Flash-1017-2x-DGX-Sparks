@@ -1,5 +1,13 @@
 # The two Sparks: this machine (rank 0) and WORKER (rank 1, over ssh). The link between them is found from the routes and
 # subnets between them (detect_link): one direct CX7 cable, its PCIe twin as a second rail when it reaches the peer.
+# Sourced by start.sh, stop.sh and prepare.sh after config.sh; sourced on its own (tests, a one-off shell) it loads
+# scripts/runtime.sh itself, so $RT_WORDS and ctr are there.
+if [[ -z "${RT_WORDS:-}" ]]; then
+  _nodes_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  [[ ! -r "$_nodes_dir/runtime.sh" ]] || source "$_nodes_dir/runtime.sh"
+  unset _nodes_dir
+fi
+
 # Sourced by start.sh, stop.sh and prepare.sh after config.sh.
 # From the node helpers of MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold (Mia's AI Lab), cut to two Sparks.
 
@@ -33,17 +41,17 @@ worker() {
 save_log() {
   local dir=$1 rank=$2 c=$3 keep=$4 stamp f i=0
   [[ "$keep" =~ ^[0-9]+$ ]] && (( keep > 0 )) || return 0
-  docker inspect "$c" >/dev/null 2>&1 || return 0
+  ctr inspect "$c" >/dev/null 2>&1 || return 0
   mkdir -p "$dir" || return 1
   stamp=$(date +%Y%m%d-%H%M%S); f="$dir/$stamp-rank$rank.log.gz"
   while [[ -e "$f" ]]; do f="$dir/$stamp.$((++i))-rank$rank.log.gz"; done   # same second: still sorts as newer
-  if ! docker logs --timestamps "$c" 2>&1 | gzip > "$f"; then rm -f "$f"; return 1; fi
+  if ! ctr logs --timestamps "$c" 2>&1 | gzip > "$f"; then rm -f "$f"; return 1; fi
   ls -1 "$dir"/*-rank"$rank".log.gz 2>/dev/null | { grep -vxF "$f" || true; } | LC_ALL=C sort -r | tail -n +"$keep" | xargs -r rm -f --
   echo "$f"
 }
 # worker_save_log <i>: the same, for rank i on worker i (into ~/.cache/dsv41-tensorfold/logs there)
 worker_save_log() {
-  worker "$1" "$(declare -f save_log); save_log \"\$HOME/.cache/dsv41-tensorfold/logs\" $1 '$CONTAINER_NAME' '$LOG_KEEP'"
+  worker "$1" "$(runtime_env)$(declare -f ctr save_log); save_log \"\$HOME/.cache/dsv41-tensorfold/logs\" $1 '$CONTAINER_NAME' '$LOG_KEEP'"
 }
 
 need_worker() {
@@ -79,16 +87,16 @@ ensure_nfs_volume() {
   local i=$1 server have h
   server=$(nfs_server "$i"); h=$(worker_host "$i")
   [[ -n "$server" ]] || die "no NFS server address for $h: set $(wvar NFS_SERVER "$i") to the head's address on that worker's link"
-  have=$(worker "$i" "docker volume inspect -f '{{index .Options \"device\"}} {{index .Options \"o\"}}' '$NFS_VOLUME'" 2>/dev/null || true)
+  have=$(worker "$i" "$RT_WORDS volume inspect -f '{{index .Options \"device\"}} {{index .Options \"o\"}}' '$NFS_VOLUME'" 2>/dev/null || true)
   if [[ -z "$have" ]]; then
-    worker "$i" "docker volume create --driver local --opt type=nfs --opt device=':$NFS_PATH' \
+    worker "$i" "$RT_WORDS volume create --driver local --opt type=nfs --opt device=':$NFS_PATH' \
       --opt o='addr=$server,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600' '$NFS_VOLUME'" >/dev/null ||
-      die "could not create the docker volume $NFS_VOLUME on $h"
+      die "could not create the $CONTAINER_RT volume $NFS_VOLUME on $h"
   elif [[ "${have%% *}" != ":$NFS_PATH" || "$have" != *"addr=$server,"* ]]; then
-    die "$h's docker volume $NFS_VOLUME is ${have%% *} from ${have#* }, not :$NFS_PATH from $server: remove it there (docker volume rm $NFS_VOLUME) or set NFS_VOLUME / NFS_PATH / $(wvar NFS_SERVER "$i")"
+    die "$h's $CONTAINER_RT volume $NFS_VOLUME is ${have%% *} from ${have#* }, not :$NFS_PATH from $server: remove it there ($CONTAINER_RT volume rm $NFS_VOLUME) or set NFS_VOLUME / NFS_PATH / $(wvar NFS_SERVER "$i")"
   fi
 }
-worker_nfs() { local i=$1; shift; worker "$i" "docker run --rm --entrypoint '$1' -v '$NFS_VOLUME:/hf:ro' '$IMAGE' $(printf '%q ' "${@:2}")"; }
+worker_nfs() { local i=$1; shift; worker "$i" "$RT_WORDS run --rm --entrypoint '$1' -v '$NFS_VOLUME:/hf:ro' '$IMAGE' $(printf '%q ' "${@:2}")"; }
 # Check the worker's actual file view, not just a successful mount or a prepared marker.
 # Also works with the documented PREPARE=0 / host-path NFS_VOLUME setup: do not create a volume here.
 worker_files_check() {
@@ -194,9 +202,9 @@ worker_link_info() { worker "$1" "$(declare -f link_info); link_info $2"; }
 # matches across a mixed pair (issue #8). The template holds no spaces: worker() passes it through ssh, which
 # re-splits arguments. A missing image is "missing". worker_image_ident <i> <image>: on worker i.
 IMAGE_IDENT='{{.RootFS.Layers}}{{.Config.Env}}{{.Config.Entrypoint}}{{.Config.Cmd}}{{.Config.WorkingDir}}'
-image_ident() { local s; s=$(docker image inspect -f "$IMAGE_IDENT" "$1" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing; }
+image_ident() { local s; s=$(ctr image inspect -f "$IMAGE_IDENT" "$1" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing; }
 worker_image_ident() {
-  local s; s=$(worker "$1" docker image inspect -f "$IMAGE_IDENT" "$2" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing
+  local s; s=$(worker "$1" "$RT_WORDS image inspect -f $IMAGE_IDENT '$2'" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing
 }
 # cx7_peer <i>: worker i's address on a CX7 port that one of this node's CX7 ports reaches directly (same subnet, no
 # gateway), for a worker given by its LAN address (issue #9). Empty when there is none.
@@ -327,13 +335,13 @@ detect_links() { detect_link; }
 head_hf_mount() {
   [[ -n "$HEAD_NFS_SERVER" ]] || { echo "$HF_CACHE"; return 0; }
   local have
-  have=$(docker volume inspect -f '{{index .Options "device"}} {{index .Options "o"}}' "$HEAD_NFS_VOLUME" 2>/dev/null || true)
+  have=$(ctr volume inspect -f '{{index .Options "device"}} {{index .Options "o"}}' "$HEAD_NFS_VOLUME" 2>/dev/null || true)
   if [[ -z "$have" ]]; then
-    docker volume create --driver local --opt type=nfs --opt device=":$NFS_PATH" \
+    ctr volume create --driver local --opt type=nfs --opt device=":$NFS_PATH" \
       --opt o="addr=$HEAD_NFS_SERVER,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600" "$HEAD_NFS_VOLUME" >/dev/null ||
-      die "could not create the docker volume $HEAD_NFS_VOLUME here"
+      die "could not create the $CONTAINER_RT volume $HEAD_NFS_VOLUME here"
   elif [[ "${have%% *}" != ":$NFS_PATH" || "$have" != *"addr=$HEAD_NFS_SERVER,"* ]]; then
-    die "the docker volume $HEAD_NFS_VOLUME here is ${have%% *} from ${have#* }, not :$NFS_PATH from $HEAD_NFS_SERVER: remove it (docker volume rm $HEAD_NFS_VOLUME) or set HEAD_NFS_VOLUME / HEAD_NFS_SERVER"
+    die "the $CONTAINER_RT volume $HEAD_NFS_VOLUME here is ${have%% *} from ${have#* }, not :$NFS_PATH from $HEAD_NFS_SERVER: remove it ($CONTAINER_RT volume rm $HEAD_NFS_VOLUME) or set HEAD_NFS_VOLUME / HEAD_NFS_SERVER"
   fi
   echo "$HEAD_NFS_VOLUME"
 }
@@ -366,13 +374,15 @@ await_memory() {
 MEMGUARD_REMOTE_DIR='$HOME/.cache/dsv41-tensorfold'
 memguard_start() {
   awk -v g="$MEMGUARD_GIB" 'BEGIN {exit !(g > 0)}' || return 0
-  "$_cfg_root/scripts/memguard.sh" start "$CONTAINER_NAME" "$MEMGUARD_GIB" "$LOG_DIR/memguard.log" "$STATE_DIR/memguard.pid" "$MEMGUARD_HOLD_S" "$MEMGUARD_HARD_GIB" ||
+  CONTAINER_RT="$CONTAINER_RT" CONTAINER_RT_SUDO="$CONTAINER_RT_SUDO" "$_cfg_root/scripts/memguard.sh" start "$CONTAINER_NAME" "$MEMGUARD_GIB" "$LOG_DIR/memguard.log" "$STATE_DIR/memguard.pid" "$MEMGUARD_HOLD_S" "$MEMGUARD_HARD_GIB" ||
     die "the memory guard did not start here"
   local i
   for i in $(worker_ids); do
     worker "$i" "mkdir -p $MEMGUARD_REMOTE_DIR/logs && cat > $MEMGUARD_REMOTE_DIR/memguard.sh && chmod +x $MEMGUARD_REMOTE_DIR/memguard.sh" \
       < "$_cfg_root/scripts/memguard.sh" || die "could not copy the memory guard to $(worker_host "$i")"
-    worker "$i" "$MEMGUARD_REMOTE_DIR/memguard.sh start '$CONTAINER_NAME' $MEMGUARD_GIB $MEMGUARD_REMOTE_DIR/logs/memguard.log $MEMGUARD_REMOTE_DIR/memguard.pid $MEMGUARD_HOLD_S $MEMGUARD_HARD_GIB" ||
+    worker "$i" "cat > $MEMGUARD_REMOTE_DIR/runtime.sh" < "$_cfg_root/scripts/runtime.sh" ||
+      die "could not copy the runtime settings to $(worker_host "$i")"
+    worker "$i" "$(runtime_env)$MEMGUARD_REMOTE_DIR/memguard.sh start '$CONTAINER_NAME' $MEMGUARD_GIB $MEMGUARD_REMOTE_DIR/logs/memguard.log $MEMGUARD_REMOTE_DIR/memguard.pid $MEMGUARD_HOLD_S $MEMGUARD_HARD_GIB" ||
       die "the memory guard did not start on $(worker_host "$i")"
   done
   log "Memory guard on: each rank's container is killed when the memory available stays under $MEMGUARD_GIB GiB for $MEMGUARD_HOLD_S s, or falls under $MEMGUARD_HARD_GIB GiB (log: memguard.log)"

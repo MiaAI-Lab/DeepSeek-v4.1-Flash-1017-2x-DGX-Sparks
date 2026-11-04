@@ -18,9 +18,11 @@ The hardware, link, ssh, Docker, disk and NFS setup the recipe needs. The README
 - **Key-based ssh** from the first Spark (the head, which runs `./start.sh` and the API) to the second (the worker):
   `ssh-copy-id user@<worker>`; check with `ssh -o BatchMode=yes user@<worker> true`.
 - Docker with the NVIDIA container runtime and your user in the `docker` group, on both Sparks; `git`, `python3` and the
-  `hf` CLI (`pip install -U huggingface_hub`) on the head.
+  `hf` CLI (`pip install -U huggingface_hub`) on the head. Podman 4.9+ instead: `CONTAINER_RT=podman` with
+  `CONTAINER_RT_SUDO=1` (rootful: the worker's NFS volume and a system cgroup parent need root); see
+  [PODMAN.md](PODMAN.md).
 - **Disk.** Head: ~505 GB (the checkpoint 196 GiB, Engram's tables ~203 GB, rank 0's weight file ~106 GB) plus ~25 GB for
-  the image under Docker's root. Worker: ~310 GB (Engram's tables and rank 1's weight file) plus the image; the worker
+  the image under the runtime's root. Worker: ~310 GB (Engram's tables and rank 1's weight file) plus the image; the worker
   reads the checkpoint from the head over NFS.
 - **NFS.** The worker mounts the head's Hugging Face cache read-only. If a host or container NFS server already exports
   that cache, use it (see below); do not start a competing server. Otherwise, on the head, once (needs root; the worker needs

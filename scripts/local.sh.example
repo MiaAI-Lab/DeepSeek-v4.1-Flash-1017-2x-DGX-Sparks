@@ -5,6 +5,11 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # HF_CACHE=/models/hf          # this Spark's Hugging Face cache, if it is not ~/.cache/huggingface (it needs ~505 GB free)
 # WORKER_ENGRAM_DIR='$HOME/.cache/dsv41-tensorfold/engram-1bae0e10'     # on the worker: Engram's tables (~203 GB)
 # WORKER_CACHE_DIR='$HOME/.cache/dsv41-tensorfold/rank-cache-c178a012'  # on the worker: rank 1's weight file (~106 GB)
+# The container runtime: docker by default; podman instead with these two (rootful: the worker's NFS volume and a
+# system cgroup parent need root). CGROUP_PARENT adds --cgroup-parent to both ranks. docs/PODMAN.md
+# CONTAINER_RT=podman
+# CONTAINER_RT_SUDO=1
+# CGROUP_PARENT=tensorfold.slice
 # MEMGUARD_GIB=2.5            # memguard's floor (GiB of MemAvailable), held MEMGUARD_HOLD_S=4 s before a kill; MEMGUARD_HARD_GIB=1 kills at once. docs/memory-and-safety.md
 # EAQ_V1_1=1                   # 1: the experimental EAQ v1.1 mixed pack (BF16 indexer/compressor linears); 0 (default): EAQ v1
 # MODEL_ID=Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw   # the default checkpoint (EAQ v1; this repo's name and revision)

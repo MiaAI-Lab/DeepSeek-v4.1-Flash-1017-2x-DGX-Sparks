@@ -28,6 +28,7 @@
 #   files    EAQ_V1_1 (0 | 1), ABLIT (0 | 1), ABLIT_REVISION, MODEL_ID, MODEL_REVISION, ENGRAM_ID, ENGRAM_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER, NFS_VOLUME,
 #            WORKER_ENGRAM_DIR, WORKER_CACHE_DIR, STATE_DIR, LOG_DIR, LOG_KEEP, LOG_MAX_SIZE, LOG_MAX_FILE
 #   engine   TF_REPO, TF_REF, INPUTS_REF, KIT_REPO, KIT_REF, ZIG_VERSION, BASE_IMAGE, IMAGE, CONTAINER_NAME
+#   runtime  CONTAINER_RT (docker | podman), CONTAINER_RT_SUDO, CGROUP_PARENT (scripts/runtime.sh)
 #   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1
 #   memory   MIN_AVAIL_GIB (refuse to start below it; pages parked on the per-CPU free lists count, as the engine counts
 #            them, and a start waits up to MIN_AVAIL_WAIT_S for them to drain), MEMGUARD_GIB (kill a rank's container
@@ -70,7 +71,7 @@ for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] ||
 [[ "$MEMGUARD_GIB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "MEMGUARD_GIB is a number of GiB (2.5 is fine; 0 turns it off), not $MEMGUARD_GIB"
 [[ "$MEMGUARD_HOLD_S" =~ ^[0-9]+(\.[0-9]+)?$ && "$MEMGUARD_HARD_GIB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "MEMGUARD_HOLD_S is a number of seconds and MEMGUARD_HARD_GIB a number of GiB, not $MEMGUARD_HOLD_S and $MEMGUARD_HARD_GIB"
 [[ "$PREFILL_INTERLEAVE_MS" =~ ^[0-9]+$ ]] && (( PREFILL_INTERLEAVE_MS <= 5000 )) || die "PREFILL_INTERLEAVE_MS is 0 to 5000 milliseconds, not $PREFILL_INTERLEAVE_MS"
-[[ -z "$LOG_MAX_SIZE" || "$LOG_MAX_SIZE" =~ ^[1-9][0-9]*[kmg]$ ]] || die "LOG_MAX_SIZE is a size such as 100m (k, m or g), or empty for the docker daemon's own setting, not $LOG_MAX_SIZE"
+[[ -z "$LOG_MAX_SIZE" || "$LOG_MAX_SIZE" =~ ^[1-9][0-9]*[kmg]$ ]] || die "LOG_MAX_SIZE is a size such as 100m (k, m or g), or empty for the runtime's own log setting, not $LOG_MAX_SIZE"
 [[ "$LOG_MAX_FILE" =~ ^[1-9][0-9]*$ ]] || die "LOG_MAX_FILE is a number of files, 1 or more, not $LOG_MAX_FILE"
 for v in EAQ_V1_1 THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$GRAPH_CAP" =~ ^[0-9]+$ ]] || die "GRAPH_CAP is a count of CUDA graphs a rank keeps, 0 for all, not $GRAPH_CAP"
@@ -115,31 +116,31 @@ printf '%s  %s · 2 x DGX Spark · %s at once · %s-token window%s · EXL3 2.9 b
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
-command -v docker >/dev/null || die "docker is not installed"
+rt_present
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 exec 8>"$STATE_DIR/start.lock"
 flock -n 8 || die "another ./start.sh is already running; wait for it to finish"
-(( DRY )) && log "DRY_RUN=1: printing the docker commands; nothing is stopped, started or prepared"
+(( DRY )) && log "DRY_RUN=1: printing the $CONTAINER_RT commands; nothing is stopped, started or prepared"
 
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 URL="http://$API_HOST:$PORT"
-running_here()   { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
-running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
+running_here()   { [[ "$(ctr inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
+running_worker() { [[ "$(worker "$1" "$RT_WORDS inspect -f '{{.State.Running}}' '$CONTAINER_NAME'" 2>/dev/null)" == true ]]; }
 # a container of that name at all, running or exited (a rank that failed, or rank 0 ended by a broken pair's status 75)
-exists_here()    { docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
-exists_worker()  { worker "$1" docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
+exists_here()    { ctr inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
+exists_worker()  { worker "$1" "$RT_WORDS inspect $CONTAINER_NAME" >/dev/null 2>&1; }
 if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; then
   # Preparation may have run separately while the old server stayed up: inspect the live ranks too.
-  live_head=$(docker inspect -f '{{index .Config.Labels "tf.recipe.ablit"}}' "$CONTAINER_NAME")
-  live_worker=$(worker 1 "docker inspect -f '{{index .Config.Labels \"tf.recipe.ablit\"}}' '$CONTAINER_NAME'")
+  live_head=$(ctr inspect -f '{{index .Config.Labels "tf.recipe.ablit"}}' "$CONTAINER_NAME")
+  live_worker=$(worker 1 "$RT_WORDS inspect -f '{{index .Config.Labels \"tf.recipe.ablit\"}}' '$CONTAINER_NAME'")
   # Containers launched before this flag existed are stock.
   [[ -n "$live_head" && "$live_head" != '<no value>' ]] || live_head=0
   [[ -n "$live_worker" && "$live_worker" != '<no value>' ]] || live_worker=0
   [[ "$live_head" == "$(ablit_identity)" && "$live_worker" == "$(ablit_identity)" ]] || \
     die "the running ranks use a different ABLIT mode or overlay revision; run ./start.sh restart with ABLIT=$ABLIT"
   # the ported features (scripts/port.sh): containers started before them carry no label, and run with all of them off
-  live_head=$(docker inspect -f '{{index .Config.Labels "tf.recipe.port"}}' "$CONTAINER_NAME")
-  live_worker=$(worker 1 "docker inspect -f '{{index .Config.Labels \"tf.recipe.port\"}}' '$CONTAINER_NAME'")
+  live_head=$(ctr inspect -f '{{index .Config.Labels "tf.recipe.port"}}' "$CONTAINER_NAME")
+  live_worker=$(worker 1 "$RT_WORDS inspect -f '{{index .Config.Labels \"tf.recipe.port\"}}' '$CONTAINER_NAME'")
   [[ -n "$live_head" && "$live_head" != '<no value>' ]] || live_head=off
   [[ -n "$live_worker" && "$live_worker" != '<no value>' ]] || live_worker=off
   [[ "$live_head" == "$live_worker" ]] || die "the two running ranks disagree on the ported features ($live_head here, $live_worker on $(worker_host 1)): run ./start.sh restart"
@@ -176,7 +177,7 @@ if (( need_prepare )); then
 else
   log "Ready: $IMAGE, $MODEL_ID @ $(snapshot_rev | cut -c1-8), Engram's tables, the weight files and the kit"
 fi
-docker image inspect "$IMAGE" >/dev/null 2>&1 || (( DRY )) || die "image $IMAGE missing: scripts/prepare.sh did not build it"
+ctr image inspect "$IMAGE" >/dev/null 2>&1 || (( DRY )) || die "image $IMAGE missing: scripts/prepare.sh did not build it"
 MODEL_ARG=$(model_in_container)
 
 # ---------------------------------------------------------------- 2. checks
@@ -199,8 +200,8 @@ for r in 0 1; do
 done
 # the serve flags against what this build of tensorfold-native serves (scripts/zig_flags.py, from the GLM-5.3-Flash recipe):
 # the binary refuses an unsupported flag at start, after the container is up and the old server stopped
-if docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  docker run --rm --network none --entrypoint tensorfold-native "$IMAGE" capabilities --json |
+if ctr image inspect "$IMAGE" >/dev/null 2>&1; then
+  ctr run --rm --network none --entrypoint tensorfold-native "$IMAGE" capabilities --json |
     python3 scripts/zig_flags.py "${SERVE[@]:3}" || die "rank 0's serve arguments are not ones $IMAGE serves (above); nothing was stopped"
 fi
 # (the spill tier's directories were checked before the flags were made: port_spill_check, above)
@@ -214,8 +215,8 @@ if (( ! DRY )); then
   # stop.sh for any container left, an exited one too: it saves each rank's log before it removes the container, so a
   # restart (./start.sh restart, or a supervisor's start after rank 0 exited) keeps the failed run's last lines
   if exists_here || exists_worker 1; then ./stop.sh; fi
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  worker 1 "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"
+  ctr rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  worker 1 "$RT_WORDS rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"
   if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"; fi
   # memory: a rank that takes all of a Spark's memory freezes the machine, so refuse to start on one that cannot hold it.
   # Counted as the engine's startup budget counts it (0119): MemAvailable plus the pages parked on the per-CPU free
@@ -249,16 +250,16 @@ foreground() {
       worker 1 true 2>/dev/null || continue         # a worker out of reach for a moment says nothing about its rank
       running_worker 1 && continue
       warn "rank 1 on $(worker_host 1) exited: stopping rank 0"
-      docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
+      ctr stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
       exit 1
     done ) &
   watch=$!
-  docker logs -f "$CONTAINER_NAME" || true
+  ctr logs -f "$CONTAINER_NAME" || true
   kill "$watch" 2>/dev/null || true
   w=0; wait "$watch" || w=$?
-  code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
+  code=$(ctr inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
   [[ "$w" != 1 || "$code" != 0 ]] || code=1         # the worker's rank failed, even if rank 0 then shut down cleanly
-  worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
+  worker 1 "$RT_WORDS stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
   exit "$code"
 }
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)
@@ -274,6 +275,8 @@ ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's i
 while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
+# podman: a system cgroup parent (rootful), so the slice's MemorySwapMax=0 reaches the rank (the host tuning's slice)
+[[ "$CONTAINER_RT" != podman || -z "$CGROUP_PARENT" ]] || RUN_ARGS+=" --cgroup-parent $CGROUP_PARENT"
 # each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response
 [[ -z "$LOG_MAX_SIZE" ]] || RUN_ARGS+=" --log-driver json-file --log-opt max-size=$LOG_MAX_SIZE --log-opt max-file=$LOG_MAX_FILE"
 DATA=/hf/$DATA_SUB
@@ -311,7 +314,7 @@ step 3 "Launch: container $CONTAINER_NAME, rank 1 on the worker, then rank 0 her
 cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache 1 2 ${LINK_HEAD_ADDR[1]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
 [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[1]}"   # this node's RoCE devices
 spill1=$(port_spill_args 1)   # rank 1's spill directory (scripts/port.sh; empty, and no extra space, with it off)
-remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill1:+$spill1 }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}" ${PORT_RANK_SHA[1]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[1]}"} ${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"}) $(rank_nccl_env 1) $IMAGE $cmd"
+remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && $RT_WORDS run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill1:+$spill1 }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}" ${PORT_RANK_SHA[1]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[1]}"} ${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"}) $(rank_nccl_env 1) $IMAGE $cmd"
 if (( DRY )); then printf '[dry-run] rank 1 on %s:\n  %s\n' "$(worker_host 1)" "$remote"
 else
   log "Rank 1 on $(worker_host 1): $cmd"
@@ -321,7 +324,7 @@ ENV0=(TF_TP_WORLD=2 "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_POR
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container)" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json"
       "TF_DS_GRAPHS=$GRAPHS" "TF_DS_GRAPH_CAP=$GRAPH_CAP" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
 if (( DRY )); then HEAD_HF=${HEAD_NFS_SERVER:+$HEAD_NFS_VOLUME}; HEAD_HF=${HEAD_HF:-$HF_CACHE}; else HEAD_HF=$(head_hf_mount); fi
-here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro")
+here=(ctr run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro")
 read -ra port0 <<<"$(port_spill_args 0)"; here+=(${port0[@]+"${port0[@]}"})   # rank 0's spill directory (scripts/port.sh)
 if [[ -n "$HEAD_ENGRAM_DIR" ]]; then
   here+=(-v "$HEAD_ENGRAM_DIR:/engram:ro")
@@ -332,24 +335,24 @@ if [[ "$API_KEY" == 1 ]]; then here+=(-v "$API_KEY_FILE:$API_KEY_IN_CONTAINER:ro
 for x in "${ENV0[@]}" "${ENGINE_ENV[@]}"; do here+=(-e "$x"); done
 rank_nccl_args 0
 here+=("${NCCL_ARGS[@]}" "$IMAGE" "${SERVE[@]}")
-if (( DRY )); then printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"; exit 0; fi
+if (( DRY )); then printf '[dry-run] rank 0 here:\n  %s %s\n' "$RT_WORDS" "$(printf '%q ' "${here[@]:1}")"; exit 0; fi
 log "Rank 0 here: ${SERVE[*]}"
 "${here[@]}" >/dev/null
 [[ "${FOREGROUND:-0}" != 1 ]] || foreground
 
 # ---------------------------------------------------------------- 4. load
 step 4 "Loading: ~98 GiB of weights on each Spark, then Engram and the caches (a few minutes)"
-docker logs -f "$CONTAINER_NAME" 2>&1 | sed -u "s/^/  ${D}│${R} /" &
+ctr logs -f "$CONTAINER_NAME" 2>&1 | sed -u "s/^/  ${D}│${R} /" &
 LOGS_PID=$!
 trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
 fail() {
   kill $LOGS_PID 2>/dev/null || true
-  printf '%s── rank 1 (%s): last log lines ──%s\n' "$D" "$(worker_host 1)" "$R"; worker 1 docker logs --tail 15 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
+  printf '%s── rank 1 (%s): last log lines ──%s\n' "$D" "$(worker_host 1)" "$R"; worker 1 "$RT_WORDS logs --tail 15 '$CONTAINER_NAME'" 2>&1 | sed 's/^/  │ /'
   die "$1"
 }
 start=$SECONDS
 until curl -sf --max-time 5 "${AUTH[@]}" "$URL/v1/models" >/dev/null 2>&1; do
-  running_here || fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
+  running_here || fail "rank 0 exited (code $(ctr inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
   running_worker 1 || fail "rank 1 on $(worker_host 1) exited before the server was ready"
   (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running"
   sleep 5
@@ -386,7 +389,7 @@ cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)
     Access   $( [[ "$API_KEY" == 1 ]] && echo "API key required: Authorization: Bearer \$(cat $API_KEY_FILE)" || echo "open: no key, anyone who reaches port $PORT can use it (API_KEY=1 requires one)")
     Window   $CONTEXT tokens · $PARALLEL at once · EXL3 2.9 bpw · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images on$(port_summary)
-    Logs     docker logs -f $CONTAINER_NAME   (rank 1: ssh $(worker_host 1) docker logs -f $CONTAINER_NAME)
+    Logs     $CONTAINER_RT logs -f $CONTAINER_NAME   (rank 1: ssh $(worker_host 1) $CONTAINER_RT logs -f $CONTAINER_NAME)
     Restart  ./start.sh restart
     Stop     ./stop.sh
 

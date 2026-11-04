@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Memory watchdog for a DGX Spark running a rank: a Spark's GPU shares its 121 GiB with the host, so a rank that takes
 # all of it does not get a clean CUDA out-of-memory error, the whole machine stops answering (and has to be power-cycled).
-# This kills the rank's container (docker kill, no grace period) before the machine gets there, on either of two levels:
+# This kills the rank's container (docker/podman kill, no grace period) before the machine gets there, on either of two levels:
 #   - MemAvailable under the HARD floor (default 1 GiB) in two samples in a row (0.25 s apart): at once;
 #   - MemAvailable under the (soft) floor for HOLD seconds without once coming back over it (default 4 s): a long prompt's workspace
 #     takes a few GiB for a moment and gives them back, which is not a rank in trouble. A dip that recovers is logged, not killed.
@@ -13,6 +13,14 @@
 # The engine keeps its own reserve (TENSORFOLD_MEMORY_RESERVE_GIB, 12.2 GiB by default) free, so a healthy rank stays well
 # above a floor of a few GiB; only something else eating into the reserve (or a reserve set too low) trips this.
 set -u
+
+# The container runtime (scripts/runtime.sh travels beside this script: start.sh copies both to the worker); ctr
+# resolves to docker, podman or "sudo -n podman".
+_here=$(cd "$(dirname "$0")" && pwd)
+[[ -r "$_here/runtime.sh" ]] && . "$_here/runtime.sh"
+if ! declare -F ctr >/dev/null; then
+  ctr() { if [[ "${CONTAINER_RT:-docker}" == podman ]]; then if [[ "${CONTAINER_RT_SUDO:-0}" == 1 ]]; then sudo -n podman "$@"; else podman "$@"; fi; else docker "$@"; fi; }
+fi
 
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 avail_kb() { local k v; while read -r k v _; do [[ $k == MemAvailable: ]] && { echo "$v"; return; }; done <"${MEMGUARD_MEMINFO:-/proc/meminfo}"; }
@@ -58,7 +66,7 @@ run_guard() {
     # Kill first, log afterwards: on a machine that is already thrashing every command ahead of the kill costs time. The
     # process snapshot runs beside it (it shows who else holds the memory); docker kill fails when the container is not running.
     ps -eo rss,pid,comm --sort=-rss 2>/dev/null | head -6 > "$snap" &
-    if timeout 20 docker kill "$c" >/dev/null 2>&1; then
+    if timeout 20 ctr kill "$c" >/dev/null 2>&1; then
       wait
       {
         echo "$(stamp) memguard: MemAvailable $(( a / 1024 )) MiB (lowest $(( low_min / 1024 )) MiB) was under the $floor_gib GiB floor for $hold s or under the $hard_gib GiB hard floor: killed container $c"

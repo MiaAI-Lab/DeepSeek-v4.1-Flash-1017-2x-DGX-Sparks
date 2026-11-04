@@ -49,8 +49,8 @@ needle test and what was and was not checked are in [docs/measurements.md](docs/
 - **The same GPU clock ceiling on both** (`nvidia-smi -lgc 0,2200`): the ranks meet twice a layer, so the slower GPU sets the pace.
 - **A direct ConnectX-7 link** (a QSFP cable, an IPv4 address on each end in one private subnet, a RoCE v2 GID); address both PCIe
   "twin" netdevs of the port on each Spark and both are used as rails.
-- **Key-based ssh** from the head (which runs `./start.sh` and the API) to the worker; Docker with the NVIDIA runtime on both; `git`,
-  `python3` and the `hf` CLI on the head.
+- **Key-based ssh** from the head (which runs `./start.sh` and the API) to the worker; Docker with the NVIDIA runtime on both,
+  or podman 4.9+ (rootful: `docs/PODMAN.md`); `git`, `python3` and the `hf` CLI on the head.
 - **Disk:** ~505 GB on the head plus ~25 GB for the image; ~310 GB on the worker plus the image.
 - **NFS:** the worker mounts the head's Hugging Face cache read-only (or both Sparks run from a local copy).
 
@@ -83,7 +83,7 @@ The model thinks before it answers unless a request turns thinking off, so give 
 ```bash
 ./start.sh restart                                       # restart both ranks, e.g. after changing a setting
 ./stop.sh                                                # stop both ranks and free their GPU memory
-docker logs -f dsv41-1017-exl3-tf                        # rank 0's log (here)
+docker logs -f dsv41-1017-exl3-tf                        # rank 0's log (here; podman logs under podman)
 ssh <worker> docker logs -f dsv41-1017-exl3-tf           # rank 1's log (why it exited, if it did)
 python3 tools/validate.py http://<head-address>:8888 --model DeepSeek-V4.1-Flash-1017   # text, thinking, tools, image, long prompt
 API_URL=http://<head-address>:8888 python3 tools/toolcheck.py    # also needle.py (a passphrase in ~195k tokens), end_of_turn.py
@@ -114,6 +114,7 @@ Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after t
 ## Documentation
 
 - [Requirements](docs/requirements.md): hardware, link, ssh, disk, NFS and what gets downloaded
+- [Podman instead of Docker](docs/PODMAN.md): the settings, the three differences, and moving a pair over
 - [How `start.sh` and `prepare.sh` work](docs/how-it-works.md)
 - [Configuration](docs/configuration.md): every setting, and the log settings
 - [Memory and safety](docs/memory-and-safety.md): `CONTEXT` and `POOL`, admission, `memguard`, the head's headroom
