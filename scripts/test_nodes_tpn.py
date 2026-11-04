@@ -117,12 +117,17 @@ class TwoSparksUnchanged(Base):
             self.patch(tree, LINK_TP2 + MEM)
 
     def observe(self, tree, setup, args, extra_env):
-        """One run in a fresh sandbox: (exit code and output, the ssh commands, the docker calls), paths and times out."""
+        """One run in a fresh sandbox: (exit code and output, the ssh commands, the docker calls), paths and times out.
+        Each run has a home of its own: in a shared one, a second run's saved logs (save_log) and API key would find
+        the first run's there."""
         self.fresh_sim()
+        self.runs = getattr(self, "runs", 0) + 1
+        home = self.tmp / f"home-{self.runs}"
+        home.mkdir()
         setup()
-        code, out = self.run_in(tree, args, extra_env)
+        code, out = self.run_in(tree, args, {"HOME": str(home), **(extra_env or {})})
         def norm(text):
-            text = text.replace(str(tree), "<repo>").replace(str(self.tmp), "<tmp>")
+            text = text.replace(str(tree), "<repo>").replace(str(home), "<home>").replace(str(self.tmp), "<tmp>")
             text = re.sub(r"\d{8}-\d{6}", "<stamp>", text)                  # saved logs' names
             text = re.sub(r"answered after \d+s", "answered after <n>s", text)
             text = re.sub(r"\(\d+ s\)", "(<n> s)", text)
@@ -255,7 +260,8 @@ class ThreeRanks(Base):
             self.assertIn(f"-e TF_RDMA_GID_INDEX={gid} ", cmds[i])
             self.assertIn(f"-e NCCL_IB_HCA={hca} ", cmds[i])
         self.assertIn(" -e TF_TP_WORLD=3 ", cmds[0])
-        self.assertIn(" -e TF_RDMA_DEVICES=hca0a,hca0b ", cmds[0])
+        # (rank 0's line is start.sh's printf %q, which bash 5.2 gives a comma a backslash in and bash 4 and 5.1 do not)
+        self.assertRegex(cmds[0], r" -e TF_RDMA_DEVICES=hca0a\\?,hca0b ")
         self.assertIn("[dry-run] rank 2 on w2:", out)
         self.assertIn("rank 2 (w2): RoCE hca2 (GID 5), NFS from 10.9.2.1", out)
 
