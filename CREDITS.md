@@ -35,6 +35,15 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   every exit, and the AIO, `Model.open`, `Pool.init` and `Tables.open` failure paths release what they made) was authored by
   **Hector Isaza** ([hecisaza](https://github.com/hecisaza)) in [pull request #79](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/79)
   (commit [`549f473`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/79/commits/549f473d4a5fd2ba39dc6eb666255a18bece098e)); carried as sent.
+- **`zig/patches/0046-server-get-delete-body-discard.patch`** (a `GET` or `DELETE` body is read and dropped before its route, so a kept
+  connection cannot hand those bytes to the next request) was authored by **Christopher A. Williamson** ([cawilliamson](https://github.com/cawilliamson)) in
+  [pull request #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37) of the 4-Spark recipe, where it is `0044`
+  (commit [`0430154`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37/commits/0430154e85ed00702a76989f7ba83282eb3eefd8)); carried as sent, renumbered.
+- **`tools/claims/0046-server-get-delete-body-discard.sh`** (checks that patch on a running server) was written by **Hector Isaza**
+  ([hecisaza](https://github.com/hecisaza)) with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit), in
+  [hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold)
+  (commit [`10c4c7c`](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/commit/10c4c7c21679f920aa2780d25a0019989ff284af)); unchanged below the header this recipe
+  added, except for the connection check Mia's AI Lab added, so a server that is down exits 2, not 1.
 - **EAQ v1.1 support** (`EAQ_V1_1=1`) was authored by **Mykhailo Tamarin** ([MykhailoTamarin](https://github.com/MykhailoTamarin))
   in [pull request #57](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/57) (Apache-2.0):
   **`zig/patches/0024-mixed-pack.patch`** and **`zig/patches-inputs/0001-mixed-pack-rank-cache.patch`** (the EAQ v1.1 mixed

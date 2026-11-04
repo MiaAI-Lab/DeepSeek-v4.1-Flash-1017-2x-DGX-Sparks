@@ -12,6 +12,16 @@
   the `fill_resume` frame: before, the planner's fill stayed the cut-in's, and the cut-in's first decode round would
   have re-made the view at the cut-in's extent on the paused pass's slot. Without `TF_FILL_*` nothing changes. By
   **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)**.
+- `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
+  it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
+  the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
+  body-carrying one answered `501 Unsupported method ('probe=0044&scanner=1GET')`. By **Christopher A. Williamson
+  ([cawilliamson](https://github.com/cawilliamson))**, [pull request #37](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/37)
+  of the 4-Spark recipe, where it is `0044`; carried as sent. `tools/claims/0046-server-get-delete-body-discard.sh`, written
+  by **Hector Isaza ([hecisaza](https://github.com/hecisaza))** with the verify step of
+  [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit), checks it on a running server: on a pair it exits 1 on
+  the image before the patch and 0 on `exl3-tp2-9d0f4a04af7f`, whose replies to `tools/exact.py`'s 39 prompts are identical
+  ([measurements](docs/measurements.md)).
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
