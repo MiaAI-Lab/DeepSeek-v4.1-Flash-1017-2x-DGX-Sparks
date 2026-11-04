@@ -331,6 +331,8 @@ rank_nccl_env() { nccl_env "${NODE_DEV[$1]}" "${NODE_HCAS[$1]}" "${NODE_GID[$1]}
 rank_nccl_args() { nccl_env "${NODE_DEV[$1]}" "${NODE_HCAS[$1]}" "${NODE_GID[$1]}" >/dev/null; }
 
 # detect_links: the one link of two Sparks (start.sh and prepare.sh call it; the GLM scripts' name for it at any TP).
+# detect_link and probe_rails are the two-node path in the GLM-5.3 3x and the 4x recipes too; three Sparks need each
+# node's links to both others (their node_inventory and pair_links), which come with TP=3.
 detect_links() { detect_link; }
 
 # Rank 0's checkpoint volume (HEAD_NFS_SERVER): like ensure_nfs_volume, for this Spark. Prints what rank 0 mounts at /hf.
