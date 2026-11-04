@@ -63,6 +63,7 @@ for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] ||
 (( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16 (the engine's streams), not $PARALLEL"
 [[ -z "$ROUND_ROWS" ]] || { [[ "$ROUND_ROWS" =~ ^[0-9]+$ ]] && (( ROUND_ROWS == 16 )); } || die "ROUND_ROWS must be empty or 16: the pinned kit has no wider row kernels (issue #23), not $ROUND_ROWS"
 [[ -z "$THINKING_BUDGET" || "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]] || die "THINKING_BUDGET is a positive count of reasoning tokens (or empty for no cap), not $THINKING_BUDGET"
+[[ "$DROP_REASONING_HISTORY" =~ ^[01]$ ]] || die "DROP_REASONING_HISTORY is 0 or 1, not $DROP_REASONING_HISTORY"
 [[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || die "REASONING_EFFORT is low, medium, high or xhigh (or empty), not $REASONING_EFFORT"
 [[ "$MIN_AVAIL_GIB" =~ ^[0-9]+$ ]] || die "MIN_AVAIL_GIB is a whole number of GiB (0 turns it off), not $MIN_AVAIL_GIB"
 [[ "$MIN_AVAIL_WAIT_S" =~ ^[0-9]+$ ]] && (( MIN_AVAIL_WAIT_S <= 3600 )) || die "MIN_AVAIL_WAIT_S is 0 to 3600 seconds, not $MIN_AVAIL_WAIT_S"
@@ -97,6 +98,7 @@ SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$
 if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking); fi
 [[ -z "$REASONING_EFFORT" ]] || SERVE+=(--reasoning-effort "$REASONING_EFFORT")
 [[ -z "$THINKING_BUDGET" ]] || SERVE+=(--thinking-budget "$THINKING_BUDGET")
+[[ "$DROP_REASONING_HISTORY" != 1 ]] || SERVE+=(--drop-reasoning-history)
 # drafts off on rank 0 as on rank 1 (a follower without the drafter refuses a drafted round)
 [[ "$DRAFTS" == 1 ]] || SERVE+=(--no-drafts)
 [[ "$API_KEY" != 1 ]] || SERVE+=(--api-key-file "$API_KEY_IN_CONTAINER")
