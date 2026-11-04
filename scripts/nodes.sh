@@ -3,8 +3,9 @@
 # Sourced by start.sh, stop.sh and prepare.sh after config.sh.
 # From the node helpers of MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold (Mia's AI Lab), cut to two Sparks.
 
-# wvar <NAME> <i>: the name of worker i's own setting: NAME for worker 1 (WORKER, FABRIC_PEER, NFS_SERVER). The helpers
-# keep the GLM scripts' per-worker form; this recipe has the one worker.
+# wvar <NAME> <i>: the name of worker i's own setting: NAME for worker 1 (WORKER, FABRIC_PEER, NFS_SERVER), NAME<i>
+# for the others (WORKER2, FABRIC_PEER2, NFS_SERVER2). The helpers keep the GLM scripts' per-worker form: every step
+# that reaches a worker goes through worker_ids, which is the one worker at TP=2.
 wvar() { if (( $2 == 1 )); then echo "$1"; else echo "$1$2"; fi; }
 wval() { local v; v=$(wvar "$1" "$2"); echo "${!v:-}"; }
 worker_host() { wval WORKER "$1"; }
@@ -12,10 +13,19 @@ worker_host() { wval WORKER "$1"; }
 worker_ids() { seq 1 $((TP - 1)); }
 configured_workers() { local i; for i in 1 2 3; do [[ -z "$(worker_host "$i")" ]] || echo "$i"; done; }
 
-# check_workers: this recipe serves two Sparks (the dsv41 family's TP=2), and WORKER is set.
+# check_workers: this recipe serves two Sparks (the dsv41 family's TP=2), and WORKER .. WORKER<TP-1> are set and
+# distinct (a WORKER2 set at TP=2 is left alone).
 check_workers() {
+  local i j h what
+  [[ "$TP" != 3 ]] || die "TP=3 (three Sparks) is not served yet: the scripts take WORKER2, but the links between three Sparks and their launch are not done. Leave TP at 2 (the default)"
   [[ "$TP" == 2 ]] || die "TP is 2 (two Sparks): the dsv41 family runs tensor-parallel over two nodes here, not $TP"
-  [[ -n "$(worker_host 1)" ]] || die "WORKER is not set: put WORKER=user@<address of the second Spark> in scripts/local.sh (see scripts/local.sh.example)"
+  for i in $(worker_ids); do
+    h=$(worker_host "$i"); what="the second Spark"; (( i == 1 )) || what="rank $i's Spark"
+    [[ -n "$h" ]] || die "$(wvar WORKER "$i") is not set: put $(wvar WORKER "$i")=user@<address of $what> in scripts/local.sh (see scripts/local.sh.example)"
+    for (( j = 1; j < i; j++ )); do
+      [[ "$h" != "$(worker_host "$j")" ]] || die "$(wvar WORKER "$i") and $(wvar WORKER "$j") are the same node ($h)"
+    done
+  done
 }
 
 # DRY_RUN=1 goes on without workers it cannot reach (a fictitious WORKER): its values print as <WORKER:...>.
