@@ -185,6 +185,15 @@ if [[ "$ABLIT" == 1 ]]; then
       --wo-b "/hf/$overlay_sub/$ABLIT_SIDECAR" || die "applying the matching Mia overlay failed; rerun prepare.sh to retry"
     python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["n_edited"] == 104, "expected 104 Mia overlay tensors"' \
       "$DATA_DIR/checkpoint.new/ABLIT_META.json" || die "Mia overlay did not replace all 104 tensors"
+    # An unchanged shard the overlay left as a symbolic link (linked, not hard-linked, from its source: from a Hub
+    # snapshot that is a link into ../../blobs) breaks once its source goes, and LakyFx's tools (TP=3) refuse links:
+    # it becomes the stock snapshot's file itself, a hard link, as the overlay meant (never anything from the Hub)
+    for f in "$DATA_DIR/checkpoint.new"/*; do
+      [[ -L "$f" ]] || continue
+      real=$(realpath -e "$SNAP/${f##*/}") && ln -f "$real" "$f.real" && mv -f "$f.real" "$f" ||
+        die "the overlay left ${f##*/} as a link, and the stock snapshot has no such file to put in its place"
+    done
+    [[ -z "$(find "$DATA_DIR/checkpoint.new" -maxdepth 1 -type l)" ]] || die "the overlay checkpoint still holds symbolic links"
     stock_dtypes "/hf/$DATA_SUB/checkpoint.new" || die "could not give the overlay checkpoint its stock dtypes back"
     touch "$DATA_DIR/checkpoint.new/.ablit-ready"
     rm -rf "$DATA_DIR/checkpoint"
