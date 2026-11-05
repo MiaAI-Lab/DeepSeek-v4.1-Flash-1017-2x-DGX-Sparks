@@ -1,0 +1,134 @@
+# port-patches.sh: port/long-session-cache-0063 @ c479b3e46a8a over 44e969ceda7f (squash 44e969ceda7f..c479b3e46a8a)
+# Preserve an unsharded cached prefix when a separate full-request copy cannot fit: grow in place under pressure, guarding idle tail victims and protecting live streams and loading restores; shared-prefix forks still copy when room exists. Includes placement regressions. Rebased onto main: the placement runs before 0045-cut-in-tail, whose resume_at reads sn.stale.
+# Applied by zig/Dockerfile with git apply after the hand-written patches; regenerate with scripts/port-patches.sh, do not edit.
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 40006aaecadbf74d26454cef0dc22e337ba04ce3..3c79f33f16c601023a1b3abff624d99ca943c54e 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -924,13 +924,17 @@ pub const Lanes = struct {
+             } else s.reuse_failed = true;
+         };
+         const base = if (parted) |pp| pp.base else if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
++        // placeKept may grow the source in place when a separate copy cannot fit.
++        if (parted == null) {
++            if (kept) |sn| moved = base != sn.base;
++        }
+         // a cut-in (Stream.cut_in) runs whole between another pass's pieces: where it really resumes is known only
+         // now (the state may have gone stale, or found no room to move to), and if it would compute more than its
+         // bound, or rows for a picture, it is refused before its extent, the kept state's end, other states' rows, its
+         // sequence, rank 1's fill or a chunk change (the placement's own moves and evictions stand, as for any pass
+         // that fails past it; a part goes back by the errdefer above)
+         if (s.cut_in > 0) {
+-            const resume_at: usize = if (kept) |sn| (if (moved and sn.stale) 0 else sn.at) else 0;
++            const resume_at: usize = if (kept) |sn| (if (sn.stale) 0 else sn.at) else 0;
+             if (len - resume_at > s.cut_in or lanes.Engine.picturesPast(s.images, resume_at)) {
+                 std.log.info("dsv41: a cut-in of {d} tokens resumes at {d}, not at {d} as admitted; it waits for the pass in pieces", .{ len, resume_at, s.reuse.at });
+                 return error.FillBusy;
+@@ -940,7 +944,7 @@ pub const Lanes = struct {
+             sn.wanted = 0;
+             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
+         }
+-        if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
++        if (kept) |sn| if (sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+             if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} found no room to move to ({d} positions); the prompt runs from 0", .{ sn.at, sn.base, size });
+             kept = null;
+             s.reuse_failed = true;
+@@ -1255,6 +1259,16 @@ pub const Lanes = struct {
+                 return if (try roomAfter(gpa, rows.items, b, size, self.m.pool_cap)) b else error.ContextFull;
+             }
+             if (got) |b| return b;
++            // A restored point may hold only its prefix's rows, with another idle
++            // state in the waiting request's tail. A disjoint copy needs room for
++            // BOTH the source and the whole request: impossible past half a pool.
++            // Prefer a copy while it fits (shared-prefix forks keep their later
++            // marks); under pressure grow here, retiring only the overwritten
++            // tail. Never overwrite a live stream or an in-flight restore.
++            if (source) |sn| if (self.canGrowHere(live, size, sn)) {
++                self.staleOver(sn.base + sn.at, sn.base + size, sn);
++                return sn.base;
++            };
+             const victim = for (self.snaps.items) |sn| {
+                 if (!sn.stale and !sn.loading and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
+             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
+@@ -1264,6 +1278,12 @@ pub const Lanes = struct {
+         }
+     }
+ 
++    fn canGrowHere(self: *const Lanes, live: []const [2]usize, size: usize, source: *const Snap) bool {
++        if (source.stale or source.loading or source.base + size > self.m.pool_cap or clashes(live, source.base, source.base + size)) return false;
++        for (self.snaps.items) |sn| if (!sn.stale and sn.loading and sn.base < source.base + size and source.base < sn.base + sn.at) return false;
++        return true;
++    }
++
+     /// Whether a kept state other than `except` and its shorter siblings has rows in [lo, hi); a longer one may be another conversation's.
+     fn keptOver(self: *const Lanes, lo: usize, hi: usize, except: *const Snap) bool {
+         for (self.snaps.items) |sn| if (sn != except and !sn.stale and (sn.base != except.base or sn.at > except.at) and sn.base < hi and lo < sn.base + sn.at) return true;
+@@ -2120,6 +2140,24 @@ test "retained histories preserve their replay and output reservations (PR #10:
+     try std.testing.expect(!ln.snaps.items[0].stale); // its rows lie in the live stream: that stream holds the room
+ }
+ 
++test "a restored prefix over half the pool grows in place instead of evicting itself" {
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    m.pool_cap = 524288;
++    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
++    defer ln.snaps.deinit(gpa);
++    // spillReserve could fit only the point's rows, not the waiting request.
++    // Another idle chat still has rows in the tail the request now needs.
++    var source: Snap = .{ .id = 1, .at = 270336, .base = 0, .end = 270336, .buf = undefined, .restored = true };
++    var other: Snap = .{ .id = 2, .at = 65536, .base = 270336, .end = 370688, .buf = undefined };
++    try ln.snaps.append(gpa, &source);
++    try ln.snaps.append(gpa, &other);
++    try std.testing.expect(ln.keptOver(source.at, 274432, &source));
++    try std.testing.expectEqual(@as(usize, 0), try ln.placeKept(&.{}, 274432, &source));
++    try std.testing.expect(!source.stale);
++    try std.testing.expect(other.stale);
++}
++
+ test "a prefix two conversations share: the second one resuming it in place would stale the first one's later marks" {
+     var m: Model = undefined;
+     m.pool_cap = 1 << 20;
+@@ -2134,6 +2172,43 @@ test "a prefix two conversations share: the second one resuming it in place woul
+     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+ }
+ 
++test "in-place growth under pressure never overwrites a live stream or a loading restore" {
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    m.pool_cap = 524288;
++    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
++    defer ln.snaps.deinit(gpa);
++    var source: Snap = .{ .id = 1, .at = 270336, .base = 0, .end = 270336, .buf = undefined };
++    var loading: Snap = .{ .id = 2, .at = 65536, .base = 270336, .end = 370688, .buf = undefined, .loading = true };
++    try ln.snaps.append(gpa, &source);
++    try ln.snaps.append(gpa, &loading);
++    try std.testing.expect(!ln.canGrowHere(&.{}, 274432, &source));
++    try std.testing.expectError(error.ContextFull, ln.placeKept(&.{}, 274432, &source));
++    try std.testing.expect(!loading.stale);
++    source.stale = false;
++    loading.stale = true;
++    try std.testing.expect(ln.canGrowHere(&.{}, 274432, &source));
++    try std.testing.expect(!ln.canGrowHere(&.{.{ 270336, 370688 }}, 274432, &source));
++    try std.testing.expect(!ln.canGrowHere(&.{.{ 0, 270336 }}, 274432, &source));
++    source.base = m.pool_cap - source.at; // the prefix fits here, but its continuation does not
++    try std.testing.expect(!ln.canGrowHere(&.{}, 274432, &source));
++}
++
++test "a shared prefix still copies without evicting later marks when there is room" {
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    m.pool_cap = 1048576;
++    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
++    defer ln.snaps.deinit(gpa);
++    var source: Snap = .{ .id = 1, .at = 270336, .base = 0, .end = 370688, .buf = undefined };
++    var later: Snap = .{ .id = 2, .at = 368640, .base = 0, .end = 370688, .buf = undefined };
++    try ln.snaps.append(gpa, &source);
++    try ln.snaps.append(gpa, &later);
++    try std.testing.expect(ln.keptOver(source.at, 274432, &source));
++    try std.testing.expect(try ln.placeKept(&.{}, 274432, &source) != source.base);
++    try std.testing.expect(!source.stale and !later.stale);
++}
++
+ test "a prompt that needs picture rows does not cut in between another pass's pieces, nor any into a pass with pictures" {
+     var m: Model = undefined;
+     m.io = std.testing.io;
