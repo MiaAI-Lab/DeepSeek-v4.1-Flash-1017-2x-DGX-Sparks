@@ -1,0 +1,144 @@
+From 84e04f46bf666de32748856a7bc777cdba12d50f Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:29:33 +0200
+Subject: [PATCH] native: the lane thread makes its CUDA context current as it
+ starts
+
+CUDA binds a context per thread, and the lane host's thread had it made current only lazily, by
+the backend's wrappers (Host.bind). Admission reaches the device before any of them runs when the
+first request after a start resumes a state on disk: LaneHost.admitOne -> park ->
+Store.restoreBeginOver -> the spill tier's begin, through the prompt cache's vtables, which are not
+wrapped. That restore failed with CUDA_ERROR_INVALID_CONTEXT and the request prefilled from 0; after
+any prefill the thread was bound and later restores worked (issue #102 of the DeepSeek-V4.1-Flash
+2-Spark recipe).
+
+LaneHost.enter runs first on the lane thread; the CUDA host sets it to bind its context. Test:
+lane_host_tier_test.zig, "the lane thread runs its enter hook before the tier's first restore"
+(the fake tier records whether a begin ran where the hook had not), which fails without the call.
+---
+ zig/src/core/lane_host.zig              |  8 +++++++
+ zig/src/core/lane_host_tier_test.zig    | 31 +++++++++++++++++++++++++
+ zig/src/core/prompt_cache_fake_tier.zig |  7 ++++++
+ zig/src/native/cuda.zig                 |  9 +++++++
+ 4 files changed, 55 insertions(+)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 8c4ff688..5245739c 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -110,6 +110,10 @@ pub const LaneHost = struct {
+     /// The backend's word that its device is between launches it may interleave with (dsv41: no CUDA graph capture
+     /// on its stream); null: always.
+     quiet: ?Quiet = null,
++    /// Runs first on the lane thread, before anything else there: the backend makes its device context current (CUDA
++    /// binds a context per thread, and admission can reach the device through the prompt cache's tier, a restore,
++    /// before any backend call has bound it). null: nothing to do.
++    enter: ?Enter = null,
+     rounds_open: u32 = 0, // engine thread: inside the lane core's step (a round's launches)
+     in_between: bool = false, // engine thread: inside Stream.between (the filling pass stands between two chunks)
+     /// A service asked for where it must not run panics (debug builds), else is skipped and counted.
+@@ -137,6 +141,9 @@ pub const LaneHost = struct {
+     /// The backend's device state for the service fence.
+     pub const Quiet = struct { ctx: *anyopaque, check: *const fn (ctx: *anyopaque) bool };
+ 
++    /// The backend's hook for the lane thread's start.
++    pub const Enter = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) void };
++
+     /// A backend error that means the rank pair broke, wherever it surfaces (a prompt pass, a round, the lone
+     /// driver); `drain`: rounds can still run, so decoding streams may finish first.
+     pub const Fatal = struct { err: anyerror, drain: bool };
+@@ -978,6 +985,7 @@ pub const LaneHost = struct {
+     }
+ 
+     fn run(h: *LaneHost) void {
++        if (h.enter) |e| e.run(e.ctx);
+         while (true) {
+             if (h.isBroken()) {
+                 if (h.brokenStep()) return;
+diff --git a/zig/src/core/lane_host_tier_test.zig b/zig/src/core/lane_host_tier_test.zig
+index 390489fc..b7c907e4 100644
+--- a/zig/src/core/lane_host_tier_test.zig
++++ b/zig/src/core/lane_host_tier_test.zig
+@@ -492,3 +492,34 @@ test "spill switches a backend never bound are refused, not ignored" {
+     host.configure(disk);
+     try std.testing.expect(!disk.unbound(host.engine()));
+ }
++
++threadlocal var lane_entered: bool = false;
++
++fn enterLane(_: *anyopaque) void {
++    lane_entered = true;
++}
++
++fn enteredHere(_: *anyopaque) bool {
++    return lane_entered;
++}
++
++test "the lane thread runs its enter hook before the tier's first restore: a restore that is the first device work finds the context current" {
++    const r = try Rig.createWith(.{ .load_ms = 5, .flush_ms = 1000 }, struct {
++        fn pre(rig: *Rig) void {
++            rig.host.enter = .{ .ctx = rig, .run = enterLane };
++            rig.tier.on_begin = .{ .ctx = rig, .check = enteredHere };
++        }
++    }.pre);
++    defer r.destroy();
++    _ = try r.point(&t2, 8);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached); // it resumed the restored state, nothing prefilled from 0
++    try b.exact(&t2);
++    r.stop();
++    try std.testing.expect(r.tier.begins >= 1);
++    try std.testing.expectEqual(@as(u64, 0), r.tier.begins_unbound);
++}
+diff --git a/zig/src/core/prompt_cache_fake_tier.zig b/zig/src/core/prompt_cache_fake_tier.zig
+index 83f7b0f7..b6f0d54b 100644
+--- a/zig/src/core/prompt_cache_fake_tier.zig
++++ b/zig/src/core/prompt_cache_fake_tier.zig
+@@ -32,6 +32,10 @@ pub const FakeTier = struct {
+     refuse_if: ?Check = null,
+     refused: u64 = 0,
+     begins: u64 = 0,
++    /// Asked at each begin, on the thread that begins it (the lane host's): a false answer counts in `begins_unbound`
++    /// (the lane thread's enter hook had not run there: a device context would not be current).
++    on_begin: ?Check = null,
++    begins_unbound: u64 = 0,
+     /// The next `full` asks of Tier.VTable.full answer true (the tier at its cap before any room is made; `fulls`
+     /// counts the asks).
+     full: u32 = 0,
+@@ -152,6 +156,9 @@ pub const FakeTier = struct {
+         t.lock();
+         defer t.unlock();
+         t.begins += 1;
++        if (t.on_begin) |c| if (!c.check(c.ctx)) {
++            t.begins_unbound += 1;
++        };
+         if (t.refuse > 0 and (if (t.refuse_if) |c| c.check(c.ctx) else true)) {
+             t.refuse -= 1;
+             t.refused += 1;
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 555c1ce0..ecf42473 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -219,9 +219,18 @@ const Host = struct {
+         h.host.quiet = h.quiet;
+         if (h.pair_watch) |w| w(h.family, &h.host, api.LaneHost.pairBrokenFn); // (the family's breaks reach the host)
+         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
++        // the context current on the lane thread from its start: admission reaches the device through the prompt
++        // cache's tier (a restore's begin) before any backend call binds it, and the first restore after a start
++        // failed with CUDA_ERROR_INVALID_CONTEXT and prefilled from 0
++        if (h.gpu != null) h.host.enter = .{ .ctx = h, .run = enterLane };
+         try h.host.start();
+     }
+ 
++    /// The lane thread's first step: its context current (LaneHost.enter).
++    fn enterLane(p: *anyopaque) void {
++        _ = bind(p);
++    }
++
+     /// The family's lone driver with the context current on the lane thread.
+     fn loneRun(p: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool {
+         const x = bind(p);

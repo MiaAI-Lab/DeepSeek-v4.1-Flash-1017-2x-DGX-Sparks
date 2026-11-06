@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `zig/patches/0059-lane-thread-binds-context.patch` (always on): the lane host's thread makes its CUDA context
+  current as it starts. With the spill tier on, the first request after a start that resumed a state from disk
+  reached the tier's restore (through the prompt cache, whose calls are not wrapped) before any backend call had bound
+  the context on that thread: the restore failed with `CUDA_ERROR_INVALID_CONTEXT` and the request prefilled from 0.
+  Host test: `lane_host_tier_test.zig` (fails without the change). Not yet run on a pair. Reported with the
+  diagnosis by **Phan Quý Nguyên ([NguyenPhan2810](https://github.com/NguyenPhan2810))**, issue #102.
 - `zig/patches/0058-responses-include-encrypted.patch` (always on): `/v1/responses` accepts and ignores
   `include: ["reasoning.encrypted_content"]`, which Pi and other Responses-API clients send with every reasoning
   request; before, each such request was refused with a 400. Other `include` values are still refused. Test:
