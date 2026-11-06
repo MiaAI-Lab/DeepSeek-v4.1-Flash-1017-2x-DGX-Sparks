@@ -23,15 +23,15 @@ source ./scripts/nodes.sh
 # not be listed (ssh or docker ps failed) may still run its rank: unknown=1, and stop.sh fails (exit 1).
 unknown=0
 here=0
-if names=$(docker ps -a --format '{{.Names}}'); then
+if names=$(ctr ps -a --format '{{.Names}}'); then
   grep -qxF -- "$CONTAINER_NAME" <<<"$names" && here=1
 else
-  warn "cannot list the containers here (docker ps failed): rank 0 was left alone"
+  warn "cannot list the containers here ($CONTAINER_RT ps failed): rank 0 was left alone"
   unknown=1
 fi
 # a server started with the spill tier gets the longer stop even when SPILL_GIB has been set to 0 since (a rollback)
 if [[ -z "${STOP_TIMEOUT:-}" ]] && (( here )); then
-  _spill=$(docker inspect -f '{{index .Config.Labels "tf.recipe.spill"}}' "$CONTAINER_NAME" 2>/dev/null || true)
+  _spill=$(ctr inspect -f '{{index .Config.Labels "tf.recipe.spill"}}' "$CONTAINER_NAME" 2>/dev/null || true)
   [[ -z "$_spill" || "$_spill" == '<no value>' ]] || STOP_TIMEOUT=$(port_stop_timeout)
 fi
 workers=$(configured_workers)
@@ -44,7 +44,7 @@ for i in $workers; do
   if ! worker "$i" true 2>/dev/null; then
     warn "cannot reach the worker ($(worker_host "$i")) over ssh: rank $i was left alone"
     unknown=1
-  elif ! names=$(worker "$i" "docker ps -a --format '{{.Names}}'"); then
+  elif ! names=$(worker "$i" "$RT_WORDS ps -a --format '{{.Names}}'"); then
     warn "cannot list the containers on the worker ($(worker_host "$i")): rank $i was left alone"
     unknown=1
   elif grep -qxF -- "$CONTAINER_NAME" <<<"$names"; then
@@ -66,7 +66,7 @@ else
   where=$(paste -sd, <<<"$where" | sed 's/,/, /g')
 fi
 
-if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; then
+if [[ "$(ctr inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; then
   api_host="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && api_host=127.0.0.1
   [[ "$api_host" == *:* ]] && api_host="[$api_host]"
   busy=$(curl -s --max-time 3 "http://$api_host:$PORT/health" 2>/dev/null |
@@ -75,9 +75,9 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" 
 fi
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
   log "DRY_RUN=1: would stop and remove $CONTAINER_NAME $where (up to ${STOP_TIMEOUT:-30}s); nothing is stopped"
-  if (( here )); then printf '[dry-run] rank 0 here:\n  docker stop -t %s %s; (its log saved to %s); docker rm -f %s\n' "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" "$LOG_DIR" "$CONTAINER_NAME"; fi
+  if (( here )); then printf '[dry-run] rank 0 here:\n  %s stop -t %s %s; (its log saved to %s); %s rm -f %s\n' "$CONTAINER_RT" "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" "$LOG_DIR" "$CONTAINER_RT" "$CONTAINER_NAME"; fi
   for i in $workers; do
-    if (( there[i] )); then printf '[dry-run] rank %s on %s:\n  docker stop -t %s %s; (its log saved to ~/.cache/dsv41-tensorfold/logs there); docker rm -f %s\n' "$i" "$(worker_host "$i")" "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" "$CONTAINER_NAME"; fi
+    if (( there[i] )); then printf '[dry-run] rank %s on %s:\n  %s stop -t %s %s; (its log saved to ~/.cache/dsv41-tensorfold/logs there); %s rm -f %s\n' "$i" "$(worker_host "$i")" "$CONTAINER_RT" "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" "$CONTAINER_RT" "$CONTAINER_NAME"; fi
   done
   (( unknown == 0 )) || exit 1                           # a warning above said which Spark could not be listed
   exit 0
@@ -88,20 +88,20 @@ log "Stopping $CONTAINER_NAME $where (up to ${STOP_TIMEOUT:-30}s)"
 # container started with the spill tier carries the tf.recipe.spill label; scripts/port.sh), then remove the container
 stop_here() {
   local saved
-  docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  ctr stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1 || true
   spill_fix_container "$CONTAINER_NAME" || warn "could not give rank 0's spill files back to their directory's owner"
   saved=$(save_log "$LOG_DIR" 0 "$CONTAINER_NAME" "$LOG_KEEP") || warn "could not save rank 0's log to $LOG_DIR"
-  docker rm -f "$CONTAINER_NAME" >/dev/null
+  ctr rm -f "$CONTAINER_NAME" >/dev/null
   log "Stopped and removed rank 0 here${saved:+; its log: $saved}"
 }
 stop_worker() {
   local saved h
   h=$(worker_host "$1")
-  worker "$1" "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME' >/dev/null 2>&1" || true
-  worker "$1" "$(declare -f spill_fix_target spill_fix_owner spill_fix_container); spill_fix_container '$CONTAINER_NAME'" ||
+  worker "$1" "$RT_WORDS stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME' >/dev/null 2>&1" || true
+  worker "$1" "$(runtime_env)$(declare -f spill_fix_target spill_fix_owner spill_fix_container ctr); spill_fix_container '$CONTAINER_NAME'" ||
     warn "could not give rank $1's spill files back to their directory's owner on $h"
   saved=$(worker_save_log "$1") || warn "could not save rank $1's log on $h"
-  worker "$1" "docker rm -f '$CONTAINER_NAME' >/dev/null" || { warn "could not stop rank $1 on $h"; return 1; }
+  worker "$1" "$RT_WORDS rm -f '$CONTAINER_NAME' >/dev/null" || { warn "could not stop rank $1 on $h"; return 1; }
   log "Stopped and removed rank $1 on $h${saved:+; its log there: $saved}"
 }
 wpids=()
