@@ -122,6 +122,8 @@
   `CGROUP_PARENT` (e.g. `tensorfold.slice`) keeps a host tuning's `MemorySwapMax=0` in force. Docker stays the default
   and nothing changes for an existing setup. New `scripts/runtime.sh` holds the switch and the one command word the
   scripts use; `docs/PODMAN.md` covers the three places podman is not a drop-in and how to move a pair across.
+  `CGROUP_PARENT` is optional and checked as a slice name (`tensorfold.slice`), because the value reaches the worker
+  inside an ssh command line.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).

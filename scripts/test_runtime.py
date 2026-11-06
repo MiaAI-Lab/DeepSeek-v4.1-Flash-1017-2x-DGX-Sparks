@@ -13,7 +13,8 @@ ROOT = Path(os.environ.get("SCRIPTS_DIR") or Path(__file__).resolve().parent.par
 
 
 def bash(script, env=None, args=()):
-    e = dict(os.environ)
+    # only `env` sets the settings under test: "unset" has to mean unset, as it is on a host with no local.sh
+    e = {k: v for k, v in os.environ.items() if k not in ("CONTAINER_RT", "CONTAINER_RT_SUDO", "CGROUP_PARENT")}
     e.update(env or {})
     out = subprocess.run(["bash", "-c", script, "test-runtime", *args], cwd=str(ROOT), env=e,
                          capture_output=True, text=True)
@@ -71,6 +72,19 @@ class Runtime(unittest.TestCase):
         code, _, err = bash(PROBE, {"CONTAINER_RT": "docker", "CONTAINER_RT_SUDO": "1"}, ["words"])
         self.assertNotEqual(code, 0)
         self.assertIn("CONTAINER_RT_SUDO is for podman", err)
+
+    def test_cgroup_parent_is_optional(self):
+        # start.sh reads it under set -u (its --cgroup-parent line); runtime.sh owns the empty default
+        self.assertEqual(self.probe("words", CONTAINER_RT="podman", CONTAINER_RT_SUDO="1"), "sudo -n podman")
+
+    def test_cgroup_parent_must_be_a_slice_name(self):
+        # it travels to the worker inside an ssh command line (start.sh's RUN_ARGS), so no shell syntax and no path
+        for bad in ("tensorfold", "-rf.slice", "$(id).slice", "tensorfold.slice; id", "../../etc/passwd.slice"):
+            with self.subTest(value=bad):
+                code, _, err = bash(PROBE, {"CONTAINER_RT": "podman", "CGROUP_PARENT": bad}, ["words"])
+                self.assertNotEqual(code, 0)
+                self.assertIn("CGROUP_PARENT is a slice name", err)
+        self.assertEqual(self.probe("words", CONTAINER_RT="podman", CGROUP_PARENT="tensorfold.slice"), "podman")
 
 
 class NoBareDocker(unittest.TestCase):

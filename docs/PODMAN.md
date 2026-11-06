@@ -63,8 +63,10 @@ The host tuning for these Sparks makes `tensorfold.slice` with `MemorySwapMax=0`
 CGROUP_PARENT=tensorfold.slice
 ```
 
-and `start.sh` adds `--cgroup-parent tensorfold.slice` to both ranks. The slice must exist (it does after the host
-tuning); a missing slice makes the rank fail to start, which is the loud failure you want.
+and `start.sh` adds `--cgroup-parent tensorfold.slice` to both ranks. The value is checked as a slice name before it
+goes into the ranks' command line (it reaches the worker inside an ssh command), so a typo or a shell fragment is
+refused at start instead of sent; it is optional, and unset is the same as empty. The slice must exist (it does after
+the host tuning); a missing slice makes the rank fail to start, which is the loud failure you want.
 
 ## Moving a pair from Docker to Podman
 

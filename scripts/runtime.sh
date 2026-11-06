@@ -17,6 +17,7 @@
 # CONTAINER_RT_SUDO are in its environment (runtime_env prints that prefix).
 CONTAINER_RT="${CONTAINER_RT:-docker}"
 CONTAINER_RT_SUDO="${CONTAINER_RT_SUDO:-0}"
+CGROUP_PARENT="${CGROUP_PARENT:-}"
 case "$CONTAINER_RT" in
   docker)
     RT=(docker); RT_WORDS=docker
@@ -28,6 +29,11 @@ case "$CONTAINER_RT" in
   *)
     echo "ERROR: CONTAINER_RT is docker or podman, not $CONTAINER_RT" >&2; exit 1 ;;
 esac
+
+# CGROUP_PARENT reaches start.sh's RUN_ARGS, which start.sh sends to the worker inside one ssh command line: it must
+# be a slice name and nothing a shell would read (a space, a quote, a semicolon). Empty means no --cgroup-parent.
+[[ -z "$CGROUP_PARENT" || "$CGROUP_PARENT" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@-]*\.slice$ ]] ||
+  { echo "ERROR: CGROUP_PARENT is a slice name (tensorfold.slice), not $CGROUP_PARENT" >&2; exit 1; }
 
 # ctr: the runtime with its arguments (identical flags under both: run, inspect -f '{{...}}', ps --format, volume
 # create --opt, image inspect, save, load, logs, kill, stop, rm, build). Read at call time: a function sent to the
