@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `zig/patches/0058-responses-include-encrypted.patch` (always on): `/v1/responses` accepts and ignores
+  `include: ["reasoning.encrypted_content"]`, which Pi and other Responses-API clients send with every reasoning
+  request; before, each such request was refused with a 400. Other `include` values are still refused. Test:
+  `zig/src/server/responses_include_test.zig` (fails without the change). Reported by **Unitea
+  ([unitea1992](https://github.com/unitea1992))**, issue #99.
 - `zig/patches/0057-drop-reasoning-history.patch` (`DROP_REASONING_HISTORY=1`, off by default): rank 0's
   `--drop-reasoning-history` removes `reasoning_content` from every assistant turn before the chat template renders, for
   clients that replay each turn's reasoning in a tool loop (long agent runs drifted into flat, then repeating reasoning:
