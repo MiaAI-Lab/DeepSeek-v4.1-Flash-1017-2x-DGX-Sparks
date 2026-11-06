@@ -1,0 +1,937 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 5245739cd..233d62fa2 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -720,19 +720,27 @@ pub const LaneHost = struct {
+         return h.interleave_ns > 0 and h.core.fill_chunks == 0;
+     }
+ 
++    /// The filling pass stands inside a chunk (between two layer slices), not between two chunks.
++    fn midChunk(h: *const LaneHost) bool {
++        const job = h.passing orelse return false;
++        return job.stream.fill_mid_chunk;
++    }
++
+     fn betweenWanted(ptr: *anyopaque) bool {
+         const h: *LaneHost = @ptrCast(@alignCast(ptr));
+         if (h.core.log != null) return false;
+-        return (h.interleaving() and h.core.runnableCount() > 0) or h.pending();
++        return (h.interleaving() and h.core.runnableCount() > 0) or (!h.midChunk() and h.pending());
+     }
+ 
+     /// Stream.between: decode rounds for the other live streams, interleave_ns at most, between two of the filling
+     /// job's prompt chunks; their tokens go out as they land. Then parked work's service. Engine thread only (inside
+-    /// the filling job's addStream).
++    /// the filling job's addStream). Inside a chunk (between two layer slices) it runs one round and no service: the
++    /// fence stays shut between a chunk's layers.
+     fn between(ptr: *anyopaque) anyerror!void {
+         const h: *LaneHost = @ptrCast(@alignCast(ptr));
+         if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
+-        h.in_between = true; // (the filling pass stands between two chunks: the service fence's one way in)
++        const mid = h.midChunk();
++        h.in_between = !mid; // (the filling pass stands between two chunks: the service fence's one way in)
+         defer h.in_between = false;
+         h.progressed(); // (a chunk ended: the stall monitor's clock restarts)
+         if (h.interleaving()) {
+@@ -762,9 +770,10 @@ pub const LaneHost = struct {
+                     } else i += 1;
+                 }
+                 h.noteLive();
++                if (mid) break;
+             }
+         }
+-        if (h.servicing()) {
++        if (h.servicing() and !mid) {
+             if (h.passing) |f| f.reported(); // its restore is done (a chunk ran): a restore's room may evict that entry now
+             h.service(h.tier.service_ns);
+         }
+@@ -1822,6 +1831,92 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
+     try std.testing.expectEqual(Reason.cancelled, a.wait());
+ }
+ 
++test "prefill interleave: inside a chunk's layer slices the host runs one round a park and no chunk-boundary work" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.interleave_ns = 50 * std.time.ns_per_ms; // (a chunk boundary runs rounds for up to this long, a slice park one)
++    try host.start();
++    defer host.stop();
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: usize = 0,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens += t.len,
++                .finished => |f| b.done = f.reason,
++                else => {},
++            }
++        }
++        fn read(b: *@This()) usize {
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            return b.tokens;
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    const e = host.engine();
++    const prompt_a = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++    var a: Box = .{};
++    const req_a: Request = .{ .prompt = &prompt_a, .max_tokens = 100000 };
++    try e.submit(1, &req_a, .{ .ctx = &a, .event = Box.event });
++    while (a.read() == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++    // B: two chunks of four slices; at each park note the rounds run and whether the host knows it stands inside a chunk
++    const Watch = struct {
++        host: *LaneHost,
++        target: *lanes.fake.Fake,
++        rounds: [6]u64 = @splat(0),
++        parks: usize = 0,
++        mid_seen: bool = true,
++        fenced: bool = true,
++        fn park(ctx: *anyopaque, _: *lanes.Stream) void {
++            const w: *@This() = @ptrCast(@alignCast(ctx));
++            if (w.parks < w.rounds.len) w.rounds[w.parks] = w.target.rounds;
++            w.parks += 1;
++            w.mid_seen = w.mid_seen and w.host.midChunk();
++            w.fenced = w.fenced and !w.host.in_between;
++        }
++    };
++    var watch = Watch{ .host = &host, .target = &target };
++    target.prefill_chunks = 2;
++    target.prefill_slices = 4;
++    target.mid_hook = Watch.park;
++    target.mid_hook_ctx = &watch;
++    const prompt_b = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4 };
++    var b: Box = .{};
++    const req_b: Request = .{ .prompt = &prompt_b, .max_tokens = 1 };
++    try e.submit(2, &req_b, .{ .ctx = &b, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(usize, 6), watch.parks); // 3 parks a chunk, none after its last slice
++    try std.testing.expect(watch.mid_seen and watch.fenced);
++    // one round between two parks of a chunk
++    for ([_]usize{ 0, 3 }) |first| {
++        try std.testing.expectEqual(watch.rounds[first] + 1, watch.rounds[first + 1]);
++        try std.testing.expectEqual(watch.rounds[first + 1] + 1, watch.rounds[first + 2]);
++    }
++    try std.testing.expect(!host.midChunk()); // (the flag is down outside a park)
++    e.cancel(1);
++    try std.testing.expectEqual(Reason.cancelled, a.wait());
++}
++
+ test "the service fence: never inside a round, a prompt pass's chunk or a graph capture; skipped and counted when not panicking" {
+     const gpa = std.testing.allocator;
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 4cf9c5141..714c58bf8 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -39,6 +39,9 @@ pub const Fake = struct {
+     prefill_count: usize = 0,
+     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
+     prefill_hook_ctx: ?*anyopaque = null,
++    prefill_slices: usize = 0, // layer slices a chunk runs in (0, 1: whole); the host's rounds run between two, as dsv41's sliced chunk offers them
++    mid_hook: ?*const fn (ctx: *anyopaque, s: *Stream) void = null, // before each such park
++    mid_hook_ctx: ?*anyopaque = null,
+     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+     refuse_busy: usize = 0, // a cut-in (Stream.cut_in) is refused this many times with error.FillBusy (its state gone)
+@@ -134,6 +137,12 @@ pub const Fake = struct {
+         while (l.pieces < total and ran < chunks) : (ran += 1) {
+             x.prefill_count += 1;
+             if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, l.pieces);
++            if (x.prefill_slices > 1) for (1..x.prefill_slices) |_| {
++                s.fill_mid_chunk = true;
++                defer s.fill_mid_chunk = false;
++                if (x.mid_hook) |mh| mh(x.mid_hook_ctx.?, s);
++                if (s.between) |b| if (b.wanted(b.ptr)) try b.run(b.ptr);
++            };
+             l.pieces += 1;
+             if (s.isCancelled()) return error.Cancelled;
+             // the host's rounds for the other streams between two chunks, as dsv41's prompt pass offers them
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 134debd74..a38edbcd5 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -186,6 +186,7 @@ pub const Stream = struct {
+     /// most this many tokens past the state it resumes; a backend that finds the state gone as the pass opens refuses
+     /// it (error.FillBusy) before it runs, and it waits for that pass as a long prompt does.
+     cut_in: u32 = 0,
++    fill_mid_chunk: bool = false, // the backend calls `between` inside a chunk (layer slices): rounds only, no chunk-boundary work
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+     context: std.ArrayList(u32) = .empty,
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 40006aaec..d08d94d3b 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -58,8 +58,9 @@ pub var logits_sha = false;
+ /// rank_wire too (rank_wire.zig's frames: the parts' agreement, each plan's ops, each transfer's
+ /// shard_xfer/shard_finish, the digest checks). Both on together share one rank_wire Leader (Lanes.rw, rank 0) and
+ /// one Follower a follower (PairFollower): one Tracker sees every frame of the pair. (Kind 11, the untracked spill
+-/// notes of round 2, is gone: a frame of it is BadFrame.)
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, fill_resume = 12 };
++/// notes of round 2, is gone: a frame of it is BadFrame.) fill_slice (TF_DS_PREFILL_SLICE) is 13: layers [lo, hi) of a
++/// chunk (SliceFrame).
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, fill_resume = 12, fill_slice = 13 };
+ 
+ comptime {
+     std.debug.assert(@intFromEnum(Kind.rank_wire) == @import("rank_wire.zig").lanes_kind);
+@@ -434,6 +435,39 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
+     if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
+ }
+ 
++/// A fill_slice frame's fields after kind and step: the layers [lo, hi), and for a chunk's first slice (lo 0) the chunk
++/// (fill_chunk's start, rows and replay).
++const SliceFrame = struct {
++    lo: u32,
++    hi: u32,
++    chunk: ?model.ChunkArgs = null,
++};
++
++fn putSlice(w: *Wire, gpa: std.mem.Allocator, f: SliceFrame) !void {
++    try w.int(gpa, u32, f.lo);
++    try w.int(gpa, u32, f.hi);
++    if (f.lo != 0) return;
++    const ck = f.chunk orelse return error.BadFrame;
++    try w.int(gpa, u64, ck.start);
++    try w.int(gpa, u32, @intCast(ck.n));
++    try w.int(gpa, u64, ck.replay);
++}
++
++fn getSlice(r: *Reader) !SliceFrame {
++    var f: SliceFrame = .{ .lo = try r.int(u32), .hi = try r.int(u32) };
++    if (f.hi <= f.lo) return error.BadFrame;
++    if (f.lo != 0) {
++        if (r.rest().len != 0) return error.BadFrame;
++        return f;
++    }
++    const start: usize = std.math.cast(usize, try r.int(u64)) orelse return error.BadFrame;
++    const n: usize = try r.int(u32);
++    const replay: usize = std.math.cast(usize, try r.int(u64)) orelse return error.BadFrame;
++    if (r.rest().len != 0) return error.BadFrame;
++    f.chunk = .{ .start = start, .n = n, .replay = replay };
++    return f;
++}
++
+ /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
+ const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false, base: usize = 0, restored: bool = false, part: ?u64 = null };
+ 
+@@ -805,6 +839,7 @@ pub const Lanes = struct {
+             if (self.paused != null and self.paused.?.s == s) try self.fillResume() else try self.fillOpen(s);
+         }
+         errdefer self.fill = null;
++        errdefer m.dropChunk();
+         const f = &self.fill.?;
+         const seq = self.seqs[f.slot].items;
+         m.fill_seq = seq;
+@@ -819,18 +854,20 @@ pub const Lanes = struct {
+             const len = f.len;
+             if (start > 0 and s.isCancelled()) return error.Cancelled;
+             const n = @min(model.chunk_rows, len - start);
+-            if (try self.begin(.fill_chunk)) {
++            // TF_DS_KV_SHARD pins the twins for the whole chunk: it runs whole
++            const sliced = m.slice_layers > 0 and self.kv == null and midWanted(s);
++            if (!sliced) if (try self.begin(.fill_chunk)) {
+                 try self.wire.int(self.gpa, u64, start);
+                 try self.wire.int(self.gpa, u32, @intCast(n));
+                 try self.wire.int(self.gpa, u64, f.replay);
+                 try self.flush();
+-            }
++            };
+             if (self.spill) |t| t.bump(f.base + start, f.base + start + n);
+             f.head = blk: {
+                 // TF_DS_KV_SHARD: the stream's twins pinned while its chunk runs (parts.zig setPartial), not between
+                 if (f.part) |id| self.kv.?.planner.setPartial(id, true);
+                 defer if (f.part) |id| self.kv.?.planner.setPartial(id, false);
+-                break :blk try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
++                break :blk if (sliced) try self.fillSliced(s, seq, .{ .start = start, .n = n, .replay = f.replay }) else try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+             };
+             f.start += n;
+             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+@@ -862,6 +899,47 @@ pub const Lanes = struct {
+         return true;
+     }
+ 
++    /// Whether the host would run rounds for other streams inside a chunk (Stream.between, between two layer slices).
++    fn midWanted(s: *lanes.Stream) bool {
++        const b = s.between orelse return false;
++        if (s.images.len > 0) return false;
++        s.fill_mid_chunk = true;
++        defer s.fill_mid_chunk = false;
++        return b.wanted(b.ptr);
++    }
++
++    /// A chunk in slices of TF_DS_PREFILL_SLICE layers, the host's decode round between two (the parks are Stream.between's,
++    /// as between chunks); true when it reached the head. Each slice reaches rank 1 as a fill_slice frame.
++    fn fillSliced(self: *Lanes, s: *lanes.Stream, seq: []const i32, args: model.ChunkArgs) !bool {
++        const m = self.m;
++        var lo: usize = 0;
++        while (true) {
++            const sl = model.nextSlice(m.eng.c.layers, m.slice_layers, lo);
++            if (try self.begin(.fill_slice)) {
++                try putSlice(&self.wire, self.gpa, .{ .lo = @intCast(sl.lo), .hi = @intCast(sl.hi), .chunk = if (sl.lo == 0) args else null });
++                try self.flush();
++            }
++            const end = try m.fillSlice(seq[0 .. args.start + args.n], args, sl.lo, sl.hi);
++            if (end != .more) return end == .head;
++            lo = sl.hi;
++            try self.parkSlice(s, seq);
++            if (args.start > 0 and s.isCancelled()) return error.Cancelled;
++        }
++    }
++
++    /// Between two slices of a chunk: one decode round for the other streams, the chunk's Engram read-ahead left running
++    /// where Model.pauseAhead allows.
++    fn parkSlice(self: *Lanes, s: *lanes.Stream, seq: []const i32) !void {
++        if (!midWanted(s)) return;
++        const b = s.between.?;
++        const m = self.m;
++        s.fill_mid_chunk = true;
++        defer s.fill_mid_chunk = false;
++        m.pauseAhead();
++        try b.run(b.ptr);
++        m.fill_seq = seq;
++    }
++
+     /// A paused pass resumes: both ranks' model views back on its slot and extent, whose rows, rings and ids it kept.
+     fn fillResume(self: *Lanes) !void {
+         const f = self.paused.?;
+@@ -1465,6 +1543,7 @@ pub const Lanes = struct {
+         const self = of(ptr);
+         if (self.fill) |f| if (f.s == s) {
+             self.m.joinAhead();
++            self.m.dropChunk();
+             self.m.fill_seq = &.{};
+             self.fill = null;
+         };
+@@ -1875,15 +1954,21 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+             9 => .done,
+             10 => .rank_wire,
+             12 => .fill_resume,
++            13 => .fill_slice,
+             else => return error.BadFrame,
+         };
+         if (try r.int(u64) != step) return error.OutOfStep;
+         step += 1;
+         if (spill) |sd| sd.service(std.time.ns_per_ms); // (rank 0 pumps between its primitives alike)
+         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
+-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and kind != .rank_wire) {
+-            m.joinAhead();
+-            m.fill_seq = &.{};
++        // (a round beside a part-run chunk leaves the read-ahead running, as rank 0's park does: Model.pauseAhead)
++        if (kind != .fill_chunk and kind != .fill_slice and kind != .snap_save and kind != .snap_restore and kind != .fill_images and kind != .rank_wire) {
++            if (kind == .verify or kind == .pass) {
++                m.pauseAhead();
++            } else {
++                m.joinAhead();
++                m.fill_seq = &.{};
++            }
+         }
+         switch (kind) {
+             .fill_begin => {
+@@ -1919,6 +2004,14 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+                 // an error that parts the ranks (an Engram read this rank could not make) ends the follower; rank 0 ends the pair
+                 if (m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay)) |_| {} else |err| try roundRefused(err);
+             },
++            .fill_slice => {
++                const f = try getSlice(&r);
++                const args = f.chunk orelse m.resumeArgs() orelse return error.BadFrame;
++                if (args.start + args.n > seqs[slot].items.len) return error.BadChunk;
++                if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a slice after a round: the read-ahead again
++                if (f.lo == 0) if (spill) |sd| sd.bump(fill_base + args.start, fill_base + args.start + args.n);
++                if (m.fillSlice(seqs[slot].items[0 .. args.start + args.n], args, f.lo, f.hi)) |_| {} else |err| try roundRefused(err);
++            },
+             .verify => {
+                 const nw = try r.int(u32);
+                 if (nw == 0 or nw > max_streams) return error.BadFrame;
+@@ -2062,6 +2155,57 @@ test "a frame's fields read back as written" {
+     try std.testing.expectError(error.ShortFrame, r.int(u8));
+ }
+ 
++test "a fill_slice frame reads back as written, with the chunk on the first slice only" {
++    const gpa = std.testing.allocator;
++    var w: Wire = .{};
++    defer w.deinit(gpa);
++    try w.begin(gpa, .fill_slice, 3);
++    try putSlice(&w, gpa, .{ .lo = 0, .hi = 8, .chunk = .{ .start = 4096, .n = 2048, .replay = 5322 } });
++    var r: Reader = .{ .b = w.buf.items };
++    try std.testing.expectEqual(@as(u8, 13), try r.int(u8));
++    try std.testing.expectEqual(@as(u64, 3), try r.int(u64));
++    const first = try getSlice(&r);
++    try std.testing.expectEqual(@as(u32, 0), first.lo);
++    try std.testing.expectEqual(@as(u32, 8), first.hi);
++    try std.testing.expectEqual(model.ChunkArgs{ .start = 4096, .n = 2048, .replay = 5322 }, first.chunk.?);
++
++    try w.begin(gpa, .fill_slice, 5);
++    try putSlice(&w, gpa, .{ .lo = 8, .hi = 16 });
++    r = .{ .b = w.buf.items };
++    try std.testing.expectEqual(@as(u8, 13), try r.int(u8));
++    try std.testing.expectEqual(@as(u64, 5), try r.int(u64));
++    const next = try getSlice(&r);
++    try std.testing.expectEqual(@as(u32, 8), next.lo);
++    try std.testing.expect(next.chunk == null);
++}
++
++test "a fill_slice frame needs its chunk on the first slice and an ordered layer range" {
++    const gpa = std.testing.allocator;
++    var w: Wire = .{};
++    defer w.deinit(gpa);
++    try std.testing.expectError(error.BadFrame, putSlice(&w, gpa, .{ .lo = 0, .hi = 8 }));
++    w.buf.clearRetainingCapacity();
++    try w.int(gpa, u32, 8);
++    try w.int(gpa, u32, 8);
++    var r: Reader = .{ .b = w.buf.items };
++    try std.testing.expectError(error.BadFrame, getSlice(&r));
++    w.buf.clearRetainingCapacity();
++    try putSlice(&w, gpa, .{ .lo = 8, .hi = 16 });
++    try w.int(gpa, u8, 0); // a later slice carries nothing after its range
++    r = .{ .b = w.buf.items };
++    try std.testing.expectError(error.BadFrame, getSlice(&r));
++    w.buf.clearRetainingCapacity();
++    try putSlice(&w, gpa, .{ .lo = 0, .hi = 8, .chunk = .{ .start = 0, .n = 64, .replay = 0 } });
++    try w.int(gpa, u8, 0); // nor does a first one after its chunk
++    r = .{ .b = w.buf.items };
++    try std.testing.expectError(error.BadFrame, getSlice(&r));
++    w.buf.clearRetainingCapacity();
++    try w.int(gpa, u32, 0);
++    try w.int(gpa, u32, 8);
++    r = .{ .b = w.buf.items };
++    try std.testing.expectError(error.ShortFrame, getSlice(&r));
++}
++
+ test "a round's rows: each window at its positions, its ids written over the rejected rows" {
+     const gpa = std.testing.allocator;
+     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 8b37d6e3e..b89c95521 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -36,6 +36,50 @@ const prompt_rows = @import("prompt_rows.zig");
+ 
+ /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
+ pub const chunk_rows = 2048;
++
++/// A prompt chunk runs in slices of this many layers at most, a decode round between two (TF_DS_PREFILL_SLICE; 0: the whole chunk).
++pub const max_slice_layers = 40;
++pub const slice_env = "TF_DS_PREFILL_SLICE";
++pub const slice_hint = std.fmt.comptimePrint("{s}: the layers a prompt chunk runs between decode rounds, 1 to {d} (unset or 0: the whole chunk)", .{ slice_env, max_slice_layers });
++
++/// TF_DS_PREFILL_SLICE's text as the slice's layers (error.BadSliceLayers: not a number or over the limit).
++pub fn parseSliceLayers(text: []const u8) error{BadSliceLayers}!usize {
++    const layers = std.fmt.parseInt(usize, std.mem.trim(u8, text, " "), 10) catch return error.BadSliceLayers;
++    if (layers > max_slice_layers) return error.BadSliceLayers;
++    return layers;
++}
++
++/// One slice of a chunk: layers [lo, hi), and whether it reaches the chunk's last layer.
++pub const Slice = struct { lo: usize, hi: usize, last: bool };
++
++/// The slice of a `layers`-layer chunk that starts at layer `lo`, `per` layers long (0: the rest of the chunk).
++pub fn nextSlice(layers: usize, per: usize, lo: usize) Slice {
++    const hi = if (per == 0) layers else @min(lo + per, layers);
++    return .{ .lo = lo, .hi = hi, .last = hi == layers };
++}
++
++/// A chunk's placement in its prompt, as a slice that starts it carries it.
++pub const ChunkArgs = struct { start: usize, n: usize, replay: usize };
++
++/// How a slice ended: layers remain, the chunk reached the head, or it was encoder-only and stopped at the decoder's first layer.
++pub const SliceEnd = enum { more, head, encoder_only };
++
++/// What a part-run chunk keeps between its slices; `live` while one is part run.
++pub const Resume = struct {
++    live: bool = false,
++    next: usize = 0, // the layer the next slice starts at
++    args: ChunkArgs = .{ .start = 0, .n = 0, .replay = 0 },
++    shared: prompt.Shared = .{},
++    floor: usize = 0,
++    kv_done: ?usize = null,
++    ahead: ?std.Thread = null, // this chunk's Engram read-ahead of its second layer
++
++    /// Joins the read-ahead and forgets the chunk.
++    pub fn reset(r: *Resume) void {
++        if (r.ahead) |th| th.join();
++        r.* = .{};
++    }
++};
+ /// The pool's streams (--parallel 4).
+ pub const max_streams = draft.max_streams;
+ /// The pool's streams when unset (--parallel 4).
+@@ -75,6 +119,7 @@ pub const Options = struct {
+     plain_rows: usize = round.default_rows, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; 0: the round's own)
+     window_rows: usize = prompt_rows.default_window, // a chunk under these rows takes the MoE decode window (TF_DS_PROMPT_WINDOW_ROWS; every rank alike)
+     gemm_rows: usize = prompt_rows.default_gemm, // a chunk over these rows takes the prefill GEMM (TF_DS_PROMPT_GEMM_ROWS; every rank alike)
++    slice_layers: usize = 0, // a chunk's layers between decode rounds (TF_DS_PREFILL_SLICE; rank 0's: a follower runs the slices its frames name; 0: the whole chunk)
+     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
+     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
+     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+@@ -92,6 +137,8 @@ pub const Model = struct {
+     streams: usize, // the pool's streams (Options.streams)
+     window_rows: usize, // Options.window_rows
+     gemm_rows: usize, // Options.gemm_rows
++    slice_layers: usize, // Options.slice_layers
++    rs: Resume, // the chunk part run between two slices
+     round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
+     pool_cap: usize,
+     cache_dir: std.Io.Dir,
+@@ -126,6 +173,7 @@ pub const Model = struct {
+     aio: ?*engram_aio.Aio = null,
+     paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
+     paio2: ?*engram_aio.Aio = null, // TF_DS_ENGRAM_LEAD: the second Engram layer's prompt reads, on a ring of their own
++    ahead_apart: bool = false, // a round's reads and the prompt's go to rings of their own (else the pool runs one job at a time)
+     eh: ?prompt.EngramHost = null,
+     host_pos: []i64,
+     ids64: []i64,
+@@ -193,6 +241,9 @@ pub const Model = struct {
+         if (!prompt_rows.validGemm(o.gemm_rows)) return error.BadPromptGemmRows;
+         m.window_rows = o.window_rows;
+         m.gemm_rows = o.gemm_rows;
++        if (o.slice_layers > max_slice_layers) return error.BadSliceLayers;
++        m.slice_layers = o.slice_layers;
++        m.rs = .{};
+         m.round_ms = o.round_ms orelse &draft.round_ms;
+         if (m.round_ms.len == 0) return error.BadRoundMs;
+         m.pool_cap = o.pool; // (agree, below, compares it with the other rank's)
+@@ -210,6 +261,7 @@ pub const Model = struct {
+         m.aio = null;
+         m.paio = null;
+         m.paio2 = null;
++        m.ahead_apart = false;
+         m.eh = null;
+         m.fill_seq = &.{};
+         m.ahead = null;
+@@ -410,6 +462,7 @@ pub const Model = struct {
+                 // a prompt chunk's reads (2 x 12 x 2,048 at most): a ring of 4,096 slots (32 MiB), 1,024 rows a batch
+                 m.paio = try engram_aio.Aio.init(gpa, io, 4096);
+                 m.eh.?.paio = m.paio;
++                m.ahead_apart = true;
+             }
+             // TF_DS_ENGRAM_LEAD=1, read on each rank (they need not agree): each Engram layer's prompt reads on a ring
+             if (engram_lead.enabled(if (std.c.getenv("TF_DS_ENGRAM_LEAD")) |v| std.mem.span(v) else null)) {
+@@ -621,13 +674,28 @@ pub const Model = struct {
+     // -- the primitives (both ranks, in the same order) ----------------------------------------------------------
+ 
+     /// A stream's prompt is about to fill pool slot `slot`, its compressed rows in its extent from position `base`.
+-    /// Wait for the next chunk's Engram read-ahead, if one runs (before the prompt it reads changes or goes).
++    /// Wait for the next chunk's Engram read-ahead and a part-run chunk's, if they run (before the prompt they read changes or goes).
+     pub fn joinAhead(m: *Model) void {
+         if (m.ahead) |th| th.join();
+         m.ahead = null;
++        if (m.rs.ahead) |th| th.join();
++        m.rs.ahead = null;
+         m.lead.joinAll(); // (TF_DS_ENGRAM_LEAD's readers)
+     }
+ 
++    /// A chunk is part run and its read-ahead has rings of its own, so a round shares no buffer with it.
++    fn aheadParked(m: *const Model) bool {
++        return m.rs.live and m.ahead_apart;
++    }
++
++    /// Before a decode round beside a pass: the read-ahead is joined and the pass's ids forgotten, except while a chunk is
++    /// part run with rings apart, where the read-ahead runs across the round and the next slice finds its rows.
++    pub fn pauseAhead(m: *Model) void {
++        if (m.aheadParked()) return;
++        m.joinAhead();
++        m.fill_seq = &.{};
++    }
++
+     /// A kept prompt state's own bytes (the prompt cache's snapshots; the compressed plane stays in the stream's
+     /// extent): one slot's window ring of every layer and positional stores of every ratio-2 layer.
+     pub fn snapBytes(m: *const Model) usize {
+@@ -945,6 +1013,7 @@ pub const Model = struct {
+         if (m.eh) |*eh| { // rows read ahead for another prompt are not this one's, even at the same positions
+             eh.ahead_start = std.math.maxInt(usize);
+             eh.ahead_ready = .{ false, false };
++            eh.chunk_hashed = false;
+             eh.ahead_n = 0;
+             eh.ahead_err = null;
+             if (eh.lead_on) m.lead.reset(eh);
+@@ -1120,6 +1189,7 @@ pub const Model = struct {
+         if (slot >= m.streams) return error.BadSlot;
+         // a read-ahead an earlier pass left (cancelled between chunks) never feeds this one: a resume at that pass's
+         // next chunk start would otherwise take its rows, hashed from the other prompt's ids
++        m.dropChunk();
+         m.resetEngramAhead();
+         m.spans.clearRetainingCapacity();
+         m.ch.spans = &.{};
+@@ -1141,6 +1211,33 @@ pub const Model = struct {
+     /// the decoder's first layer). A chunk that reaches the head leaves the logits of its last row in ch.head_g and,
+     /// drafting, its DSpark taps absorbed into the slot's drafter rings. True when it reached the head.
+     pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
++        const end = try m.fillSlice(seq, .{ .start = start, .n = n, .replay = replay }, 0, m.eng.c.layers);
++        return end == .head;
++    }
++
++    /// Layers [lo, hi) of a chunk: lo 0 starts the chunk (`args`, seq through its end, as fillChunk takes them), any
++    /// other lo continues the part-run chunk from the layer it stopped at. The slice that reaches the last layer (or
++    /// the replay cut of an encoder-only chunk) ends the chunk as fillChunk does. A failed slice leaves no chunk to resume.
++    pub fn fillSlice(m: *Model, seq: []const i32, args: ChunkArgs, lo: usize, hi: usize) !SliceEnd {
++        return m.sliceRun(seq, args, lo, hi) catch |err| {
++            m.rs.reset();
++            return err;
++        };
++    }
++
++    /// The part-run chunk's placement (null: none runs).
++    pub fn resumeArgs(m: *const Model) ?ChunkArgs {
++        return if (m.rs.live) m.rs.args else null;
++    }
++
++    /// Forgets a part-run chunk, if one is.
++    pub fn dropChunk(m: *Model) void {
++        if (m.rs.live) m.rs.reset();
++    }
++
++    fn openChunk(m: *Model, seq: []const i32, args: ChunkArgs) !void {
++        const start = args.start;
++        const n = args.n;
+         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
+         const e = &m.eng;
+         const c = e.c;
+@@ -1149,21 +1246,17 @@ pub const Model = struct {
+         // image token's, which its span row then replaces
+         const image_id: i64 = if (c.image_token) |t| t else 0;
+         for (0..n) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
+-        var shared: prompt.Shared = .{};
+         const pt = m.ptimer;
+         if (pt) |t| try t.mark(m.stream, .start);
+         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
+         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
+         if (pt) |t| try t.mark(m.stream, .embed);
+-        const taps = m.dr != null;
+-        var floor: usize = 0;
+-        var kv_done: ?usize = null;
+         // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
+         // overlap): this chunk's both layers' during the chunk before it (m.ahead), else the first layer's from the
+         // chunk's start and the next's once the first is applied
+         var ahead: ?std.Thread = m.ahead;
+         m.ahead = null;
+-        defer if (ahead) |th| th.join();
++        m.rs = .{ .live = true, .args = args };
+         if (m.eh) |*eh| ref: {
+             // TF_DS_ENGRAM_LEAD: each layer's rows come from its own reader (engram_lead.zig), not the read-ahead below
+             if (eh.lead_on) {
+@@ -1180,29 +1273,49 @@ pub const Model = struct {
+                 eh.ahead_start = start;
+                 eh.ahead_n = n;
+                 eh.ahead_ready = .{ false, false };
++                eh.chunk_hashed = false;
+                 eh.ahead_err = null;
+                 ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+             }
+         }
+-        for (0..c.layers) |li| {
++        m.rs.ahead = ahead;
++    }
++
++    fn sliceRun(m: *Model, seq: []const i32, args: ChunkArgs, lo: usize, hi: usize) !SliceEnd {
++        const e = &m.eng;
++        const c = e.c;
++        const ch = &m.ch;
++        const rs = &m.rs;
++        if (hi <= lo or hi > c.layers) return error.BadSlice;
++        if (lo == 0) {
++            m.dropChunk();
++            try m.openChunk(seq, args);
++        } else if (!rs.live or rs.next != lo or seq.len != rs.args.start + rs.args.n) return error.BadSlice;
++        const start = rs.args.start;
++        const n = rs.args.n;
++        const replay = rs.args.replay;
++        const pt = m.ptimer;
++        const taps = m.dr != null;
++        for (lo..hi) |li| {
+             if (li == c.layers / 2) {
+-                if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
++                if (!try prompt.replayCut(e, ch, &m.view, &rs.shared, li, replay, m.host_pos)) {
+                     // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
+                     // run while this one's last layers do; the profile alone waits
+                     if (pt) |t| {
+                         try m.stream.synchronize();
+                         try t.finish();
+                     }
+-                    return false;
++                    m.rs.reset();
++                    return .encoder_only;
+                 }
+-                floor = replay;
+-                kv_done = li;
++                rs.floor = replay;
++                rs.kv_done = li;
+             }
+             if (e.w.layers[li].engram_wkv != null) {
+                 const eh = if (m.eh) |*x| x else return error.NoEngramTables;
+-                if (ahead) |th| {
++                if (rs.ahead) |th| {
+                     th.join();
+-                    ahead = null;
++                    rs.ahead = null;
+                 }
+                 if (eh.ahead_err) |err| return err;
+                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
+@@ -1216,13 +1329,14 @@ pub const Model = struct {
+                     m.lead.after(eh, c, seq, start, n, j, if (more) m.fill_seq[0 .. start + n + nn] else null, nn);
+                 } else if (j + 1 < ne) {
+                     if (!eh.ahead_ready[j + 1])
+-                        ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
++                        rs.ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
+                 } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
+                     // the next chunk's rows while this one's layers run
+                     const nn = @min(chunk_rows, m.fill_seq.len - start - n);
+                     eh.ahead_start = start + n;
+                     eh.ahead_n = nn;
+                     eh.ahead_ready = .{ false, false };
++                    eh.chunk_hashed = false;
+                     eh.ahead_err = null;
+                     m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
+                 }
+@@ -1232,7 +1346,7 @@ pub const Model = struct {
+             if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
+             try prompt.attnMixes(e, ch, li);
+             if (pt) |t| try t.mark(m.stream, .mix_attn);
+-            try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
++            try prompt.attention(e, ch, &m.view, &rs.shared, li, m.ring_view[li], rs.floor, rs.kv_done != null and rs.kv_done.? == li);
+             if (pt) |t| try t.mark(m.stream, .attn);
+             try prompt.gather(e, ch, ch.pa, ch.ga);
+             if (pt) |t| try t.mark(m.stream, .gather_a);
+@@ -1244,6 +1358,8 @@ pub const Model = struct {
+             if (pt) |t| try t.mark(m.stream, .gather_m);
+             prompt.endLayer(ch);
+         }
++        rs.next = hi;
++        if (hi < c.layers) return .more;
+         try prompt.head(e, ch);
+         if (pt) |t| try t.mark(m.stream, .head);
+         if (m.dr) |*dr| {
+@@ -1259,7 +1375,8 @@ pub const Model = struct {
+             try m.stream.synchronize();
+             try t.finish();
+         }
+-        return true;
++        m.rs.reset();
++        return .head;
+     }
+ 
+     /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.
+@@ -1272,7 +1389,7 @@ pub const Model = struct {
+     /// eager absorb: rows past the ones the round keeps sit where the drafter never reads, and the next window
+     /// overwrites them). absorb[i]: window i's stream drafts.
+     pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool) !void {
+-        m.joinAhead(); // a prompt chunk's Engram read-ahead shares the host buffers a round's Engram reads use
++        if (!m.aheadParked()) m.joinAhead(); // a prompt chunk's Engram read-ahead shares the host buffers a round's Engram reads use
+         const e = &m.eng;
+         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
+         const t0 = m.now();
+@@ -1375,6 +1492,113 @@ pub const Model = struct {
+     }
+ };
+ 
++test "the slice knob parses to 0 or 1 to 40 layers" {
++    try std.testing.expectEqual(@as(usize, 0), try parseSliceLayers("0"));
++    try std.testing.expectEqual(@as(usize, 5), try parseSliceLayers("5"));
++    try std.testing.expectEqual(@as(usize, 40), try parseSliceLayers(" 40 "));
++    for ([_][]const u8{ "41", "100", "-1", "", "abc", "4.0" }) |bad|
++        try std.testing.expectError(error.BadSliceLayers, parseSliceLayers(bad));
++}
++
++/// The slices of a chunk of `layers` layers at `per` layers a slice, as [lo, hi) pairs in order.
++fn sliceBounds(out: *std.ArrayList([2]usize), layers: usize, per: usize) !void {
++    var lo: usize = 0;
++    while (true) {
++        const sl = nextSlice(layers, per, lo);
++        try out.append(std.testing.allocator, .{ sl.lo, sl.hi });
++        if (sl.last) return;
++        lo = sl.hi;
++    }
++}
++
++test "a chunk's slices tile its layers in order, the last one reaching the end" {
++    for ([_]usize{ 1, 5, 8, 40 }) |per| {
++        var out: std.ArrayList([2]usize) = .empty;
++        defer out.deinit(std.testing.allocator);
++        try sliceBounds(&out, 40, per);
++        try std.testing.expectEqual((40 + per - 1) / per, out.items.len);
++        var next: usize = 0;
++        for (out.items) |b| {
++            try std.testing.expectEqual(next, b[0]);
++            try std.testing.expect(b[1] > b[0] and b[1] - b[0] <= per);
++            next = b[1];
++        }
++        try std.testing.expectEqual(@as(usize, 40), next);
++    }
++    var out: std.ArrayList([2]usize) = .empty;
++    defer out.deinit(std.testing.allocator);
++    try sliceBounds(&out, 40, 8);
++    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 8 }, .{ 8, 16 }, .{ 16, 24 }, .{ 24, 32 }, .{ 32, 40 } }, out.items);
++    out.clearRetainingCapacity();
++    try sliceBounds(&out, 40, 5);
++    try std.testing.expectEqual(@as(usize, 8), out.items.len);
++    try std.testing.expectEqual([2]usize{ 35, 40 }, out.items[7]);
++}
++
++test "a slice of 0 layers is the whole chunk, and one longer than the chunk is clamped to it" {
++    const whole = nextSlice(40, 0, 0);
++    try std.testing.expectEqual(Slice{ .lo = 0, .hi = 40, .last = true }, whole);
++    try std.testing.expectEqual(Slice{ .lo = 0, .hi = 40, .last = true }, nextSlice(40, 40, 0));
++    try std.testing.expectEqual(Slice{ .lo = 30, .hi = 40, .last = true }, nextSlice(40, 16, 30));
++    try std.testing.expectEqual(Slice{ .lo = 0, .hi = 16, .last = false }, nextSlice(40, 16, 0));
++}
++
++fn parkedThread() void {}
++
++test "resetting the resume state joins the read-ahead and forgets the chunk" {
++    var r: Resume = .{
++        .live = true,
++        .next = 12,
++        .args = .{ .start = 2048, .n = 2048, .replay = 100 },
++        .shared = .{ .kv_layer = 3, .kk = 4, .pool = true },
++        .floor = 7,
++        .kv_done = 20,
++        .ahead = try std.Thread.spawn(.{}, parkedThread, .{}),
++    };
++    r.reset();
++    try std.testing.expect(!r.live and r.ahead == null and r.kv_done == null);
++    try std.testing.expectEqual(@as(usize, 0), r.next);
++    try std.testing.expectEqual(@as(usize, 0), r.args.n);
++    try std.testing.expectEqual(@as(?usize, null), r.shared.kv_layer);
++    try std.testing.expectEqual(@as(usize, 0), r.floor);
++    r.reset();
++    try std.testing.expect(!r.live);
++}
++
++test "a round beside a part-run chunk leaves the read-ahead and the pass's ids when the rings are apart, else joins both" {
++    const ids = [_]i32{ 1, 2, 3 };
++    var m: Model = undefined;
++    m.rs = .{};
++    m.lead = .{};
++    // a chunk part run, the rings apart: nothing joins, nothing clears
++    m.rs.live = true;
++    m.ahead_apart = true;
++    m.fill_seq = &ids;
++    m.ahead = try std.Thread.spawn(.{}, parkedThread, .{});
++    m.pauseAhead();
++    try std.testing.expect(m.ahead != null);
++    try std.testing.expectEqual(@as(usize, 3), m.fill_seq.len);
++    // the rings shared (the pool runs one job at a time): joined and cleared
++    m.ahead_apart = false;
++    m.pauseAhead();
++    try std.testing.expect(m.ahead == null);
++    try std.testing.expectEqual(@as(usize, 0), m.fill_seq.len);
++    // no chunk part run (the knob off, or between chunks): joined and cleared
++    m.rs.live = false;
++    m.ahead_apart = true;
++    m.fill_seq = &ids;
++    m.ahead = try std.Thread.spawn(.{}, parkedThread, .{});
++    m.pauseAhead();
++    try std.testing.expect(m.ahead == null);
++    try std.testing.expectEqual(@as(usize, 0), m.fill_seq.len);
++    // a part-run chunk's own read-ahead is joined with the rest when the rings are shared
++    m.rs.live = true;
++    m.ahead_apart = false;
++    m.rs.ahead = try std.Thread.spawn(.{}, parkedThread, .{});
++    m.pauseAhead();
++    try std.testing.expect(m.rs.ahead == null);
++}
++
+ test "copyExtent's refusals come before anything is enqueued: pool bounds, parts, ratios, overlap, a stale source" {
+     const R = Model.extentRefusal;
+     const ratios = [_]usize{ 1, 2 };
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 51644e441..5c7364ed9 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -29,6 +29,10 @@
+ //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
+ //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
+ //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
++//!   TF_DS_PREFILL_SLICE=<layers>                (rank 0; with TF_DS_PREFILL_INTERLEAVE_MS) a prompt chunk runs this many layers
++//!                                               (1 .. 40) at a time and one decode round runs between slices, so the decoding
++//!                                               streams stall a slice, not a chunk (unset or 0: the whole chunk; a follower
++//!                                               runs the slices rank 0's frames name)
+ //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
+ //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
+ //!   TF_DS_T25_DRAFT_CAL                         a weight in (0, 1]: each stream's draft survival is scaled by its realised over
+@@ -234,6 +238,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .plain_rows = if (getenv("TF_DS_PLAIN_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadPlainRows else round.default_rows,
+         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
+         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
++        .slice_layers = if (getenv(model.slice_env)) |v| model.parseSliceLayers(v) catch return error.BadSliceLayers else 0,
+     };
+     st.m = try model.Model.open(gpa, io, ctx, mo);
+     errdefer st.m.close();
+@@ -649,6 +654,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
+         error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
+         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
++        error.BadSliceLayers => model.slice_hint,
+         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
+         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
+         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+@@ -698,6 +704,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+ 
+ test "refusals name what to set" {
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadSliceLayers).?, "TF_DS_PREFILL_SLICE") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadPromptWindowRows).?, "TF_DS_PROMPT_WINDOW_ROWS") != null);
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index d77e94b1a..b463c5c9d 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -1410,6 +1410,7 @@ pub const EngramHost = struct {
+     lo: usize,
+     hi: usize,
+     hashes: []i64, // [cap][layers][cols]
++    chunk_hashes: []i64, // the same for the read-ahead threads: a round between a chunk's slices writes `hashes`
+     flat: []i64, // [cap * (hi - lo)]
+     w: []u8, // FP8 rows
+     s: []u8, // their E8M0 scales
+@@ -1430,6 +1431,7 @@ pub const EngramHost = struct {
+     ahead_rows: [2][]u16 = .{ &.{}, &.{} },
+     ahead_flat: [2][]i64 = .{ &.{}, &.{} },
+     ahead_ready: [2]bool = .{ false, false },
++    chunk_hashed: bool = false, // chunk_hashes holds the hashes of [ahead_start, ahead_start + ahead_n); clear it with ahead_ready
+     ahead_start: usize = 0,
+     ahead_n: usize = 0,
+     ahead_err: ?anyerror = null,
+@@ -1488,6 +1490,7 @@ pub const EngramHost = struct {
+             .lo = lo,
+             .hi = hi,
+             .hashes = try gpa.alloc(i64, cap * hasher.layers * cols),
++            .chunk_hashes = try gpa.alloc(i64, cap * hasher.layers * cols),
+             .flat = try gpa.alloc(i64, cap * k),
+             .w = try gpa.alloc(u8, cap * k * t.row_w),
+             .s = try gpa.alloc(u8, cap * k * t.row_s),
+@@ -1527,9 +1530,13 @@ fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usiz
+     const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+     const cols = eh.hasher.cols();
+     const k = eh.hi - eh.lo;
+-    if (j == 0) eh.hasher.hashes(seq, start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
++    // layer 0's read-ahead hashes the chunk; a later layer hashes it too when that thread never ran (spawn failed)
++    if (j == 0 or !eh.chunk_hashed) {
++        eh.hasher.hashes(seq, start, n, eh.chunk_hashes[0 .. n * eh.hasher.layers * cols]);
++        eh.chunk_hashed = true;
++    }
+     for (0..n) |r| {
+-        for (0..k) |q| eh.ahead_flat[j][r * k + q] = eh.hashes[(r * eh.hasher.layers + j) * cols + eh.lo + q];
++        for (0..k) |q| eh.ahead_flat[j][r * k + q] = eh.chunk_hashes[(r * eh.hasher.layers + j) * cols + eh.lo + q];
+     }
+     const m = n * k;
+     // by AIO on the prompt's ring when it is open (the main thread reads by it only after joining this one)
