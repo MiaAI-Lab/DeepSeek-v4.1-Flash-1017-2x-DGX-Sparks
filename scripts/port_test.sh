@@ -318,20 +318,23 @@ case_ "spill args name the checked path" 0 "SPILL_GIB=8" "$expect
   port_spill_judge 1 there '$ok_line'
   expect \"\$(port_spill_args 1)\" '--label tf.recipe.spill=/home/u/.cache/dsv41-tensorfold-spill -v /home/u/.cache/dsv41-tensorfold-spill:/spill'"
 
-# ---- port_engram_check: with the spill tier on, both ranks must list the same regular files of their Engram folder,
-# because the engine's rank fingerprint compares exactly that (name and size; symlinks are skipped, so a HF snapshot
-# lists nothing against the worker's copied files) — issue #61. Checked before anything is stopped.
+# ---- port_engram_check: with the spill tier on, both ranks must list the same files of their Engram folder, because
+# the engine's rank fingerprint compares exactly that (name and size, through symlinks; directories skipped: rebased
+# 0016, rank_identity.zig listing()). A HF snapshot's symlinks list as their blobs, like the worker's copies — issue #61.
 et=$(mktemp -d "${TMPDIR:-/tmp}/port-engram.XXXXXX")
 mkdir -p "$et/real" "$et/snap"
 printf 'abcde' > "$et/real/config.json"
 printf 'abcdefg' > "$et/real/model.safetensors.index.json"
 ln -s "$et/real/config.json" "$et/snap/config.json"
 ln -s "$et/real/model.safetensors.index.json" "$et/snap/model.safetensors.index.json"
+mkdir -p "$et/snap/sub" "$et/extra"   # a directory in the snapshot is skipped, as the engine skips it
+cp "$et/real/"* "$et/extra/"; printf 'zz' > "$et/extra/.cache_note"
 et_list='config.json:5; model.safetensors.index.json:7; '
 et_stubs="engram_rev() { echo 1bae0e1088993b9b82de08f59de5be5a34e42170; }; worker_host() { echo w; }; ENGRAM_ID=deepseek-ai/DeepSeek-V4.1-Flash-1017; ENGRAM_SHARDS='model-00047-of-00048.safetensors model-00048-of-00048.safetensors'"
-case_ "engram listing: name:size of the regular files, sorted; symlinks skipped" 0 "" "$expect
+case_ "engram listing: name:size of the files, sorted; symlinks followed, directories skipped" 0 "" "$expect
   expect \"\$(engram_listing '$et/real' | tr '\n' ' ')\" '$et_list'
-  expect \"[\$(engram_listing '$et/snap' | tr '\n' ' ')]\" '[]'"
+  expect \"\$(engram_listing '$et/snap' | tr '\n' ' ')\" '$et_list'
+  expect \"\$(engram_listing '$et/extra' | tr '\n' ' ')\" '.cache_note:2; $et_list'"
 case_ "engram dir: HEAD_ENGRAM_DIR when set" 0 "HEAD_ENGRAM_DIR=$et/real" "$expect
   expect \"\$(head_engram_dir)\" '$et/real'"
 case_ "engram dir: no HEAD_ENGRAM_DIR -> the HF snapshot path on this Spark" 0 "" "$expect
@@ -346,7 +349,10 @@ case_ "engram check: KV sharding alone compares nothing (its agreement marks eng
 case_ "engram check: spill on, both folders list the same files -> ok" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/real WORKER_ENGRAM_DIR=/y" "$expect; $et_stubs
   worker() { printf 'config.json:5;\nmodel.safetensors.index.json:7;\n'; }
   expect \"[\$(port_engram_check 2>&1)]\" '[]'"
-case_ "engram check: spill on, rank 0's folder is a HF snapshot (symlinks only) -> refused before anything stops" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/snap WORKER_ENGRAM_DIR=/y" "$expect; $et_stubs
+case_ "engram check: spill on, rank 0's folder is a HF snapshot (symlinks into blobs) listing the worker's files -> ok" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/snap WORKER_ENGRAM_DIR=/y" "$expect; $et_stubs
+  worker() { printf 'config.json:5;\nmodel.safetensors.index.json:7;\n'; }
+  expect \"[\$(port_engram_check 2>&1)]\" '[]'"
+case_ "engram check: spill on, rank 0's folder holds a file the worker's lacks -> refused before anything stops" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/extra WORKER_ENGRAM_DIR=/y" "$expect; $et_stubs
   worker() { printf 'config.json:5;\nmodel.safetensors.index.json:7;\n'; }
   out=\$(port_engram_check 2>&1); rc=\$?
   expect \"\$rc\" 1

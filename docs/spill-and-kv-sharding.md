@@ -36,12 +36,13 @@ for those defaults: the start goes on **without** the feature, with a loud `SPIL
   spill.
 
 **The ranks' Engram folders must list the same files.** With the tier on, the rank fingerprint covers the Engram
-folder's regular files by name and size (`zig/patches/0016`, `fingerprint.zig`'s `listing()`, which skips symlinks).
-With `HEAD_ENGRAM_DIR` empty rank 0 reads the HF snapshot, whose entries are symlinks into `blobs/`, so it lists nothing
-while `WORKER_ENGRAM_DIR` lists its four files: the pair then refuses to load with `FingerprintMismatch` in `engram`
-(issue #61). `start.sh` compares the two listings before anything is stopped and refuses with both of them and the fix;
-put the same files on the head's disk and point `HEAD_ENGRAM_DIR` at them (hardlinks cost no extra disk), which also
-gives rank 0 local Engram reads instead of the HF cache.
+folder's files by name and size (`zig/patches/0016`, `rank_identity.zig`'s `listing()`: every entry but a directory, its
+size read through symlinks). With `HEAD_ENGRAM_DIR` empty rank 0 reads the HF snapshot, whose symlinks into `blobs/`
+list as the files they point to, the same four the worker's `WORKER_ENGRAM_DIR` holds. (Before the rebase onto
+`fbbc971` the engine skipped symlinks, so a snapshot listed nothing and the pair refused to load with
+`FingerprintMismatch` in `engram`: issue #61.) `start.sh` still compares the two listings before anything is stopped
+and refuses folders that differ, naming both. A `HEAD_ENGRAM_DIR` on the head's own disk (hardlinks cost no extra disk)
+is optional: it gives rank 0 local Engram reads instead of the HF cache.
 
 | Switch | Default | |
 | --- | --- | --- |

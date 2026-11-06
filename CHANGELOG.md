@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `start.sh`'s Engram pre-flight (`port_engram_check`, issue #61) lists a folder the way the engine's rank fingerprint
+  now does: every entry but a directory, dotfiles included, its size read through symlinks (rebased `0016`,
+  `rank_identity.zig`'s `listing()` stats through links since the move to `fbbc971`). It still skipped symlinks, so with
+  `SPILL_GIB` on and `HEAD_ENGRAM_DIR` empty it refused a start the engine accepts: rank 0's HF snapshot listed nothing
+  against the worker's copied files. `HEAD_ENGRAM_DIR` is now optional (local Engram reads); folders that really differ
+  are still refused before anything is stopped. `scripts/port_test.sh` covers a symlinked snapshot, a directory in it and
+  a dotfile. Reported by **Kyungtaek Lee ([lastingchild](https://github.com/lastingchild))**.
 - `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
   it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
   the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
