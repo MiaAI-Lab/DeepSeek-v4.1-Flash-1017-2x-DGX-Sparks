@@ -139,7 +139,7 @@ REASONING_EFFORT="${REASONING_EFFORT:-}"
 # cap). A request's own thinking_budget wins. With no cap, a turn on a hard task can spend its whole MAX_TOKENS thinking and end
 # with no text and no tool call (finish_reason length).
 THINKING_BUDGET="${THINKING_BUDGET:-}"
-# 1: the chat template sees no assistant turn's reasoning_content (tensorfold-native --drop-reasoning-history, patch 0049). A client
+# 1: the chat template sees no assistant turn's reasoning_content (tensorfold-native --drop-reasoning-history, patch 0057). A client
 # that replays every turn's reasoning in a tool loop (omp does; the template keeps it all once tools are present) otherwise shows
 # the model its own earlier thinking at every step, and long agent runs drifted into flat, then repeating reasoning (loops).
 DROP_REASONING_HISTORY="${DROP_REASONING_HISTORY:-0}"

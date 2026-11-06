@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `zig/patches/0057-drop-reasoning-history.patch` (`DROP_REASONING_HISTORY=1`, off by default): rank 0's
+  `--drop-reasoning-history` removes `reasoning_content` from every assistant turn before the chat template renders, for
+  clients that replay each turn's reasoning in a tool loop (long agent runs drifted into flat, then repeating reasoning:
+  3 of 6 replayed replies looped without it, 0 of 6 with it). With it on, each turn re-prefills the previous reply.
+  `start.sh` accepts only `0`/`1`. Sent as `0049`; renumbered (0049-0051 are Lukasz Raczylo's). By **marknx
+  ([marknx](https://github.com/marknx))**, [pull request #116](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/116).
 - `start.sh`'s Engram pre-flight (`port_engram_check`, issue #61) lists a folder the way the engine's rank fingerprint
   now does: every entry but a directory, dotfiles included, its size read through symlinks (rebased `0016`,
   `rank_identity.zig`'s `listing()` stats through links since the move to `fbbc971`). It still skipped symlinks, so with
