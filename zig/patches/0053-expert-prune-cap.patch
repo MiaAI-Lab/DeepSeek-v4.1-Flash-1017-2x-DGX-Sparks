@@ -1,0 +1,1323 @@
+diff --git a/zig/kernels/cuda/dsv41_ops.cu b/zig/kernels/cuda/dsv41_ops.cu
+index 8503b89e9..8b877c47c 100644
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
+@@ -271,6 +271,146 @@ extern "C" __global__ void tf_ds_iota_vis_kernel(const long long* vis, long long
+     }
+ }
+ 
++// Routed-expert top-p prune of a decode window (expert_prune.zig's pruneWindow, op for op), in place on the router's
++// output, one thread a row. A slot the rule drops becomes pick -1, weight 0; the kept weights are scaled by total / kept
++// sum (renorm). With cap > 0 the window then keeps only its cap heaviest experts (the rows' kept shares summed in row
++// and slot order, ties to the lower id), and each row also its cap_min heaviest picks. apply 0 only counts. stats
++// (nullable) u64 [6]: windows, distinct before, distinct after, dropped slots, rows, dropped weight share in millionths.
++// pick/wts [rows, slots] (the routed slots first); one block of 64.
++struct TfDsPrune { float topp; int min_k, renorm, apply, topk, slots, rows, cap, cap_min; };
++#define TF_DS_PRUNE_ROWS 64
++#define TF_DS_PRUNE_TOPK 8
++#define TF_DS_PRUNE_EXPERTS 512
++extern "C" __global__ void __launch_bounds__(TF_DS_PRUNE_ROWS) tf_ds_expert_prune_kernel(int* pick, float* wts, TfDsPrune a, unsigned long long* stats) {
++    __shared__ unsigned mb[16], ma[16], acc[3], ins[16];
++    __shared__ int sp[TF_DS_PRUNE_ROWS * TF_DS_PRUNE_TOPK];
++    __shared__ float sf[TF_DS_PRUNE_ROWS * TF_DS_PRUNE_TOPK], score[TF_DS_PRUNE_EXPERTS];
++    const int r = threadIdx.x;
++    if (r < 16) { mb[r] = 0; ma[r] = 0; ins[r] = 0; }
++    if (r < 3) acc[r] = 0;
++    __syncthreads();
++    int* pk = pick + r * a.slots;
++    float* w = wts + r * a.slots;
++    int p[8], rank[8], live = 0;
++    float f[8], ex[8], tot = 0.f;
++    bool keep[8], ok = false;
++    if (r < a.rows) {
++        for (int i = 0; i < a.topk; ++i) {
++            p[i] = pk[i];
++            keep[i] = true;
++            if (p[i] < 0) continue;
++            ++live;
++            tot = __fadd_rn(tot, w[i]);
++            if (stats && p[i] < 512) atomicOr(&mb[p[i] >> 5], 1u << (p[i] & 31));
++        }
++        ok = live > 0 && tot > 0.f && !isinf(tot);
++        if (ok) {
++            for (int i = 0; i < a.topk; ++i) f[i] = p[i] >= 0 ? __fdiv_rn(w[i], tot) : 0.f;
++            for (int i = 0; i < a.topk; ++i) {
++                rank[i] = 0;
++                if (p[i] < 0) continue;
++                for (int j = 0; j < a.topk; ++j) rank[i] += p[j] >= 0 && (f[j] > f[i] || (f[j] == f[i] && j < i));
++            }
++            float run = 0.f;
++            for (int k = 0; k < live; ++k)
++                for (int i = 0; i < a.topk; ++i)
++                    if (p[i] >= 0 && rank[i] == k) { ex[i] = run; run = __fadd_rn(run, f[i]); }
++            const int floor_k = a.min_k > 1 ? a.min_k : 1;
++            for (int i = 0; i < a.topk; ++i)
++                if (p[i] >= 0) keep[i] = rank[i] < floor_k || ex[i] < a.topp;
++        }
++        if (a.cap > 0)
++            for (int i = 0; i < a.topk; ++i) {
++                const bool in = ok && p[i] >= 0 && p[i] < TF_DS_PRUNE_EXPERTS && keep[i];
++                sp[r * TF_DS_PRUNE_TOPK + i] = in ? p[i] : -1;
++                sf[r * TF_DS_PRUNE_TOPK + i] = in ? f[i] : 0.f;
++            }
++    }
++    if (a.cap > 0) {
++        // over the window's picks only: an expert's score is summed once, at its first pick, in row and slot order;
++        // score[x] < 0 marks a pick that is not an expert's first
++        __syncthreads();
++        const int ne = a.rows * TF_DS_PRUNE_TOPK;
++        for (int x = r; x < ne; x += TF_DS_PRUNE_ROWS) {
++            const int e = (x % TF_DS_PRUNE_TOPK) < a.topk ? sp[x] : -1;
++            float s = -1.f;
++            if (e >= 0) {
++                bool first = true;
++                for (int y = 0; y < x && first; ++y) first = !((y % TF_DS_PRUNE_TOPK) < a.topk && sp[y] == e);
++                if (first) {
++                    s = 0.f;
++                    for (int y = x; y < ne; ++y)
++                        if ((y % TF_DS_PRUNE_TOPK) < a.topk && sp[y] == e) s = __fadd_rn(s, sf[y]);
++                }
++            }
++            score[x] = s;
++        }
++        __syncthreads();
++        for (int x = r; x < ne; x += TF_DS_PRUNE_ROWS) {
++            if (score[x] < 0.f) continue;
++            const int e = sp[x];
++            int k = 0;
++            for (int y = 0; y < ne; ++y)
++                k += score[y] >= 0.f && (score[y] > score[x] || (score[y] == score[x] && sp[y] < e));
++            if (k < a.cap) atomicOr(&ins[e >> 5], 1u << (e & 31));
++        }
++        __syncthreads();
++    }
++    if (r < a.rows) {
++        if (ok) {
++            int kept = 0;
++            float ks = 0.f, mass = 0.f;
++            for (int i = 0; i < a.topk; ++i) {
++                if (p[i] < 0) continue;
++                if (a.cap > 0 && keep[i] && rank[i] >= a.cap_min &&
++                    (p[i] >= TF_DS_PRUNE_EXPERTS || !((ins[p[i] >> 5] >> (p[i] & 31)) & 1u)))
++                    keep[i] = false;
++                if (keep[i]) { ++kept; ks = __fadd_rn(ks, w[i]); }
++                else mass = __fadd_rn(mass, f[i]);
++            }
++            if (kept < live) {
++                if (a.apply) {
++                    const float g = __fdiv_rn(tot, ks);
++                    for (int i = 0; i < a.topk; ++i) {
++                        if (p[i] < 0) continue;
++                        if (keep[i]) { if (a.renorm) w[i] = __fmul_rn(w[i], g); }
++                        else { pk[i] = -1; w[i] = 0.f; }
++                    }
++                }
++                atomicAdd(&acc[0], (unsigned)(live - kept));
++                atomicAdd(&acc[2], (unsigned)(mass * 1e6f + 0.5f));
++            }
++        } else if (a.cap > 0 && live > a.cap_min) {
++            // a row with no usable weight sum keeps its first cap_min live slots (route's heaviest): every row then
++            // keeps its picks in the cap's set and at most cap_min more, which bounds the window's places
++            int seen = 0;
++            for (int i = 0; i < a.topk; ++i) {
++                if (p[i] < 0) continue;
++                keep[i] = seen < a.cap_min;
++                ++seen;
++                if (!keep[i] && a.apply) { pk[i] = -1; w[i] = 0.f; }
++            }
++            atomicAdd(&acc[0], (unsigned)(live - a.cap_min));
++        }
++        if (stats) {
++            atomicAdd(&acc[1], 1u);
++            for (int i = 0; i < a.topk; ++i)
++                if (p[i] >= 0 && keep[i] && p[i] < 512) atomicOr(&ma[p[i] >> 5], 1u << (p[i] & 31));
++        }
++    }
++    __syncthreads();
++    if (stats && r == 0) {
++        int before = 0, after = 0;
++        for (int i = 0; i < 16; ++i) { before += __popc(mb[i]); after += __popc(ma[i]); }
++        atomicAdd(stats, 1ull);
++        atomicAdd(stats + 1, (unsigned long long)before);
++        atomicAdd(stats + 2, (unsigned long long)after);
++        atomicAdd(stats + 3, (unsigned long long)acc[0]);
++        atomicAdd(stats + 4, (unsigned long long)acc[1]);
++        atomicAdd(stats + 5, (unsigned long long)acc[2]);
++    }
++}
++
+ // rounds.py _candidates_fast where the pool takes every block (contexts up to nblocks * bsize keys): a row's block mask
+ // (torch's bool, as u8) = the block's maximum (amax: a NaN wins) above -inf, or the block is the row's newest,
+ // (vis - 1) // bsize (floor division). score [rows, nb * bsize] fp32 (row stride ss), vis [rows], out [rows, nb] (row
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index 5ac250b9d..656b62fa6 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -632,7 +632,7 @@ pub const Drafter = struct {
+         }
+         try tri_norm.route(e.t, dr.gl, kc, lay.gate_b, dr.topk, c.routed_scaling, lay.experts.count - 1, dr.pick, dr.mw, R, ne, dr.slots_moe);
+         // routed(): fewer than EXACT_ROWS rows take the decode window's fused path, more the chunk's (13+ streams)
+-        if (R < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
++        if (R < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit, null);
+         try exl3_experts.prompt(e.ex, e.s, lay.experts, dr.xs, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
+     }
+ };
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 27c9fb291..4f4764940 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -50,6 +50,7 @@ pub const draft = @import("draft.zig");
+ pub const sampling = @import("sampling.zig");
+ pub const model = @import("model.zig");
+ pub const prompt_rows = @import("prompt_rows.zig");
++pub const expert_prune = @import("expert_prune.zig");
+ pub const lanes = @import("lanes.zig");
+ pub const pool = @import("pool.zig");
+ pub const spill_state = @import("spill_state.zig");
+@@ -108,6 +109,7 @@ test {
+     refAll(sampling);
+     refAll(model);
+     refAll(prompt_rows);
++    refAll(expert_prune);
+     refAll(lanes);
+     refAll(pool);
+     refAll(spill_state);
+diff --git a/zig/src/families/dsv41/exl3_experts.zig b/zig/src/families/dsv41/exl3_experts.zig
+index 8810b3c64..e6816d09a 100644
+--- a/zig/src/families/dsv41/exl3_experts.zig
++++ b/zig/src/families/dsv41/exl3_experts.zig
+@@ -354,8 +354,8 @@ pub const DecodeLaunch = struct {
+ /// initialized. shared_slot changes nothing here (only a prompt chunk's SHARED_DENSE path reads it), and without
+ /// before_down nothing waits before down. Three launches on `s`: decode_prep plain, gate / up and down as programmatic
+ /// dependents.
+-pub fn decode(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32) !void {
+-    var ls = try decodeLaunches(ex, sc, x, x_stride, pick, wts, out, r, limit);
++pub fn decode(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32, places: ?usize) !void {
++    var ls = try decodeLaunches(ex, sc, x, x_stride, pick, wts, out, r, limit, places);
+     var fs: [3]cuda.Function = undefined;
+     for (&ls, &fs) |*l, *f| f.* = switch (l.kernel) {
+         .prep => k.decode_prep,
+@@ -373,7 +373,8 @@ pub fn isWindow(sc: DecodeScratch, r: usize) bool {
+ 
+ /// decode's three launches in order: experts.py _routed_fused, experts.cu exl3x_decode_prep_cuda and
+ /// exl3x_grouped_decode_cuda, experts_grouped.cuh grouped_cp_launch.
+-pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32) ![3]DecodeLaunch {
++/// places: a proven bound on the window's distinct expert ids (expert_prune.placeBound); the grids then stop there.
++pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32, places: ?usize) ![3]DecodeLaunch {
+     const d: usize = ex.dims;
+     const i: usize = ex.width;
+     const e: usize = ex.count;
+@@ -386,7 +387,7 @@ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride:
+     if (cgu[0] != 8 or cgu[1] != 4 or cd[0] != 8 or cd[1] != 4 or cd[2] != 1) return error.UnsupportedShape;
+     if (i % 128 != 0 or d % 128 != 0 or slots > 32) return error.UnsupportedShape;
+     const p = r * slots;
+-    const maxu = @min(p, e); // the window's expert places (Scratch.window): ids [maxu], members [maxu, R]
++    const maxu = @min(p, e, places orelse p); // the window's expert places (Scratch.window): ids [maxu], members [maxu, R]
+     const mt = (r + 15) / 16; // a place's 16-row member tiles
+ 
+     // decode_prep: block 0 adds one to epoch, groups the picks (ids, count, members) and combines the rows that route
+@@ -462,11 +463,11 @@ test "a TP2 DeepSeek-V4.1 rank's decode scratch and windows" {
+     // 1 to 63 rows (no more than the scratch holds); 64 and more are prompt chunks
+     const ex: weights.Experts = .{ .trellis = 0, .gate_ptr = 0, .up_ptr = 0, .down_ptr = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .count = 385, .dims = 5120, .width = 1152, .down_k = 1152, .down_n = 5120, .k2_gu = .{ 6, 10 }, .k2_d = .{ 6, 10 } };
+     const sc: DecodeScratch = .{ .rows = 64, .slots = 7, .xg = 0, .xu = 0, .xd = 0, .z = 0, .y = 0, .cnt_gu = 0, .cnt_d = 0, .epoch = 0, .ready = 0, .ready_cnt = 0, .ids = 0, .count = 0, .members = 0 };
+-    for ([_]usize{ 0, 64, 65 }) |r| try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
++    for ([_]usize{ 0, 64, 65 }) |r| try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10, null));
+     var small = sc;
+     small.rows = 8;
+-    try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 9, 10));
+-    _ = try decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 8, 10);
++    try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 9, 10, null));
++    _ = try decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 8, 10, null);
+ }
+ 
+ test "a decode window under the scratch's rows, up to the kernel's member list" {
+diff --git a/zig/src/families/dsv41/exl3_experts2d_rec.zig b/zig/src/families/dsv41/exl3_experts2d_rec.zig
+index 5c726083e..b568aa204 100644
+--- a/zig/src/families/dsv41/exl3_experts2d_rec.zig
++++ b/zig/src/families/dsv41/exl3_experts2d_rec.zig
+@@ -183,7 +183,7 @@ test "a 2D node's drafter window is its TP2 rank's" {
+     ex.down_n = 5120;
+     ex.k2_gu = .{ 8, 8 };
+     ex.k2_d = .{ 8, 8 };
+-    const ls = try xe.decodeLaunches(ex, scratch(4), x, 5120, pick, wts, out, 5, limit);
++    const ls = try xe.decodeLaunches(ex, scratch(4), x, 5120, pick, wts, out, 5, limit, null);
+     try expectRecorded(&ls, draft, 5);
+ }
+ 
+diff --git a/zig/src/families/dsv41/exl3_experts_rec.zig b/zig/src/families/dsv41/exl3_experts_rec.zig
+index 519a6704f..44d957c94 100644
+--- a/zig/src/families/dsv41/exl3_experts_rec.zig
++++ b/zig/src/families/dsv41/exl3_experts_rec.zig
+@@ -140,7 +140,7 @@ fn expectKernel(name: []const u8, l: *const xe.DecodeLaunch) !void {
+ test "decode's launches are the served build's recorded ones" {
+     const gpa = std.testing.allocator;
+     for (cases) |c| {
+-        const ls = try xe.decodeLaunches(experts(c), scratch(c.slots), x, 5120, pick, wts, out, c.r, limit);
++        const ls = try xe.decodeLaunches(experts(c), scratch(c.slots), x, 5120, pick, wts, out, c.r, limit, null);
+         var lines = std.mem.splitScalar(u8, c.rec, '\n');
+         for (&ls) |*l| {
+             const line = lines.next() orelse return error.TestUnexpectedResult;
+@@ -165,7 +165,7 @@ test "decode passes each buffer where experts.cu does" {
+     const c = cases[0];
+     const ex = experts(c);
+     const sc = scratch(c.slots);
+-    const ls = try xe.decodeLaunches(ex, sc, x, 5120, pick, wts, out, c.r, limit);
++    const ls = try xe.decodeLaunches(ex, sc, x, 5120, pick, wts, out, c.r, limit, null);
+     const want = [3][]const u64{
+         // decode_prep: x, pick, suh0, suh1, out0, out1, uids, ucount, members, wts, y, add (none), out, epoch
+         &.{ x, pick, ex.suh_g, ex.suh_u, sc.xg, sc.xu, sc.ids, sc.count, sc.members, wts, sc.y, 0, out, sc.epoch },
+diff --git a/zig/src/families/dsv41/expert_prune.zig b/zig/src/families/dsv41/expert_prune.zig
+new file mode 100644
+index 000000000..48468166d
+--- /dev/null
++++ b/zig/src/families/dsv41/expert_prune.zig
+@@ -0,0 +1,818 @@
++//! Routed-expert top-p prune of a decode round's picks (TF_DS_T13_EXPERT_PRUNE; lossy, opt-in, experiment only): the
++//! switch's parsing, the host reference of the kernel (tf_ds_expert_prune_kernel), the kernel's argument and the
++//! counters it keeps. Pure: no cuda import.
++const std = @import("std");
++
++pub const env_name: [:0]const u8 = "TF_DS_T13_EXPERT_PRUNE";
++pub const cap_env_name: [:0]const u8 = "TF_DS_T13_EXPERT_CAP";
++pub const max_topk = 8; // the kernel's per-row arrays
++pub const max_experts = 512; // the kernel's distinct-expert bitmasks (16 words)
++pub const max_rows = 64; // the kernel's block width: one thread a row
++const stats_prefix = "stats";
++
++pub const Renorm = enum(c_int) { orig = 0, kept = 1 };
++
++pub const Rule = struct { topp: f32, min_k: u32, renorm: Renorm };
++
++/// Jay Leaton's p85k (credited in CREDITS.md): the slots whose exclusive prefix of weight share (heaviest first) is under 0.85, at least 3.
++pub const default_rule: Rule = .{ .topp = 0.85, .min_k = 3, .renorm = .kept };
++
++/// A window's cap after the rule: its `experts` heaviest experts by the rows' summed kept
++/// shares, and each row's `floor` heaviest picks.
++pub const Cap = struct { experts: u32, floor: u32 = 1 };
++
++/// `apply` false: the kernel only counts what the rule would drop.
++pub const Mode = struct { rule: Rule, apply: bool, cap: ?Cap = null };
++
++/// "<topp>,<min_k>[,kept|orig]" with topp in (0, 1) and min_k in 1..max_topk (null: malformed).
++fn parseRule(text: []const u8) ?Rule {
++    var it = std.mem.splitScalar(u8, text, ',');
++    const p = it.next() orelse return null;
++    const k = it.next() orelse return null;
++    const topp = std.fmt.parseFloat(f32, p) catch return null;
++    if (!(topp > 0 and topp < 1)) return null;
++    const min_k = std.fmt.parseInt(u32, k, 10) catch return null;
++    if (min_k < 1 or min_k > max_topk) return null;
++    var renorm: Renorm = .kept;
++    if (it.next()) |r| {
++        if (std.mem.eql(u8, r, "kept")) renorm = .kept else if (std.mem.eql(u8, r, "orig")) renorm = .orig else return null;
++    }
++    if (it.next() != null) return null;
++    return .{ .topp = topp, .min_k = min_k, .renorm = renorm };
++}
++
++/// The switch's value: unset, "" or "0" off; "1" prune by the default rule; a rule prunes by it; "stats" counts
++/// by the default rule and "stats:<rule>" by that rule, neither pruning. Malformed: null, with a message on stderr
++/// (`fromText` turns that into a refusal to start).
++pub fn parse(text: ?[]const u8) ?Mode {
++    const t = text orelse return null;
++    if (t.len == 0 or std.mem.eql(u8, t, "0")) return null;
++    if (std.mem.eql(u8, t, "1")) return .{ .rule = default_rule, .apply = true };
++    if (std.mem.startsWith(u8, t, stats_prefix)) {
++        const rest = t[stats_prefix.len..];
++        if (rest.len == 0) return .{ .rule = default_rule, .apply = false };
++        if (rest[0] == ':') if (parseRule(rest[1..])) |r| return .{ .rule = r, .apply = false };
++    } else if (parseRule(t)) |r| return .{ .rule = r, .apply = true };
++    std.debug.print("{s}: expected 1, stats, [stats:]<topp>,<min_k>[,kept|orig] (topp in (0, 1), min_k in 1..{d})\n", .{ env_name, max_topk });
++    return null;
++}
++
++/// "<experts>[,<floor>]" with experts in 1..max_experts and floor in 1..max_topk (default 1; null: malformed).
++fn parseCap(text: []const u8) ?Cap {
++    var it = std.mem.splitScalar(u8, text, ',');
++    const c = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
++    if (c < 1 or c > max_experts) return null;
++    var floor: u32 = 1;
++    if (it.next()) |f| floor = std.fmt.parseInt(u32, f, 10) catch return null;
++    if (floor < 1 or floor > max_topk or it.next() != null) return null;
++    return .{ .experts = c, .floor = floor };
++}
++
++/// The cap's switch over a prune mode: unset, "" or "0" leaves `m` as it is. A cap needs the prune on and a floor
++/// within its min_k (the rule keeps the floor's picks); otherwise the result carries no cap, with a message on stderr.
++pub fn withCap(m: ?Mode, text: ?[]const u8) ?Mode {
++    const t = text orelse return m;
++    if (t.len == 0 or std.mem.eql(u8, t, "0")) return m;
++    const c = parseCap(t) orelse {
++        std.debug.print("{s}: expected <experts>[,<floor>] (experts in 1..{d}, floor in 1..{d})\n", .{ cap_env_name, max_experts, max_topk });
++        return m;
++    };
++    var x = m orelse {
++        std.debug.print("{s}: needs {s} on; the cap is off\n", .{ cap_env_name, env_name });
++        return null;
++    };
++    if (c.floor > x.rule.min_k) {
++        std.debug.print("{s}: floor {d} above the rule's min_k {d}; the cap is off\n", .{ cap_env_name, c.floor, x.rule.min_k });
++        return x;
++    }
++    x.cap = c;
++    return x;
++}
++
++fn isSet(text: ?[]const u8) bool {
++    const t = text orelse return false;
++    return t.len != 0 and !std.mem.eql(u8, t, "0");
++}
++
++/// The mode from the two switches' texts. A switch that is set and malformed, or a cap without its prune, is an
++/// error (the message is already on stderr): the process refuses to start rather than run unpruned.
++pub fn fromText(prune_text: ?[]const u8, cap_text: ?[]const u8) error{BadExpertPrune}!?Mode {
++    const m = parse(prune_text);
++    if (m == null and isSet(prune_text)) return error.BadExpertPrune;
++    const r = withCap(m, cap_text);
++    if (isSet(cap_text) and (r == null or r.?.cap == null)) return error.BadExpertPrune;
++    return r;
++}
++
++/// The mode from the process environment.
++pub fn fromEnv() error{BadExpertPrune}!?Mode {
++    const p = if (std.c.getenv(env_name)) |v| std.mem.span(v) else null;
++    const c = if (std.c.getenv(cap_env_name)) |v| std.mem.span(v) else null;
++    return fromText(p, c);
++}
++
++/// Whether the model's shape fits the kernel's arrays; the caller refuses to start otherwise.
++pub fn fits(topk: usize, experts: usize, rows: usize, m: Mode) bool {
++    const floor_ok = if (m.cap) |c| c.floor <= m.rule.min_k else true;
++    return topk <= max_topk and experts <= max_experts and rows <= max_rows and m.rule.min_k <= topk and floor_ok;
++}
++
++/// Opt-in switch: size the experts launch's grid by placeBound instead of every slot of the window.
++pub const bound_env_name: [:0]const u8 = "TF_DS_T15_PLACE_BOUND";
++
++/// Whether the bound switch is "1".
++pub fn boundOn() bool {
++    const v = std.c.getenv(bound_env_name) orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// The most expert places a window of `rows` can have once `m` has run: the cap's experts, each row's floor and the
++/// shared expert. Null when nothing bounds them (no cap, or the cap counts without applying).
++pub fn placeBound(m: Mode, rows: usize) ?usize {
++    const c = m.cap orelse return null;
++    if (!m.apply) return null;
++    return c.experts + rows * c.floor + 1;
++}
++
++/// tf_ds_expert_prune_kernel's argument.
++pub const KArgs = extern struct { topp: f32, min_k: c_int, renorm: c_int, apply: c_int, topk: c_int, slots: c_int, rows: c_int, cap: c_int, cap_min: c_int };
++
++pub fn kargs(m: Mode, rows: usize, topk: usize, slots: usize) KArgs {
++    const c: Cap = m.cap orelse .{ .experts = 0, .floor = 0 };
++    return .{ .topp = m.rule.topp, .min_k = @intCast(m.rule.min_k), .renorm = @intFromEnum(m.rule.renorm), .apply = @intFromBool(m.apply), .topk = @intCast(topk), .slots = @intCast(slots), .rows = @intCast(rows), .cap = @intCast(c.experts), .cap_min = @intCast(c.floor) };
++}
++
++/// The kernel's counters (device u64s, in this order), summed over the layer windows since the last print.
++pub const Stats = extern struct {
++    windows: u64 = 0, // kernel launches: a layer's decode window each
++    before: u64 = 0, // distinct routed experts of the windows' picks as routed
++    after: u64 = 0, // the same once the rule has dropped its slots (counted, not applied, in stats mode)
++    dropped: u64 = 0, // slots the rule drops
++    rows: u64 = 0, // rows seen
++    dropped_ppm: u64 = 0, // weight share of the dropped slots, in millionths, summed over rows
++};
++
++pub const stats_bytes = @sizeOf(Stats);
++
++fn per(total: u64, n: u64) f64 {
++    return if (n == 0) 0 else @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(n));
++}
++
++/// The counters as a profile line: per layer window the distinct routed experts before and after the rule (the experts
++/// read), and per row the slots and weight share it drops.
++pub fn write(w: *std.Io.Writer, rank: u32, s: Stats) !void {
++    const ppm: f64 = @floatFromInt(s.dropped_ppm);
++    try w.print("{{\"rank\": {d}, \"expert_prune\": {{\"windows\": {d}, \"rows\": {d}, \"distinct_before\": {d:.3}, \"distinct_after\": {d:.3}, \"saved_a_window\": {d:.3}, \"dropped_a_row\": {d:.3}, \"dropped_share\": {d:.4}}}}}\n", .{
++        rank,
++        s.windows,
++        s.rows,
++        per(s.before, s.windows),
++        per(s.after, s.windows),
++        per(s.before -| s.after, s.windows),
++        per(s.dropped, s.rows),
++        if (s.rows == 0) 0 else ppm / 1e6 / @as(f64, @floatFromInt(s.rows)),
++    });
++}
++
++/// What pruneRow did to a row.
++pub const Outcome = struct { dropped: u32 = 0, mass: f32 = 0 };
++
++/// One row's first `p.len` slots (the routed ones: the shared expert's slot is the caller's to leave out), the
++/// kernel's arithmetic op for op. A slot with pick < 0 is not routed: it is left as it is and takes no part. f = w / total (fp32 sum
++/// in slot order); rank by f descending, ties to the lower slot; keep = rank < max(min_k, 1) or the exclusive prefix
++/// of f in rank order < topp. A dropped slot becomes pick -1, weight 0; with `.kept` the kept weights are scaled by
++/// total / kept sum so their sum holds. Nothing to drop (or a total that is not a positive finite number): the row is
++/// untouched, bit for bit. `apply` false only measures.
++pub fn pruneRow(r: Rule, apply: bool, p: []i32, w: []f32) Outcome {
++    std.debug.assert(p.len == w.len and p.len <= max_topk);
++    var live: u32 = 0;
++    var tot: f32 = 0;
++    for (p, w) |e, x| {
++        if (e < 0) continue;
++        live += 1;
++        tot += x;
++    }
++    if (live == 0 or !(tot > 0) or std.math.isInf(tot)) return .{};
++    var f: [max_topk]f32 = undefined;
++    var rank: [max_topk]u32 = undefined;
++    for (p, w, 0..) |e, x, i| f[i] = if (e >= 0) x / tot else 0;
++    for (p, 0..) |ei, i| {
++        rank[i] = 0;
++        if (ei < 0) continue;
++        for (p, 0..) |ej, j| {
++            if (ej >= 0 and (f[j] > f[i] or (f[j] == f[i] and j < i))) rank[i] += 1;
++        }
++    }
++    var ex: [max_topk]f32 = undefined;
++    var acc: f32 = 0;
++    for (0..live) |k| {
++        for (p, 0..) |ei, i| {
++            if (ei >= 0 and rank[i] == k) {
++                ex[i] = acc;
++                acc += f[i];
++            }
++        }
++    }
++    const floor = @max(r.min_k, 1);
++    var keep: [max_topk]bool = undefined;
++    var kept: u32 = 0;
++    var kept_sum: f32 = 0;
++    var mass: f32 = 0;
++    for (p, w, 0..) |e, x, i| {
++        keep[i] = true;
++        if (e < 0) continue;
++        keep[i] = rank[i] < floor or ex[i] < r.topp;
++        if (keep[i]) {
++            kept += 1;
++            kept_sum += x;
++        } else mass += f[i];
++    }
++    if (kept == live) return .{};
++    if (apply) {
++        const g = tot / kept_sum;
++        for (p, w, 0..) |*e, *x, i| {
++            if (e.* < 0) continue;
++            if (keep[i]) {
++                if (r.renorm == .kept) x.* *= g;
++            } else {
++                e.* = -1;
++                x.* = 0;
++            }
++        }
++    }
++    return .{ .dropped = live - kept, .mass = mass };
++}
++
++/// A window's rows (`rows` of `slots` slots, the first `topk` routed) as tf_ds_expert_prune_kernel leaves them, op
++/// for op: each row's rule (pruneRow's arithmetic), then `m.cap`'s window cap if any. Returns the slots dropped and
++/// the dropped weight share summed over the rows.
++pub fn pruneWindow(m: Mode, rows: usize, slots: usize, topk: usize, p: []i32, w: []f32) Outcome {
++    std.debug.assert(rows <= max_rows and topk <= max_topk and topk <= slots and p.len == w.len and p.len >= rows * slots);
++    var f: [max_rows][max_topk]f32 = undefined;
++    var rank: [max_rows][max_topk]u32 = undefined;
++    var keep: [max_rows][max_topk]bool = undefined;
++    var tot: [max_rows]f32 = undefined;
++    var live: [max_rows]u32 = undefined;
++    var ok: [max_rows]bool = undefined;
++    for (0..rows) |r| {
++        const pr = p[r * slots ..][0..topk];
++        const wr = w[r * slots ..][0..topk];
++        live[r] = 0;
++        tot[r] = 0;
++        for (pr, wr, 0..) |e, x, i| {
++            keep[r][i] = true;
++            if (e < 0) continue;
++            live[r] += 1;
++            tot[r] += x;
++        }
++        ok[r] = live[r] > 0 and tot[r] > 0 and !std.math.isInf(tot[r]);
++        if (!ok[r]) continue;
++        for (pr, wr, 0..) |e, x, i| f[r][i] = if (e >= 0) x / tot[r] else 0;
++        for (pr, 0..) |ei, i| {
++            rank[r][i] = 0;
++            if (ei < 0) continue;
++            for (pr, 0..) |ej, j| {
++                if (ej >= 0 and (f[r][j] > f[r][i] or (f[r][j] == f[r][i] and j < i))) rank[r][i] += 1;
++            }
++        }
++        var ex: [max_topk]f32 = undefined;
++        var run: f32 = 0;
++        for (0..live[r]) |k| {
++            for (pr, 0..) |e, i| {
++                if (e >= 0 and rank[r][i] == k) {
++                    ex[i] = run;
++                    run += f[r][i];
++                }
++            }
++        }
++        const floor = @max(m.rule.min_k, 1);
++        for (pr, 0..) |e, i| {
++            if (e >= 0) keep[r][i] = rank[r][i] < floor or ex[i] < m.rule.topp;
++        }
++    }
++    var in_cap: [max_experts]bool = @splat(false);
++    if (m.cap) |c| {
++        var score: [max_experts]f32 = undefined;
++        for (0..max_experts) |e| {
++            var s: f32 = 0;
++            var any = false;
++            for (0..rows) |q| {
++                for (0..topk) |i| {
++                    const x = p[q * slots + i];
++                    if (ok[q] and x >= 0 and x < max_experts and keep[q][i] and @as(usize, @intCast(x)) == e) {
++                        s += f[q][i];
++                        any = true;
++                    }
++                }
++            }
++            score[e] = if (any) s else -1;
++        }
++        for (0..max_experts) |e| {
++            if (score[e] < 0) continue;
++            var k: usize = 0;
++            for (0..max_experts) |o| {
++                if (score[o] >= 0 and (score[o] > score[e] or (score[o] == score[e] and o < e))) k += 1;
++            }
++            in_cap[e] = k < c.experts;
++        }
++    }
++    var out: Outcome = .{};
++    for (0..rows) |r| {
++        if (!ok[r]) {
++            if (m.cap) |c| {
++                if (live[r] > c.floor) {
++                    var seen: u32 = 0;
++                    for (p[r * slots ..][0..topk], w[r * slots ..][0..topk]) |*e, *x| {
++                        if (e.* < 0) continue;
++                        if (seen >= c.floor and m.apply) {
++                            e.* = -1;
++                            x.* = 0;
++                        }
++                        seen += 1;
++                    }
++                    out.dropped += live[r] - c.floor;
++                }
++            }
++            continue;
++        }
++        const pr = p[r * slots ..][0..topk];
++        const wr = w[r * slots ..][0..topk];
++        var kept: u32 = 0;
++        var ks: f32 = 0;
++        var mass: f32 = 0;
++        for (pr, wr, 0..) |e, x, i| {
++            if (e < 0) continue;
++            if (m.cap) |c| {
++                if (keep[r][i] and rank[r][i] >= c.floor and (e >= max_experts or !in_cap[@intCast(e)])) keep[r][i] = false;
++            }
++            if (keep[r][i]) {
++                kept += 1;
++                ks += x;
++            } else mass += f[r][i];
++        }
++        if (kept == live[r]) continue;
++        if (m.apply) {
++            const g = tot[r] / ks;
++            for (pr, wr, 0..) |*e, *x, i| {
++                if (e.* < 0) continue;
++                if (keep[r][i]) {
++                    if (m.rule.renorm == .kept) x.* *= g;
++                } else {
++                    e.* = -1;
++                    x.* = 0;
++                }
++            }
++        }
++        out.dropped += live[r] - kept;
++        out.mass += mass;
++    }
++    return out;
++}
++
++/// Distinct non-negative expert ids below max_experts in `p` (a window's rows' routed picks).
++pub fn distinct(p: []const i32) u32 {
++    var seen: [max_experts / 64]u64 = @splat(0);
++    var n: u32 = 0;
++    for (p) |e| {
++        if (e < 0 or e >= max_experts) continue;
++        const u: usize = @intCast(e);
++        const bit = @as(u64, 1) << @intCast(u % 64);
++        if (seen[u / 64] & bit == 0) n += 1;
++        seen[u / 64] |= bit;
++    }
++    return n;
++}
++
++/// The rule as 16 bytes every rank must hold alike: ranks on different rules pick different expert sets and sum
++/// wrong partials without any error.
++pub const fingerprint_bytes = 16;
++
++pub fn fingerprint(m: ?Mode) [fingerprint_bytes]u8 {
++    var b: [fingerprint_bytes]u8 = @splat(0);
++    const x = m orelse return b;
++    b[0] = if (x.apply) 2 else 1;
++    b[1] = @as(u8, @intCast(@intFromEnum(x.rule.renorm))) + 1;
++    std.mem.writeInt(u32, b[4..8], @bitCast(x.rule.topp), .little);
++    std.mem.writeInt(u32, b[8..12], x.rule.min_k, .little);
++    if (x.cap) |c| {
++        std.mem.writeInt(u16, b[12..14], @intCast(c.experts), .little);
++        b[14] = @intCast(c.floor);
++    }
++    return b;
++}
++
++/// Whether every rank's fingerprint (`all`: rank after rank) is the first's.
++pub fn agree(all: []const u8) bool {
++    const n = fingerprint_bytes;
++    if (all.len == 0 or all.len % n != 0) return false;
++    var i: usize = n;
++    while (i < all.len) : (i += n) {
++        if (!std.mem.eql(u8, all[0..n], all[i..][0..n])) return false;
++    }
++    return true;
++}
++
++// -- tests -----------------------------------------------------------------------------------------------------------
++
++const expectEqual = std.testing.expectEqual;
++
++test "the switch parses its forms and nothing else" {
++    try expectEqual(@as(?Mode, null), parse(null));
++    try expectEqual(@as(?Mode, null), parse(""));
++    try expectEqual(@as(?Mode, null), parse("0"));
++    const on = parse("1").?;
++    try std.testing.expect(on.apply);
++    try expectEqual(default_rule, on.rule);
++    const st = parse("stats").?;
++    try std.testing.expect(!st.apply);
++    try expectEqual(default_rule, st.rule);
++    const r = parse("0.9,2,orig").?;
++    try std.testing.expect(r.apply);
++    try expectEqual(Rule{ .topp = 0.9, .min_k = 2, .renorm = .orig }, r.rule);
++    try expectEqual(Renorm.kept, parse("0.85,3").?.rule.renorm);
++    const sr = parse("stats:0.7,1").?;
++    try std.testing.expect(!sr.apply);
++    try expectEqual(Rule{ .topp = 0.7, .min_k = 1, .renorm = .kept }, sr.rule);
++    for ([_][]const u8{ "1.0,3", "0,3", "0.85,0", "0.85,9", "0.85,3,foo", "0.85,3,kept,x", "abc", "0.85", "stats:", "stats:abc", "statsx", "2", "-0.5,3" }) |bad| {
++        try expectEqual(@as(?Mode, null), parse(bad));
++    }
++}
++
++test "the model must fit the kernel's arrays" {
++    const m = parse("1").?;
++    try std.testing.expect(fits(6, 384, 48, m));
++    try std.testing.expect(!fits(9, 384, 48, m));
++    try std.testing.expect(!fits(6, 600, 48, m));
++    try std.testing.expect(!fits(6, 384, 65, m));
++    try std.testing.expect(!fits(2, 384, 48, m)); // min_k 3 of a top-2
++}
++
++test "the kernel argument carries the mode" {
++    const a = kargs(parse("stats:0.9,2,orig").?, 4, 6, 7);
++    try expectEqual(@as(c_int, 0), a.apply);
++    try expectEqual(@as(c_int, 2), a.min_k);
++    try expectEqual(@as(c_int, 0), a.renorm);
++    try expectEqual(@as(c_int, 6), a.topk);
++    try expectEqual(@as(c_int, 7), a.slots);
++    try expectEqual(@as(c_int, 4), a.rows);
++    try expectEqual(@as(usize, 6 * 8), stats_bytes);
++}
++
++fn sum(w: []const f32) f32 {
++    var s: f32 = 0;
++    for (w) |x| s += x;
++    return s;
++}
++
++test "top-p keeps the heaviest slots until the share is passed" {
++    var p = [_]i32{ 10, 11, 12, 13, 14, 15 };
++    var w = [_]f32{ 0.40 * 1.5, 0.25 * 1.5, 0.15 * 1.5, 0.10 * 1.5, 0.06 * 1.5, 0.04 * 1.5 };
++    const total = sum(&w);
++    const o = pruneRow(default_rule, true, &p, &w);
++    try expectEqual(@as(u32, 2), o.dropped);
++    try std.testing.expectApproxEqAbs(@as(f32, 0.10), o.mass, 1e-6);
++    try expectEqual([_]i32{ 10, 11, 12, 13, -1, -1 }, p);
++    try expectEqual(@as(f32, 0), w[4]);
++    try expectEqual(@as(f32, 0), w[5]);
++    try std.testing.expectApproxEqAbs(total, sum(&w), 2 * std.math.floatEps(f32) * total);
++}
++
++test "the kept slots follow weight rank, not slot order" {
++    var p = [_]i32{ 1, 2, 3, 4, 5, 6 };
++    var w = [_]f32{ 0.04, 0.40, 0.06, 0.25, 0.10, 0.15 };
++    const o = pruneRow(default_rule, true, &p, &w);
++    try expectEqual(@as(u32, 2), o.dropped);
++    try expectEqual([_]i32{ -1, 2, -1, 4, 5, 6 }, p);
++}
++
++test "at least min_k slots survive however low the threshold" {
++    var p = [_]i32{ 1, 2, 3, 4, 5, 6 };
++    var w = [_]f32{ 0.3, 0.25, 0.2, 0.1, 0.1, 0.05 };
++    const o = pruneRow(.{ .topp = 0.01, .min_k = 3, .renorm = .kept }, true, &p, &w);
++    try expectEqual(@as(u32, 3), o.dropped);
++    try expectEqual([_]i32{ 1, 2, 3, -1, -1, -1 }, p);
++}
++
++test "a pruned row always keeps one slot, even with min_k 0" {
++    var p = [_]i32{ 7, 8, 9 };
++    var w = [_]f32{ 0.5, 0.3, 0.2 };
++    const o = pruneRow(.{ .topp = 0.001, .min_k = 0, .renorm = .kept }, true, &p, &w);
++    try expectEqual(@as(u32, 2), o.dropped);
++    try expectEqual([_]i32{ 7, -1, -1 }, p);
++    try std.testing.expectApproxEqAbs(@as(f32, 1.0), w[0], 1e-6);
++}
++
++test "a threshold past the whole row leaves it bit for bit" {
++    var p = [_]i32{ 1, 2, 3, 4, 5, 6 };
++    var w = [_]f32{ 0.4, 0.25, 0.15, 0.1, 0.06, 0.04 };
++    const p0 = p;
++    const w0 = w;
++    const o = pruneRow(.{ .topp = 0.9999999, .min_k = 1, .renorm = .kept }, true, &p, &w);
++    try expectEqual(@as(u32, 0), o.dropped);
++    try expectEqual(p0, p);
++    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&w0), std.mem.asBytes(&w));
++}
++
++test "equal weights tie to the lower slot" {
++    var p = [_]i32{ 1, 2, 3, 4, 5, 6 };
++    var w: [6]f32 = @splat(0.25);
++    const o = pruneRow(.{ .topp = 0.4, .min_k = 1, .renorm = .kept }, true, &p, &w);
++    // exclusive prefixes 0, 1/6, 2/6, 3/6 ...: slots 0, 1, 2 are under 0.4, the rest follow in slot order
++    try expectEqual(@as(u32, 3), o.dropped);
++    try expectEqual([_]i32{ 1, 2, 3, -1, -1, -1 }, p);
++}
++
++test "orig leaves the kept weights bit for bit, kept holds the sum" {
++    const p0 = [_]i32{ 1, 2, 3, 4, 5, 6 };
++    const w0 = [_]f32{ 0.5, 0.2, 0.15, 0.1, 0.03, 0.02 };
++    var p = p0;
++    var w = w0;
++    _ = pruneRow(.{ .topp = 0.9, .min_k = 3, .renorm = .orig }, true, &p, &w);
++    try expectEqual([_]i32{ 1, 2, 3, 4, -1, -1 }, p);
++    try std.testing.expectEqualSlices(u8, std.mem.asBytes(w0[0..4]), std.mem.asBytes(w[0..4]));
++    p = p0;
++    w = w0;
++    _ = pruneRow(.{ .topp = 0.9, .min_k = 3, .renorm = .kept }, true, &p, &w);
++    try std.testing.expectApproxEqAbs(sum(&w0), sum(&w), 1e-6);
++}
++
++test "an unrouted slot passes through and takes no part" {
++    var p = [_]i32{ -1, 2, 3, 4, -1, 6 };
++    var w = [_]f32{ 0.9, 0.5, 0.3, 0.1, 0.7, 0.1 };
++    const o = pruneRow(.{ .topp = 0.85, .min_k = 1, .renorm = .orig }, true, &p, &w);
++    // live weights 0.5 0.3 0.1 0.1 (total 1.0): prefixes 0, 0.5, 0.8, 0.9 -> the last drops
++    try expectEqual(@as(u32, 1), o.dropped);
++    try expectEqual([_]i32{ -1, 2, 3, 4, -1, -1 }, p);
++    try expectEqual(@as(f32, 0.9), w[0]);
++    try expectEqual(@as(f32, 0.7), w[4]);
++    var none = [_]i32{ -1, -1 };
++    var wn = [_]f32{ 1, 1 };
++    try expectEqual(@as(u32, 0), pruneRow(default_rule, true, &none, &wn).dropped);
++}
++
++test "a total that is zero, negative, infinite or NaN leaves the row alone" {
++    for ([_]f32{ 0, -1, std.math.inf(f32), std.math.nan(f32) }) |t| {
++        var p = [_]i32{ 1, 2, 3 };
++        var w = [_]f32{ t, 0, 0 };
++        try expectEqual(@as(u32, 0), pruneRow(default_rule, true, &p, &w).dropped);
++        try expectEqual([_]i32{ 1, 2, 3 }, p);
++    }
++}
++
++test "stats mode counts the drop and writes nothing" {
++    const p0 = [_]i32{ 1, 2, 3, 4, 5, 6 };
++    const w0 = [_]f32{ 0.4, 0.25, 0.15, 0.1, 0.06, 0.04 };
++    var p = p0;
++    var w = w0;
++    const o = pruneRow(default_rule, false, &p, &w);
++    try expectEqual(@as(u32, 2), o.dropped);
++    try expectEqual(p0, p);
++    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&w0), std.mem.asBytes(&w));
++}
++
++test "pruning keeps the weight sum, min_k slots and invents no pick" {
++    var prng = std.Random.DefaultPrng.init(0x5eed);
++    const rnd = prng.random();
++    for (0..2000) |_| {
++        var p: [6]i32 = undefined;
++        var w: [6]f32 = undefined;
++        for (&p, &w) |*e, *x| {
++            e.* = rnd.intRangeAtMost(i32, 0, 383);
++            x.* = rnd.float(f32) + 0.01;
++        }
++        const p0 = p;
++        const t0 = sum(&w);
++        const rule: Rule = .{ .topp = 0.5 + 0.49 * rnd.float(f32), .min_k = rnd.intRangeAtMost(u32, 1, 6), .renorm = .kept };
++        const o = pruneRow(rule, true, &p, &w);
++        try std.testing.expect(o.dropped <= 6 - rule.min_k);
++        try std.testing.expectApproxEqAbs(t0, sum(&w), 4 * std.math.floatEps(f32) * t0);
++        var live: u32 = 0;
++        for (p, p0) |e, e0| {
++            if (e >= 0) {
++                live += 1;
++                try expectEqual(e0, e);
++            }
++        }
++        try std.testing.expect(live >= rule.min_k);
++    }
++}
++
++test "distinct counts experts once and skips unrouted and out-of-range ids" {
++    try expectEqual(@as(u32, 0), distinct(&.{}));
++    try expectEqual(@as(u32, 3), distinct(&.{ 5, 9, 5, 383, 9, -1, 5, 512, 9999 }));
++}
++
++test "a drop only saves a read when no other row picks the expert" {
++    var p = [_]i32{ 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 7, 8 }; // two rows of six
++    var w = [_]f32{ 0.4, 0.25, 0.15, 0.1, 0.06, 0.04, 0.4, 0.25, 0.15, 0.1, 0.06, 0.04 };
++    const before = distinct(&p);
++    _ = pruneRow(default_rule, true, p[0..6], w[0..6]);
++    _ = pruneRow(default_rule, true, p[6..12], w[6..12]);
++    try expectEqual(@as(u32, 8), before);
++    try expectEqual(@as(u32, 4), distinct(&p));
++}
++
++test "the fingerprint tells modes and rules apart" {
++    const off = fingerprint(null);
++    const on = fingerprint(parse("1"));
++    const st = fingerprint(parse("stats"));
++    const other = fingerprint(parse("0.9,3"));
++    try std.testing.expect(!std.mem.eql(u8, &off, &on));
++    try std.testing.expect(!std.mem.eql(u8, &on, &st));
++    try std.testing.expect(!std.mem.eql(u8, &on, &other));
++    try std.testing.expect(!std.mem.eql(u8, &fingerprint(parse("0.85,3,kept")), &fingerprint(parse("0.85,3,orig"))));
++    try std.testing.expect(std.mem.eql(u8, &on, &fingerprint(parse("0.85,3,kept"))));
++}
++
++test "ranks agree only on identical fingerprints" {
++    const a = fingerprint(parse("1"));
++    const b = fingerprint(parse("0.9,3"));
++    try std.testing.expect(agree(&(a ++ a)));
++    try std.testing.expect(agree(&(a ++ a ++ a ++ a)));
++    try std.testing.expect(!agree(&(a ++ b)));
++    try std.testing.expect(!agree(&(a ++ a ++ a ++ b)));
++    try std.testing.expect(!agree(a[0..8]));
++    try std.testing.expect(!agree(&[_]u8{}));
++}
++
++test "the cap switch parses its forms and needs the prune" {
++    const rule = parse("0.83,3");
++    try expectEqual(Cap{ .experts = 10, .floor = 1 }, withCap(rule, "10").?.cap.?);
++    try expectEqual(Cap{ .experts = 12, .floor = 2 }, withCap(rule, "12,2").?.cap.?);
++    try expectEqual(@as(?Cap, null), withCap(rule, "10,4").?.cap); // floor above min_k 3
++    try expectEqual(@as(?Mode, null), withCap(null, "10"));
++    try expectEqual(@as(?Cap, null), withCap(rule, null).?.cap);
++    for ([_][]const u8{ "", "0", "abc", "10,0", "10,9", "600", "10,1,2", "-3" }) |t| {
++        try expectEqual(@as(?Cap, null), withCap(rule, t).?.cap);
++    }
++}
++
++test "a set switch that is malformed, or a cap without its prune, refuses to start" {
++    try expectEqual(@as(?Mode, null), try fromText(null, null));
++    try expectEqual(@as(?Mode, null), try fromText("", "0"));
++    try expectEqual(default_rule, (try fromText("1", null)).?.rule);
++    try expectEqual(Cap{ .experts = 12, .floor = 2 }, (try fromText("0.83,3", "12,2")).?.cap.?);
++    for ([_][]const u8{ "abc", "1.0,3", "0.85,9", "stats:", "2" }) |bad| {
++        try std.testing.expectError(error.BadExpertPrune, fromText(bad, null));
++        try std.testing.expectError(error.BadExpertPrune, fromText(bad, "10"));
++    }
++    for ([_][]const u8{ "abc", "10,0", "10,9", "600", "10,1,2", "-3", "10,4" }) |bad| {
++        try std.testing.expectError(error.BadExpertPrune, fromText("0.83,3", bad));
++    }
++    try std.testing.expectError(error.BadExpertPrune, fromText(null, "10"));
++    try std.testing.expectError(error.BadExpertPrune, fromText("0", "10"));
++}
++
++test "the kernel argument and the fingerprint carry the cap" {
++    const off = kargs(parse("1").?, 4, 6, 7);
++    try expectEqual(@as(c_int, 0), off.cap);
++    try expectEqual(@as(c_int, 0), off.cap_min);
++    const on = withCap(parse("1"), "10,2").?;
++    const a = kargs(on, 4, 6, 7);
++    try expectEqual(@as(c_int, 10), a.cap);
++    try expectEqual(@as(c_int, 2), a.cap_min);
++    try std.testing.expect(!std.mem.eql(u8, &fingerprint(parse("1")), &fingerprint(on)));
++    try std.testing.expect(!std.mem.eql(u8, &fingerprint(withCap(parse("1"), "10").?), &fingerprint(on)));
++    try std.testing.expect(!fits(6, 384, 48, .{ .rule = .{ .topp = 0.8, .min_k = 1, .renorm = .kept }, .apply = true, .cap = .{ .experts = 4, .floor = 2 } }));
++}
++
++const test_slots = 7; // six routed slots and the shared expert's
++
++fn randomWindow(rnd: std.Random, rows: usize, p: []i32, w: []f32) void {
++    for (0..rows) |r| {
++        for (0..test_slots) |i| {
++            p[r * test_slots + i] = if (i == 6) 384 else rnd.intRangeAtMost(i32, 0, 47); // few ids: rows share experts
++            w[r * test_slots + i] = rnd.float(f32) + 0.01;
++        }
++    }
++}
++
++test "without a cap a window is pruneRow row by row, bit for bit" {
++    var prng = std.Random.DefaultPrng.init(0xcab0);
++    const rnd = prng.random();
++    for (0..500) |_| {
++        const rows = rnd.intRangeAtMost(usize, 1, 16);
++        var p: [16 * test_slots]i32 = undefined;
++        var w: [16 * test_slots]f32 = undefined;
++        randomWindow(rnd, rows, &p, &w);
++        var p2 = p;
++        var w2 = w;
++        const m = parse("0.83,3").?;
++        _ = pruneWindow(m, rows, test_slots, 6, p[0 .. rows * test_slots], w[0 .. rows * test_slots]);
++        for (0..rows) |r| _ = pruneRow(m.rule, true, p2[r * test_slots ..][0..6], w2[r * test_slots ..][0..6]);
++        try std.testing.expectEqualSlices(i32, p2[0 .. rows * test_slots], p[0 .. rows * test_slots]);
++        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w2[0 .. rows * test_slots]), std.mem.sliceAsBytes(w[0 .. rows * test_slots]));
++    }
++}
++
++test "the cap keeps at most experts + rows * floor, keeps each row's floor and invents no pick" {
++    var prng = std.Random.DefaultPrng.init(0x1ea4);
++    const rnd = prng.random();
++    for (0..2000) |_| {
++        const rows = rnd.intRangeAtMost(usize, 1, 16);
++        const c: Cap = .{ .experts = rnd.intRangeAtMost(u32, 1, 24), .floor = rnd.intRangeAtMost(u32, 1, 3) };
++        const m = withCap(parse("0.83,3"), null).?;
++        var mc = m;
++        mc.cap = c;
++        var p: [16 * test_slots]i32 = undefined;
++        var w: [16 * test_slots]f32 = undefined;
++        randomWindow(rnd, rows, &p, &w);
++        const p0 = p;
++        const w0 = w;
++        var pr = p;
++        var wr = w;
++        _ = pruneWindow(m, rows, test_slots, 6, pr[0 .. rows * test_slots], wr[0 .. rows * test_slots]);
++        _ = pruneWindow(mc, rows, test_slots, 6, p[0 .. rows * test_slots], w[0 .. rows * test_slots]);
++        var routed: [16 * 6]i32 = undefined;
++        var routed_rule: [16 * 6]i32 = undefined;
++        for (0..rows) |r| {
++            @memcpy(routed[r * 6 ..][0..6], p[r * test_slots ..][0..6]);
++            @memcpy(routed_rule[r * 6 ..][0..6], pr[r * test_slots ..][0..6]);
++            try expectEqual(@as(i32, 384), p[r * test_slots + 6]); // the shared slot is not the cap's
++            // kept is a subset of what the rule kept, and the weights still sum to the row's total
++            var t0: f32 = 0;
++            var t1: f32 = 0;
++            for (0..6) |i| {
++                const e = p[r * test_slots + i];
++                t0 += w0[r * test_slots + i];
++                t1 += w[r * test_slots + i];
++                if (e >= 0) try expectEqual(pr[r * test_slots + i], e);
++            }
++            try std.testing.expectApproxEqAbs(t0, t1, 8 * std.math.floatEps(f32) * t0);
++            // the row's `floor` heaviest picks survive
++            for (0..6) |i| {
++                var above: u32 = 0;
++                for (0..6) |j| {
++                    const wi = w0[r * test_slots + i];
++                    const wj = w0[r * test_slots + j];
++                    if (wj > wi or (wj == wi and j < i)) above += 1;
++                }
++                if (above < c.floor) try expectEqual(p0[r * test_slots + i], p[r * test_slots + i]);
++            }
++        }
++        const after = distinct(routed[0 .. rows * 6]);
++        try std.testing.expect(after <= c.experts + @as(u32, @intCast(rows)) * c.floor);
++        if (c.experts >= distinct(routed_rule[0 .. rows * 6])) try std.testing.expectEqualSlices(i32, pr[0 .. rows * test_slots], p[0 .. rows * test_slots]);
++    }
++}
++
++test "under a cap a row with no usable weight sum keeps its first floor picks" {
++    for ([_]f32{ 0, -1, std.math.inf(f32), std.math.nan(f32) }) |t| {
++        var p = [_]i32{ 7, -1, 8, 9, 10, 11, 384 };
++        var w = [_]f32{ t, 0, 0, 0, 0, 0, 1 };
++        const o = pruneWindow(withCap(parse("0.83,3"), "4,2").?, 1, test_slots, 6, &p, &w);
++        try expectEqual([_]i32{ 7, -1, 8, -1, -1, -1, 384 }, p);
++        try expectEqual(@as(u32, 3), o.dropped);
++    }
++}
++
++test "a capped window, degenerate rows too, has at most placeBound places" {
++    var prng = std.Random.DefaultPrng.init(0x91ace);
++    const rnd = prng.random();
++    for (0..2000) |_| {
++        const rows = rnd.intRangeAtMost(usize, 1, 16);
++        var m = withCap(parse("0.83,3"), null).?;
++        m.cap = .{ .experts = rnd.intRangeAtMost(u32, 1, 24), .floor = rnd.intRangeAtMost(u32, 1, 3) };
++        var p: [16 * test_slots]i32 = undefined;
++        var w: [16 * test_slots]f32 = undefined;
++        randomWindow(rnd, rows, &p, &w);
++        for (0..rows) |r| {
++            if (rnd.intRangeLessThan(u32, 0, 8) == 0) w[r * test_slots] = std.math.nan(f32);
++        }
++        _ = pruneWindow(m, rows, test_slots, 6, p[0 .. rows * test_slots], w[0 .. rows * test_slots]);
++        // places: the distinct ids of every slot, the shared one included (decode_prep's grouping)
++        try std.testing.expect(distinct(p[0 .. rows * test_slots]) <= placeBound(m, rows).?);
++    }
++}
++
++test "only an applied cap bounds the places" {
++    try expectEqual(@as(?usize, null), placeBound(parse("0.83,3").?, 6));
++    try expectEqual(@as(?usize, 19), placeBound(withCap(parse("0.83,3"), "12").?, 6));
++    var counted = withCap(parse("0.83,3"), "12").?;
++    counted.apply = false;
++    try expectEqual(@as(?usize, null), placeBound(counted, 6));
++}
++
++test "the cap keeps the window's heaviest experts" {
++    // row 0: experts 1, 2, 3 at 0.5, 0.3, 0.2; row 1: 1, 4, 5 at 0.4, 0.35, 0.25. Scores 1: 0.9, 4: 0.35, 2: 0.3,
++    // 5: 0.25, 3: 0.2; a cap of 2 keeps {1, 4}, and each row's heaviest (expert 1) is in it.
++    var p = [_]i32{ 1, 2, 3, -1, -1, -1, 384, 1, 4, 5, -1, -1, -1, 384 };
++    var w = [_]f32{ 0.5, 0.3, 0.2, 0, 0, 0, 1, 0.4, 0.35, 0.25, 0, 0, 0, 1 };
++    const m = withCap(parse("0.99,3"), "2").?;
++    const o = pruneWindow(m, 2, test_slots, 6, &p, &w);
++    try expectEqual([_]i32{ 1, -1, -1, -1, -1, -1, 384, 1, 4, -1, -1, -1, -1, 384 }, p);
++    try expectEqual(@as(u32, 3), o.dropped);
++    try std.testing.expectApproxEqAbs(@as(f32, 1), w[0], 1e-6);
++    try std.testing.expectApproxEqAbs(@as(f32, 1), w[7] + w[8], 1e-6);
++}
++
++test "the profile line means a window and prints zeros, not NaN, when empty" {
++    var buf: [512]u8 = undefined;
++    var w = std.Io.Writer.fixed(&buf);
++    // 10 windows of 4 rows: 60 experts read as routed, 51 once pruned, 12 slots dropped holding 0.1 of each row's weight
++    try write(&w, 0, .{ .windows = 10, .before = 60, .after = 51, .dropped = 12, .rows = 40, .dropped_ppm = 4_000_000 });
++    try std.testing.expectEqualStrings("{\"rank\": 0, \"expert_prune\": {\"windows\": 10, \"rows\": 40, \"distinct_before\": 6.000, \"distinct_after\": 5.100, \"saved_a_window\": 0.900, \"dropped_a_row\": 0.300, \"dropped_share\": 0.1000}}\n", w.buffered());
++    var w2 = std.Io.Writer.fixed(&buf);
++    try write(&w2, 1, .{});
++    try std.testing.expectEqualStrings("{\"rank\": 1, \"expert_prune\": {\"windows\": 0, \"rows\": 0, \"distinct_before\": 0.000, \"distinct_after\": 0.000, \"saved_a_window\": 0.000, \"dropped_a_row\": 0.000, \"dropped_share\": 0.0000}}\n", w2.buffered());
++}
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index a6ec0aefa..5ea01c314 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -240,6 +240,7 @@ pub fn main(init: std.process.Init) !u8 {
+             w.print("}}}}\n", .{}) catch {};
+             printClock(w, o.rank, m) catch {};
+             printKvShard(w, o.rank, m) catch {};
++            printPrune(w, o.rank, m) catch {};
+             if (m.ptimer) |tm| {
+                 w.print("{{\"rank\": {d}, \"prefill_phases_ms\": {{", .{o.rank}) catch {};
+                 for (dsv41.round.PhaseTimer.phases, 0..) |name, i| w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, if (tm.rounds == 0) 0 else tm.ms[i] / @as(f64, @floatFromInt(tm.rounds)) }) catch {};
+@@ -419,6 +420,7 @@ pub fn main(init: std.process.Init) !u8 {
+         try w.flush();
+         try printClock(w, 0, m);
+         try printKvShard(w, 0, m);
++        try printPrune(w, 0, m);
+         if (m.eh) |eh| if (eh.p_calls > 0) {
+             const pc: f64 = @floatFromInt(eh.p_calls);
+             try w.print("{{\"rank\": 0, \"prefill_engram_ms\": {{\"calls\": {d}, \"rows\": {d:.2}, \"upload\": {d:.2}, \"mm\": {d:.2}, \"exchange\": {d:.2}, \"gate\": {d:.2}}}}}\n", .{ eh.p_calls, @as(f64, @floatFromInt(eh.p_rows)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_upload)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_mm)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_x)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_gate)) / pc / 1e6 });
+@@ -507,6 +509,13 @@ fn printKvShard(w: *std.Io.Writer, rank: u32, m: *const dsv41.model.Model) !void
+     try w.flush();
+ }
+ 
++/// The expert prune's counters on this rank (a profile); nothing when the prune is off.
++fn printPrune(w: *std.Io.Writer, rank: u32, m: *dsv41.model.Model) !void {
++    const st = try m.pruneStats() orelse return;
++    try dsv41.expert_prune.write(w, rank, st);
++    try w.flush();
++}
++
+ /// A profile's round GPU clock gaps (us a round): start to the first stretch, then each stretch and the wait after it.
+ fn printClock(w: *std.Io.Writer, rank: u32, m: *const dsv41.model.Model) !void {
+     if (m.clk_rounds == 0) return;
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index b89c95521..65ef5a5e8 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -33,6 +33,7 @@ const pool_mod = @import("pool.zig");
+ const shard = @import("shard.zig");
+ const shard_ops = @import("shard_ops.zig");
+ const prompt_rows = @import("prompt_rows.zig");
++const expert_prune = @import("expert_prune.zig");
+ 
+ /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
+ pub const chunk_rows = 2048;
+@@ -125,6 +126,8 @@ pub const Options = struct {
+     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+ };
+ 
++const max_world = 4; // the 2D split
++
+ pub const Model = struct {
+     gpa: std.mem.Allocator,
+     host: std.heap.ArenaAllocator, // allocations that live as long as the model
+@@ -418,6 +421,7 @@ pub const Model = struct {
+             try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
+         }
+         m.rd = try round.Round.init(&m.eng, &m.arena, a, m.request_cap);
++        try m.agreePrune();
+         if (m.kvs != null) try m.rd.useShard(&m.eng, &m.arena, a);
+         m.amax = try m.arena.take(round.max_rows * 4);
+         if (o.graphs) m.graphs = round.Graphs.init(gpa, o.graph_cap);
+@@ -552,6 +556,34 @@ pub const Model = struct {
+         return .{ .mode = mode, .pool = pool, .window = window };
+     }
+ 
++    /// Every rank holds the same expert-prune rule (or none): ranks on different rules pick different expert sets and sum
++    /// wrong partials without an error, so a mismatch ends the start. Collective, so it runs with the switch unset too.
++    fn agreePrune(m: *Model) !void {
++        const n = expert_prune.fingerprint_bytes;
++        const d = m.ctx.d;
++        var dev = try cuda.DeviceBuffer.alloc(d, n * (1 + max_world));
++        defer dev.free();
++        const mine = expert_prune.fingerprint(m.rd.prune);
++        try dev.upload(0, &mine);
++        try m.comm.allGather(dev.ptr, dev.ptr + n, n, .u8, m.stream);
++        try m.stream.synchronize();
++        var all: [n * max_world]u8 = undefined;
++        const got = all[0 .. n * m.world];
++        try dev.download(n, got);
++        if (!expert_prune.agree(got)) {
++            std.debug.print("{s}: the ranks run different prune rules; set it alike on every rank\n", .{expert_prune.env_name});
++            return error.ExpertPruneMismatch;
++        }
++    }
++
++    /// The prune kernel's counters since the start (null: the prune is off).
++    pub fn pruneStats(m: *Model) !?expert_prune.Stats {
++        if (m.rd.pstat == 0) return null;
++        var st: expert_prune.Stats = undefined;
++        try m.ctx.d.check(m.ctx.d.api.cuMemcpyDtoH_v2(&st, m.rd.pstat, expert_prune.stats_bytes), "cuMemcpyDtoH");
++        return st;
++    }
++
+     /// The start-up's note of what it serves when the pool is not the window or the shard is on: the pool, its parts,
+     /// the single-conversation limit (below the window asked: said so, with the numbers), the compressed planes'
+     /// bytes a rank (calculated: rows by the formula; the arena's figure is the measured one).
+diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
+index a82baee07..9dafc34d2 100644
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -6,6 +6,7 @@
+ //! gate checks them.
+ const std = @import("std");
+ const cuda = @import("cuda");
++const expert_prune = @import("expert_prune.zig");
+ 
+ /// launch_shape.h's tf_launch_blocks: a block a `threads` elements, at most 65535.
+ fn blocks(count: usize, threads: usize) u32 {
+@@ -37,6 +38,8 @@ pub const Ops = struct {
+     copy16: cuda.Function,
+     argmax_rows: cuda.Function,
+     gpu_clock: cuda.Function,
++    prune: ?expert_prune.Mode = null, // TF_DS_T13_EXPERT_PRUNE and _EXPERT_CAP, read at load
++    prune_fn: ?cuda.Function = null, // looked up only when the switch is on
+ 
+     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
+     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
+@@ -46,6 +49,7 @@ pub const Ops = struct {
+         errdefer mv.unload();
+         var fm = try cuda.Module.load(d, family);
+         errdefer fm.unload();
++        const prune = try expert_prune.fromEnv();
+         return .{
+             .pointwise = pw,
+             .movement = mv,
+@@ -68,6 +72,8 @@ pub const Ops = struct {
+             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
+             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
+             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
++            .prune = prune,
++            .prune_fn = if (prune != null) try fm.function("tf_ds_expert_prune_kernel") else null,
+         };
+     }
+ 
+@@ -187,6 +193,18 @@ pub const Ops = struct {
+         try cuda.launch.launch(o.l2_prefetch, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, s, &a);
+     }
+ 
++    /// The routed-expert prune of `pick` / `wts` [rows, slots] in place (m.apply: else it only counts); `stats`: the
++    /// device's expert_prune.Stats, or 0.
++    pub fn expertPrune(o: *const Ops, s: cuda.Stream, m: expert_prune.Mode, pick: u64, wts: u64, stats: u64, rows: usize, topk: usize, slots: usize) !void {
++        if (rows == 0) return;
++        var a: cuda.Args = .{};
++        a.add(pick);
++        a.add(wts);
++        a.add(expert_prune.kargs(m, rows, topk, slots));
++        a.add(stats);
++        try cuda.launch.launch(o.prune_fn orelse return error.ExpertPruneOff, .{ .grid = .{ .x = 1 }, .block = .{ .x = expert_prune.max_rows } }, s, &a);
++    }
++
+     /// The indexer's selection of every scanned key (its top-k takes all nb): out [rows, nb] int64 = j where j <
+     /// vis[r], else -1 (vis [rows] int64), on the device.
+     pub fn iotaVis(o: *const Ops, s: cuda.Stream, vis: u64, out: u64, nb: usize, rows: usize) !void {
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index b463c5c9d..ba840641d 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -1376,7 +1376,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
+     try routeSpans(e, ch, lay, shared_id, sl, kc);
+     if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
+     // routed(): a chunk of fewer than EXACT_ROWS rows (Engine.window_rows) takes the decode window's fused path and scratch
+-    if (prompt_rows.moeInWindow(n, e.window_rows)) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
++    if (prompt_rows.moeInWindow(n, e.window_rows)) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit, null);
+     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+ }
+ 
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index 95c72d170..e7816c92a 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -31,6 +31,7 @@ const shard = @import("shard.zig");
+ const shard_ops = @import("shard_ops.zig");
+ const shard_ring = @import("shard_ring.zig");
+ const graph_cache = @import("graph_cache.zig");
++const expert_prune = @import("expert_prune.zig");
+ 
+ const Engine = prompt.Engine;
+ const Chunk = prompt.Chunk;
+@@ -178,6 +179,9 @@ pub const Round = struct {
+     pick: u64, // int32 [R, slots]
+     mw: u64, // fp32 [R, slots]
+     pm: u64, // fp32 [R, D]
++    prune: ?expert_prune.Mode, // TF_DS_T13_EXPERT_PRUNE (TP2 only); fixed for the process, so a captured graph never differs from an eager round
++    pstat: u64, // expert_prune.Stats on the device, 0 unless prune
++    place_bound: bool, // TF_DS_T15_PLACE_BOUND under an applied cap: the experts' grids stop at placeBound
+     gm: u64, // fp32 [world, R, D]
+     // Engram
+     e_in: u64, // bf16 [R, cols * engram_head_dim]: the rows read for this rank's hash columns
+@@ -363,6 +367,23 @@ pub const Round = struct {
+         rd.pick = try a.take(R * e.slots() * 4);
+         rd.mw = try a.take(R * e.slots() * 4);
+         rd.pm = try a.take(R * d * 4);
++        rd.prune = null;
++        rd.pstat = 0;
++        rd.place_bound = false;
++        if (e.ops.prune) |m| {
++            // the 2D split's experts have not been checked to take pick -1
++            if (e.two != null) {
++                std.debug.print("{s}: ignored on the four-node split\n", .{expert_prune.env_name});
++            } else if (!expert_prune.fits(c.top_k, c.experts, R, m)) {
++                std.debug.print("{s}: the model does not fit the kernel (top_k {d}, experts {d}, rows {d})\n", .{ expert_prune.env_name, c.top_k, c.experts, R });
++                return error.BadExpertPrune;
++            } else {
++                rd.prune = m;
++                rd.place_bound = expert_prune.boundOn() and expert_prune.placeBound(m, R) != null;
++                rd.pstat = try a.take(expert_prune.stats_bytes);
++                try prompt.fill(e, rd.pstat, 0, expert_prune.stats_bytes);
++            }
++        }
+         rd.gm = try a.take(e.world * R * d * 4);
+         rd.e_in = 0;
+         rd.ek = 0;
+@@ -1281,6 +1302,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
+     const sl = e.slots();
+     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
+     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
++    if (rd.prune) |m| try e.ops.expertPrune(e.s, m, rd.pick, rd.mw, rd.pstat, R, c.top_k, sl);
+     try rd.mark(e, .m_rt);
+     if (e.two) |tw| {
+         // 2D (round2d.experts, the profile's marks between): gate / up, the intermediate's exchange, down
+@@ -1289,7 +1311,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
+         try tw.catRank(e, ch.xsd.xd, tw.xd_full, R * ch.xsd.slots, tw.gu, 2);
+         try rd.mark(e, .m_x);
+         try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, ch.xsd, tw.xd_full, rd.pick, rd.mw, rd.pm, R);
+-    } else try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
++    } else try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit, if (rd.place_bound) expert_prune.placeBound(rd.prune.?, R) else null);
+     // the prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
+     // 4 MiB of its wkv), after the last layer the head
+     if (li + 1 < e.w.layers.len) {

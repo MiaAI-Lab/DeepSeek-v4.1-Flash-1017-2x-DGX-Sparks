@@ -1,0 +1,521 @@
+diff --git a/zig/kernels/cuda/dsv41_ops.cu b/zig/kernels/cuda/dsv41_ops.cu
+index b84cce2e1..be76fe9f9 100644
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
+@@ -499,11 +499,9 @@ extern "C" __global__ void tf_ds_copy_rows16_kernel(const uint4* src, unsigned l
+ }
+ 
+ // A greedy row's token as sampling.argmax takes it on the host (best = 0; best = i where row[i] > row[best]): the
+-// first index of the largest value, a NaN never larger, and 0 when the row's first value is NaN. logits [rows, n] fp32
+-// (row stride ld), out [rows] u32; a row a block (1024 threads).
+-extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(const float* logits, unsigned long long ld,
+-                                                                             int n, unsigned* out) {
+-    const float* row = logits + (unsigned long long)blockIdx.x * ld;
++// first index of the largest value, a NaN never larger, and 0 when the row's first value is NaN. Every thread of a
++// 1024-thread block calls it; the token is valid in thread 0.
++__device__ unsigned tf_ds_block_argmax(const float* row, int n) {
+     const float ninf = -__int_as_float(0x7f800000);
+     float bv = ninf;
+     int bi = 0x7fffffff;
+@@ -531,7 +529,7 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(cons
+         si[warp] = bi;
+     }
+     __syncthreads();
+-    if (warp != 0) return;
++    if (warp != 0) return 0;
+     const int nw = (blockDim.x + 31) >> 5;
+     bv = lane < nw ? sv[lane] : ninf;
+     bi = lane < nw ? si[lane] : 0x7fffffff;
+@@ -543,7 +541,15 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(cons
+             bi = oi;
+         }
+     }
+-    if (lane == 0) out[blockIdx.x] = row[0] != row[0] ? 0u : (unsigned)bi;
++    return row[0] != row[0] ? 0u : (unsigned)bi;
++}
++
++// logits [rows, n] fp32 (row stride ld), out [rows] u32; a row a block (1024 threads).
++extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(const float* logits, unsigned long long ld,
++                                                                             int n, unsigned* out) {
++    const float* row = logits + (unsigned long long)blockIdx.x * ld;
++    const unsigned token = tf_ds_block_argmax(row, n);
++    if (threadIdx.x == 0) out[blockIdx.x] = token;
+ }
+ 
+ // ---- the vision tower (vit.zig): DeepSeek's ViT and aligner as the served lane runs them on torch, each torch op its
+@@ -688,3 +694,142 @@ extern "C" __global__ void tf_ds_keyed_noise_kernel(float* logits, uint64_t l_ro
+         row[v] += float(t * -log(-log(u)));
+     }
+ }
++
++// TF_DS_T27_DEVICE_DRAW: a sampled row's token on the device, sampling.zig's sampleRow. One block (1024 threads) a row
++// of logits [rows, n] fp32 (row stride ld); `rules` the device table of each row's rule; out [rows] u32. The host keeps
++// every row this cannot reproduce (top_k == 0, top_k + 8 > 64) off the kernel. The first top_k candidates by (value
++// desc, id asc) are the first top_k of the host's top_k + 8, so the margin is not read. The candidates come from a radix
++// select over 64-bit keys (the value's order-preserving bits above, the inverted id below, -0 as +0, a NaN as the
++// lowest value): a key is unique, so the top_k-th largest key is exact, and the keys at or above it are the candidates in
++// no order, which a rank count then sorts. The score, top_p and min_p arithmetic is the host's in double, with the
++// device exp and log in place of libm's: a pick can differ only where two scores sit within their rounding.
++struct TfDsDrawRow {
++    uint64_t seed;
++    double temp;
++    double top_p;
++    double min_p;
++    uint64_t pos;
++    uint32_t top_k;  // 1..56 when temp > 0
++    uint32_t pad;
++};
++
++__device__ __forceinline__ uint64_t tf_ds_draw_key(float v, int id) {
++    uint32_t b = __float_as_uint(v);
++    if ((b << 1) == 0) b = 0;
++    const uint32_t hi = v != v ? 0u : ((b & 0x80000000u) ? ~b : (b | 0x80000000u));
++    return (uint64_t(hi) << 32) | uint64_t(0xFFFFFFFFu - uint32_t(id));
++}
++
++extern "C" __global__ void __launch_bounds__(1024) tf_ds_draw_rows_kernel(const float* logits, unsigned long long ld, int n,
++                                                                           const TfDsDrawRow* rules, unsigned* out) {
++    const float* row = logits + (unsigned long long)blockIdx.x * ld;
++    const TfDsDrawRow rule = rules[blockIdx.x];
++    if (rule.temp <= 0.0) {
++        const unsigned token = tf_ds_block_argmax(row, n);
++        if (threadIdx.x == 0) out[blockIdx.x] = token;
++        return;
++    }
++    __shared__ unsigned hist[256];
++    __shared__ uint64_t sel[64];
++    __shared__ unsigned sid[64];
++    __shared__ double scaled[64];
++    __shared__ double score[64];
++    __shared__ unsigned count, digit, remain;
++    const int tid = threadIdx.x;
++    const unsigned k = min(rule.top_k, (unsigned)n);
++
++    uint64_t prefix = 0;
++    unsigned want = k;
++    for (int d = 0; d < 8; ++d) {
++        const int shift = 56 - 8 * d;
++        for (int i = tid; i < 256; i += blockDim.x) hist[i] = 0;
++        __syncthreads();
++        for (int i = tid; i < n; i += blockDim.x) {
++            const uint64_t key = tf_ds_draw_key(row[i], i);
++            if (d == 0 || (key >> (shift + 8)) == (prefix >> (shift + 8))) atomicAdd(&hist[(key >> shift) & 0xFF], 1u);
++        }
++        __syncthreads();
++        if (tid == 0) {
++            unsigned above = 0;
++            int b = 255;
++            for (; b > 0; --b) {
++                if (above + hist[b] >= want) break;
++                above += hist[b];
++            }
++            digit = b;
++            remain = want - above;
++        }
++        __syncthreads();
++        prefix |= uint64_t(digit) << shift;
++        want = remain;
++    }
++    // prefix is the k-th largest key
++    if (tid == 0) count = 0;
++    __syncthreads();
++    for (int i = tid; i < n; i += blockDim.x) {
++        const uint64_t key = tf_ds_draw_key(row[i], i);
++        if (key >= prefix) {
++            const unsigned at = atomicAdd(&count, 1u);
++            if (at < 64) sel[at] = key;
++        }
++    }
++    __syncthreads();
++    if (tid < (int)k) {
++        unsigned rank = 0;
++        for (unsigned m = 0; m < k; ++m) rank += sel[m] > sel[tid] ? 1u : 0u;
++        sid[rank] = ~uint32_t(sel[tid]);
++    }
++    __syncthreads();
++    const double t = fmax(rule.temp, 1e-6);
++    if (tid < (int)k) {
++        const unsigned id = sid[tid];
++        scaled[tid] = double(row[id]) / t;
++        uint64_t x = tf_ds_mix64(rule.seed + 0x9E3779B97F4A7C15ull);
++        x = tf_ds_mix64(x ^ (rule.pos * 0xD1B54A32D192ED03ull));
++        x = tf_ds_mix64(x ^ uint64_t(id));
++        const double u = double(x >> 11) * 0x1p-53 + 0x1p-54;
++        score[tid] = scaled[tid] - log(-log(u));
++    }
++    __syncthreads();
++    if (tid != 0) return;
++    const double ninf = -__longlong_as_double(0x7ff0000000000000ll);
++    if (0.0 < rule.top_p && rule.top_p < 1.0) {
++        double mx = scaled[0];
++        for (unsigned j = 1; j < k; ++j) mx = fmax(mx, scaled[j]);
++        double probs[64];
++        for (unsigned j = 0; j < k; ++j) probs[j] = exp(scaled[j] - mx);
++        // numpy's pairwise sum of k <= 56 values (sampling.pairwiseSum)
++        double sum;
++        if (k < 8) {
++            sum = 0.0;
++            for (unsigned j = 0; j < k; ++j) sum += probs[j];
++        } else {
++            double r[8];
++            for (int j = 0; j < 8; ++j) r[j] = probs[j];
++            unsigned i = 8;
++            for (; i < k - k % 8; i += 8) {
++                for (int j = 0; j < 8; ++j) r[j] += probs[i + j];
++            }
++            sum = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
++            for (; i < k; ++i) sum += probs[i];
++        }
++        double acc = 0.0;
++        unsigned below = 0;
++        for (unsigned j = 0; j < k; ++j) {
++            acc += probs[j] / sum;
++            if (acc < rule.top_p) below += 1;
++        }
++        for (unsigned j = below + 1; j < k; ++j) score[j] = ninf;
++    }
++    if (rule.min_p > 0.0) {
++        const double floor_ = scaled[0] + log(rule.min_p);
++        for (unsigned j = 0; j < k; ++j) {
++            if (scaled[j] < floor_) score[j] = ninf;
++        }
++    }
++    unsigned best = 0;
++    for (unsigned j = 0; j < k; ++j) {
++        if (score[j] > score[best]) best = j;
++    }
++    out[blockIdx.x] = sid[best];
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 9e8eb4669..9e2720e3d 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -18,6 +18,7 @@ const lanes = @import("lanes");
+ const model = @import("model.zig");
+ const round = @import("round.zig");
+ const draft = @import("draft.zig");
++const ops = @import("ops.zig");
+ const sampling = @import("sampling.zig");
+ const link = @import("link.zig");
+ const cuda = @import("cuda");
+@@ -1164,15 +1165,25 @@ pub const Lanes = struct {
+         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
+         try m.verify(rows, self.built.absorb[0..windows.len]);
+         const t2 = m.now();
+-        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
+-        var greedy = true;
+-        for (windows) |w| {
+-            if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+-                greedy = false;
+-            };
++        // every row greedy: the device's argmax (R tokens back); every sampled row one the kernel reproduces and
++        // TF_DS_T27_DEVICE_DRAW on: the device's draw (R tokens back); else the logits for the host's draws
++        var rules: sampling.RoundRules = .{};
++        for (windows) |w| if (w.stream.sampling) |sm| rules.add(sm.temperature, sm.top_k);
++        const path = rules.path(m.ops.draw_rows != null);
++        const n_rows = rows.ids.len;
++        var draw_tab: [round.max_rows]ops.DrawRow = undefined;
++        if (path == .device_draw) {
++            @memset(draw_tab[0..n_rows], .{ .seed = 0, .temp = 0, .top_p = 0, .min_p = 0, .pos = 0, .top_k = 0 });
++            for (windows, 0..) |w, k| {
++                const sm = w.stream.sampling orelse continue;
++                const row0 = self.built.wins[k].row;
++                for (0..w.rows()) |r| draw_tab[row0 + r] = .{ .seed = sm.seed, .temp = sm.temperature, .top_p = sm.top_p, .min_p = sm.min_p, .pos = w.positions[r], .top_k = sm.top_k };
++            }
++            try m.setDraw(draw_tab[0..n_rows]);
+         }
+-        const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
+-        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
++        defer m.draw_rows = 0;
++        const tokens: []const u32 = if (path == .host_draw) &.{} else try m.roundArgmax(n_rows);
++        const logits: []const f32 = if (path == .host_draw) try m.roundLogits(n_rows) else &.{};
+         if (m.ringFailed()) return error.RingFailed; // (robustness: a graph's collect gave up on a dead peer's flags)
+         const t3 = m.now();
+         defer if (self.prof) |*p| {
+@@ -1188,7 +1199,7 @@ pub const Lanes = struct {
+         const V = m.vocab;
+         for (windows, out, 0..) |w, *o, k| {
+             const row0 = self.built.wins[k].row;
+-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
++            for (0..w.rows()) |r| o.sampled[r] = if (path != .host_draw) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+             const l = self.streams.getPtr(w.stream).?;
+             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
+             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 58da3f563..78ef6dec2 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -184,6 +184,8 @@ pub const Model = struct {
+     logits: []f32, // round.max_rows rows of logits on the host
+     amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
+     amax_host: [round.max_rows]u32 = undefined,
++    draw_tab: u64 = 0, // ops.DrawRow [round.max_rows] (TF_DS_T27_DEVICE_DRAW; 0: off)
++    draw_rows: usize = 0, // rows the round's tokens are drawn on the device (setDraw; 0: the greedy argmax)
+     // the stream a fill is running: its slot and its view of the caches (its extent from base)
+     fill_slot: usize = 0,
+     // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
+@@ -425,6 +427,8 @@ pub const Model = struct {
+         try m.agreeKeyed();
+         if (m.kvs != null) try m.rd.useShard(&m.eng, &m.arena, a);
+         m.amax = try m.arena.take(round.max_rows * 4);
++        m.draw_tab = if (m.ops.draw_rows != null) try m.arena.take(round.max_rows * @sizeOf(ops_mod.DrawRow)) else 0;
++        m.draw_rows = 0;
+         if (o.graphs) m.graphs = round.Graphs.init(gpa, o.graph_cap);
+         if (o.side) try m.rd.useSide(&m.eng);
+         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
+@@ -1508,16 +1512,37 @@ pub const Model = struct {
+         return @intCast(std.Io.Timestamp.now(m.io, .awake).nanoseconds);
+     }
+ 
+-    /// The round's logits, R rows of the vocabulary, on the host (after verify).
+-    /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
++    /// The next round's rows are drawn on the device by `rules` (one per row) instead of taking the argmax; call after
++    /// verify and before roundArgmax, and set draw_rows back to 0 once the round's tokens are read.
++    pub fn setDraw(m: *Model, rules: []const ops_mod.DrawRow) !void {
++        if (rules.len == 0) {
++            m.draw_rows = 0;
++            return;
++        }
++        if (m.draw_tab == 0 or rules.len > round.max_rows) return error.DeviceDrawOff;
++        const d = m.ctx.d;
++        try d.check(d.api.cuMemcpyHtoDAsync_v2(m.draw_tab, rules.ptr, rules.len * @sizeOf(ops_mod.DrawRow), m.stream.handle), "cuMemcpyHtoDAsync");
++        m.draw_rows = rules.len;
++    }
++
++    /// The round's token kernel over R rows into amax: the draw under setDraw rules, else the argmax.
++    fn launchPick(m: *Model, R: usize) !void {
++        if (m.draw_rows == 0) return m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
++        if (R != m.draw_rows) return error.BadRound;
++        try m.ops.drawRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.draw_tab, m.amax);
++    }
++
++    /// The round's tokens, R rows, on the host: the device's argmax of the round's logits (as sampling.argmax), or under
++    /// setDraw rules their draw (sampling.sampleRow).
+     pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
+         const d = m.ctx.d;
+-        try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
++        try m.launchPick(R);
+         try m.stream.synchronize();
+         try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
+         return m.amax_host[0..R];
+     }
+ 
++    /// The round's logits, R rows of the vocabulary, on the host (after verify).
+     pub fn roundLogits(m: *Model, R: usize) ![]const f32 {
+         const d = m.ctx.d;
+         try m.stream.synchronize();
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index e2a56633a..c90da4409 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -14,6 +14,10 @@
+ //!   TF_DS_T26_KEYED_DRAFT=1                     a sampled stream's drafts take the sampler's keyed Gumbel noise (seed, position,
+ //!                                               token id) on the drafter's logits, so they match the target's draws (unset: off;
+ //!                                               greedy streams unchanged; set alike on every rank: ops.zig reads it at load)
++//!   TF_DS_T27_DEVICE_DRAW=1                     a decode round with sampled streams draws every row's token on the device (the
++//!                                               sampler's keyed rule, top_k 1..56) and returns the tokens as the greedy argmax
++//!                                               does, no logits copy; any other rule keeps the host's draw (unset: off;
++//!                                               set alike on every rank: ops.zig reads it at load)
+ //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
+ //!                                               streams (4; its 16): --parallel at most the streams
+ //!   TF_DS_PROMPT_WINDOW_ROWS=<rows>             a prompt chunk under these rows (64 .. 128; 64 unset) takes the MoE decode window
+diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
+index 0a3a73a45..6fbef1610 100644
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -25,6 +25,13 @@ fn envOn(name: [:0]const u8) bool {
+     return std.mem.eql(u8, std.mem.span(v), "1");
+ }
+ 
++/// The switch for the device draw of sampled rows (tf_ds_draw_rows_kernel); read at load on every rank.
++pub const draw_env = "TF_DS_T27_DEVICE_DRAW";
++
++/// One row of tf_ds_draw_rows_kernel's rule table: the sampler's seed, temperature, top_p, min_p, the row's absolute
++/// position and top_k (1..56 when temp > 0; the host keeps other rules off the kernel).
++pub const DrawRow = extern struct { seed: u64, temp: f64, top_p: f64, min_p: f64, pos: u64, top_k: u32, pad: u32 = 0 };
++
+ /// tf_ds_l2_prefetch_kernel's argument: up to 16 device ranges (their first byte and length).
+ pub const Prefetch = extern struct { ptr: [16]u64 = @splat(0), bytes: [16]u64 = @splat(0), n: c_int = 0 };
+ 
+@@ -53,6 +60,7 @@ pub const Ops = struct {
+     prune: ?expert_prune.Mode = null, // TF_DS_T13_EXPERT_PRUNE and _EXPERT_CAP, read at load
+     prune_fn: ?cuda.Function = null, // looked up only when the switch is on
+     keyed_noise: ?cuda.Function = null, // TF_DS_T26_KEYED_DRAFT, looked up only when on
++    draw_rows: ?cuda.Function = null, // TF_DS_T27_DEVICE_DRAW, looked up only when on
+ 
+     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
+     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
+@@ -88,6 +96,7 @@ pub const Ops = struct {
+             .prune = prune,
+             .prune_fn = if (prune != null) try fm.function("tf_ds_expert_prune_kernel") else null,
+             .keyed_noise = if (envOn(keyed_env)) try fm.function("tf_ds_keyed_noise_kernel") else null,
++            .draw_rows = if (envOn(draw_env)) try fm.function("tf_ds_draw_rows_kernel") else null,
+         };
+     }
+ 
+@@ -324,6 +333,20 @@ pub const Ops = struct {
+         try go(o.argmax_rows, s, rows, 1024, &a);
+     }
+ 
++    /// Each row's sampled token (sampling.sampleRow of the row's rule, or its argmax at temperature <= 0): out [rows] u32
++    /// of logits [rows, n] fp32 (row stride ld floats); `table` the device DrawRow of each row.
++    pub fn drawRows(o: *const Ops, s: cuda.Stream, logits: u64, ld: usize, n: usize, rows: usize, table: u64, out: u64) !void {
++        const f = o.draw_rows orelse return error.DeviceDrawOff;
++        if (rows == 0 or n == 0) return;
++        var a: cuda.Args = .{};
++        a.add(logits);
++        a.add(@as(u64, ld));
++        a.add(@as(c_int, @intCast(n)));
++        a.add(table);
++        a.add(out);
++        try go(f, s, rows, 1024, &a);
++    }
++
+     /// Adds T * gumbel(seed, pos + step, col0 + v) to column v of each of `rows` streams' logits row (fp32, rows `l_row`
+     /// floats apart, `width` columns; `table` the device KeyedRow of each stream), skipping streams with T <= 0.
+     pub fn keyedNoise(o: *const Ops, s: cuda.Stream, logits: u64, l_row: usize, width: usize, col0: usize, table: u64, step: usize, rows: usize) !void {
+@@ -376,3 +399,12 @@ test "a keyed row is the kernel's TfDsKeyedRow: u64 seed, f64 temperature, i64 p
+     try std.testing.expectEqual(@as(usize, 8), @offsetOf(KeyedRow, "temp"));
+     try std.testing.expectEqual(@as(usize, 16), @offsetOf(KeyedRow, "pos"));
+ }
++
++test "a draw row is the kernel's TfDsDrawRow" {
++    try std.testing.expectEqual(@as(usize, 48), @sizeOf(DrawRow));
++    try std.testing.expectEqual(@as(usize, 8), @offsetOf(DrawRow, "temp"));
++    try std.testing.expectEqual(@as(usize, 16), @offsetOf(DrawRow, "top_p"));
++    try std.testing.expectEqual(@as(usize, 24), @offsetOf(DrawRow, "min_p"));
++    try std.testing.expectEqual(@as(usize, 32), @offsetOf(DrawRow, "pos"));
++    try std.testing.expectEqual(@as(usize, 40), @offsetOf(DrawRow, "top_k"));
++}
+diff --git a/zig/src/families/dsv41/sampling.zig b/zig/src/families/dsv41/sampling.zig
+index fc2c16459..8ff2c1862 100644
+--- a/zig/src/families/dsv41/sampling.zig
++++ b/zig/src/families/dsv41/sampling.zig
+@@ -150,6 +150,32 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
+     return ids[best];
+ }
+ 
++/// A row's rule is one the device draw reproduces: greedy, or top_k in 1..max_candidates - margin (sampleRow's errors
++/// NotPortedYet and TooManyCandidates stay on the host's path).
++pub fn deviceDrawable(temperature: f64, top_k: usize) bool {
++    return temperature <= 0 or (top_k != 0 and top_k + margin <= max_candidates);
++}
++
++/// How a verify round gets its tokens: the device's argmax, the device's draw, or the logits on the host.
++pub const RoundPath = enum { greedy, device_draw, host_draw };
++
++/// The path of a round from its windows' rules (`add` each window's stream) and the TF_DS_T27_DEVICE_DRAW switch: one
++/// row the device cannot draw sends the whole round to the host.
++pub const RoundRules = struct {
++    sampled: bool = false,
++    drawable: bool = true,
++
++    pub fn add(r: *RoundRules, temperature: f64, top_k: usize) void {
++        if (temperature > 0) r.sampled = true;
++        if (!deviceDrawable(temperature, top_k)) r.drawable = false;
++    }
++
++    pub fn path(r: RoundRules, device_draw: bool) RoundPath {
++        if (!r.sampled) return .greedy;
++        return if (device_draw and r.drawable) .device_draw else .host_draw;
++    }
++};
++
+ test "splitmix64 draws as exact_sampling.uniform makes them" {
+     // (seed, position, id) -> the bits of exact_sampling.uniform's double
+     try std.testing.expectEqual(@as(u64, 0x3fe8cd8867d6a69c), @as(u64, @bitCast(uniform(101, 2229, 2581))));
+@@ -190,3 +216,94 @@ test "top candidates by value, then id" {
+     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 5, 2 }, &ids);
+     try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 3 }, &v);
+ }
++
++/// A deterministic fp32 row of `n` logits for the device draw's checks: values on a 1/8 grid (many equal ones, so the
++/// ties by id matter), a few large outliers, a spread like a trained model's top.
++fn testRow(a: std.mem.Allocator, n: usize, seed: u64) ![]f32 {
++    var prng = std.Random.DefaultPrng.init(seed);
++    const rnd = prng.random();
++    const row = try a.alloc(f32, n);
++    for (row) |*v| v.* = @round(rnd.floatNorm(f32) * 8.0) / 8.0;
++    for (0..24) |_| row[rnd.uintLessThan(usize, n)] = 4.0 + @round(rnd.float(f32) * 16.0) / 8.0;
++    return row;
++}
++
++test "top candidates equal a full sort of the row by value, then id" {
++    const a = std.testing.allocator;
++    const Pair = struct { v: f32, id: i64 };
++    for ([_]u64{ 1, 2, 3 }) |seed| {
++        const row = try testRow(a, 5000, seed);
++        defer a.free(row);
++        const all = try a.alloc(Pair, row.len);
++        defer a.free(all);
++        for (row, 0..) |v, i| all[i] = .{ .v = v, .id = @intCast(i) };
++        std.mem.sort(Pair, all, {}, struct {
++            fn lt(_: void, x: Pair, y: Pair) bool {
++                return before(x.v, x.id, y.v, y.id);
++            }
++        }.lt);
++        var values: [max_candidates]f32 = undefined;
++        var ids: [max_candidates]i64 = undefined;
++        for ([_]usize{ 1, 20, 28, max_candidates }) |count| {
++            try std.testing.expectEqual(count, topCandidates(row, count, &values, &ids));
++            for (0..count) |j| {
++                try std.testing.expectEqual(all[j].id, ids[j]);
++                try std.testing.expectEqual(all[j].v, values[j]);
++            }
++        }
++    }
++}
++
++test "pinned draws the device kernel must reproduce" {
++    const a = std.testing.allocator;
++    const Case = struct { row_seed: u64, position: u64, s: Sampling, token: i64 };
++    const cases = [_]Case{
++        .{ .row_seed = 11, .position = 2229, .s = .{ .seed = 101 }, .token = 1779 },
++        .{ .row_seed = 12, .position = 59, .s = .{ .seed = 404, .temperature = 0.7, .top_k = 8, .top_p = 1.0 }, .token = 2396 },
++        .{ .row_seed = 13, .position = 0, .s = .{ .seed = 0, .temperature = 1.3, .top_k = 56, .top_p = 0.5, .min_p = 0.05 }, .token = 3508 },
++        .{ .row_seed = 14, .position = 1048575, .s = .{ .seed = 0x7fffffffffffffff, .top_k = 1 }, .token = 1998 },
++        .{ .row_seed = 15, .position = 777, .s = .{ .seed = 9, .top_k = 33, .top_p = 0.0, .min_p = 0.3 }, .token = 562 },
++        .{ .row_seed = 16, .position = 31, .s = .{ .seed = 5, .temperature = 0.0 }, .token = 846 },
++    };
++    for (cases) |c| {
++        const row = try testRow(a, 4096, c.row_seed);
++        defer a.free(row);
++        try std.testing.expectEqual(c.token, try sampleRow(row, c.position, c.s));
++    }
++}
++
++test "the device draw takes a round only when every sampled row is one it reproduces" {
++    const T = RoundRules;
++    // a greedy round stays on the argmax path whatever the switch
++    var r: T = .{};
++    r.add(0.0, 0);
++    r.add(0.0, 500);
++    try std.testing.expectEqual(RoundPath.greedy, r.path(true));
++    try std.testing.expectEqual(RoundPath.greedy, r.path(false));
++    // sampled rows within 1..56 take the device with the switch on, the host with it off
++    r = .{};
++    r.add(0.7, 20);
++    r.add(0.0, 0); // a greedy row beside it is the argmax row of the same kernel
++    try std.testing.expectEqual(RoundPath.device_draw, r.path(true));
++    try std.testing.expectEqual(RoundPath.host_draw, r.path(false));
++    // top_k + margin must fit max_candidates: 56 is the largest
++    r = .{};
++    r.add(1.0, max_candidates - margin);
++    try std.testing.expectEqual(RoundPath.device_draw, r.path(true));
++    r = .{};
++    r.add(1.0, max_candidates - margin + 1);
++    try std.testing.expectEqual(RoundPath.host_draw, r.path(true));
++    // top_k 0 (the nucleus path the host does not port) and one bad row among good ones send the whole round to the host
++    r = .{};
++    r.add(1.0, 0);
++    try std.testing.expectEqual(RoundPath.host_draw, r.path(true));
++    r = .{};
++    r.add(1.0, 20);
++    r.add(0.5, 57);
++    r.add(1.0, 20);
++    try std.testing.expectEqual(RoundPath.host_draw, r.path(true));
++    // the rule agrees with sampleRow's own refusals
++    const row = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++    try std.testing.expectError(error.NotPortedYet, sampleRow(&row, 0, .{ .seed = 1, .top_k = 0 }));
++    try std.testing.expect(!deviceDrawable(1.0, 0));
++}
