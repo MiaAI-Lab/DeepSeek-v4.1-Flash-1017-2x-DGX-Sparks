@@ -20,19 +20,22 @@ think block keeps the gate, which is where it already works (the opener is force
 
 What changes: a request with `tool_choice: "required"` or a named function **and** thinking on no longer sets
 `request.call`, so the engine runs it as `auto`. Its reply is the model's own: a tool call when the model makes one, text
-otherwise. `auto`, `none`, absent `tool_choice`, and every non-thinking `required`/named request are unchanged.
+otherwise. `auto`, `none`, absent `tool_choice`, and every non-thinking `required`/named request are unchanged. The
+engine's `docs/api.md` now says so in the `tool_choice` row and in "Tool calls": with thinking on `required` is not
+enforced, and a client that needs it sends `chat_template_kwargs: {"enable_thinking": false}`.
 
-Verified on a pair (`tensorfold-dsv41:exl3-tp2-b8825cd47726`, built from this patch after `0038`; `./start.sh restart`
+Verified on a pair (`tensorfold-dsv41:exl3-tp2-b8825cd47726`, built from this patch after `0038` at the time (it applies after `0059` now); `./start.sh restart`
 exit 0, health `warming: false`, both Sparks on the same image): six one-token `required` + thinking requests return
 128822, the id `auto` returns, where the old image returned 1130, 1131, ...; `required` + `enable_thinking: false` still
 returns the opener (id 30) six times; and a `required` reply on `What is 17 times 23? Think it through step by step, then
 call get_time.` has clean reasoning (`We need answer 17*23 step by step ...`), the right answer (391) and
 `finish_reason: "tool_calls"` with `get_time` — the same ids, reasoning and content as the `auto` reply. `auto` and the
 non-thinking paths return the same ids as before, and the patch touches no sampler or round-loop code, so drafted and
-plain replies are unaffected. The patch applies with `git apply` after `0038` on a clean `TF_REF`.
+plain replies are unaffected. The patch applies with `git apply` after `0059` on a clean `TF_REF`.
 ---
+ docs/api.md               | 8 +++++++-
  zig/src/server/server.zig | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
+ 2 files changed, 12 insertions(+), 2 deletions(-)
 
 diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
 index 5cc8776..c41a3b3 100644
@@ -51,3 +54,29 @@ index 5cc8776..c41a3b3 100644
              const form = try srv.callForm(cx);
              const opener = if (form) |fm| oneToken(srv, cx.a, fm.opener) else null;
              if (opener == null) return cx.refuse("tool_choice \"required\" or a named function needs a chat template that marks tool calls (<tool_call> or <|tool_call>), and this one does not: send \"auto\"");
+diff --git a/docs/api.md b/docs/api.md
+index 3032adb..9898888 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -78,7 +78,7 @@ For decisions, `chat_template_kwargs` may be omitted, null, or an object contain
+ | --- | --- | --- |
+ | `messages` | Text messages, including system, developer, assistant tool calls and tool results | Both |
+ | `tools` | OpenAI function tools | Both |
+-| `tool_choice` | `none` hides tools from the template; `required` or a named function makes the reply call a tool | Both |
++| `tool_choice` | `none` hides tools from the template; `required` or a named function makes the reply call a tool. With thinking on it is not enforced (see "Tool calls") | Both |
+ | `parallel_tool_calls` | False returns at most one completed call | Both |
+ | `max_tokens`, `max_completion_tokens` | Explicit reply limit; rejected if prompt plus reply exceeds the window | Both |
+ | `temperature`, `top_p`, `top_k`, `min_p` | Sampling overrides; zero temperature is greedy | Both |
+@@ -184,6 +184,12 @@ only tool the template offers. Each fix depends only on the tokens before it, so
+ decoding write the same call. The MLX engine fixes tokens inside its rounds; CUDA stops the engine at a fix and
+ decodes on from the reply. The model writes the arguments; a malformed call returns as content.
+ 
++With thinking on, the gate is not applied (issue #80): its first-token path commits the backend's draw handle
++instead of the draw, so a gated thinking reply opens its reasoning with a stray token. A thinking request with
++`required` or a named function therefore runs as `auto`: its reply is the model's own, a call when the model makes
++one, text otherwise, and `finish_reason` may be `stop`. To have `required` enforced, send
++`chat_template_kwargs: {"enable_thinking": false}`.
++
+ ## Structured output
+ 
+ Every model on both backends enforces `response_format` (`{"type": "json_schema", "json_schema": {"schema": ...}}`
