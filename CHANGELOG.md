@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
+  bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
+  count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
+  `MissingTritonVariant` and later requests with `CudaFailed (901)` (issues #65, #63; 524,288 and 1,048,576 did not).
+  The engine side (ending a failed capture on the side stream too) is still open in #65. Test in
+  `scripts/test_scripts.py`. Reported by **Cristiano Revil ([cristianorevil](https://github.com/cristianorevil))** and
+  **XueYun ([xueyuenet](https://github.com/xueyuenet))**, with the window data from **ldenaeyer**.
 - `zig/patches/0059-lane-thread-binds-context.patch` (always on): the lane host's thread makes its CUDA context
   current as it starts. With the spill tier on, the first request after a start that resumed a state from disk
   reached the tier's restore (through the prompt cache, whose calls are not wrapped) before any backend call had bound

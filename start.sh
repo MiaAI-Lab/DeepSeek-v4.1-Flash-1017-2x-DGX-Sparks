@@ -284,6 +284,17 @@ KIT=/hf/$KIT_SUB/kit
 FOLLOW="--pool ${POOL:-$CONTEXT} --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 # zig/patches/0033: only with graphs on, so an image from before 0033 still starts with GRAPHS=0 (it refuses the flag)
 [[ "$GRAPHS" == 0 ]] || FOLLOW+=" --graph-cap $GRAPH_CAP"
+# A round's context bucket is the next power of two of its depth, capped at the pool (round.zig bucketFor). A pool off
+# the 4,096 grid makes the capped bucket's indexer tile count one the kit captured no _index_score variant for: a prompt
+# past the largest power of two below the pool fails with MissingTritonVariant, and later requests with CudaFailed (901)
+# until a restart (issues #65 and #63: 400,000 and 500,000 failed, 524,288 and 1,048,576 did not).
+_cap=${POOL:-$CONTEXT}
+if [[ "$GRAPHS" == 1 ]] && (( _cap % 4096 != 0 )); then
+  _p2=1024; while (( _p2 * 2 < _cap )); do _p2=$(( _p2 * 2 )); done
+  _what="CONTEXT=$CONTEXT"; [[ -z "${POOL:-}" ]] || _what="POOL=$POOL"
+  warn "the pool ($_what) is not a multiple of 4096: with GRAPHS=1 a prompt past $_p2 positions can fail with MissingTritonVariant and leave later requests failing with CudaFailed (901) until a restart (issues #65, #63). Use a power of two (524288, 1048576) or a multiple of 4096"
+fi
+unset _cap _p2 _what
 [[ -z "$ROUND_ROWS" ]] || FOLLOW+=" --round-rows $ROUND_ROWS"
 # RANK1_PROFILE=1|2: rank 1's own profile (--profile; 2 adds prefill_phases_ms), AGGREGATED over the run and printed to its
 # log only when rank 0 goes away first (docker stop rank 0, read rank 1's log, then ./stop.sh). It synchronizes the stream
