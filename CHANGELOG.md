@@ -124,6 +124,8 @@
   scripts use; `docs/PODMAN.md` covers the three places podman is not a drop-in and how to move a pair across.
   `CGROUP_PARENT` is optional and checked as a slice name (`tensorfold.slice`), because the value reaches the worker
   inside an ssh command line.
+- `scripts/memguard.sh` logs a kill it could not complete (the runtime's `kill` failing, or `timeout`) instead of
+  staying silent, once per run of failures; a failed kill used to leave no trace in the guard's log.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).

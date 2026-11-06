@@ -44,7 +44,7 @@ stop_guard() {
 nap() { sleep "$1" & wait $!; }
 
 run_guard() {
-  local c=$1 floor_kb hard_kb log=$3 pidfile=$4 hold_us a snap now since=0 low_min=0 hard_low=0 floor_gib=$2 hold=${5:-4} hard_gib=${6:-1}
+  local c=$1 floor_kb hard_kb log=$3 pidfile=$4 hold_us a snap now since=0 low_min=0 hard_low=0 floor_gib=$2 hold=${5:-4} hard_gib=${6:-1} kill_failed=0
   floor_kb=$(awk -v g="$floor_gib" 'BEGIN {printf "%d", g * 1048576}')
   hard_kb=$(awk -v g="$hard_gib" 'BEGIN {printf "%d", g * 1048576}')
   hold_us=$(awk -v h="$hold" 'BEGIN {printf "%d", h * 1000000}')
@@ -60,7 +60,7 @@ run_guard() {
       if (( since )); then
         echo "$(stamp) memguard: MemAvailable was under the $floor_gib GiB floor for $(( (now - since) / 1000 )) ms (lowest $(( low_min / 1024 )) MiB) and recovered: no kill" >> "$log"
       fi
-      since=0; hard_low=0; continue
+      since=0; hard_low=0; kill_failed=0; continue
     fi
     if (( ! since )); then since=$now; low_min=$a; fi
     (( a < low_min )) && low_min=$a
@@ -80,6 +80,9 @@ run_guard() {
       nap 5
     else
       wait
+      # once per run of failures: a container that is already gone fails the kill on every pass, and the guard keeps watching
+      (( kill_failed )) || echo "$(stamp) memguard: the kill of $c did not complete (${RT[*]} kill): the guard keeps watching" >> "$log"
+      kill_failed=1
     fi
   done
 }
