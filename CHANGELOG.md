@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `zig/patches/0061-call-gate-first-token.patch` (always on, issue #80): `started` read the first token through the
+  same `feed` it assigned; Zig built the literal at `feed`'s address first, so the tag became `.value` before
+  `readFeed(feed)` ran and the read returned the union's payload, the backend's per-request draw handle. A thinking
+  `required` reply therefore opened with that handle (ids 506, 607, ... 1109 on the pair, past the 1024 ring), while
+  `auto` was clean. Reading the handle into a temporary first fixes it: `required` with thinking on now opens with the
+  drawn token (the id `auto` returns, stable across requests), thinking off still forces the opener (id 30), and a
+  400-token reply has clean reasoning and calls its tool. Host tests in `engine_test.zig`. Supersedes #81/`0060`, which
+  keeps a thinking request off the gate and changes the API's contract. Verified on the pair (image `1fdb193d7a06`).
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with

@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 06 Nov 2026 13:30:00 -0500
+Subject: [PATCH] dsv41: the call gate's first token is the drawn token, not the
+ draw handle (#80)
+
+`started` read the first token through the same `feed` it assigned:
+
+    if (s.gate != null and forced == null) feed = .{ .value = try e.correctCall(s, try e.readFeed(feed)) };
+
+Zig builds the literal at `feed`'s address, so the tag became `.value` before `readFeed(feed)` ran; the read then took
+the union's payload (the handle) as the value. With thinking on the gate starts disarmed (the prompt ends in a think
+block), so `cut` leaves the token alone and the handle is committed: every `required` reply opens with the backend's
+per-request draw handle (the live pair returned 506, 607, ... 1109 over 600 requests; the id passes the 1024 ring, so it
+is the handle, not the ring index). `auto` never takes the branch, hence clean; `required` with thinking off forces the
+opener before the read, hence also clean.
+
+Read into a temporary first, then assign. The gate still forces the opener when armed, and a thinking `required` reply
+now opens with the drawn token; nothing else changes.
+
+Two host tests in engine_test.zig cover a disarmed gate (the drawn token, not the handle) and an armed one (the opener).
+
+Fixes #80. Supersedes the #81/0060 stopgap, which keeps a thinking request off the gate and changes the API's contract.
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 030743f..39c058e 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -160,7 +160,12 @@ pub const Engine = struct {
+         const forced = try e.forcedNext(s);
+         if (forced) |t| feed = .{ .value = t };
+         // tool_choice required: a drawn first token passes the gate; a forced one is committed as it is
+-        if (s.gate != null and forced == null) feed = .{ .value = try e.correctCall(s, try e.readFeed(feed)) };
++        if (s.gate != null and forced == null) {
++            // Read the handle before the assignment: writing `feed` first would make the read below
++            // see the new tag (.value) with the handle still in the payload, committing the handle.
++            const first = try e.readFeed(feed);
++            feed = .{ .value = try e.correctCall(s, first) };
++        }
+         var asked: ?u32 = null;
+         if (e.cfg.family_mtp and s.drafts) {
+             // the head reads the prompt's last row and the first token, and drafts the one after it
+diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
+index b8dc135..06bf56e 100644
+--- a/zig/src/core/lanes/engine_test.zig
++++ b/zig/src/core/lanes/engine_test.zig
+@@ -181,3 +181,68 @@ test "a cycle in the answer does not refire or reclose" {
+     for (plain[0].emitted) |token| close_count += @intFromBool(token == 90);
+     try std.testing.expectEqual(@as(usize, 1), close_count);
+ }
++
++// The call gate's first token: the drawn token, not the backend's draw handle (#80).
++fn lexBlank(_: *anyopaque, _: u32) bool {
++    return false;
++}
++fn lexText(_: *anyopaque, _: std.mem.Allocator, _: u32) ![]const u8 {
++    return "";
++}
++fn lexEncode(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]const u32 {
++    return &.{};
++}
++
++const gated_prompt = [_]u32{ 3, 1, 4, 1, 5, 7 }; // 7 = think_open last: the gate starts disarmed
++
++fn runGated(prompt: []const u32, gated: bool) ![]u32 {
++    var cfg = try model();
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    var p = try SuffixLookup.init(gpa, .{ .min_match = 4 });
++    defer p.deinit();
++    var s = try sm.Stream.init(gpa, .{
++        .id = "gated",
++        .prompt = prompt,
++        .max_new = 1,
++        .eos = &.{96},
++        .drafts = false,
++        .proposer = p.proposer(),
++        .think_close = &.{ 90, 91, 92 },
++        .think_end = 8,
++        .call = if (gated) .{
++            .opener = 30,
++            .think_open = 7,
++            .think_end = 8,
++            .lead = "",
++            .names = &.{"x"},
++            .tail = "",
++            .lex = .{ .ctx = @ptrCast(&cfg), .blank = lexBlank, .text = lexText, .encode = lexEncode },
++        } else null,
++    });
++    defer s.deinit(gpa);
++    try engine.addStream(&s);
++    while (engine.activeCount() > 0) try engine.step();
++    return gpa.dupe(u32, s.emitted());
++}
++
++test "a disarmed gate commits the drawn first token, not the backend's handle" {
++    const expected = fake.next(&gated_prompt, null, gated_prompt.len);
++    const gated = try runGated(&gated_prompt, true);
++    defer gpa.free(gated);
++    try std.testing.expectEqualSlices(u32, &.{expected}, gated);
++}
++
++test "an armed gate still forces the opener" {
++    const armed = [_]u32{ 3, 1, 4, 1, 5 }; // no think opener in the prompt: armed
++    const plain = try runGated(&armed, false);
++    defer gpa.free(plain);
++    try std.testing.expectEqualSlices(u32, &.{fake.next(&armed, null, armed.len)}, plain);
++    const gated = try runGated(&armed, true);
++    defer gpa.free(gated);
++    try std.testing.expectEqualSlices(u32, &.{30}, gated);
++}
