@@ -7,8 +7,8 @@ then run `--phase pressure`. Use the same new --seed for both phases. The
 pressure phase creates a prefix and a competing tail, and fails unless the
 long request actually resumes. Save server logs to verify placement separately.
 
-  python3 -I tools/claims/0047-growth-exact.py --phase cold --scenario fork --seed 12345 --out cold.json
-  python3 -I tools/claims/0047-growth-exact.py --phase pressure --scenario fork --seed 12345 --reference cold.json --out pressure.json
+  python3 -I tools/claims/0063-growth-exact.py --phase cold --scenario fork --seed 12345 --out cold.json
+  python3 -I tools/claims/0063-growth-exact.py --phase pressure --scenario fork --seed 12345 --reference cold.json --out pressure.json
 
 A cached-token count alone does not prove that the in-place fallback ran;
 confirm it separately with an instrumented engine or a placement regression.
