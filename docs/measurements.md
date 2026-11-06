@@ -30,6 +30,11 @@ What was checked on a pair of Sparks, and how it was measured. The headline deco
 
 ## Measurements
 
+Speculative decoding's speed depends on how well the drafts guess, and repetitive filler (a word or a sentence repeated
+to reach a length) is far easier to guess than real text: comparing two packs or two settings on filler moved the
+measured speed by 30-60 % where natural prompts moved it by about 0 % (issue #92). Compare on natural prompts, and give
+the draft acceptance rate next to the speed.
+
 Served and measured on one pair of Sparks (the head also runs a desktop and ~18 small containers; the worker is otherwise
 idle). Two sets of numbers, from two tools: sparkDash (the README's tables) and `tools/bench.py`.
 
