@@ -78,6 +78,7 @@
   server's allocator now holds one picture's preparation at a time and only the payload is copied out; a refusal's message is
   copied out first. On a pair, a cold request with 30 screenshots took the head's `MemAvailable` 0.23 GiB under its level
   just before, against 0.71 GiB without the patch (~16 MiB a picture).
+  By **marknx ([marknx](https://github.com/marknx))**, [pull request #112](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/112).
 - `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
   it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
   the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
@@ -106,12 +107,14 @@
   skipped them on the `629c524` pin (`pictureNeedsRows`); the rebase onto `fbbc971` kept the helper and its test but
   lost the call in `fillOpen`, which this restores. Pictures that straddle the resume point, and passes that do not
   resume, are handled as before.
+  By **Dick Lai ([laidick](https://github.com/laidick))**, [pull request #93](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/93).
 - `zig/patches/0045-cut-in-tail.patch` (with `TF_FILL_CUT_IN`): a queued prompt cuts in between another pass's pieces when the tokens
   it computes past the kept state it resumes fit `TF_FILL_CUT_IN`, not its whole length; a turn of a 300K-token conversation with 1.5K
   new tokens now cuts in. A prompt with pictures cuts in when every picture is inside that kept state (no tower run, no rows: the
   `pictureNeedsRows` test). Unchanged: one cut-in at a time, none into a pass with pictures, and a prompt that needs picture rows waits.
   The bound stays hard: if the kept state is gone when the pass opens (stale, or no room to move it), dsv41's `fillOpen` refuses the
   cut-in (`error.FillBusy`) before anything changes, and it waits for the pass in pieces as a long prompt does (it used to be dropped).
+  By **Dick Lai ([laidick](https://github.com/laidick))**, [pull request #95](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/95).
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
