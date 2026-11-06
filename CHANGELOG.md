@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `zig/patches/0053-expert-prune-cap.patch` (`TF_DS_T13_EXPERT_PRUNE`, `TF_DS_T13_EXPERT_CAP`, `TF_DS_T15_PLACE_BOUND`; all off unless set; **lossy**): a router-side kernel drops routed experts, so replies change when a switch is set. On a GB10 pair `TF_DS_T13_EXPERT_CAP=12,1` raised code decode from about 99 to 112 tok/s, with the author's quality set at 40 of 40 and exact copy at 15 of 15 (the author's engine line); `10,1` was faster but lost one quality item. By **Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo))**, [pull request #108](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/108).
+- `zig/patches/0052-prefill-slice.patch` (`TF_DS_PREFILL_SLICE=n`, off unless set; needs `TF_DS_PREFILL_INTERLEAVE_MS`): a prompt chunk runs in slices of n layers with one decode round between two slices. On a GB10 pair with n=5, the longest freeze of a decoding stream beside a 5418-token prompt fell from 1.29 to 0.46 s, at a cost of about 248 ms per chunk on the prompt's own first token (21 percent on the long prompt under load). It is a fairness change, not a throughput one: the stalled time is unchanged and spread over more, shorter gaps (the author's engine line). By **Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo))**, [pull request #107](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/107).
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
