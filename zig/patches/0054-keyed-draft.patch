@@ -1,0 +1,586 @@
+diff --git a/zig/kernels/cuda/dsv41_ops.cu b/zig/kernels/cuda/dsv41_ops.cu
+index 8b877c47c..b84cce2e1 100644
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
+@@ -651,3 +651,40 @@ extern "C" __global__ void tf_ds_vspan_kernel(const unsigned char* types, const
+         out[i] = ty == 1 ? rows[(long long)row_of[t] * dim + c] : ty == 0 ? start[c] : ty == 2 ? newline[c] : end[c];
+     }
+ }
++
++// TF_DS_T26_KEYED_DRAFT: a draft step's logits plus the served sampler's keyed Gumbel noise. sampling.zig's score of a
++// candidate is value / T + gumbel(seed, position, id), so the target's pick maximises value + T * gumbel; this adds
++// T * gumbel(seed, pos + step, col0 + v) to logits row r (rows l_row floats apart, `width` columns, global column ids
++// from col0) of every stream r with T > 0 and leaves the others alone. keyBits is sampling.keyBits (splitmix64 of
++// seed, position, id) in u64 ops, the uniform and the Gumbel draw are double as the host takes them; the only
++// divergence from the host score is the f64 -> f32 rounding of T * gumbel and the device log against libm's.
++struct TfDsKeyedRow {
++    uint64_t seed;
++    double temp;
++    int64_t pos;  // the absolute position of step 0's draft
++};
++
++__device__ __forceinline__ uint64_t tf_ds_mix64(uint64_t x) {
++    x ^= x >> 30;
++    x *= 0xBF58476D1CE4E5B9ull;
++    x ^= x >> 27;
++    x *= 0x94D049BB133111EBull;
++    return x ^ (x >> 31);
++}
++
++// grid (ceil(width / blockDim), streams); the row table is device memory so a captured graph reads each pass's seeds.
++extern "C" __global__ void tf_ds_keyed_noise_kernel(float* logits, uint64_t l_row, uint32_t width, uint64_t col0,
++                                                    const TfDsKeyedRow* rows, uint32_t step) {
++    const TfDsKeyedRow k = rows[blockIdx.y];
++    if (!(k.temp > 0.0)) return;
++    const double t = fmax(k.temp, 1e-6);
++    const uint64_t pos = uint64_t(k.pos) + step;
++    float* row = logits + uint64_t(blockIdx.y) * l_row;
++    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < width; v += gridDim.x * blockDim.x) {
++        uint64_t x = tf_ds_mix64(k.seed + 0x9E3779B97F4A7C15ull);
++        x = tf_ds_mix64(x ^ (pos * 0xD1B54A32D192ED03ull));
++        x = tf_ds_mix64(x ^ (col0 + v));
++        const double u = double(x >> 11) * 0x1p-53 + 0x1p-54;
++        row[v] += float(t * -log(-log(u)));
++    }
++}
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index 656b62fa6..4c1297221 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -25,6 +25,8 @@ const exl3_experts = @import("exl3_experts.zig");
+ const markov_tokens = @import("markov_tokens.zig");
+ const draft2d = @import("draft2d.zig");
+ 
++const ops_mod = @import("ops.zig");
++
+ const Engine = prompt.Engine;
+ const Chunk = prompt.Chunk;
+ 
+@@ -98,6 +100,25 @@ pub const Probe = struct {
+ /// window's first position.
+ pub const Item = struct { slot: usize, taps: u64, n: usize, start: usize };
+ 
++/// The served sampler's keys of a pass's streams (TF_DS_T26_KEYED_DRAFT): each stream's seed and temperature (<= 0:
++/// greedy, no noise). Draft j of a stream is keyed at q0 + 1 + j, the key the verify's sampler uses for that row.
++pub const Keyed = struct { seeds: []const u64, temps: []const f64 };
++
++/// The Markov loop's pre-step hook: step i's logits block row of every stream plus T * gumbel (each step reads its own
++/// block row of `local`, so no noise reaches another step).
++const NoiseTap = struct {
++    e: *const Engine,
++    dr: *const Drafter,
++    n: usize,
++
++    fn run(ctx: *anyopaque, step: usize) anyerror!void {
++        const x: *NoiseTap = @ptrCast(@alignCast(ctx));
++        const mk = x.dr.mk;
++        const lw = mk.rowCols();
++        try x.e.ops.keyedNoise(x.e.s, x.dr.local + 4 * step * lw, x.dr.n * lw, lw, mk.col0(), x.dr.nz, step, x.n);
++    }
++};
++
+ /// The per-step gather of the Markov loop's bests: [world, rows, 4] fp32 into dst.
+ const MarkovGather = struct {
+     e: *const Engine,
+@@ -116,7 +137,7 @@ pub const PassGraphs = struct {
+     gpa: std.mem.Allocator,
+     map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
+ 
+-    pub const Key = struct { streams: u32, steps: u32 };
++    pub const Key = struct { streams: u32, steps: u32, keyed: bool = false };
+ 
+     pub fn init(gpa: std.mem.Allocator) PassGraphs {
+         return .{ .gpa = gpa };
+@@ -133,11 +154,11 @@ pub const PassGraphs = struct {
+         return g.map.count();
+     }
+ 
+-    fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize) !void {
+-        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
++    fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, keyed: bool) !void {
++        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps), .keyed = keyed };
+         if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
+         try cuda.graph.beginCapture(e.s, .thread_local);
+-        dr.body(e, ch, pool, N, steps, null) catch |err| {
++        dr.body(e, ch, pool, N, steps, null, keyed) catch |err| {
+             if (cuda.graph.endCapture(e.s)) |got| {
+                 var x = got;
+                 x.deinit();
+@@ -210,6 +231,7 @@ pub const Drafter = struct {
+     msc: tri_markov.Scratch,
+     mg: u64, // fp32 [world, max_streams, 4]: a step's gathered bests
+     out: u64, // int64 [max_streams, n + 1]: each stream's last token, then its drafts
++    nz: u64 = 0, // ops.KeyedRow [max_streams] (TF_DS_T26_KEYED_DRAFT; 0: off): each stream's seed, temperature and first draft position
+     // the confidence head
+     embs: u64, // bf16 [max_rows, rank]: the Markov embedding rows of the tokens each step read
+     xcf: u64, // fp32 [max_rows, D]
+@@ -336,6 +358,7 @@ pub const Drafter = struct {
+         try prompt.fill(e, dr.msc.send, 0, max_streams * 4 * 4);
+         dr.mg = try a.take(dr.mk.world * max_streams * 4 * 4);
+         dr.out = try a.take(max_streams * (max_block + 1) * 8);
++        dr.nz = if (e.ops.keyed_noise != null) try a.take(max_streams * @sizeOf(ops_mod.KeyedRow)) else 0;
+         // the confidence head
+         const rank = c.markov_rank;
+         dr.embs = try a.take(R * rank * 2);
+@@ -435,7 +458,7 @@ pub const Drafter = struct {
+ 
+     /// BatchDraftGraph.run for N streams (tokens at positions q0 in slots): each stream's `steps` drafts and their
+     /// confidences into drafts / confs. Each slot's rings hold its positions before q0 (absorbed).
+-    pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, probe: ?Probe) !void {
++    pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, probe: ?Probe, keyed: ?Keyed) !void {
+         const N = tokens.len;
+         const n = dr.n;
+         const R = N * n;
+@@ -465,7 +488,21 @@ pub const Drafter = struct {
+         var ho: [max_streams * (max_block + 1)]i64 = @splat(0);
+         for (0..N) |i| ho[i * ts] = tokens[i];
+         try prompt.upload(e, dr.out, &ho, N * ts * 8);
+-        if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps) else try dr.body(e, ch, pool, N, steps, probe);
++        // the noise runs only in a pass with a sampled stream: all-greedy passes (and the flag off) launch what they did
++        var noisy = false;
++        if (keyed) |k| {
++            if (k.seeds.len != N or k.temps.len != N) return error.BadDraftPass;
++            var tab: [max_streams]ops_mod.KeyedRow = undefined;
++            for (0..N) |i| {
++                tab[i] = .{ .seed = k.seeds[i], .temp = k.temps[i], .pos = q0[i] + 1 };
++                if (k.temps[i] > 0.0) noisy = true;
++            }
++            if (noisy) {
++                if (dr.nz == 0) return error.KeyedDraftOff;
++                try prompt.upload(e, dr.nz, &tab, N * @sizeOf(ops_mod.KeyedRow));
++            }
++        }
++        if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps, noisy) else try dr.body(e, ch, pool, N, steps, probe, noisy);
+         // one host read: the drafts and the confidences
+         try e.s.synchronize();
+         var hc: [max_streams * max_block]f32 = undefined;
+@@ -481,7 +518,7 @@ pub const Drafter = struct {
+ 
+     /// The pass's device work for N streams of `steps` drafts, from the rows' embeddings to the confidence head (its
+     /// inputs uploaded: the index rows, the pick lists, the Markov loop's first column): what a pass graph captures.
+-    fn body(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, probe: ?Probe) !void {
++    fn body(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, probe: ?Probe, noisy: bool) !void {
+         const c = e.c;
+         const t = e.t;
+         const n = dr.n;
+@@ -525,7 +562,9 @@ pub const Drafter = struct {
+         // the Markov loop: out [N, steps + 1], each stream's last token first
+         const ts = steps + 1;
+         var g: MarkovGather = .{ .e = e, .dst = dr.mg };
+-        try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
++        var nt: NoiseTap = .{ .e = e, .dr = dr, .n = N };
++        const noise: ?tri_markov.Tap = if (noisy) .{ .ctx = &nt, .run = NoiseTap.run } else null;
++        try dr.mk.stepsWith(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run }, noise);
+         try Probe.check(probe, .markov, S, dr.out);
+         // the confidence head: [xc (fp32), the embedding rows the steps read (fp32)] @ conf^T, a stream's first steps rows
+         const rank = c.markov_rank;
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index d08d94d3b..9e8eb4669 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -53,14 +53,16 @@ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+ /// fill_resume (TF_FILL_CHUNKS' pieces) is 12: 11 stays unused (a frame of it is BadFrame), both ranks run one build.
++/// pass_keyed (14) is pass with each stream's sampler seed (u64) and temperature (f64 bits) after its slot
++/// (TF_DS_T26_KEYED_DRAFT).
+ /// With the spill tier on: rank_wire's frames (spill_tier: restores' agreement, guards, and the notices of rank 0's
+ /// write at keep and point metadata: keep/share/touch/forget, tracked like every other command). TF_DS_KV_SHARD adds
+ /// rank_wire too (rank_wire.zig's frames: the parts' agreement, each plan's ops, each transfer's
+ /// shard_xfer/shard_finish, the digest checks). Both on together share one rank_wire Leader (Lanes.rw, rank 0) and
+ /// one Follower a follower (PairFollower): one Tracker sees every frame of the pair. (Kind 11, the untracked spill
+ /// notes of round 2, is gone: a frame of it is BadFrame.) fill_slice (TF_DS_PREFILL_SLICE) is 13: layers [lo, hi) of a
+-/// chunk (SliceFrame).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, fill_resume = 12, fill_slice = 13 };
++/// chunk (SliceFrame). pass_keyed (TF_DS_T26_KEYED_DRAFT) is 14: a drafter pass with keyed noise.
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, rank_wire = 10, fill_resume = 12, fill_slice = 13, pass_keyed = 14 };
+ 
+ comptime {
+     std.debug.assert(@intFromEnum(Kind.rank_wire) == @import("rank_wire.zig").lanes_kind);
+@@ -1233,6 +1235,9 @@ pub const Lanes = struct {
+         var q0: [max_streams]i64 = undefined;
+         var slots: [max_streams]i64 = undefined;
+         var depths: [max_streams]usize = undefined;
++        var seeds: [max_streams]u64 = undefined;
++        var temps: [max_streams]f64 = undefined;
++        var sampled = false;
+         var asked: [max_streams]*Lane = undefined;
+         var n: usize = 0;
+         var steps: usize = 0;
+@@ -1247,24 +1252,37 @@ pub const Lanes = struct {
+             tokens[n] = token;
+             q0[n] = @intCast(r.position - 1);
+             slots[n] = @intCast(l.slot);
++            seeds[n] = 0;
++            temps[n] = 0;
++            if (r.stream.sampling) |sm| if (sm.temperature > 0) {
++                seeds[n] = sm.seed;
++                temps[n] = sm.temperature;
++                sampled = true;
++            };
+             depths[n] = @min(r.depth, block);
+             asked[n] = l;
+             steps = @max(steps, depths[n]);
+             n += 1;
+         }
+         if (n == 0) return;
+-        if (try self.begin(.pass)) {
++        // the sampler's keys go to the pass only with TF_DS_T26_KEYED_DRAFT (the drafter's kernel loaded) and a sampled stream
++        const keyed = sampled and m.dr.?.nz != 0;
++        if (try self.begin(if (keyed) .pass_keyed else .pass)) {
+             try self.wire.int(gpa, u32, @intCast(n));
+             try self.wire.int(gpa, u32, @intCast(steps));
+             for (0..n) |i| {
+                 try self.wire.int(gpa, i64, tokens[i]);
+                 try self.wire.int(gpa, i64, q0[i]);
+                 try self.wire.int(gpa, i64, slots[i]);
++                if (keyed) {
++                    try self.wire.int(gpa, u64, seeds[i]);
++                    try self.wire.int(gpa, u64, @bitCast(temps[i]));
++                }
+             }
+             try self.flush();
+         }
+         const t0 = m.now();
+-        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
++        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, if (keyed) .{ .seeds = seeds[0..n], .temps = temps[0..n] } else null);
+         if (self.prof) |*p| {
+             p.pass += m.now() - t0;
+             p.passes += 1;
+@@ -1955,6 +1973,7 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+             10 => .rank_wire,
+             12 => .fill_resume,
+             13 => .fill_slice,
++            14 => .pass_keyed,
+             else => return error.BadFrame,
+         };
+         if (try r.int(u64) != step) return error.OutOfStep;
+@@ -2030,19 +2049,26 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+                     follow_prof.forward += m.t_forward;
+                 }
+             },
+-            .pass => {
++            .pass, .pass_keyed => {
+                 const n = try r.int(u32);
+                 const steps = try r.int(u32);
+                 if (n == 0 or n > max_streams) return error.BadFrame;
+                 var tokens: [max_streams]i64 = undefined;
+                 var q0: [max_streams]i64 = undefined;
+                 var slots: [max_streams]i64 = undefined;
++                var seeds: [max_streams]u64 = undefined;
++                var temps: [max_streams]f64 = undefined;
+                 for (0..n) |i| {
+                     tokens[i] = try r.int(i64);
+                     q0[i] = try r.int(i64);
+                     slots[i] = try r.int(i64);
++                    if (kind == .pass_keyed) {
++                        seeds[i] = try r.int(u64);
++                        temps[i] = @bitCast(try r.int(u64));
++                    }
+                 }
+-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| try roundRefused(err);
++                if (kind == .pass_keyed and (m.dr == null or m.dr.?.nz == 0)) return error.KeyedDraftOff;
++                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, if (kind == .pass_keyed) .{ .seeds = seeds[0..n], .temps = temps[0..n] } else null) catch |err| try roundRefused(err);
+             },
+             .fill_images => {
+                 const count = try r.int(u32);
+diff --git a/zig/src/families/dsv41/layer_main.zig b/zig/src/families/dsv41/layer_main.zig
+index 94b0b8fae..4b1fb8f42 100644
+--- a/zig/src/families/dsv41/layer_main.zig
++++ b/zig/src/families/dsv41/layer_main.zig
+@@ -757,7 +757,7 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
+                 }
+             }
+             var dc: DraftCheck = .{ .run = run, .call = bp.call, .layers = c.layers, .after = bp.call, .vis = vis[0..nv] };
+-            dr.pass(eng, ch, &pool, tok, q0, sl, steps, .{ .ctx = &dc, .at = DraftCheck.at }) catch |err| {
++            dr.pass(eng, ch, &pool, tok, q0, sl, steps, .{ .ctx = &dc, .at = DraftCheck.at }, null) catch |err| {
+                 if (err == error.DraftMismatch) return false;
+                 try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"draft_call\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, k, bp.call, @errorName(err) });
+                 try w_out.flush();
+@@ -1243,7 +1243,7 @@ fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *
+                 }
+             }
+             var dc: DraftCheck = .{ .run = run, .call = bp.call, .layers = c.layers, .after = bp.call, .vis = vis[0..nv] };
+-            dr.pass(eng, ch, &pool, tok[0..nd], q0[0..nd], sl[0..nd], steps, .{ .ctx = &dc, .at = DraftCheck.at }) catch |err| {
++            dr.pass(eng, ch, &pool, tok[0..nd], q0[0..nd], sl[0..nd], steps, .{ .ctx = &dc, .at = DraftCheck.at }, null) catch |err| {
+                 if (err == error.DraftMismatch) return false;
+                 try w_out.print("{{\"rank\": {d}, \"draft_call\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, bp.call, @errorName(err) });
+                 try w_out.flush();
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 65ef5a5e8..58da3f563 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -422,6 +422,7 @@ pub const Model = struct {
+         }
+         m.rd = try round.Round.init(&m.eng, &m.arena, a, m.request_cap);
+         try m.agreePrune();
++        try m.agreeKeyed();
+         if (m.kvs != null) try m.rd.useShard(&m.eng, &m.arena, a);
+         m.amax = try m.arena.take(round.max_rows * 4);
+         if (o.graphs) m.graphs = round.Graphs.init(gpa, o.graph_cap);
+@@ -576,6 +577,25 @@ pub const Model = struct {
+         }
+     }
+ 
++    /// Every rank has the keyed draft noise on, or none does: a follower with it off rejects the first keyed frame and ends
++    /// the pair mid-request, so a mismatch ends the start. Collective, so it runs with the switch unset too.
++    fn agreeKeyed(m: *Model) !void {
++        const d = m.ctx.d;
++        var dev = try cuda.DeviceBuffer.alloc(d, 1 + max_world);
++        defer dev.free();
++        const mine = [1]u8{@intFromBool(m.ops.keyed_noise != null)};
++        try dev.upload(0, &mine);
++        try m.comm.allGather(dev.ptr, dev.ptr + 1, 1, .u8, m.stream);
++        try m.stream.synchronize();
++        var all: [max_world]u8 = undefined;
++        const got = all[0..m.world];
++        try dev.download(1, got);
++        if (!std.mem.allEqual(u8, got[1..], got[0])) {
++            std.debug.print("{s}: the ranks differ; set it alike on every rank\n", .{ops_mod.keyed_env});
++            return error.KeyedDraftMismatch;
++        }
++    }
++
+     /// The prune kernel's counters since the start (null: the prune is off).
+     pub fn pruneStats(m: *Model) !?expert_prune.Stats {
+         if (m.rd.pstat == 0) return null;
+@@ -1515,12 +1535,12 @@ pub const Model = struct {
+ 
+     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
+     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
+-    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
++    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, keyed: ?draft.Keyed) !void {
+         if (m.dr == null) return error.NoDrafter;
+         const dr = &m.dr.?;
+         const pool = &m.dpool.?;
+         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
+-        try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
++        try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null, keyed);
+     }
+ };
+ 
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 5c7364ed9..e2a56633a 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -11,6 +11,9 @@
+ //!                                               they need, the pool's caches by the context)
+ //!   TF_DS_ROUND_MS                              the lane core's round costs by rows (ms, comma separated; the
+ //!                                               served ROUND_MS unless set: a four-node lane's rounds cost less)
++//!   TF_DS_T26_KEYED_DRAFT=1                     a sampled stream's drafts take the sampler's keyed Gumbel noise (seed, position,
++//!                                               token id) on the drafter's logits, so they match the target's draws (unset: off;
++//!                                               greedy streams unchanged; set alike on every rank: ops.zig reads it at load)
+ //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
+ //!                                               streams (4; its 16): --parallel at most the streams
+ //!   TF_DS_PROMPT_WINDOW_ROWS=<rows>             a prompt chunk under these rows (64 .. 128; 64 unset) takes the MoE decode window
+diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
+index 9dafc34d2..0a3a73a45 100644
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -13,6 +13,18 @@ fn blocks(count: usize, threads: usize) u32 {
+     return @intCast(@min((count + threads - 1) / threads, 65535));
+ }
+ 
++/// The switch for the drafter's keyed noise (tf_ds_keyed_noise_kernel); read at load on every rank.
++pub const keyed_env = "TF_DS_T26_KEYED_DRAFT";
++
++/// One stream's row of tf_ds_keyed_noise_kernel's table: the sampler's seed and temperature, and the absolute position
++/// of its step-0 draft.
++pub const KeyedRow = extern struct { seed: u64, temp: f64, pos: i64 };
++
++fn envOn(name: [:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
+ /// tf_ds_l2_prefetch_kernel's argument: up to 16 device ranges (their first byte and length).
+ pub const Prefetch = extern struct { ptr: [16]u64 = @splat(0), bytes: [16]u64 = @splat(0), n: c_int = 0 };
+ 
+@@ -40,6 +52,7 @@ pub const Ops = struct {
+     gpu_clock: cuda.Function,
+     prune: ?expert_prune.Mode = null, // TF_DS_T13_EXPERT_PRUNE and _EXPERT_CAP, read at load
+     prune_fn: ?cuda.Function = null, // looked up only when the switch is on
++    keyed_noise: ?cuda.Function = null, // TF_DS_T26_KEYED_DRAFT, looked up only when on
+ 
+     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
+     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
+@@ -74,6 +87,7 @@ pub const Ops = struct {
+             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
+             .prune = prune,
+             .prune_fn = if (prune != null) try fm.function("tf_ds_expert_prune_kernel") else null,
++            .keyed_noise = if (envOn(keyed_env)) try fm.function("tf_ds_keyed_noise_kernel") else null,
+         };
+     }
+ 
+@@ -310,6 +324,21 @@ pub const Ops = struct {
+         try go(o.argmax_rows, s, rows, 1024, &a);
+     }
+ 
++    /// Adds T * gumbel(seed, pos + step, col0 + v) to column v of each of `rows` streams' logits row (fp32, rows `l_row`
++    /// floats apart, `width` columns; `table` the device KeyedRow of each stream), skipping streams with T <= 0.
++    pub fn keyedNoise(o: *const Ops, s: cuda.Stream, logits: u64, l_row: usize, width: usize, col0: usize, table: u64, step: usize, rows: usize) !void {
++        const f = o.keyed_noise orelse return error.KeyedDraftOff;
++        if (rows == 0 or width == 0) return;
++        var a: cuda.Args = .{};
++        a.add(logits);
++        a.add(@as(u64, l_row));
++        a.add(@as(u32, @intCast(width)));
++        a.add(@as(u64, col0));
++        a.add(table);
++        a.add(@as(u32, @intCast(step)));
++        try cuda.launch.launch(f, .{ .grid = .{ .x = blocks(width, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
++    }
++
+     /// The GPU clock (ns) into buf[i] when the stream reaches it (a profile).
+     pub fn gpuClock(o: *const Ops, s: cuda.Stream, buf: u64, tag: u32, reset: bool, cap: u32) !void {
+         var a: cuda.Args = .{};
+@@ -341,3 +370,9 @@ test "launch geometry of the development launchers" {
+     try std.testing.expectEqual(@as(u32, 2), blocks(257, 256));
+     try std.testing.expectEqual(@as(u32, 65535), blocks(1 << 40, 256));
+ }
++
++test "a keyed row is the kernel's TfDsKeyedRow: u64 seed, f64 temperature, i64 position" {
++    try std.testing.expectEqual(@as(usize, 24), @sizeOf(KeyedRow));
++    try std.testing.expectEqual(@as(usize, 8), @offsetOf(KeyedRow, "temp"));
++    try std.testing.expectEqual(@as(usize, 16), @offsetOf(KeyedRow, "pos"));
++}
+diff --git a/zig/src/families/dsv41/sampling.zig b/zig/src/families/dsv41/sampling.zig
+index 3a8c450f8..fc2c16459 100644
+--- a/zig/src/families/dsv41/sampling.zig
++++ b/zig/src/families/dsv41/sampling.zig
+@@ -35,12 +35,17 @@ fn mix(x0: u64) u64 {
+     return x ^ (x >> 31);
+ }
+ 
+-/// exact_sampling.uniform: a (0, 1) double from a splitmix64 hash of (seed, position, token id).
+-pub fn uniform(seed: u64, position: u64, id: u64) f64 {
++/// The splitmix64 chain of (seed, position, token id): the bits uniform() takes its double from (the CUDA port
++/// tf_ds_keyed_noise_kernel repeats it).
++pub fn keyBits(seed: u64, position: u64, id: u64) u64 {
+     var x = mix(seed +% 0x9E3779B97F4A7C15);
+     x = mix(x ^ (position *% 0xD1B54A32D192ED03));
+-    x = mix(x ^ id);
+-    return @as(f64, @floatFromInt(x >> 11)) * 0x1p-53 + 0x1p-54;
++    return mix(x ^ id);
++}
++
++/// exact_sampling.uniform: a (0, 1) double from a splitmix64 hash of (seed, position, token id).
++pub fn uniform(seed: u64, position: u64, id: u64) f64 {
++    return @as(f64, @floatFromInt(keyBits(seed, position, id) >> 11)) * 0x1p-53 + 0x1p-54;
+ }
+ 
+ /// numpy's pairwise sum of a contiguous float64 row (umath pairwise_sum, under its 128-element block).
+@@ -152,6 +157,23 @@ test "splitmix64 draws as exact_sampling.uniform makes them" {
+     try std.testing.expectEqual(@as(u64, 0x3fc9ff45ea7ce2be), @as(u64, @bitCast(uniform(0, 0, 0))));
+ }
+ 
++test "keyed draws pin the bits the CUDA noise kernel must reproduce" {
++    // (seed, position, id) -> keyBits, the bits of uniform and the Gumbel draw -log(-log(u)) (libm: to 1e-13)
++    const Case = struct { seed: u64, position: u64, id: u64, key: u64, uniform_bits: u64, gumbel: f64 };
++    const cases = [_]Case{
++        .{ .seed = 101, .position = 2229, .id = 2581, .key = 0xc66c433eb534db7d, .uniform_bits = 0x3fe8cd8867d6a69c, .gumbel = 1.3673673033878002 },
++        .{ .seed = 404, .position = 59, .id = 129279, .key = 0x423de17e1b6869c5, .uniform_bits = 0x3fd08f785f86da1b, .gumbel = -0.30148655447310424 },
++        .{ .seed = 0, .position = 0, .id = 0, .key = 0x33fe8bd4f9c57863, .uniform_bits = 0x3fc9ff45ea7ce2be, .gumbel = -0.4662735186548661 },
++        .{ .seed = 0x7fffffffffffffff, .position = 1048575, .id = 129279, .key = 0x434ffaa90bb2ee6d, .uniform_bits = 0x3fd0d3feaa42ecbb, .gumbel = -0.2895548427148701 },
++    };
++    for (cases) |c| {
++        try std.testing.expectEqual(c.key, keyBits(c.seed, c.position, c.id));
++        const u = uniform(c.seed, c.position, c.id);
++        try std.testing.expectEqual(c.uniform_bits, @as(u64, @bitCast(u)));
++        try std.testing.expectApproxEqAbs(c.gumbel, -log(-log(u)), 1e-13);
++    }
++}
++
+ test "numpy's pairwise sum" {
+     const a = [_]f64{ 1e16, 1.0, -1e16, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 0.5, 0.25 };
+     // r = a[0..8] (no whole second block of 8); ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7)), then the rest in order
+diff --git a/zig/src/families/dsv41/tri_markov.zig b/zig/src/families/dsv41/tri_markov.zig
+index 3157a8162..2f23ee99b 100644
+--- a/zig/src/families/dsv41/tri_markov.zig
++++ b/zig/src/families/dsv41/tri_markov.zig
+@@ -105,6 +105,15 @@ pub const Markov = struct {
+         m.slot = slot;
+     }
+ 
++    /// The columns of a logits row this rank scores, and the global id of the first.
++    pub fn rowCols(m: Markov) usize {
++        return if (m.lg_w != 0) m.lg_w else m.n_cols;
++    }
++
++    pub fn col0(m: Markov) usize {
++        return m.seg0 * m.n_cols;
++    }
++
+     /// Markov.local_best: step i of out [N, steps + 1] int64 (row stride ts) on this rank's columns: out[:, i + 1], or the returned send [N, 4] (split).
+     pub fn localBest(m: Markov, t: Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, i: usize, sc: Scratch) !?u64 {
+         if (n > np) return error.TooManyRows;
+@@ -133,13 +142,25 @@ pub const Markov = struct {
+ 
+     /// Markov.steps: out [N, count + 1] int64 (out[:, 0] the last tokens) -> out[:, 1:] the drafts, each step's bests gathered over the ranks before its pick.
+     pub fn steps(m: Markov, t: Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, count: usize, sc: Scratch, gather: Gather) !void {
++        return m.stepsWith(t, lg, out, ts, n, block, count, sc, gather, null);
++    }
++
++    /// `steps` with `pre` run before step i's first launch (it may rewrite the step's logits block row: no later step reads it).
++    pub fn stepsWith(m: Markov, t: Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, count: usize, sc: Scratch, gather: Gather, pre: ?Tap) !void {
+         for (0..count) |i| {
++            if (pre) |x| try x.run(x.ctx, i);
+             const send = try m.localBest(t, lg, out, ts, n, block, i, sc) orelse continue;
+             try m.pick(t, try gather.run(gather.ctx, send, n), m.world, out, ts, n, i);
+         }
+     }
+ };
+ 
++/// A hook of the Markov loop, run with the step index.
++pub const Tap = struct {
++    ctx: *anyopaque,
++    run: *const fn (ctx: *anyopaque, step: usize) anyerror!void,
++};
++
+ /// prefill.HAD_SCALE: 1 / sqrt(128).
+ pub const had_scale: f32 = 0.08838834764831845;
+ /// prefill.BN: a GEMM program's columns, one Hadamard block.
+@@ -281,3 +302,43 @@ test "steps: each step's bias, score and finish, then the pick of the ranks' gat
+         try std.testing.expectEqual(out + 8 * @as(u64, j / 4 + 1), k.args[2].value.ptr.addr);
+     }
+ }
++
++test "a pre hook runs before each step's launches and adds none" {
++    var log: tri.Log = .{ .gpa = std.testing.allocator };
++    defer log.deinit();
++    const cfg = try modelConfig();
++    const m = try Markov.init(cfg, .{ .rank = 1, .world = tp }, elsewhere, elsewhere, elsewhere);
++    const Probe = struct {
++        log: *tri.Log,
++        seen: [3]usize = undefined,
++        n: usize = 0,
++        fn gather(_: *anyopaque, _: u64, _: usize) anyerror!u64 {
++            return 0x7d00_0000_0000;
++        }
++        fn pre(ctx: *anyopaque, step: usize) anyerror!void {
++            const r: *@This() = @ptrCast(@alignCast(ctx));
++            try std.testing.expectEqual(r.n, step);
++            r.seen[step] = r.log.items.items.len;
++            r.n += 1;
++        }
++    };
++    var pr: Probe = .{ .log = &log };
++    const sc: Scratch = .{ .pv = 0x7c00_0000_0000, .pi = 0x7c00_0000_0100, .send = 0x7c00_0000_0200, .stage = 0x7c00_0000_0300 };
++    try m.stepsWith(.{ .log = &log }, elsewhere, 0x7b00_0000_0000, 4, 3, cfg.dspark_block, 3, sc, .{ .ctx = &pr, .run = Probe.gather }, .{ .ctx = &pr, .run = Probe.pre });
++    try std.testing.expectEqual(@as(usize, 3), pr.n);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8 }, &pr.seen);
++    try std.testing.expectEqual(@as(usize, 12), log.items.items.len);
++}
++
++test "a logits row's columns and first global id: TP2's slice, a 2D node's quarter" {
++    const cfg = try modelConfig();
++    const m = try Markov.init(cfg, .{ .rank = 1, .world = tp }, elsewhere, elsewhere, elsewhere);
++    try std.testing.expectEqual(cfg.vocab / tp, m.rowCols());
++    try std.testing.expectEqual(cfg.vocab / tp, m.col0());
++    var q = m;
++    q.lg_w = 3 * 128;
++    q.n_cols = 128;
++    q.seg0 = 5;
++    try std.testing.expectEqual(@as(usize, 384), q.rowCols());
++    try std.testing.expectEqual(@as(usize, 640), q.col0());
++}
