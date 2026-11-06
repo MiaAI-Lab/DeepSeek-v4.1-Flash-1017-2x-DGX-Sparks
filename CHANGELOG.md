@@ -2,11 +2,18 @@
 
 ## Unreleased
 
+- `zig/patches/0062-failed-capture-forgets-forked-work.patch` (always on): one failed graph capture no longer fails later
+  requests. A stretch that failed inside its capture left `Round.side_out` and `pf_out` set, so each new capture waited
+  on a join event from the dead capture: CUDA refused it (`INVALID_VALUE`, then `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`,
+  901), and only graphs already captured kept working, until a restart (issue #65). The failed stretch now joins
+  what it forked, ends the capture and clears both flags. The request that hit the failure still fails. Tests: a host
+  test in `round.zig` and `tf-cuda-test capture-fork` on the GPU; not yet run on a pair in this exact form. By
+  **ldenaeyer ([ldenaeyer](https://github.com/ldenaeyer))**.
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
   `MissingTritonVariant` and later requests with `CudaFailed (901)` (issues #65, #63; 524,288 and 1,048,576 did not).
-  The engine side (ending a failed capture on the side stream too) is still open in #65. Test in
+  The later failures are `0062`'s, above; the prompt itself still fails at such a window. Test in
   `scripts/test_scripts.py`. Reported by **Cristiano Revil ([cristianorevil](https://github.com/cristianorevil))** and
   **XueYun ([xueyuenet](https://github.com/xueyuenet))**, with the window data from **ldenaeyer**.
 - `zig/patches/0059-lane-thread-binds-context.patch` (always on): the lane host's thread makes its CUDA context

@@ -329,7 +329,7 @@ detect_links() {
 
     def test_graphs_with_a_pool_off_the_4096_grid_warns(self):
         # issues #65 and #63: a round's context bucket is capped at the pool, so a pool off the 4,096 grid gives the
-        # indexer's _index_score a tile count the kit has no captured variant for (MissingTritonVariant, then 901)
+        # indexer's _index_score a tile count the kit has no captured variant for (MissingTritonVariant)
         for context, warned in [("400000", True), ("500000", True), ("524288", False), ("262144", False)]:
             with self.subTest(context=context):
                 code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "CONTEXT": context})

@@ -1,0 +1,325 @@
+From e4eaf51d5b572b367cac1e8ada6f2e904110d338 Mon Sep 17 00:00:00 2001
+From: ldenaeyer <258663271+ldenaeyer@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 08:25:58 -0500
+Subject: [PATCH] dsv41: a failed stretch owes the next capture no join
+
+A stretch that fails inside its CUDA capture, on a missing Triton variant for one (issue #65 of the
+DeepSeek-V4.1-Flash 2-Spark recipe), left Round.side_out and Round.pf_out set. The next capture's first
+mix then waited on a join event recorded only in the dead capture. CUDA refuses that (INVALID_VALUE) and
+invalidates the capture (STREAM_CAPTURE_INVALIDATED, 901, on everything after it). The refused wait leaves the
+flag set, so every new capture failed the same way until a restart, while graphs already captured kept
+replaying: that is why later requests failed only some of the time.
+
+The streams are not the cause. A capture ended unjoined is refused (STREAM_CAPTURE_UNJOINED, 904), but neither
+stream stays in capture, and a later capture that does not make that wait works. `tf-cuda-test capture-fork`
+(new) checks each of these on the GPU.
+
+A failed stretch now joins what it forked, so its capture ends with no 904 in the log, ends it, and clears both
+flags whatever those calls did. A stretch starts with nothing forked, so both flags can only refer to this
+capture. KV sharding's overlap stream needs nothing here: forward's errdefer already clears ss_q_out, ss_jo has
+no flag, and a ring send left open already ends the pair (ShardRingOrder).
+
+Only the failure path changes: a stretch that succeeds never reaches it, so replies keep their bits.
+
+Tests: round.zig, "a failed stretch joins what it forked, ends its capture, and owes the next capture no join"
+(host: a fake capture, and the flags on a real Round), which fails if the clear or a join is removed or a failed
+join stops the rest; `tf-cuda-test capture-fork` (GPU).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ zig/src/families/dsv41/round.zig | 107 +++++++++++++++++++++++++-
+ zig/tests/cuda/main.zig          |   2 +
+ zig/tests/cuda/runtime_tests.zig | 128 +++++++++++++++++++++++++++++++
+ 3 files changed, 233 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index 95c72d1..3ca11b4 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -1438,10 +1438,7 @@ pub const Graphs = struct {
+         const start = cy.*;
+         try cuda.graph.beginCapture(e.s, .thread_local);
+         stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
+-            if (cuda.graph.endCapture(e.s)) |got| {
+-                var x = got;
+-                x.deinit();
+-            } else |_| {}
++            leaveCapture(StretchCapture{ .e = e, .rd = rd });
+             return err;
+         };
+         var graph = try cuda.graph.endCapture(e.s);
+@@ -1459,6 +1456,45 @@ pub const Graphs = struct {
+     }
+ };
+ 
++/// What leaveCapture does to a stretch's capture.
++const StretchCapture = struct {
++    e: *const Engine,
++    rd: *Round,
++
++    fn joinSide(c: StretchCapture) !void {
++        return c.rd.joinSide(c.e);
++    }
++
++    fn joinPrefetch(c: StretchCapture) !void {
++        return c.rd.joinPrefetch(c.e);
++    }
++
++    fn end(c: StretchCapture) !cuda.graph.Graph {
++        return cuda.graph.endCapture(c.e.s);
++    }
++
++    fn forgetForked(c: StretchCapture) void {
++        c.rd.side_out = false;
++        c.rd.pf_out = false;
++    }
++};
++
++/// A stretch failed inside its capture. What it forked is joined so the capture ends cleanly (ended unjoined it fails
++/// with STREAM_CAPTURE_UNJOINED, though the streams leave capture all the same). Then the round forgets that work,
++/// whatever those calls did: a stretch starts with nothing forked, so all of it belonged to this capture. A flag left
++/// set would make the next capture's first mix wait on an event recorded only in this one, which CUDA refuses
++/// (INVALID_VALUE, then STREAM_CAPTURE_INVALIDATED on all that follows). The refused wait leaves the flag set, so every
++/// new capture would fail until a restart while graphs already captured kept replaying (`tf-cuda-test capture-fork`).
++fn leaveCapture(cap: anytype) void {
++    cap.joinSide() catch {};
++    cap.joinPrefetch() catch {};
++    if (cap.end()) |got| {
++        var graph = got;
++        graph.deinit();
++    } else |_| {}
++    cap.forgetForked();
++}
++
+ /// A round's errors after which the ranks cannot go on together: the ring or the communicator dead (RingFailed,
+ /// CommAborted), a decode round's ring transfers out of their fixed order or row lists (RingOrder, ShardRingOrder,
+ /// BadRingRows: a sized send may be in flight with no receive, or the peer waits in a collect), a prompt chunk's Engram
+@@ -1719,6 +1755,69 @@ test "context buckets as graph.py makes them" {
+     try std.testing.expectEqual(@as(usize, 4096), bucketFor(5000, 4096));
+ }
+ 
++test "a failed stretch joins what it forked, ends its capture, and owes the next capture no join" {
++    const Fake = struct {
++        const Call = enum { side, prefetch, end, free, forget };
++        calls: [5]Call = undefined,
++        n: usize = 0,
++        side_fails: bool = false,
++        prefetch_fails: bool = false,
++        end_fails: bool = false,
++
++        const Self = @This();
++        const Graph = struct {
++            f: *Self,
++            fn deinit(g: *Graph) void {
++                g.f.note(.free);
++            }
++        };
++
++        fn note(f: *Self, c: Call) void {
++            f.calls[f.n] = c;
++            f.n += 1;
++        }
++        fn joinSide(f: *Self) !void {
++            f.note(.side);
++            if (f.side_fails) return error.CudaFailed;
++        }
++        fn joinPrefetch(f: *Self) !void {
++            f.note(.prefetch);
++            if (f.prefetch_fails) return error.CudaFailed;
++        }
++        fn end(f: *Self) !Graph {
++            f.note(.end);
++            if (f.end_fails) return error.CudaFailed;
++            return .{ .f = f };
++        }
++        fn forgetForked(f: *Self) void {
++            f.note(.forget);
++        }
++    };
++    // both joins before the end, the graph it returns freed, the flags cleared last
++    const whole = [_]Fake.Call{ .side, .prefetch, .end, .free, .forget };
++    var ok: Fake = .{};
++    leaveCapture(&ok);
++    try std.testing.expectEqualSlices(Fake.Call, &whole, ok.calls[0..ok.n]);
++    // a failed join stops nothing after it
++    var side: Fake = .{ .side_fails = true };
++    leaveCapture(&side);
++    try std.testing.expectEqualSlices(Fake.Call, &whole, side.calls[0..side.n]);
++    var prefetch: Fake = .{ .prefetch_fails = true };
++    leaveCapture(&prefetch);
++    try std.testing.expectEqualSlices(Fake.Call, &whole, prefetch.calls[0..prefetch.n]);
++    // an invalidated capture's refused joins and end still clear the flags
++    var dead: Fake = .{ .side_fails = true, .prefetch_fails = true, .end_fails = true };
++    leaveCapture(&dead);
++    try std.testing.expectEqualSlices(Fake.Call, &.{ .side, .prefetch, .end, .forget }, dead.calls[0..dead.n]);
++    // the real one clears both flags
++    var rd: Round = undefined;
++    rd.side_out = true;
++    rd.pf_out = true;
++    (StretchCapture{ .e = undefined, .rd = &rd }).forgetForked();
++    try std.testing.expect(!rd.side_out);
++    try std.testing.expect(!rd.pf_out);
++}
++
+ fn getenv(name: [*:0]const u8) ?[]const u8 {
+     return std.mem.span(std.c.getenv(name) orelse return null);
+ }
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 1ff1bad..5451efb 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -14,6 +14,7 @@ const usage =
+     \\  info                      driver, device and library versions
+     \\  smoke                     copies, fills, launches, argument packing, module globals
+     \\  graph                     stream capture, explicit graphs, node and whole-exec updates
++    \\  capture-fork              a capture with work forked to a second stream, and what a failed one leaves
+     \\  overhead [n] [reps]       dependent one-thread kernels: plain stream vs one graph
+     \\  overhead-pdl [n] [reps]   the same with programmatic dependent launch on every kernel
+     \\  launch-ex                 cuLaunchKernelEx: clusters, cooperative grid, PDL on a stream and in a graph
+@@ -61,6 +62,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "info")) return info(gpu);
+     if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
+     if (std.mem.eql(u8, cmd, "graph")) return runtime_tests.graphs(gpu);
++    if (std.mem.eql(u8, cmd, "capture-fork")) return runtime_tests.captureFork(gpu);
+     if (std.mem.eql(u8, cmd, "overhead") or std.mem.eql(u8, cmd, "overhead-pdl")) {
+         const n = if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 1000;
+         const reps = if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 20;
+diff --git a/zig/tests/cuda/runtime_tests.zig b/zig/tests/cuda/runtime_tests.zig
+index 390a892..3f0642e 100644
+--- a/zig/tests/cuda/runtime_tests.zig
++++ b/zig/tests/cuda/runtime_tests.zig
+@@ -180,6 +180,134 @@ pub fn graphs(gpu: Gpu) !void {
+     try explicitGraphs(gpu, probe, stream);
+ }
+ 
++fn stepOn(step: cuda.Function, counter: cuda.DeviceBuffer, stream: cuda.Stream) !void {
++    var args: cuda.Args = .{};
++    args.add(counter.ptr);
++    args.add(@as(u64, 1));
++    try cuda.launch.launch(step, .{ .grid = .{}, .block = .{} }, stream, &args);
++}
++
++/// `res` is an error: what CUDA must refuse here.
++fn mustFail(res: anytype, what: []const u8) !void {
++    if (res) |_| {
++        std.debug.print("FAIL {s}: CUDA took it\n", .{what});
++        return error.TestFailed;
++    } else |_| {}
++}
++
++const ForkedCapture = struct {
++    step: cuda.Function,
++    counter: cuda.DeviceBuffer,
++    main: cuda.Stream,
++    side: cuda.Stream,
++    fork: cuda.Event,
++    join: cuda.Event,
++
++    /// Where a dsv41 round's stretch stands after a mix: work on the main stream and work forked to the side stream,
++    /// its join recorded and not yet waited on.
++    fn begin(f: ForkedCapture) !void {
++        try cuda.graph.beginCapture(f.main, .thread_local);
++        try stepOn(f.step, f.counter, f.main);
++        try f.fork.record(f.main);
++        try f.side.wait(f.fork);
++        try stepOn(f.step, f.counter, f.side);
++        try f.join.record(f.side);
++    }
++
++    fn outOfCapture(f: ForkedCapture) !void {
++        try expect(try cuda.graph.captureStatus(f.main) == .none, "main stream left the capture", .{});
++        try expect(try cuda.graph.captureStatus(f.side) == .none, "side stream left the capture", .{});
++    }
++
++    /// A capture joined in order ends, leaves no stream capturing, and its graph runs both streams' work.
++    fn works(f: ForkedCapture) !void {
++        try f.begin();
++        try expect(try cuda.graph.captureStatus(f.side) == .active, "the fork pulls the side stream into the capture", .{});
++        try f.main.wait(f.join);
++        var graph = try cuda.graph.endCapture(f.main);
++        defer graph.deinit();
++        try f.outOfCapture();
++        var exec = try graph.instantiate();
++        defer exec.deinit();
++        const before = try readCounter(f.counter);
++        try exec.launchOn(f.main);
++        try f.main.synchronize();
++        try expect(try readCounter(f.counter) == before + 2, "the graph runs both streams' work", .{});
++    }
++};
++
++/// A capture with work forked to a second stream, as dsv41's rounds fork their side and prefetch streams, and what a
++/// failed one leaves. The streams recover by themselves; a later wait on the dead capture's join does not (the
++/// DeepSeek-V4.1-Flash 2-Spark recipe's issue #65: 904, then INVALID_VALUE and 901 on new captures for hours).
++pub fn captureFork(gpu: Gpu) !void {
++    const d = gpu.d;
++    var probe = try cuda.Module.load(d, cuda.kernels.probe);
++    defer probe.unload();
++    const step = try probe.function("tf_probe_step");
++    var counter = try cuda.DeviceBuffer.alloc(d, 8);
++    defer counter.free();
++    try counter.fill8(0, null);
++    var main = try cuda.Stream.init(d, true);
++    defer main.deinit();
++    var side = try cuda.Stream.init(d, true);
++    defer side.deinit();
++    var fork = try cuda.Event.init(d, false);
++    defer fork.deinit();
++    var join = try cuda.Event.init(d, false);
++    defer join.deinit();
++    const f: ForkedCapture = .{ .step = step, .counter = counter, .main = main, .side = side, .fork = fork, .join = join };
++
++    try f.works();
++    check.pass("joined: the capture ends, no stream stays in it, its graph runs both streams' work", .{});
++
++    try f.begin();
++    try mustFail(cuda.graph.endCapture(main), "ending a capture with unjoined work");
++    try f.outOfCapture();
++    try f.works();
++    check.pass("ended unjoined: refused (904), yet no stream stays in it and the next capture works", .{});
++
++    // a graph captured while all is well, for the replays below
++    try cuda.graph.beginCapture(main, .thread_local);
++    try stepOn(step, counter, main);
++    var good = try cuda.graph.endCapture(main);
++    defer good.deinit();
++    var exec = try good.instantiate();
++    defer exec.deinit();
++
++    try f.begin();
++    try mustFail(cuda.graph.endCapture(main), "ending a capture with unjoined work");
++    for (0..3) |_| {
++        try cuda.graph.beginCapture(main, .thread_local);
++        try mustFail(main.wait(join), "a new capture waiting on the dead capture's join");
++        try expect(try cuda.graph.captureStatus(main) == .invalidated, "the refused wait invalidates the capture", .{});
++        try mustFail(stepOn(step, counter, main), "a launch in an invalidated capture");
++        try mustFail(cuda.graph.endCapture(main), "ending an invalidated capture");
++        try f.outOfCapture();
++        const before = try readCounter(counter);
++        try exec.launchOn(main);
++        try main.synchronize();
++        try expect(try readCounter(counter) == before + 1, "a graph already captured still replays", .{});
++    }
++    check.pass("waiting on the dead capture's join: refused every time (1, then 901), while a graph already captured replays", .{});
++
++    try f.works();
++    check.pass("without that wait the next capture works", .{});
++
++    var other = try cuda.Stream.init(d, true);
++    defer other.deinit();
++    var outside = try cuda.Event.init(d, false);
++    defer outside.deinit();
++    try outside.record(other);
++    try f.begin();
++    try mustFail(main.wait(outside), "a capture waiting on uncaptured work");
++    try expect(try cuda.graph.captureStatus(side) == .invalidated, "the side stream's part is invalidated too", .{});
++    try mustFail(main.wait(join), "a join in an invalidated capture");
++    try mustFail(cuda.graph.endCapture(main), "ending an invalidated capture");
++    try f.outOfCapture();
++    try f.works();
++    check.pass("invalidated with work forked: the join and the end refused (901), yet no stream stays in it and the next capture works", .{});
++}
++
+ fn readCounter(counter: cuda.DeviceBuffer) !u64 {
+     var v: u64 = 0;
+     try counter.download(0, std.mem.asBytes(&v));
