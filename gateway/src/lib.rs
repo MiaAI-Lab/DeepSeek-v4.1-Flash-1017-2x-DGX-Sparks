@@ -161,6 +161,9 @@ pub struct Gateway {
     pub encoding: DeepseekV41Encoding,
     pub eos: u32,
     special_tokens: Arc<dyn SpecialTokens>,
+    /// Built once: `PromptTokenizer::new` clones the whole tokenizer (vocab and merges, hundreds of thousands of
+    /// small allocations); doing that twice per request kept the gateway's resident memory growing for good.
+    prompt_tokenizer: Arc<PromptTokenizer>,
 }
 
 impl Gateway {
@@ -199,12 +202,14 @@ impl Gateway {
             .first()
             .copied()
             .ok_or_else(|| ApiError::internal("the tokenizer has no EOS token"))?;
+        let prompt_tokenizer = Arc::new(PromptTokenizer::new(&tokenizer));
         Ok(Self {
             options,
             tokenizer,
             encoding,
             eos,
             special_tokens,
+            prompt_tokenizer,
         })
     }
 
@@ -237,7 +242,7 @@ impl Gateway {
         conversation: &Conversation,
     ) -> Result<(RenderedPrompt, Vec<u32>, Vec<usize>), ApiError> {
         let rendered = self.encoding.render_conversation(conversation);
-        let encoder = OffsetsEncoder::new(&self.tokenizer);
+        let encoder = OffsetsEncoder::shared(&self.prompt_tokenizer);
         let encoding = DeepseekV41Encoding::new()
             .with_special_tokens(Arc::clone(&self.special_tokens))
             .with_tokenizer(encoder.clone());
@@ -278,8 +283,8 @@ impl Gateway {
         if rendered.prompt.len() <= COUNT_IN_PIECES_FROM {
             return Ok(false);
         }
-        let tokenizer = PromptTokenizer::new(&self.tokenizer);
-        let count = count_in_pieces(&tokenizer, rendered, COUNT_PIECE_BYTES, limit)?;
+        let tokenizer: &PromptTokenizer = &self.prompt_tokenizer;
+        let count = count_in_pieces(tokenizer, rendered, COUNT_PIECE_BYTES, limit)?;
         Ok(count > limit.saturating_add(cut_allowance(rendered.prompt.len(), COUNT_PIECE_BYTES)))
     }
 
@@ -313,7 +318,7 @@ impl Gateway {
         text: &str,
         special_ranges: &[Range<usize>],
     ) -> Result<Vec<u32>, ApiError> {
-        let encoder = OffsetsEncoder::new(&self.tokenizer);
+        let encoder = OffsetsEncoder::shared(&self.prompt_tokenizer);
         encoder
             .encode_ids(text, special_ranges)
             .map_err(ApiError::internal)
@@ -433,7 +438,7 @@ fn exact_cut(previous: char, next: char) -> bool {
 /// index at which each explicit special-token range starts.
 #[derive(Clone)]
 pub struct OffsetsEncoder {
-    inner: PromptTokenizer,
+    inner: Arc<PromptTokenizer>,
     offsets: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -442,7 +447,15 @@ impl OffsetsEncoder {
     /// added-vocabulary spellings exactly as deepseek-recipe does.
     pub fn new(tokenizer: &Tokenizer) -> Self {
         Self {
-            inner: PromptTokenizer::new(tokenizer),
+            inner: Arc::new(PromptTokenizer::new(tokenizer)),
+            offsets: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Reuse a prompt tokenizer built once, instead of cloning the tokenizer per request.
+    pub fn shared(inner: &Arc<PromptTokenizer>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
             offsets: Arc::new(Mutex::new(Vec::new())),
         }
     }
