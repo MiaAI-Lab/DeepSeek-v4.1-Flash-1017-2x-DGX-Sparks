@@ -40,3 +40,15 @@ answering and has to be power-cycled (this happened once, with the engine's rese
 - the KV cache is small (compressed FP4 with block scales; about 0.5 GiB at 262,144 tokens and ~1.8 GiB at the full window,
   by two memory readings); it is sized from `CONTEXT` when the model loads and shared by the streams. Most of the
   memory is the weights (~99 GiB, of which ~3.5 GiB are the drafter's), so the head's other software decides what is left.
+
+## Host settings and large copies
+
+- **Kernel memory sysctls** (`vm.lowmem_reserve_ratio`, `vm.watermark_boost_factor`, `vm.min_free_kbytes`) are not
+  tested with this recipe. The kernel's `MemAvailable`, which `scripts/memguard.sh` reads, already subtracts the zones'
+  reserves, so lowering them raises the reading partly on paper: memguard's floor then sits that much closer to real
+  exhaustion (issue #117).
+- **A large file copy on a serving Spark** fills the page cache and can hold `MemAvailable` under memguard's floor long
+  enough for it to stop the rank (a 5.8 GB copy did, issue #117). `start.sh` stops the server before it prepares; a copy
+  you start yourself, or `scripts/prepare.sh` run on its own, does not. Stop the server first, or copy with direct I/O
+  (`dd iflag=direct oflag=direct`, `rsync` from the other Spark).
+

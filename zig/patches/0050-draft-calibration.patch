@@ -1,0 +1,521 @@
+diff --git a/zig/src/core/lanes/calibration_test.zig b/zig/src/core/lanes/calibration_test.zig
+new file mode 100644
+index 000000000..4599d9855
+--- /dev/null
++++ b/zig/src/core/lanes/calibration_test.zig
+@@ -0,0 +1,197 @@
++//! The draft-survival calibration: a stream's realised over predicted drafts scales the chances its window is allocated by.
++const std = @import("std");
++const Config = @import("config.zig").Config;
++const Cost = @import("config.zig").Cost;
++const Engine = @import("engine.zig").Engine;
++const Stream = @import("stream.zig").Stream;
++const fake = @import("fake.zig");
++const be = @import("backend.zig");
++const win = @import("windows.zig");
++
++const gpa = std.testing.allocator;
++
++const chain = [_]f64{ 0.9, 0.81, 0.729, 0.6561 };
++
++fn chances(_: *anyopaque, _: *Stream, out: []f64) anyerror!bool {
++    @memcpy(out, chain[0..out.len]);
++    return true;
++}
++
++fn startNow(_: *anyopaque) void {}
++
++fn elapsed(_: *anyopaque, _: be.Mark) f64 {
++    return 0.0;
++}
++
++/// Each stream's granted drafts and predicted landings after one allocation of 4 held drafts apiece.
++fn grants(weight: f64, cals: []const f64, granted: []u32, predicted: []f64) !void {
++    var costs: [16]Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(w)) };
++    var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .draft_cal = weight }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var vtable = target.backend().vtable.*;
++    vtable.probabilities = chances;
++    var token: u8 = 0;
++    var engine = Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
++    defer engine.deinit();
++    var streams: [2]Stream = undefined;
++    var plans: [2]win.Plan = undefined;
++    for (cals, 0..) |cal, i| {
++        streams[i] = try Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 8 });
++        streams[i].cal = cal;
++        plans[i] = .{ .stream = &streams[i], .position = 0, .kind = .head, .held = 4 };
++    }
++    defer for (streams[0..cals.len]) |*s| s.deinit(gpa);
++    try win.allocate(&engine, plans[0..cals.len]);
++    for (streams[0..cals.len], granted, predicted) |s, *g, *p| {
++        g.* = s.granted.?;
++        p.* = s.predicted();
++    }
++}
++
++test "off, the chances and the grant are the uncalibrated ones whatever the stream's cal" {
++    var g: [1]u32 = undefined;
++    var p: [1]f64 = undefined;
++    try grants(0.0, &.{0.3}, &g, &p);
++    try std.testing.expectEqual(@as(u32, 4), g[0]);
++    try std.testing.expectEqual(@as(f64, 0.0), p[0]);
++}
++
++test "a cold stream is uncalibrated and predicts the drafts it was granted" {
++    var g: [1]u32 = undefined;
++    var p: [1]f64 = undefined;
++    try grants(0.5, &.{1.0}, &g, &p);
++    try std.testing.expectEqual(@as(u32, 4), g[0]);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.9 + 0.81 + 0.729 + 0.6561), p[0], 1e-12);
++}
++
++test "a stream that realises half its drafts is granted fewer, and predicts from the uncalibrated chances" {
++    var g: [1]u32 = undefined;
++    var p: [1]f64 = undefined;
++    try grants(0.5, &.{0.5}, &g, &p);
++    try std.testing.expectEqual(@as(u32, 2), g[0]);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.9 + 0.81), p[0], 1e-12);
++}
++
++test "the floor keeps a collapsed stream drafting" {
++    var g: [1]u32 = undefined;
++    var p: [1]f64 = undefined;
++    try grants(0.5, &.{0.05}, &g, &p);
++    try std.testing.expectEqual(@as(u32, 1), g[0]);
++    var at_floor: [1]u32 = undefined;
++    try grants(0.5, &.{0.2}, &at_floor, &p);
++    try std.testing.expectEqual(g[0], at_floor[0]);
++}
++
++test "a shared round gives each stream its own calibration" {
++    var g: [2]u32 = undefined;
++    var p: [2]f64 = undefined;
++    try grants(0.5, &.{ 1.0, 0.2 }, &g, &p);
++    try std.testing.expectEqual(@as(u32, 4), g[0]);
++    try std.testing.expectEqual(@as(u32, 0), g[1]);
++}
++
++test "the survival solves the chances landed for the kept drafts" {
++    const p = [_]f64{ 0.97, 0.94, 0.91, 0.88 };
++    const c = Stream.survival(&p, 2.55);
++    try std.testing.expect(c > 0.84 and c < 0.87);
++    try std.testing.expectEqual(@as(f64, 1.0), Stream.survival(&p, 4.0));
++    try std.testing.expectEqual(@as(f64, 1.0), Stream.survival(&p, 3.7));
++    try std.testing.expectEqual(@as(f64, 0.2), Stream.survival(&p, 0.0));
++    try std.testing.expectApproxEqAbs(@as(f64, 0.5), Stream.survival(&.{0.9}, 0.45), 1e-6);
++    try std.testing.expectEqual(@as(f64, 1.0), Stream.survival(&p, 40.0));
++}
++
++test "the average moves by the weight toward the round's kept and expected drafts" {
++    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 });
++    defer s.deinit(gpa);
++    s.observeCal(0.5, 3.0);
++    try std.testing.expectEqual(@as(f64, 1.0), s.cal);
++    s.predict(&.{0.9});
++    s.observeCal(0.5, 0.0);
++    try std.testing.expectEqual(@as(f64, 0.2), s.cal);
++    s.predict(&.{0.9});
++    s.observeCal(0.5, 1.0);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.5 / 0.9), s.cal, 1e-6);
++    s.cal = 0.0;
++    try std.testing.expectEqual(@as(f64, 0.2), s.calScale());
++}
++
++/// The cal after 20 rounds of 4 drafts whose true per-draft survival is `factor` (its expected kept drafts).
++fn converged(factor: f64) f64 {
++    var s = Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 }) catch unreachable;
++    defer s.deinit(gpa);
++    const raw = [_]f64{ 0.97, 0.94, 0.91, 0.88 };
++    var kept: f64 = 0.0;
++    var f: f64 = 1.0;
++    for (raw) |p| {
++        f *= factor;
++        kept += f * p;
++    }
++    for (0..20) |_| {
++        s.predict(&raw);
++        s.observeCal(0.3, kept);
++    }
++    return s.cal;
++}
++
++test "prose-like and code-like streams settle near their per-draft survival" {
++    try std.testing.expectApproxEqAbs(@as(f64, 0.85), converged(0.85), 0.01);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.99), converged(0.99), 0.01);
++}
++
++/// The mean scale over many rounds of a chain whose drafts survive at `factor` times the predicted rate, drawn at random.
++fn meanScale(factor: f64) f64 {
++    var s = Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 }) catch unreachable;
++    defer s.deinit(gpa);
++    var prng = std.Random.DefaultPrng.init(7);
++    const rng = prng.random();
++    const q = 0.85;
++    var raw: [4]f64 = undefined;
++    var reach: f64 = 1.0;
++    for (&raw) |*p| {
++        reach *= q;
++        p.* = reach;
++    }
++    var total: f64 = 0.0;
++    const rounds = 4000;
++    for (0..rounds) |_| {
++        var kept: f64 = 0.0;
++        for (0..raw.len) |_| {
++            if (rng.float(f64) >= factor * q) break;
++            kept += 1.0;
++        }
++        s.predict(&raw);
++        s.observeCal(0.2, kept);
++        total += s.calScale();
++    }
++    return total / rounds;
++}
++
++test "noise does not drag a well calibrated stream's scale down, and a short one still shows" {
++    try std.testing.expect(meanScale(1.0) > 0.95);
++    const low = meanScale(0.8);
++    try std.testing.expect(low > 0.72 and low < 0.88);
++}
++
++test "the probe logs one line on its period and never on an empty round" {
++    var s = try Stream.init(gpa, .{ .id = "probe", .prompt = &.{1}, .max_new = 8 });
++    defer s.deinit(gpa);
++    s.predict(&.{ 0.9, 0.81 });
++    s.observeCal(0.2, 1.0);
++    s.logCal(1, 3, 1, 2);
++    s.logCal(0, 3, 1, 2);
++    s.cal_n = 0;
++    s.logCal(1, 1, 0, 1);
++    try std.testing.expectEqual(@as(u64, 3), s.cal_rounds);
++}
++
++test "the weight must lie in 0..1" {
++    for ([_]f64{ -0.1, 1.5, std.math.nan(f64), std.math.inf(f64) }) |bad| {
++        try std.testing.expectError(error.BadDraftCal, Config.init(gpa, .{ .draft_cal = bad }, 16, 15));
++    }
++    var ok = try Config.init(gpa, .{ .draft_cal = 1.0 }, 16, 15);
++    ok.deinit(gpa);
++}
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 4f677df21..c948c9aed 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -13,6 +13,8 @@ pub const default_prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.
+ /// What a backend reports about its loaded model: the attributes the Python engine reads at setup.
+ pub const Model = struct {
+     solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
++    draft_cal: f64 = 0.0, // the weight of a round in each stream's realised-over-predicted draft survival (0: off)
++    cal_log: u32 = 0, // print every n-th calibrated verify of a stream to stderr (0: off)
+     copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
+     exact_width: u32 = 1, // the widest window that reproduces one-token steps bit for bit
+     first_copy_rows: u32 = 0, // a lone stream's first copy window (0: the exact width)
+@@ -38,6 +40,8 @@ pub const Model = struct {
+ 
+ pub const Config = struct {
+     solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
++    draft_cal: f64 = 0.0, // Model.draft_cal
++    cal_log: u32 = 0, // Model.cal_log
+     copy_proposals: bool = true, // suffix-lookup copy windows; false opts a backend out
+     family_width: u32,
+     max_copy: u32,
+@@ -70,6 +74,7 @@ pub const Config = struct {
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
++        if (!std.math.isFinite(m.draft_cal) or m.draft_cal < 0.0 or m.draft_cal > 1.0) return error.BadDraftCal;
+         if (max_rows < 1) return error.BadMaxRows;
+         if (m.solo_head_overhead_ms) |cost| {
+             if (!std.math.isFinite(cost) or cost < 0.0) return error.BadSoloHeadOverhead;
+@@ -124,6 +129,8 @@ pub const Config = struct {
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
+             .solo_head_overhead_ms = m.solo_head_overhead_ms,
++            .draft_cal = m.draft_cal,
++            .cal_log = m.cal_log,
+             .copy_proposals = m.copy_proposals,
+         };
+     }
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 22c56905a..5617c18ca 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -430,6 +430,11 @@ pub const Engine = struct {
+                         s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
+                     }
+                 } else if (p.kind == .head) {
++                    if (e.cfg.draft_cal > 0.0) {
++                        s.observeCal(e.cfg.draft_cal, @floatFromInt(kept));
++                        s.logCal(e.cfg.cal_log, rows, kept, path.len);
++                        s.cal_n = 0;
++                    }
+                     if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);
+                     const ds = try accept.depths(a, parents);
+                     const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds;
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index b7c8e1309..f07d04e8e 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -33,4 +33,5 @@ test {
+     std.testing.refAllDecls(@This());
+     _ = @import("engine_test.zig");
+     _ = @import("gpu_full_test.zig");
++    _ = @import("calibration_test.zig");
+ }
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 2e17c40c9..576898340 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -25,6 +25,9 @@ pub const Mode = enum { pipe, drain, verify, exit };
+ pub const loop_max_period: usize = 8;
+ pub const loop_min_run: usize = 256;
+ pub const loop_warm_in: usize = 64;
++pub const cal_floor: f64 = 0.2; // the lowest survival scale a stream's calibration applies
++pub const cal_max: usize = 32; // the granted drafts a round keeps for its calibration
++const cal_steps = 24; // bisections of a round's per-draft survival
+ 
+ /// Return the shortest exact cycle at the end of a combined token prefix.
+ fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
+@@ -211,6 +214,13 @@ pub const Stream = struct {
+     inflight: ?u64 = null,
+     served: ?u64 = null,
+     granted: ?u32 = null,
++    cal: f64 = 1.0, // realised over predicted drafts, a moving average (TF_DS_T25_DRAFT_CAL)
++    cal_raw: [cal_max]f64 = @splat(0.0), // the granted drafts' cumulative chances this round, before calibration
++    cal_n: usize = 0, // and how many (0: none)
++    cal_kept: f64 = 0.0, // moving averages of the drafts kept and of the drafts the chances expected, over verified rounds
++    cal_sum: f64 = 0.0, // (0: no round yet)
++    cal_c: f64 = 1.0, // the per-draft survival the last verified round solved for
++    cal_rounds: u64 = 0, // calibrated verifies, for the log
+     copy_width: ?u32 = null,
+     gate: ?call_gate.Gate = null,
+ 
+@@ -257,6 +267,7 @@ pub const Stream = struct {
+         s.inflight = null;
+         s.served = null;
+         s.granted = null;
++        s.cal_n = 0;
+         s.copy_width = null;
+     }
+ 
+@@ -327,6 +338,90 @@ pub const Stream = struct {
+         return std.mem.indexOfScalar(u32, s.eos, token) != null;
+     }
+ 
++    /// The survival scale the allocation uses: a cold or noisy stream cannot collapse its depth to nothing.
++    pub fn calScale(s: *const Stream) f64 {
++        return std.math.clamp(s.cal, cal_floor, 1.0);
++    }
++
++    /// Remember the granted drafts' raw cumulative chances for the round's verify.
++    pub fn predict(s: *Stream, chances: []const f64) void {
++        s.cal_n = @min(chances.len, cal_max);
++        @memcpy(s.cal_raw[0..s.cal_n], chances[0..s.cal_n]);
++    }
++
++    /// The drafts the allocation expected to land this round.
++    pub fn predicted(s: *const Stream) f64 {
++        var sum: f64 = 0.0;
++        for (s.cal_raw[0..s.cal_n]) |p| sum += p;
++        return sum;
++    }
++
++    /// Fold the round into the averages of kept and expected drafts, weight `w`, and set `cal` to the per-draft
++    /// survival whose expected drafts are the average's share of this round's chances. A per-round ratio would bias
++    /// `cal` low: its noise is clipped at 1 on one side only.
++    pub fn observeCal(s: *Stream, w: f64, kept: f64) void {
++        const n = s.cal_n;
++        if (n == 0) return;
++        const expected = s.predicted();
++        if (!(expected > 0.0)) return;
++        const realised = std.math.clamp(kept, 0.0, @as(f64, @floatFromInt(n)));
++        if (s.cal_sum > 0.0) {
++            s.cal_kept = (1.0 - w) * s.cal_kept + w * realised;
++            s.cal_sum = (1.0 - w) * s.cal_sum + w * expected;
++        } else {
++            s.cal_kept = realised;
++            s.cal_sum = expected;
++        }
++        s.cal_c = survival(s.cal_raw[0..n], s.cal_kept / s.cal_sum * expected);
++        s.cal = s.cal_c;
++    }
++
++    /// One line on stderr for the probe: the round, what it predicted, and what the next allocation will see.
++    pub fn logCal(s: *Stream, every: u32, rows: usize, kept: usize, tokens: usize) void {
++        s.cal_rounds += 1;
++        if (every == 0 or s.cal_rounds % every != 0) return;
++        var buf: [1024]u8 = undefined;
++        var at: usize = 0;
++        const n = s.cal_n;
++        at += (std.fmt.bufPrint(buf[at..], "tf-cal {{\"stream\": \"{s}\", \"rows\": {d}, \"granted\": {d}, \"kept\": {d}, \"pred_sum\": {d:.3}, \"chances\": [", .{ s.id, rows, n, kept, s.predicted() }) catch return).len;
++        for (s.cal_raw[0..n], 0..) |p, i| at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p }) catch return).len;
++        at += (std.fmt.bufPrint(buf[at..], "], \"c\": {d:.3}, \"cal\": {d:.3}, \"next\": [", .{ s.cal_c, s.cal }) catch return).len;
++        const scale = s.calScale();
++        var factor: f64 = 1.0;
++        for (s.cal_raw[0..n], 0..) |p, i| {
++            factor *= scale;
++            at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p * factor }) catch return).len;
++        }
++        at += (std.fmt.bufPrint(buf[at..], "], \"tokens\": {d}}}\n", .{tokens}) catch return).len;
++        std.debug.print("{s}", .{buf[0..at]});
++    }
++
++    /// The per-draft survival c in [cal_floor, 1] with sum_i c^i * chances[i-1] = kept (kept clamped to the drafts).
++    pub fn survival(chances: []const f64, kept: f64) f64 {
++        var total: f64 = 0.0;
++        for (chances) |p| total += p;
++        const want = std.math.clamp(kept, 0.0, @as(f64, @floatFromInt(chances.len)));
++        if (want >= total) return 1.0;
++        if (expectedKept(chances, cal_floor) >= want) return cal_floor;
++        var lo: f64 = cal_floor;
++        var hi: f64 = 1.0;
++        for (0..cal_steps) |_| {
++            const mid = 0.5 * (lo + hi);
++            if (expectedKept(chances, mid) < want) lo = mid else hi = mid;
++        }
++        return 0.5 * (lo + hi);
++    }
++
++    fn expectedKept(chances: []const f64, c: f64) f64 {
++        var sum: f64 = 0.0;
++        var factor: f64 = 1.0;
++        for (chances) |p| {
++            factor *= c;
++            sum += factor * p;
++        }
++        return sum;
++    }
++
+     /// Append tokens until the stream finishes; how many landed (a prefix of `tokens`).
+     pub fn commit(s: *Stream, gpa: Allocator, tokens: []const u32) !usize {
+         var landed: usize = 0;
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index f5306cfe6..0b1a96888 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -160,7 +160,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+     const a = e.arena.allocator();
+     const fixed = try a.alloc(u32, plans.len);
+     const probs = try a.alloc([]const f64, plans.len);
+-    for (plans, fixed, probs) |p, *fx, *pr| {
++    const raw = try a.alloc([]const f64, plans.len);
++    @memset(raw, &.{});
++    for (plans, fixed, probs, raw) |p, *fx, *pr, *rw| {
+         const n = p.count();
+         if (p.kind == .forced or n == 0) {
+             fx.* = 1 + @as(u32, @intCast(if (p.kind == .forced) n else 0));
+@@ -170,13 +172,15 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+             pr.* = try alloc.chainProbabilities(a, &.{e.cfg.copy_rate}, n);
+         } else {
+             fx.* = 1;
+-            pr.* = try nodeChances(e, p.stream, n);
++            rw.* = try nodeChances(e, p.stream, n);
++            pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale()) else rw.*;
+         }
+     }
+     const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len), e.alone, plans.len, if (plans.len > 0) plans[0].kind else .none);
+     const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, overhead, @max(plans.len, e.cfg.batch_rows));
+-    for (plans, probs, counts) |*p, chances, c| {
++    for (plans, probs, counts, raw) |*p, chances, c, rw| {
+         if (p.kind == .head) p.stream.granted = c;
++        if (e.cfg.draft_cal > 0.0) p.stream.predict(if (p.kind == .head) rw[0..c] else &.{});
+         if (chances.len == 0 or c == chances.len) continue;
+         if (c == 0) {
+             p.kind = .none;
+@@ -213,6 +217,17 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
+     return alloc.chainProbabilities(a, try e.rule.rates(who(s)), n);
+ }
+ 
++/// Cumulative chances scaled by a survival: the i-th (1-based) lands only if i drafts each survive.
++pub fn calibrated(a: std.mem.Allocator, chances: []const f64, scale: f64) ![]const f64 {
++    const out = try a.alloc(f64, chances.len);
++    var factor: f64 = 1.0;
++    for (out, chances) |*o, c| {
++        factor *= scale;
++        o.* = c * factor;
++    }
++    return out;
++}
++
+ /// The window's rows, parents and keyed positions, ready for the backend.
+ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+     const a = e.arena.allocator();
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index eaab37f86..4c3333c33 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -384,6 +384,13 @@ pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
+     return out.items;
+ }
+ 
++/// A calibration weight ("0.5"): finite, from 0 (off) to 1 (TF_DS_T25_DRAFT_CAL).
++pub fn parseCalWeight(text: []const u8) !f64 {
++    const v = try std.fmt.parseFloat(f64, std.mem.trim(u8, text, " "));
++    if (!std.math.isFinite(v) or v < 0.0 or v > 1.0) return error.BadDraftCal;
++    return v;
++}
++
+ /// A stream's place in the pool and the drafts it holds; TF_DS_KV_SHARD: its planner stream, part and generation
+ /// (parts.zig's Live), and whether its first decode round ran (planDecode).
+ const Lane = struct {
+@@ -453,6 +460,8 @@ pub const Lanes = struct {
+     prof: ?Profile = null,
+     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
+     solo_overhead: bool = false, // TF_DS_SOLO_OVERHEAD=1: a lone drafted stream's head windows cost the fixed draft allowance
++    draft_cal: f64 = 0.0, // TF_DS_T25_DRAFT_CAL: the weight of a round in each stream's draft-survival calibration (0: off)
++    cal_log: u32 = 0, // TF_DS_T25_CAL_LOG: every n-th calibrated verify of a stream prints to stderr (0: off)
+     no_copies: bool = false, // TF_DS_NO_COPIES=1: a drafted stream proposes no suffix-lookup copy windows
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+@@ -522,6 +531,8 @@ pub const Lanes = struct {
+             .window_costs = self.wc[0..],
+             .mtp_step_ms = draft.draft_ms,
+             .solo_head_overhead_ms = if (drafting and self.solo_overhead) draft.draft_ms else null, // opt-in: the Python engine's fixed draft allowance
++            .draft_cal = self.draft_cal,
++            .cal_log = self.cal_log,
+             .copy_proposals = !(drafting and self.no_copies), // opt-in: the draft head proposes; the Python engine makes no copies either
+             .streams_exact = true,
+             .hidden_rows = true,
+@@ -1987,6 +1998,15 @@ pub fn followPair(gpa: std.mem.Allocator, m: *Model, spill: ?*SpillFollower, fx:
+     }
+ }
+ 
++test "a calibration weight parses to a finite value in 0..1" {
++    try std.testing.expectEqual(@as(f64, 0.5), try parseCalWeight(" 0.5 "));
++    try std.testing.expectEqual(@as(f64, 1.0), try parseCalWeight("1"));
++    try std.testing.expectEqual(@as(f64, 0.0), try parseCalWeight("0"));
++    for ([_][]const u8{ "-0.1", "1.01", "2", "abc", "", "nan", "inf", "-inf" }) |bad| {
++        try std.testing.expect(std.meta.isError(parseCalWeight(bad)));
++    }
++}
++
+ test "draft chances are the prefix survivals chooseK sums" {
+     var out: [3]f64 = undefined;
+     survivals(&.{ 0.0, 0.0, 2.0 }, &out);
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index a03bbf65f..e02e5757b 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -25,6 +25,9 @@
+ //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
+ //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
+ //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
++//!   TF_DS_T25_DRAFT_CAL                         a weight in (0, 1]: each stream's draft survival is scaled by its realised over
++//!                                               predicted drafts (unset or 0: off; core/lanes/windows.zig)
++//!   TF_DS_T25_CAL_LOG                           print every n-th calibrated verify of a stream to stderr (unset or 0: off)
+ //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
+ //!   TF_DS_POOL=P, TF_DS_WINDOW=W                (0008, pool.zig) the pool's positions, every stream's extents
+ //!                                               together (unset: the context), and the window a request may use
+@@ -250,6 +253,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     errdefer st.lanes.stopKv();
+     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+     st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
++    st.lanes.draft_cal = if (getenv("TF_DS_T25_DRAFT_CAL")) |v| lanes_mod.parseCalWeight(v) catch return error.BadDraftCal else 0.0;
++    st.lanes.cal_log = if (getenv("TF_DS_T25_CAL_LOG")) |v| std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadCalLog else 0;
+     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
+     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
+     st.vision = null;

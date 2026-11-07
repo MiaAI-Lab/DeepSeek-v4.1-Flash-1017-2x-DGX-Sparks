@@ -63,6 +63,7 @@ for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] ||
 (( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16 (the engine's streams), not $PARALLEL"
 [[ -z "$ROUND_ROWS" ]] || { [[ "$ROUND_ROWS" =~ ^[0-9]+$ ]] && (( ROUND_ROWS == 16 )); } || die "ROUND_ROWS must be empty or 16: the pinned kit has no wider row kernels (issue #23), not $ROUND_ROWS"
 [[ -z "$THINKING_BUDGET" || "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]] || die "THINKING_BUDGET is a positive count of reasoning tokens (or empty for no cap), not $THINKING_BUDGET"
+[[ "$DROP_REASONING_HISTORY" =~ ^[01]$ ]] || die "DROP_REASONING_HISTORY is 0 or 1, not $DROP_REASONING_HISTORY"
 [[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || die "REASONING_EFFORT is low, medium, high or xhigh (or empty), not $REASONING_EFFORT"
 [[ "$MIN_AVAIL_GIB" =~ ^[0-9]+$ ]] || die "MIN_AVAIL_GIB is a whole number of GiB (0 turns it off), not $MIN_AVAIL_GIB"
 [[ "$MIN_AVAIL_WAIT_S" =~ ^[0-9]+$ ]] && (( MIN_AVAIL_WAIT_S <= 3600 )) || die "MIN_AVAIL_WAIT_S is 0 to 3600 seconds, not $MIN_AVAIL_WAIT_S"
@@ -97,6 +98,7 @@ SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$
 if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking); fi
 [[ -z "$REASONING_EFFORT" ]] || SERVE+=(--reasoning-effort "$REASONING_EFFORT")
 [[ -z "$THINKING_BUDGET" ]] || SERVE+=(--thinking-budget "$THINKING_BUDGET")
+[[ "$DROP_REASONING_HISTORY" != 1 ]] || SERVE+=(--drop-reasoning-history)
 # drafts off on rank 0 as on rank 1 (a follower without the drafter refuses a drafted round)
 [[ "$DRAFTS" == 1 ]] || SERVE+=(--no-drafts)
 [[ "$API_KEY" != 1 ]] || SERVE+=(--api-key-file "$API_KEY_IN_CONTAINER")
@@ -282,6 +284,17 @@ KIT=/hf/$KIT_SUB/kit
 FOLLOW="--pool ${POOL:-$CONTEXT} --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 # zig/patches/0033: only with graphs on, so an image from before 0033 still starts with GRAPHS=0 (it refuses the flag)
 [[ "$GRAPHS" == 0 ]] || FOLLOW+=" --graph-cap $GRAPH_CAP"
+# A round's context bucket is the next power of two of its depth, capped at the pool (round.zig bucketFor). A pool off
+# the 4,096 grid makes the capped bucket's indexer tile count one the kit captured no _index_score variant for: a prompt
+# past the largest power of two below the pool fails with MissingTritonVariant, and later requests with CudaFailed (901)
+# until a restart (issues #65 and #63: 400,000 and 500,000 failed, 524,288 and 1,048,576 did not).
+_cap=${POOL:-$CONTEXT}
+if [[ "$GRAPHS" == 1 ]] && (( _cap % 4096 != 0 )); then
+  _p2=1024; while (( _p2 * 2 < _cap )); do _p2=$(( _p2 * 2 )); done
+  _what="CONTEXT=$CONTEXT"; [[ -z "${POOL:-}" ]] || _what="POOL=$POOL"
+  warn "the pool ($_what) is not a multiple of 4096: with GRAPHS=1 a prompt past $_p2 positions can fail with MissingTritonVariant and leave later requests failing with CudaFailed (901) until a restart (issues #65, #63). Use a power of two (524288, 1048576) or a multiple of 4096"
+fi
+unset _cap _p2 _what
 [[ -z "$ROUND_ROWS" ]] || FOLLOW+=" --round-rows $ROUND_ROWS"
 # RANK1_PROFILE=1|2: rank 1's own profile (--profile; 2 adds prefill_phases_ms), AGGREGATED over the run and printed to its
 # log only when rank 0 goes away first (docker stop rank 0, read rank 1's log, then ./stop.sh). It synchronizes the stream

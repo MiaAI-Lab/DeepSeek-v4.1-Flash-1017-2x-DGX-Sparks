@@ -1,0 +1,268 @@
+From eabf90ba366b41c00d404735e3b1f49697e6e15e Mon Sep 17 00:00:00 2001
+From: "tianxu.zhang" <tianxu.zhang@bytedance.com>
+Date: Sat, 7 Nov 2026 22:46:31 +0800
+Subject: [PATCH] server: stream single DSML calls incrementally
+
+Patch 0048 deliberately preserves the old one-call stream: when
+parallel_tool_calls is false, it suppresses every tool delta and sends the
+first parsed call only after generation ends. Coding agents commonly set
+that policy, so their largest Write/Edit arguments still leave the client
+silent until the full call is complete.
+
+Pass the policy's one-call limit into the existing DSML streamer, cap it
+before a second call header can escape, and settle the streamed first call
+against the same max-one final parse. Keep legacy XML calls buffered under
+the one-call policy. Parallel DSML streams, non-stream replies, and requests
+without tools are unchanged.
+
+Extend 0048's route test to verify that a two-call answer streams only its
+first call, in multiple argument deltas, with bytes identical to the whole
+reply.
+
+---
+ zig/src/server/chat.zig             |  8 +++++---
+ zig/src/server/dsml_fuzz_test.zig   |  2 +-
+ zig/src/server/dsml_stream_test.zig | 28 ++++++++++++++++++++++------
+ zig/src/server/openai.zig           | 13 ++++++++-----
+ zig/src/server/tool_stream.zig      | 14 ++++++++------
+ 5 files changed, 44 insertions(+), 21 deletions(-)
+
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 7dacd78a..d0cff1b4 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -42,6 +42,7 @@ pub const Sink = struct {
+     ctx: *anyopaque,
+     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
+     ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
++    max_calls: ?usize = null,
+ };
+ 
+ /// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill).
+@@ -254,7 +255,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
++        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools, sink.?.max_calls) catch |e| break :blk e;
+         gen.loop(gone) catch |e| break :blk e;
+         break :blk gen.finish(cx, prepared.prompt_len, received, submitted, thinking, effort, prepared.sampled, prepared.drafts);
+     };
+@@ -440,7 +441,8 @@ const Generation = struct {
+         }
+         if (g.calls) |*c| {
+             var out: std.ArrayList(Value) = .empty;
+-            try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
++            if (sink.max_calls == null)
++                try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
+             try c.feedDsml(answer, &out); // DeepSeek-V4.1's DSML calls as they decode, never the reasoning
+             for (out.items) |d| try g.emit(sink, d);
+         }
+@@ -564,7 +566,7 @@ const Generation = struct {
+                 }
+             };
+             if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
+-            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0) {
++            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0 and sink.max_calls == null) {
+                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas (after
+                 // DSML calls went out, the finish's check sends such a call under the next index instead)
+                 var out: std.ArrayList(Value) = .empty;
+diff --git a/zig/src/server/dsml_fuzz_test.zig b/zig/src/server/dsml_fuzz_test.zig
+index cfc7b43f..3dca56c6 100644
+--- a/zig/src/server/dsml_fuzz_test.zig
++++ b/zig/src/server/dsml_fuzz_test.zig
+@@ -97,7 +97,7 @@ const Gen = struct {
+ /// header once and in order, pieces for the newest call (a held call's brace for the one before it), valid UTF-8,
+ /// joined to the streamer's record.
+ fn feed(a: Allocator, tools: []const Value, text: []const u8, r: std.Random) !tool_stream.Streamer {
+-    var s = try tool_stream.Streamer.init(a, tools);
++    var s = try tool_stream.Streamer.init(a, tools, null);
+     var out: std.ArrayList(Value) = .empty;
+     var end: usize = 0;
+     while (end < text.len) {
+diff --git a/zig/src/server/dsml_stream_test.zig b/zig/src/server/dsml_stream_test.zig
+index 5af05cb5..d89b2cea 100644
+--- a/zig/src/server/dsml_stream_test.zig
++++ b/zig/src/server/dsml_stream_test.zig
+@@ -1,8 +1,8 @@
+ //! DeepSeek-V4.1's DSML tool calls stream as they decode. Real token sequences (the DeepSeek-V4.1
+ //! tokenizer, testdata/dsml_stream.json) run through the chat route and the Messages route with a CPU fake engine. Each
+ //! stream's argument pieces join to the whole reply's arguments byte for byte, in order, sent once; a stream without
+-//! tools, or with the one-call policy, is the same as before the patch event for event (testdata/dsml_stream_golden.json,
+-//! recorded without the patch).
++//! tools, or without a call, is the same as before the patch event for event (testdata/dsml_stream_golden.json,
++//! recorded without the patch). The one-call policy streams only the first DSML call.
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const api = @import("engine_api");
+@@ -316,6 +316,24 @@ test "a call to a tool the request did not offer streams as the parse returns it
+     try expectStreamed("unoffered", &.{ 4, 4 });
+ }
+ 
++test "the one-call policy streams only the first DSML call as it decodes" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f = try Fixture.load(a);
++    defer f.tok.deinit();
++    for ([_][]const usize{ &.{1}, &.{ 3, 1, 4, 1, 5, 2 }, &.{64} }) |pattern| {
++        const whole = wholeMessage(&try chatRun(a, &f, .{ .case = "two_calls", .stream = false, .single = true }));
++        const r = try Read.of(a, &try chatRun(a, &f, .{ .case = "two_calls", .single = true, .pattern = pattern }));
++        try std.testing.expectEqual(@as(usize, 1), whole.calls.len);
++        try std.testing.expectEqual(@as(usize, 1), r.calls.items.len);
++        try std.testing.expectEqualStrings(whole.finish, r.finish.?);
++        try std.testing.expectEqualStrings(whole.calls[0].get("function").?.strField("name").?, r.calls.items[0].name);
++        try std.testing.expectEqualStrings(whole.calls[0].get("function").?.strField("arguments").?, r.calls.items[0].arguments.items);
++        if (pattern[0] == 1) try std.testing.expect(r.calls.items[0].pieces >= 6);
++    }
++}
++
+ test "DSML written in the reasoning, or quoted in the answer, is no call: no tool delta, the same content" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+@@ -365,14 +383,12 @@ fn normal(a: Allocator, text: []const u8) ![]const u8 {
+ }
+ 
+ /// The streams the patch must leave as they were: no tools (a reply with DSML in it, and one with DSML only quoted),
+-/// tools without a call, and the one-call policy (its calls go out when the reply ends).
++/// tools without a call.
+ pub const golden_asks = [_]struct { key: []const u8, ask: Ask }{
+     .{ .key = "no_tools_write", .ask = .{ .case = "write", .tools = false, .pattern = &.{ 29, 61 } } },
+     .{ .key = "no_tools_two_calls", .ask = .{ .case = "two_calls", .tools = false, .pattern = &.{ 7, 13 } } },
+     .{ .key = "no_tools_quoted", .ask = .{ .case = "quoted", .tools = false } },
+     .{ .key = "tools_quoted", .ask = .{ .case = "quoted" } },
+-    .{ .key = "single_unoffered", .ask = .{ .case = "unoffered", .single = true } },
+-    .{ .key = "single_two_calls_by_token", .ask = .{ .case = "two_calls", .single = true, .pattern = &.{1} } },
+ };
+ 
+ /// The golden file's text: each golden ask's normalized events (how testdata/dsml_stream_golden.json was recorded).
+@@ -389,7 +405,7 @@ pub fn goldenJson(a: Allocator) ![]const u8 {
+     return json.stringify(a, .{ .object = o }, .{ .ascii = true });
+ }
+ 
+-test "without tools, without a call, or with the one-call policy, a stream is event for event what it was before the patch" {
++test "without tools or without a call, a stream is event for event what it was before the patch" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index c1f50ac7..6bbc649f 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -317,7 +317,6 @@ const Run = struct {
+         };
+         reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+         reply.finish_reason = "tool_calls";
+-        if (r.plan.policy.single) reply.tool_calls_streamed = false;
+         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+     }
+ 
+@@ -416,7 +415,7 @@ const Run = struct {
+         }
+     };
+ 
+-    /// The one-call policy on a streamed delta: text filtered, tool_calls dropped; null when nothing is left.
++    /// The one-call policy on a streamed delta: text filtered; the chat streamer itself is capped at one DSML call.
+     fn policyDelta(r: *Run, delta: Value) Allocator.Error!?Value {
+         if (!r.plan.policy.single) return if (delta.truthy()) delta else null;
+         if (delta == .string) {
+@@ -426,7 +425,6 @@ const Run = struct {
+         const o = try json.newObject(r.a);
+         var content: ?[]const u8 = null;
+         for (delta.object.keys(), delta.object.values()) |k, v| {
+-            if (std.mem.eql(u8, k, "tool_calls")) continue;
+             if (std.mem.eql(u8, k, "content") and v == .string) {
+                 content = v.string;
+                 continue;
+@@ -500,7 +498,12 @@ const Run = struct {
+         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+         var sink_state: StreamSink = .{ .run = r, .tools = tools };
+         handed = true;
+-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping }, gone) catch |e| {
++        var reply = chat.generate(r.srv, &cx, prepared, .{
++            .ctx = &sink_state,
++            .call = StreamSink.call,
++            .ping = StreamSink.ping,
++            .max_calls = r.plan.policy.maxCalls(),
++        }, gone) catch |e| {
+             switch (e) {
+                 error.Cancelled => return,
+                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
+@@ -529,7 +532,7 @@ const Run = struct {
+                 r.prose_sent.appendSlice(a, tail) catch return;
+                 r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
+             }
+-            if (!r.plan.policy.single and reply.streamed_calls.len > 0) {
++            if (reply.streamed_calls.len > 0) {
+                 r.settle(&reply, calls) catch return;
+             } else if (calls != null and !reply.tool_calls_streamed) {
+                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index a7288e49..8b5533a0 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -37,6 +37,7 @@ pub const Streamer = struct {
+     a: Allocator,
+     schemas: tool_params.Schemas,
+     known: std.StringHashMapUnmanaged([]const u8) = .empty,
++    max_calls: ?usize,
+     current: []const u8 = "",
+     value_schema: Value = .null,
+     typed: bool = false,
+@@ -51,8 +52,8 @@ pub const Streamer = struct {
+     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
+     dsml: Dsml = .{}, // DeepSeek-V4.1's calls (feedDsml)
+ 
+-    pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
+-        var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
++    pub fn init(a: Allocator, tools: []const Value, max_calls: ?usize) Allocator.Error!Streamer {
++        var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools), .max_calls = max_calls };
+         // the offered names as tool_parse.parse reads them for a DSML block
+         for (tools) |tool| {
+             const name = try tool_specs.toolName(a, tool);
+@@ -279,6 +280,7 @@ pub const Streamer = struct {
+                         d.block_calls += 1;
+                         if (d.block_calls > 1) d.holding = true;
+                         try d.closePending(a, out);
++                        if (s.max_calls) |max| if (d.sent.items.len >= max) continue;
+                         // the parse's name: the offered spelling, else the model's (a copy: the answer's buffer moves)
+                         const called = d.known.get(try std.ascii.allocLowerString(a, name)) orelse try a.dupe(u8, name);
+                         const function = try json.newObject(a);
+@@ -818,7 +820,7 @@ const tool_parse = @import("tool_parse.zig");
+ 
+ /// The deltas one streamer sends while the reply grows through ``texts``.
+ fn streamed(a: Allocator, tools: []const Value, texts: []const []const u8) Allocator.Error![]Value {
+-    var s = try Streamer.init(a, tools);
++    var s = try Streamer.init(a, tools, null);
+     var out: std.ArrayList(Value) = .empty;
+     for (texts) |t| try s.feed(t, &out);
+     return out.items;
+@@ -855,7 +857,7 @@ const dsml_tools =
+ /// finish feeds it; its deltas checked: each call's header once and in order, then only its own pieces, each valid UTF-8,
+ /// joined to what the streamer records as sent.
+ fn dsmlFeed(a: Allocator, text: []const u8, step: usize, chars: bool) !Streamer {
+-    var s = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
++    var s = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array, null);
+     var out: std.ArrayList(Value) = .empty;
+     var end: usize = 0;
+     while (end < text.len) {
+@@ -999,7 +1001,7 @@ test "a text that does not extend the one read turns the streamer off instead of
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+-    var s = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
++    var s = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array, null);
+     var out: std.ArrayList(Value) = .empty;
+     const streamed_text = comptime (calls_open ++ "<" ++ D ++ " invoke name=\"Bash\">\n<" ++ D ++ " parameter name=\"command\" string=\"true\">grep -n '<|channel|>' x.zig and more");
+     var end: usize = 0;
+@@ -1009,7 +1011,7 @@ test "a text that does not extend the one read turns the streamer off instead of
+     try s.feedDsml("", &out);
+     try std.testing.expect(s.dsml.off);
+     // the finish's check: a longer text with another start
+-    var t = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array);
++    var t = try Streamer.init(a, (try json.parse(a, dsml_tools)).ok.array, null);
+     try t.feedDsml(streamed_text[0..40], &out);
+     t.dsml.verify("other text, longer than forty bytes, that does not start with the first");
+     try std.testing.expect(t.dsml.off);
+-- 
+2.50.1 (Apple Git-155)

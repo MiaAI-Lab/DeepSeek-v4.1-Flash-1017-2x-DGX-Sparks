@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+- `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
+  bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
+  count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
+  `MissingTritonVariant` and later requests with `CudaFailed (901)` (issues #65, #63; 524,288 and 1,048,576 did not).
+  The engine side (ending a failed capture on the side stream too) is still open in #65. Test in
+  `scripts/test_scripts.py`. Reported by **Cristiano Revil ([cristianorevil](https://github.com/cristianorevil))** and
+  **XueYun ([xueyuenet](https://github.com/xueyuenet))**, with the window data from **ldenaeyer**.
+- `zig/patches/0059-lane-thread-binds-context.patch` (always on): the lane host's thread makes its CUDA context
+  current as it starts. With the spill tier on, the first request after a start that resumed a state from disk
+  reached the tier's restore (through the prompt cache, whose calls are not wrapped) before any backend call had bound
+  the context on that thread: the restore failed with `CUDA_ERROR_INVALID_CONTEXT` and the request prefilled from 0.
+  Host test: `lane_host_tier_test.zig` (fails without the change). Not yet run on a pair. Reported with the
+  diagnosis by **Phan Quý Nguyên ([NguyenPhan2810](https://github.com/NguyenPhan2810))**, issue #102.
+- `zig/patches/0058-responses-include-encrypted.patch` (always on): `/v1/responses` accepts and ignores
+  `include: ["reasoning.encrypted_content"]`, which Pi and other Responses-API clients send with every reasoning
+  request; before, each such request was refused with a 400. Other `include` values are still refused. Test:
+  `zig/src/server/responses_include_test.zig` (fails without the change). Reported by **Unitea
+  ([unitea1992](https://github.com/unitea1992))**, issue #99.
+- `zig/patches/0057-drop-reasoning-history.patch` (`DROP_REASONING_HISTORY=1`, off by default): rank 0's
+  `--drop-reasoning-history` removes `reasoning_content` from every assistant turn before the chat template renders, for
+  clients that replay each turn's reasoning in a tool loop (long agent runs drifted into flat, then repeating reasoning:
+  3 of 6 replayed replies looped without it, 0 of 6 with it). With it on, each turn re-prefills the previous reply.
+  `start.sh` accepts only `0`/`1`. Sent as `0049`; renumbered (0049-0051 are Lukasz Raczylo's). By **marknx
+  ([marknx](https://github.com/marknx))**, [pull request #116](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/116).
+- `start.sh`'s Engram pre-flight (`port_engram_check`, issue #61) lists a folder the way the engine's rank fingerprint
+  now does: every entry but a directory, dotfiles included, its size read through symlinks (rebased `0016`,
+  `rank_identity.zig`'s `listing()` stats through links since the move to `fbbc971`). It still skipped symlinks, so with
+  `SPILL_GIB` on and `HEAD_ENGRAM_DIR` empty it refused a start the engine accepts: rank 0's HF snapshot listed nothing
+  against the worker's copied files. `HEAD_ENGRAM_DIR` is now optional (local Engram reads); folders that really differ
+  are still refused before anything is stopped. `scripts/port_test.sh` covers a symlinked snapshot, a directory in it and
+  a dotfile. Reported by **Kyungtaek Lee ([lastingchild](https://github.com/lastingchild))**.
+- `zig/patches/0040-restore-room.patch` (on with `SPILL_GIB` or `KV_SHARD=1`, no switch): a disk restore or a memory
+  resume that the KV pool has no room for while other streams run now gets its room the way a prompt pass does, instead
+  of the prompt running from 0. A restore refused with `ContextFull` goes back to the queue's front and asks again, for
+  `TF_SPILL_LOAD_WAIT_MS` (30 s) at most, then takes what memory holds as before; `/metrics` counts
+  `prompt_cache_restores_room_waits` and `prompt_cache_restores_room_wait_expired`. With `KV_SHARD=1` a restore whose
+  part no eviction frees moves one live stream to the other part first, and, with carries on (the default), a hit its
+  part cannot keep resumes in place (the kept states over its tail give their room, one live stream moves, or it waits
+  up to 10 s) instead of being dropped. While it waits, the request holds the queue as a waiting prompt pass does.
+  Before it, one conversation of about 600K tokens ran from 0 fourteen times in 36 hours on a pair (4 restores, 10
+  hits). Host tests in `lane_host_robust_test.zig` (each also with the prompt pass in pieces and cut-ins),
+  `kv_lanes.zig` and `parts.zig` ("11 room", three mutants). By **[nuk3s](https://github.com/nuk3s)**.
+- `zig/patches/0041-service-between-pieces.patch` (always on): with the spill tier on (`SPILL_GIB`) and `TF_FILL_CHUNKS`
+  set, the run loop asked for the service of parked work (restores, staged writes, deferred retries) on every loop while
+  a prompt pass waited for its next piece, and the service fence (`0020`) refused it each time: `tensorfold:service_refused`
+  went up, the log called it "an engine bug" once, a debug build panicked, and parked work moved only inside a piece. The
+  run loop now services it between two pieces, as `Stream.between` does inside one. Nothing changes without
+  `TF_FILL_CHUNKS`, with `SPILL_GIB=0` or with `KV_SHARD=1`. A host test that panics without the fix.
+  By **[nuk3s](https://github.com/nuk3s)**.
+- `zig/patches/0047-replayed-reasoning.patch` (always on): an assistant message's `reasoning` field reaches the chat
+  template as its `reasoning_content`, as vLLM's `chat_utils` reads it. The engine read only `reasoning_content`, and
+  LiteLLM's `hosted_vllm` provider (1.103.4) removes that field from assistant messages and keeps `reasoning`, so a
+  client behind it lost all of its replayed thinking and every history turn rendered as `<think></think>` and the
+  answer. In one 22-turn tool session that grows from 0.6K to 171K tokens (temperature 0, on a pair), the next reply
+  thought at 22 of 22 points with the reasoning in history and at 6 of 22 without it (0 of 9 above 100K). A client's own
+  `reasoning_content` wins; a request without an assistant `reasoning` field renders byte for byte as before. Two host
+  tests in `messages.zig` fail without the change. By **[nuk3s](https://github.com/nuk3s)**.
+- `zig/patches/0048-stream-tool-calls.patch` (always on): DeepSeek-V4.1's DSML tool calls stream as they decode. The
+  engine sent each call whole when the reply ended, so a client saw nothing while the model wrote it: on a pair, a Write
+  call's 869 characters of arguments came through LiteLLM's `/v1/messages` as one `input_json_delta` after 4.1 s without
+  an event. Now a call's header goes out when its invoke name is whole, string values go out as JSON-escaped pieces while
+  they decode, and other values when their parameter closes. The pieces join to the parsed arguments byte for byte, and
+  the finish checks what went out against the parse and sends nothing twice. On a pair with the patch, a Write call with
+  1,014 characters of arguments streamed as 47 argument deltas on the chat route and 48 `input_json_delta` on
+  `/v1/messages` (1 and 1 on the image before it), and as 46 through LiteLLM's `/v1/messages`. Requests without tools,
+  whole replies and `parallel_tool_calls: false` are unchanged. Route tests with real DeepSeek-V4.1 token sequences (10 of
+  14 fail without the patch), a golden stream and a fuzz test of 14,000 replies. By **[nuk3s](https://github.com/nuk3s)**.
+- `zig/patches/0051-prompt-rows.patch` (`TF_DS_PROMPT_WINDOW_ROWS`, `TF_DS_PROMPT_GEMM_ROWS`; unset: the engine unchanged): two switches choose the kernels a short prompt chunk takes. On a GB10 pair `TF_DS_PROMPT_WINDOW_ROWS=128` took about 40 ms off the first token of prompts of 64 to 127 tokens (greedy replies unchanged, the author's engine line). By **Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo))**, [pull request #106](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/106).
+- `zig/patches/0050-draft-calibration.patch` (`TF_DS_T25_DRAFT_CAL=w`, off unless set): each stream calibrates its draft survival by the acceptance its verifies realise, so a stream whose text accepts fewer drafts than the prior expects is granted fewer, and one that accepts more is granted more. On a GB10 pair with `w=0.05`, greedy prose went from 79.7 to 85.4 tok/s and code stayed at 115.9 (the author's engine line, same hardware and model), and replies were unchanged. `TF_DS_T25_CAL_LOG=n` prints every n-th calibrated verify. By **Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo))**, [pull request #105](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/105).
+- `zig/patches/0049-first-draft-depth.patch` (always on): a stream's first drafts after its prompt take the head's depth, as every later round does. The learned-cost rule priced them from the load-time table before any round was measured, so the first request after boot drafted 3 where the same request warm drafted 5, and its greedy reply could differ from the warm reply. On a GB10 pair the first greedy reply after boot matched the warm one for all 8 prompts of a fixed set at six consecutive builds after the fix, and for 7 of 8 before it. By **Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo))**, [pull request #104](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/104).
+- `zig/patches/0056-server-picture-prepare-scratch.patch` (always on): `spans()` (`zig/src/server/prompt.zig`) prepared every picture
+  of a request in the request's arena, whose frees reclaim almost nothing, so a 1024x650 screenshot kept ~16 MiB until the request ended,
+  for every picture on every turn (the cached prefix's pictures are prepared again for their digests). A scratch arena on the
+  server's allocator now holds one picture's preparation at a time and only the payload is copied out; a refusal's message is
+  copied out first. On a pair, a cold request with 30 screenshots took the head's `MemAvailable` 0.23 GiB under its level
+  just before, against 0.71 GiB without the patch (~16 MiB a picture).
+  By **marknx ([marknx](https://github.com/marknx))**, [pull request #112](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/112).
 - `zig/patches/0046-server-get-delete-body-discard.patch` (always on): a `GET` or `DELETE` that carries a request body has
   it read and dropped before its route. The dispatch read no body on either method, so the bytes stayed in the socket and
   the next request on that connection was parsed from them: on the image before this patch, a `GET /models` after a
@@ -12,6 +89,32 @@
   [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit), checks it on a running server: on a pair it exits 1 on
   the image before the patch and 0 on `exl3-tp2-9d0f4a04af7f`, whose replies to `tools/exact.py`'s 39 prompts are identical
   ([measurements](docs/measurements.md)).
+- `zig/patches/0042-kv-shard-pieces.patch` (no switch of its own): with `KV_SHARD=1` a prompt pass runs in pieces, so
+  `TF_FILL_CHUNKS`, `TF_FILL_CUT_IN` and the rest work with KV sharding. Before, `Lanes.prefillPart` ran every sharded
+  pass whole: a short request waited for a cold long prompt (25.7 s for one sent 8 s into a 70K-token prompt; 0.37-0.5 s
+  with `0042` and `TF_FILL_CHUNKS=1 TF_FILL_CUT_IN=8192`, the long reply's tokens unchanged), and
+  `TF_FILL_CHUNKS` still turned `0005`'s interleave off. A pass keeps its extent and part between its pieces; its
+  borrowed twins are pinned only while a chunk runs, so a placement between two pieces may give them back (the pass
+  then fetches). A pass a short prompt cut into binds its twins again as it resumes, on rank 0 and on the follower at
+  the `fill_resume` frame: before, the planner's fill stayed the cut-in's, and the cut-in's first decode round would
+  have re-made the view at the cut-in's extent on the paused pass's slot. Without `TF_FILL_*` nothing changes. By
+  **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)**.
+- `zig/patches/0043-picture-resume-skip.patch` (always on, issue #90): a prompt pass that resumes a kept state no longer runs
+  the vision tower for, or sends rank 1 the rows of, the pictures wholly before the kept state's end. Since the pin
+  moved to `fbbc971`, every turn of a conversation that carries pictures re-ran the tower on all of them and sent all
+  their rows across, ~5.5 s per request on a pair regardless of the prompt's length, although those rows are never read
+  (embedding, image routing and the Engram mask only touch the spans that overlap the chunk being computed). `0021`
+  skipped them on the `629c524` pin (`pictureNeedsRows`); the rebase onto `fbbc971` kept the helper and its test but
+  lost the call in `fillOpen`, which this restores. Pictures that straddle the resume point, and passes that do not
+  resume, are handled as before.
+  By **Dick Lai ([laidick](https://github.com/laidick))**, [pull request #93](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/93).
+- `zig/patches/0045-cut-in-tail.patch` (with `TF_FILL_CUT_IN`): a queued prompt cuts in between another pass's pieces when the tokens
+  it computes past the kept state it resumes fit `TF_FILL_CUT_IN`, not its whole length; a turn of a 300K-token conversation with 1.5K
+  new tokens now cuts in. A prompt with pictures cuts in when every picture is inside that kept state (no tower run, no rows: the
+  `pictureNeedsRows` test). Unchanged: one cut-in at a time, none into a pass with pictures, and a prompt that needs picture rows waits.
+  The bound stays hard: if the kept state is gone when the pass opens (stale, or no room to move it), dsv41's `fillOpen` refuses the
+  cut-in (`error.FillBusy`) before anything changes, and it waits for the pass in pieces as a long prompt does (it used to be dropped).
+  By **Dick Lai ([laidick](https://github.com/laidick))**, [pull request #95](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/95).
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).

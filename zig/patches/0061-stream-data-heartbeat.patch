@@ -1,23 +1,23 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Local deployment <noreply@invalid>
-Date: Sat, 7 Nov 2026 20:00:00 +0800
-Subject: [PATCH] server: count actual stream writes and send OpenAI data
- heartbeats
+From 2e4e892fc5adb99c71dbfb39d66b23bb998c2b0d Mon Sep 17 00:00:00 2001
+From: "tianxu.zhang" <tianxu.zhang@bytedance.com>
+Date: Sat, 7 Nov 2026 22:47:18 +0800
+Subject: [PATCH] server: emit data heartbeats after real stream silence
 
-The existing keepalive refreshed last_out_ns after every decoded token
-chunk, even when the tool-call filter emitted no bytes. A long DSML
-argument therefore kept the timer fresh while leaving the client silent.
-It also used SSE comments for OpenAI, which some agent adapters discard
-without refreshing their idle watchdog.
+Patch 0032 refreshes its silence clock after every decoded token chunk, even
+when filtering writes no bytes to the client. A long hidden envelope can
+therefore decode continuously without ever sending a keepalive. Its OpenAI
+keepalive is also an SSE comment, which some agent adapters ignore when
+advancing their parsed-event idle timer.
 
-Update last_out_ns only after a sink write, check the silence timer after
-both idle waits and decoded chunks, and make the OpenAI keepalive a normal
-empty chat-completion chunk with the request's id, model, and timestamp.
-The heartbeat changes no reconstructed message or token accounting.
+Refresh the clock only after a sink write, check it after both idle waits and
+decoded chunks, and make the OpenAI keepalive a normal empty
+chat.completion.chunk data event. Anthropic keeps its native ping event.
+Heartbeats do not change reconstructed text, tool calls, or token accounting.
+
 ---
  zig/src/server/anthropic.zig |  2 +-
- zig/src/server/chat.zig      | 42 +++++++++++++++++++++++++++++++-----------
- zig/src/server/openai.zig    | 34 ++++++++++++++++++++++++++++++----
+ zig/src/server/chat.zig      | 42 ++++++++++++++++++++++++++----------
+ zig/src/server/openai.zig    | 34 +++++++++++++++++++++++++----
  zig/src/server/root.zig      |  2 ++
  4 files changed, 64 insertions(+), 16 deletions(-)
 
@@ -35,10 +35,10 @@ index 6fc62239..fd489831 100644
          const o = json.newObject(w.reply.a) catch return error.Closed;
          o.put(w.reply.a, "type", .{ .string = "ping" }) catch return error.Closed;
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 8a940e0f..0fddce7e 100644
+index d0cff1b4..e3f20fb8 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
-@@ -47,6 +47,10 @@ pub const Sink = struct {
+@@ -48,6 +48,10 @@ pub const Sink = struct {
  /// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill).
  const ping_after_ns: i96 = 25 * std.time.ns_per_s;
  
@@ -49,7 +49,7 @@ index 8a940e0f..0fddce7e 100644
  pub const Reply = struct {
      content: []const u8,
      stop_sequence: ?[]const u8,
-@@ -436,6 +440,20 @@ const Generation = struct {
+@@ -453,6 +457,20 @@ const Generation = struct {
              g.cancel();
              return error.Cancelled;
          };
@@ -70,7 +70,7 @@ index 8a940e0f..0fddce7e 100644
      }
  
      /// Ends the request and waits for the engine; one it ended unfinished counts as a disconnect, as the Mac scheduler counts it.
-@@ -481,20 +499,11 @@ const Generation = struct {
+@@ -498,20 +516,11 @@ const Generation = struct {
                  return error.Cancelled;
              }
              const tokens = chunk orelse {
@@ -93,7 +93,7 @@ index 8a940e0f..0fddce7e 100644
          }
      }
  
-@@ -652,3 +661,14 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
+@@ -688,3 +697,14 @@ pub fn tokenSha(tokens: []const u32) [12]u8 {
      @memcpy(&out, &hex);
      return out;
  }
@@ -109,10 +109,10 @@ index 8a940e0f..0fddce7e 100644
 +    try std.testing.expect(pingDue(ordinary_write, ordinary_write + ping_after_ns + 1));
 +}
 diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
-index fac413f3..b87e594d 100644
+index 6bbc649f..a2470d51 100644
 --- a/zig/src/server/openai.zig
 +++ b/zig/src/server/openai.zig
-@@ -35,7 +35,7 @@ pub const Out = struct {
+@@ -36,7 +36,7 @@ pub const Out = struct {
          /// A whole JSON reply.
          reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
          /// A keep-alive the stream sends while nothing else is; optional.
@@ -121,7 +121,7 @@ index fac413f3..b87e594d 100644
      };
  };
  
-@@ -64,9 +64,9 @@ const ClientOut = struct {
+@@ -65,9 +65,9 @@ const ClientOut = struct {
          return sse.open(c.conn);
      }
  
@@ -145,7 +145,7 @@ index fac413f3..b87e594d 100644
          }
  
          fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
-@@ -528,3 +531,26 @@ const Run = struct {
+@@ -563,3 +566,26 @@ const Run = struct {
  fn roleDelta(a: Allocator) Allocator.Error!Value {
      return chat.deltaOf(a, "role", "assistant");
  }
@@ -173,15 +173,17 @@ index fac413f3..b87e594d 100644
 +    try std.testing.expect(choices[0].get("finish_reason").? == .null);
 +}
 diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
-index 01b4bf7c..4fc92d69 100644
+index 8259f7e6..ae483548 100644
 --- a/zig/src/server/root.zig
 +++ b/zig/src/server/root.zig
-@@ -35,6 +35,8 @@ test {
+@@ -37,6 +37,8 @@ test {
      _ = @import("status_routes.zig");
      _ = @import("log.zig");
      _ = @import("messages.zig");
 +    _ = @import("chat.zig");
 +    _ = @import("openai.zig");
      _ = @import("stream_preflight_test.zig");
+     _ = @import("responses_include_test.zig");
      _ = @import("late_system_test.zig");
-     _ = @import("status_totals_test.zig");
+-- 
+2.50.1 (Apple Git-155)

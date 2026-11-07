@@ -1,0 +1,132 @@
+From 0e2e20a36363215a0449716a83ba28827a11c152 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:21:52 +0200
+Subject: [PATCH] server: /v1/responses accepts include
+ reasoning.encrypted_content and ignores it
+
+Pi and other clients built on the Responses API send include: ["reasoning.encrypted_content"]
+with every reasoning request, and the translation refused any non-empty include with a 400, so
+none of their reasoning requests ran (issue #99 of the DeepSeek-V4.1-Flash 2-Spark recipe). The
+value asks for nothing this server leaves out: reasoning comes as text in its reasoning item, and
+nothing is encrypted. It is now skipped; any other value is still refused and named, as before.
+
+responses_include_test.zig: the first test fails without the change (the 400), the second checks
+that other values are still refused. The frozen golden refuse-include case (the reference's 400)
+is listed as a known difference in golden_check.zig.
+---
+ zig/src/server/responses_include_test.zig | 48 +++++++++++++++++++++++
+ zig/src/server/responses_translate.zig    |  9 ++++-
+ zig/src/server/root.zig                   |  1 +
+ zig/tests/server/golden_check.zig         |  4 +-
+ 4 files changed, 59 insertions(+), 3 deletions(-)
+ create mode 100644 zig/src/server/responses_include_test.zig
+
+diff --git a/zig/src/server/responses_include_test.zig b/zig/src/server/responses_include_test.zig
+new file mode 100644
+index 00000000..d47eba35
+--- /dev/null
++++ b/zig/src/server/responses_include_test.zig
+@@ -0,0 +1,48 @@
++//! A Responses request's `include`: `reasoning.encrypted_content`, which Pi and other clients built on the Responses
++//! API send with every reasoning request, asks for nothing this server leaves out (reasoning comes as text in its
++//! reasoning item, and nothing is encrypted), so it is accepted and ignored; any other value is still refused.
++const std = @import("std");
++const server = @import("root.zig");
++const json = server.json;
++const errors = @import("errors.zig");
++const responses_translate = @import("responses_translate.zig");
++
++const NoHistory = struct {
++    pub fn conversation(_: NoHistory, cx: *errors.Cx, _: json.Value) errors.Refused![]json.Value {
++        return cx.refuse("no stored responses in this test");
++    }
++};
++
++/// `body` through the Responses translation: refused with a message containing `refused`, or translated when null.
++fn expectInclude(body: []const u8, refused: ?[]const u8) !void {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const raw = (try json.parse(a, body)).ok;
++    var cx: errors.Cx = .{ .a = a };
++    if (responses_translate.translate(&cx, raw, NoHistory{})) |_| {
++        if (refused) |want| {
++            std.debug.print("translated, wanted a refusal naming {s}\n", .{want});
++            return error.TestUnexpectedResult;
++        }
++    } else |err| {
++        try std.testing.expectEqual(error.Refused, err);
++        const want = refused orelse {
++            std.debug.print("refused: {s}\n", .{cx.message});
++            return error.TestUnexpectedResult;
++        };
++        try std.testing.expect(std.mem.indexOf(u8, cx.message, want) != null);
++    }
++}
++
++test "include reasoning.encrypted_content is accepted and ignored" {
++    try expectInclude("{\"input\":\"x\",\"include\":[\"reasoning.encrypted_content\"]}", null);
++    try expectInclude("{\"input\":\"x\",\"reasoning\":{\"effort\":\"high\"},\"include\":[\"reasoning.encrypted_content\"]}", null);
++    try expectInclude("{\"input\":\"x\",\"include\":[]}", null);
++}
++
++test "any other include value is still refused, and named" {
++    try expectInclude("{\"input\":\"x\",\"include\":[\"message.output_text.logprobs\"]}", "message.output_text.logprobs");
++    try expectInclude("{\"input\":\"x\",\"include\":[\"reasoning.encrypted_content\",\"file_search_call.results\"]}", "file_search_call.results");
++    try expectInclude("{\"input\":\"x\",\"include\":\"reasoning.encrypted_content\"}", "include is not supported");
++}
+diff --git a/zig/src/server/responses_translate.zig b/zig/src/server/responses_translate.zig
+index 338ecbd0..5f824cc1 100644
+--- a/zig/src/server/responses_translate.zig
++++ b/zig/src/server/responses_translate.zig
+@@ -257,12 +257,17 @@ pub fn translate(cx: *Cx, body: Value, history: anytype) errors.Refused!Request
+     if (body.get("include")) |inc| if (inc.truthy()) {
+         var parts: std.ArrayList([]const u8) = .empty;
+         switch (inc) {
+-            .array => |items| for (items) |i| try parts.append(a, try tool_specs.pyStr(a, i)),
++            // reasoning.encrypted_content asks for nothing left out: reasoning comes as text in its reasoning item, and
++            // nothing is encrypted. Clients built on the Responses API (Pi and others) send it with every reasoning request.
++            .array => |items| for (items) |i| {
++                if (i == .string and std.mem.eql(u8, i.string, "reasoning.encrypted_content")) continue;
++                try parts.append(a, try tool_specs.pyStr(a, i));
++            },
+             .object => |o| for (o.keys()) |k| try parts.append(a, k),
+             .string => |s| for (0..s.len) |i| try parts.append(a, s[i .. i + 1]),
+             else => try parts.append(a, try tool_specs.pyStr(a, inc)),
+         }
+-        return cx.fail(.request, "include is not supported ({s}): reasoning comes as text in its reasoning item, and nothing is encrypted", .{try std.mem.join(a, ", ", parts.items)});
++        if (parts.items.len > 0) return cx.fail(.request, "include is not supported ({s}): reasoning comes as text in its reasoning item, and nothing is encrypted", .{try std.mem.join(a, ", ", parts.items)});
+     };
+     if (body.field("truncation")) |t| if (!(t == .string and std.mem.eql(u8, t.string, "disabled"))) return cx.refuse("truncation must be \"disabled\": a prompt too long for the context is refused");
+     if (json.truthyField(body, "top_logprobs")) return cx.refuse("top_logprobs is not supported");
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 5dcfccc5..8259f7e6 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -38,6 +38,7 @@ test {
+     _ = @import("log.zig");
+     _ = @import("messages.zig");
+     _ = @import("stream_preflight_test.zig");
++    _ = @import("responses_include_test.zig");
+     _ = @import("late_system_test.zig");
+     _ = @import("status_totals_test.zig");
+     _ = @import("effort_values_test.zig");
+diff --git a/zig/tests/server/golden_check.zig b/zig/tests/server/golden_check.zig
+index 12e104a1..b4378631 100644
+--- a/zig/tests/server/golden_check.zig
++++ b/zig/tests/server/golden_check.zig
+@@ -1,4 +1,4 @@
+-//! Frozen server goldens for `zig build test-golden`, with the seven differences that are still known.
++//! Frozen server goldens for `zig build test-golden`, with the eight differences that are still known.
+ const std = @import("std");
+ const posix = std.posix;
+ const Io = std.Io;
+@@ -16,6 +16,8 @@ const known_diffs = [_]Known{
+     .{ .group = "metrics-open", .name = "metrics" },
+     .{ .group = "metrics-open", .name = "v1-metrics" },
+     .{ .group = "keys", .name = "metrics-counted" },
++    // the reference refuses include reasoning.encrypted_content; this server accepts and ignores it (responses_include_test.zig)
++    .{ .group = "responses", .name = "refuse-include" },
+ };
+ 
+ fn isKnown(group: []const u8, name: []const u8) bool {

@@ -1,0 +1,519 @@
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index c5fd1125d..27c9fb291 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -49,6 +49,7 @@ pub const markov_tokens = @import("markov_tokens.zig");
+ pub const draft = @import("draft.zig");
+ pub const sampling = @import("sampling.zig");
+ pub const model = @import("model.zig");
++pub const prompt_rows = @import("prompt_rows.zig");
+ pub const lanes = @import("lanes.zig");
+ pub const pool = @import("pool.zig");
+ pub const spill_state = @import("spill_state.zig");
+@@ -106,6 +107,7 @@ test {
+     refAll(draft);
+     refAll(sampling);
+     refAll(model);
++    refAll(prompt_rows);
+     refAll(lanes);
+     refAll(pool);
+     refAll(spill_state);
+diff --git a/zig/src/families/dsv41/exl3_experts.zig b/zig/src/families/dsv41/exl3_experts.zig
+index d1c109694..8810b3c64 100644
+--- a/zig/src/families/dsv41/exl3_experts.zig
++++ b/zig/src/families/dsv41/exl3_experts.zig
+@@ -15,6 +15,8 @@ const weights = @import("weights.zig");
+ 
+ /// experts.py's settings (GLM_GATEUP, GLM_DOWN by default_config; PROMPT_TILES; MMA_KB; EXACT_ROWS; DECODE_STAGES).
+ pub const exact_rows = 64;
++/// The most rows a decode window holds: grouped_cp_launch refuses member lists past 32 * 4 warps rows.
++pub const max_window_rows = 128;
+ pub const place_threads = 256; // experts.cu PLACE_THREADS
+ pub const list_threads = 1024; // experts.cu LIST_THREADS
+ pub const mma_cols = 64; // experts_grouped.cuh MMA_COLS
+@@ -346,7 +348,7 @@ pub const DecodeLaunch = struct {
+ };
+ 
+ /// routed(x, pick, wts, ex, s, None, R, limit, ACT_F32, before_down=None, shared_slot=slots - 1) on a decode window
+-/// (R < 64), the served Model.moe's one call a layer: out fp32 [R, D] = each row's slots' expert outputs weighted by
++/// (R < 64; isWindow), the served Model.moe's one call a layer: out fp32 [R, D] = each row's slots' expert outputs weighted by
+ /// wts, summed in slot order. x bf16 [R, D] (row stride x_stride elements), pick int32 and wts fp32 [R, slots]
+ /// contiguous, every pick an expert id (the shared expert, the last, in every row's last slot); out need not be
+ /// initialized. shared_slot changes nothing here (only a prompt chunk's SHARED_DENSE path reads it), and without
+@@ -363,6 +365,12 @@ pub fn decode(k: *const Kernels, s: cuda.Stream, ex: weights.Experts, sc: Decode
+     for (&ls, fs) |*l, f| try cuda.launch.launch(f, l.cfg, s, &l.args);
+ }
+ 
++/// Whether `r` rows are a decode window of `sc`: under exact_rows rows, or under the scratch's rows when it holds more
++/// (TF_DS_PROMPT_WINDOW_ROWS), and no more than the kernel's member lists take.
++pub fn isWindow(sc: DecodeScratch, r: usize) bool {
++    return r != 0 and r <= sc.rows and r <= max_window_rows and r < @max(exact_rows, sc.rows);
++}
++
+ /// decode's three launches in order: experts.py _routed_fused, experts.cu exl3x_decode_prep_cuda and
+ /// exl3x_grouped_decode_cuda, experts_grouped.cuh grouped_cp_launch.
+ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32) ![3]DecodeLaunch {
+@@ -370,7 +378,7 @@ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride:
+     const i: usize = ex.width;
+     const e: usize = ex.count;
+     const slots = sc.slots;
+-    if (r == 0 or r >= exact_rows or r > sc.rows) return error.NotADecodeWindow;
++    if (!isWindow(sc, r)) return error.NotADecodeWindow;
+     // routed()'s gate of the fused path: GLM's tiles for gate / up (8 n tiles, 4 warps) and down (one split), 128-column
+     // blocks, at most 32 slots; and every trellis 16-byte aligned (weights packs each at a multiple of 16 bytes)
+     const cgu = try config(d, i, true);
+@@ -460,3 +468,31 @@ test "a TP2 DeepSeek-V4.1 rank's decode scratch and windows" {
+     try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 9, 10));
+     _ = try decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 8, 10);
+ }
++
++test "a decode window under the scratch's rows, up to the kernel's member list" {
++    const ex: weights.Experts = .{ .trellis = 0, .gate_ptr = 0, .up_ptr = 0, .down_ptr = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .count = 385, .dims = 5120, .width = 1152, .down_k = 1152, .down_n = 5120, .k2_gu = .{ 6, 10 }, .k2_d = .{ 6, 10 } };
++    var sc: DecodeScratch = .{ .rows = 100, .slots = 7, .xg = 0, .xu = 0, .xd = 0, .z = 0, .y = 0, .cnt_gu = 0, .cnt_d = 0, .epoch = 0, .ready = 0, .ready_cnt = 0, .ids = 0, .count = 0, .members = 0 };
++    for ([_]usize{ 0, 100, 101, 128 }) |r| try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
++    for ([_]usize{ 1, 63, 64, 99 }) |r| {
++        const ls = try decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10);
++        // a place's member tiles: gate / up's z holds 2 * splits * tiles, down's tiles
++        try std.testing.expectEqual(@as(u32, @intCast(2 * 4 * ((r + 15) / 16))), ls[1].cfg.grid.z);
++        try std.testing.expectEqual(@as(u32, @intCast((r + 15) / 16)), ls[2].cfg.grid.z);
++    }
++    // 127 rows: eight member tiles, the most the scratch of 128 rows serves
++    sc.rows = 128;
++    const wide = try decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, 127, 10);
++    try std.testing.expectEqual(@as(u32, 64), wide[1].cfg.grid.z);
++    try std.testing.expectEqual(@as(u32, 8), wide[2].cfg.grid.z);
++    try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, 128, 10));
++    // the kernel takes no more than 128 member rows whatever the scratch holds
++    sc.rows = 200;
++    try std.testing.expect(!isWindow(sc, 129));
++    try std.testing.expect(isWindow(sc, 128));
++    // the scratch's bytes grow with its rows
++    const big = try DecodeScratch.sizes(128, 7, 5120, 1152, 385);
++    const base = try DecodeScratch.sizes(64, 7, 5120, 1152, 385);
++    try std.testing.expectEqual(2 * base[0], big[0]);
++    try std.testing.expectEqual(2 * base[3], big[3]);
++    try std.testing.expectEqual(base[12], big[12]);
++}
+diff --git a/zig/src/families/dsv41/exl3_experts2d.zig b/zig/src/families/dsv41/exl3_experts2d.zig
+index 2371c8ac2..6cfec8f0a 100644
+--- a/zig/src/families/dsv41/exl3_experts2d.zig
++++ b/zig/src/families/dsv41/exl3_experts2d.zig
+@@ -155,7 +155,7 @@ const Window = struct {
+         const i: usize = ex.down_k;
+         const ig: usize = ex.width;
+         const dn: usize = ex.down_n;
+-        if (r == 0 or r >= X.exact_rows or r > sc.rows) return error.NotADecodeWindow;
++        if (!X.isWindow(sc, r)) return error.NotADecodeWindow;
+         const cgu = try X.config(d, i, true);
+         const cd = try X.config(i, d, false);
+         if (cgu[0] != 8 or cgu[1] != 4 or cd[0] != 8 or cd[1] != 4 or cd[2] != 1) return error.UnsupportedShape;
+@@ -283,6 +283,11 @@ test "a 2D node's decode scratch and windows" {
+     const sc: X.DecodeScratch = .{ .rows = 64, .slots = 7, .xg = 0, .xu = 0, .xd = 0, .z = 0, .y = 0, .cnt_gu = 0, .cnt_d = 0, .epoch = 0, .ready = 0, .ready_cnt = 0, .ids = 0, .count = 0, .members = 0 };
+     for ([_]usize{ 0, 64, 65 }) |r| try std.testing.expectError(error.NotADecodeWindow, gateUpLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
+     _ = try gateUpLaunches(ex, sc, 0, 5120, 0, 0, 0, 63, 10);
++    // a scratch of 100 rows (TF_DS_PROMPT_WINDOW_ROWS) serves windows up to 99
++    var wide = sc;
++    wide.rows = 100;
++    _ = try gateUpLaunches(ex, wide, 0, 5120, 0, 0, 0, 99, 10);
++    try std.testing.expectError(error.NotADecodeWindow, gateUpLaunches(ex, wide, 0, 5120, 0, 0, 0, 100, 10));
+     ex.width = 512;
+     try std.testing.expectEqual([13]usize{ 4587520, 4587520, 458752, 7340032, 4587520, 6160, 5120, 4, 1540, 1540, 1540, 4, 197120 }, try decodeSizes(64, 7, ex));
+     // a part of whole 128-column blocks only, within the half
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index 6f025c655..a6ec0aefa 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -8,6 +8,7 @@
+ //! the served server's) against the served reply's: the drafted, concurrent reply must be the served one. One JSON
+ //! line a request, then the summary. FILE: zrec_lanereq.py's requests (prompt ids, max_tokens, sampling, expect_sha).
+ //! KIT_DIR: a gate dir's aot/, cubins/, RoPE tables (as many rows as the pool) and engram.json.
++//! TF_DS_PROMPT_WINDOW_ROWS and TF_DS_PROMPT_GEMM_ROWS (64 and 128 unset) are read here as the served process reads them: set them alike on every rank.
+ //! The spill tier (GPU validation of keep, evict, restore and restart without the HTTP server): every rank takes
+ //! --spill-dir DIR --spill-gib G [--spill-min-free-gib F] [--spill-min-tokens T] [--spill-quota Q]
+ //! [--spill-staging-mib M] (else TF_DS_SPILL_DIR, TF_DS_SPILL_GIB, ... and TF_SPILL_TURNS / TF_SPILL_FLUSH_MS; the
+@@ -112,6 +113,8 @@ pub fn main(init: std.process.Init) !u8 {
+         .port = try std.fmt.parseInt(u16, args[6], 10),
+         .kit_dir = args[7],
+     };
++    o.window_rows = try dsv41.prompt_rows.windowFromEnv();
++    o.gemm_rows = try dsv41.prompt_rows.gemmFromEnv();
+     var requests_file: ?[]const u8 = null;
+     var parallel: ?usize = null; // default: every stream of the pool
+     var arena_gib: ?usize = null;
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 7d55f8375..8b37d6e3e 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -32,6 +32,7 @@ const rdma_env = @import("rdma_env.zig");
+ const pool_mod = @import("pool.zig");
+ const shard = @import("shard.zig");
+ const shard_ops = @import("shard_ops.zig");
++const prompt_rows = @import("prompt_rows.zig");
+ 
+ /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
+ pub const chunk_rows = 2048;
+@@ -72,6 +73,8 @@ pub const Options = struct {
+     arena_bytes: usize = 0, // the device arena's first block (0: it grows from 256 MiB blocks as the buffers ask)
+     round_rows: usize = round.default_rows, // a round's rows at most (TF_DS_ROUND_ROWS; the four-node lane's 48)
+     plain_rows: usize = round.default_rows, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; 0: the round's own)
++    window_rows: usize = prompt_rows.default_window, // a chunk under these rows takes the MoE decode window (TF_DS_PROMPT_WINDOW_ROWS; every rank alike)
++    gemm_rows: usize = prompt_rows.default_gemm, // a chunk over these rows takes the prefill GEMM (TF_DS_PROMPT_GEMM_ROWS; every rank alike)
+     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
+     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
+     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+@@ -87,6 +90,8 @@ pub const Model = struct {
+     rank: u32,
+     world: u32,
+     streams: usize, // the pool's streams (Options.streams)
++    window_rows: usize, // Options.window_rows
++    gemm_rows: usize, // Options.gemm_rows
+     round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
+     pool_cap: usize,
+     cache_dir: std.Io.Dir,
+@@ -184,6 +189,10 @@ pub const Model = struct {
+         m.world = o.world;
+         if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
+         m.streams = o.streams;
++        if (!prompt_rows.validWindow(o.window_rows)) return error.BadPromptWindowRows;
++        if (!prompt_rows.validGemm(o.gemm_rows)) return error.BadPromptGemmRows;
++        m.window_rows = o.window_rows;
++        m.gemm_rows = o.gemm_rows;
+         m.round_ms = o.round_ms orelse &draft.round_ms;
+         if (m.round_ms.len == 0) return error.BadRoundMs;
+         m.pool_cap = o.pool; // (agree, below, compares it with the other rank's)
+@@ -333,6 +342,8 @@ pub const Model = struct {
+         }
+         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+         m.eng.round_rows = o.round_rows;
++        m.eng.window_rows = m.window_rows;
++        m.eng.gemm_rows = m.gemm_rows;
+         m.eng.plain_rows = o.plain_rows;
+         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.request_cap);
+         errdefer if (m.kvs) |*x| x.k.unload(); // (registered before the load: nothing between them leaks it)
+@@ -448,20 +459,23 @@ pub const Model = struct {
+     /// What every rank serves once agree has compared them.
+     const Agreed = struct { mode: shard.Mode, pool: usize, window: usize };
+ 
+-    /// Every rank's (mode, pool, window, round rows) gathered and compared before any buffer depends on them. A rank
++    /// Every rank's (mode, pool, window, round rows, prompt window rows, prompt GEMM rows) gathered and compared before any buffer depends on them. A rank
+     /// whose shard switch or pool did not parse sends a sentinel (bad_setting) instead of failing before the gather,
+     /// then refuses with its own error after it; the other rank sees the sentinel and refuses too (KvShardMismatch),
+     /// so neither waits on the other. A rank whose switch, pool or round rows differ from rank 0's refuses
+     /// (KvShardMismatch, on both at once), a window given on both must match, and a rank without one takes rank 0's
+-    /// (the follower lane has no --context).
++    /// (the follower lane has no --context). Ranks on different prompt rows refuse too (PromptRowsMismatch): they would
++    /// launch different kernels for one chunk and sum wrong partials.
+     fn agree(m: *Model, o: Options, want_mode: anyerror!shard.Mode, want_pool: anyerror!usize, want_window: anyerror!?usize) !Agreed {
+-        const n: usize = 4;
++        const n: usize = 6;
+         const bad_setting: u64 = 0xff;
+         const mine = [n]u64{
+             if (want_mode) |x| @backingInt(x) else |_| bad_setting,
+             if (want_pool) |x| x else |_| 0,
+             if (want_window) |x| x orelse 0 else |_| bad_setting,
+             o.round_rows,
++            o.window_rows,
++            o.gemm_rows,
+         };
+         var dev = try cuda.DeviceBuffer.alloc(m.ctx.d, (1 + o.world) * n * 8);
+         defer dev.free();
+@@ -478,6 +492,7 @@ pub const Model = struct {
+         for (all[0..o.world]) |r| {
+             if (r[0] == bad_setting or r[1] == 0 or r[2] == bad_setting) return error.KvShardMismatch;
+             if (r[0] != all[0][0] or r[1] != all[0][1] or r[3] != all[0][3]) return error.KvShardMismatch;
++            if (r[4] != all[0][4] or r[5] != all[0][5]) return error.PromptRowsMismatch;
+             if (r[2] != 0 and all[0][2] != 0 and r[2] != all[0][2]) return error.KvShardMismatch;
+         }
+         const window = if (own_window) |w| w else if (all[0][2] != 0) all[0][2] else pool;
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index e02e5757b..51644e441 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -13,6 +13,12 @@
+ //!                                               served ROUND_MS unless set: a four-node lane's rounds cost less)
+ //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
+ //!                                               streams (4; its 16): --parallel at most the streams
++//!   TF_DS_PROMPT_WINDOW_ROWS=<rows>             a prompt chunk under these rows (64 .. 128; 64 unset) takes the MoE decode window
++//!                                               in place of the prompt kernels; the scratch grows to these rows. Bits may differ
++//!                                               from the prompt kernels' (set alike on every rank: a mismatch ends the start)
++//!   TF_DS_PROMPT_GEMM_ROWS=<rows>               a prompt chunk over these rows (16 .. 128; 128 unset) takes the prefill GEMM for the
++//!                                               dense linears in place of the glinear group; bits may differ (set alike on every
++//!                                               rank: a mismatch ends the start)
+ //!   TF_DS_PLAIN_ROWS                            the rows a mixed pack's plain (cuBLAS) linear runs over, padded to this
+ //!                                               count so a token's bits do not change with the round's shape (16; 0: off)
+ //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
+@@ -60,6 +66,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const model = @import("model.zig");
++const rows_mod = @import("prompt_rows.zig");
+ const pool_mod = @import("pool.zig");
+ const lanes_mod = @import("lanes.zig");
+ const round = @import("round.zig");
+@@ -222,6 +229,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .drafts = o.drafts,
+         .arena_bytes = arena_gib << 30,
+         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
++        .window_rows = if (getenv(rows_mod.window_env)) |v| rows_mod.parseWindow(v) catch return error.BadPromptWindowRows else rows_mod.default_window,
++        .gemm_rows = if (getenv(rows_mod.gemm_env)) |v| rows_mod.parseGemm(v) catch return error.BadPromptGemmRows else rows_mod.default_gemm,
+         .plain_rows = if (getenv("TF_DS_PLAIN_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadPlainRows else round.default_rows,
+         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
+         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
+@@ -633,6 +642,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.NoRankCache => "set TF_DS_RANK_CACHE to the lane's per-rank weight files",
+         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
+         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
++        error.BadPromptWindowRows => rows_mod.window_hint,
++        error.BadPromptGemmRows => rows_mod.gemm_hint,
++        error.PromptRowsMismatch => "TF_DS_PROMPT_WINDOW_ROWS / TF_DS_PROMPT_GEMM_ROWS: the ranks run different prompt paths; set them alike on every rank (tf-dsv41-lanes reads them too)",
+         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
+         error.BadGraphCap => "TF_DS_GRAPH_CAP: the captured CUDA graphs kept at most, a count (0: all)",
+         error.BadPlainRows => "TF_DS_PLAIN_ROWS: the rows a mixed pack's plain linear runs over, 0 (the round's own) or a count up to TF_DS_ROUND_ROWS",
+@@ -688,6 +700,9 @@ test "refusals name what to set" {
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PartTooSmall).?, "TF_DS_POOL") != null);
+     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.KvShardMismatch).?, "--pool") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadPromptWindowRows).?, "TF_DS_PROMPT_WINDOW_ROWS") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.BadPromptGemmRows).?, "TF_DS_PROMPT_GEMM_ROWS") != null);
++    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.PromptRowsMismatch).?, "TF_DS_PROMPT_GEMM_ROWS") != null);
+     for ([_]anyerror{ error.BadPart, error.WindowTooWide, error.FetchTooLarge, error.BadFetch, error.NoKvShard, error.CrossesPart, error.ShardDiverged, error.StaleExtent, error.TransferFailed, error.TransferTimeout, error.KvShardNotStarted, error.BadPlan, error.ShardRingOrder, error.BadRingRows }) |err|
+         try std.testing.expect(std.mem.indexOf(u8, explain(null, err).?, "TF_DS_KV_SHARD=0") != null);
+     for ([_]anyerror{ error.KvShardSettingsMismatch, error.BadKvShardRing }) |err|
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 9a0f7e1d8..d77e94b1a 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -36,6 +36,11 @@ const prompt2d = @import("prompt2d.zig");
+ const rdma = @import("rdma.zig");
+ const shard = @import("shard.zig");
+ const shard_ops = @import("shard_ops.zig");
++const prompt_rows = @import("prompt_rows.zig");
++
++comptime {
++    std.debug.assert(prompt_rows.default_window == exl3_experts.exact_rows and prompt_rows.max_window == exl3_experts.max_window_rows);
++}
+ 
+ /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
+ const key_elems: usize = 1 << 24;
+@@ -126,6 +131,8 @@ pub const Engine = struct {
+     compressed: Rope,
+     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
+     plain_rows: usize = 0, // a mixed pack's plain linear runs over at least these rows (TF_DS_PLAIN_ROWS; model.zig sets it)
++    window_rows: usize = prompt_rows.default_window, // a chunk under these rows takes the MoE decode window (TF_DS_PROMPT_WINDOW_ROWS)
++    gemm_rows: usize = prompt_rows.default_gemm, // a chunk over these rows takes the prefill GEMM (TF_DS_PROMPT_GEMM_ROWS)
+     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
+     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
+     kv: ?*shard_ops.KvShard = null, // TF_DS_KV_SHARD: the parts, the decode mode, the fetch kernels (null: replicated)
+@@ -547,9 +554,10 @@ fn addLinear(e: *const Engine, ch: *Chunk, a: *Arena, l: weights.Linear, max_gk:
+ }
+ 
+ /// Model._moe_scratch's decode scratch: experts.py Scratch(rows=max(n, 64), prompt=False), zeros but its member lists'
+-/// -1 (made at the first window under 64 rows and never replaced).
++/// -1 (made at the first window under 64 rows and never replaced). TF_DS_PROMPT_WINDOW_ROWS grows it to its rows.
+ pub fn decodeScratch(e: *const Engine, a: *Arena, ex: weights.Experts, slots: usize) !exl3_experts.DecodeScratch {
+-    const rows = exl3_experts.exact_rows;
++    const rows = e.window_rows;
++    if (rows < exl3_experts.exact_rows or rows > exl3_experts.max_window_rows) return error.BadWindowRows;
+     const sz = if (e.two != null) try exl3_experts2d.decodeSizes(rows, slots, ex) else try exl3_experts.DecodeScratch.sizes(rows, slots, ex.dims, ex.width, ex.count); // 2D: this node's widths
+     var sc: exl3_experts.DecodeScratch = undefined;
+     sc.rows = rows;
+@@ -870,7 +878,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
+     }
+ }
+ 
+-/// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond 128 rows, the layer's own group (GROUPED) up to 128.
++/// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond Engine.gemm_rows (128) rows, the layer's own group (GROUPED) up to it.
+ fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
+     // A mixed pack's float linear: torch's nn.Linear on bf16 rows (cublas.Blas.linearBf16), then the exact
+     // bf16 -> fp32 widen when the caller wants fp32 (torch's mm's out_dtype).
+@@ -885,7 +893,7 @@ fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u6
+         }
+         return;
+     }
+-    if (m > 128) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
++    if (prompt_rows.denseOnGemm(m, e.gemm_rows)) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
+     const dt: exl3_linear.DType = switch (out_type) {
+         .bf16 => .bf16,
+         .fp32 => .f32,
+@@ -927,8 +935,8 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+     const below = floor > start -| (c.window - 1);
+     const ring_mode = n <= ring_extra and !(replay_floor and below);
+     const one_split = !ring_mode and n <= tri.decode_rows;
+-    // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
+-    if (n > 128) {
++    // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to Engine.gemm_rows rows
++    if (prompt_rows.denseOnGemm(n, e.gemm_rows)) {
+         try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
+         try mm(e, ch, lay.wkv, ch.x, c.hidden, ch.y, .bf16, hd);
+     } else {
+@@ -1022,7 +1030,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+     const gk = hl * hd / groups;
+     const uw = groups * lay.wo_a[0].n;
+     var col: usize = 0;
+-    if (n > 128) {
++    if (prompt_rows.denseOnGemm(n, e.gemm_rows)) {
+         for (lay.wo_a[0..groups], 0..) |wo, g| {
+             try mm(e, ch, wo, ch.o + g * gk * 2, hl * hd, ch.u + col * 2, .bf16, uw);
+             col += wo.n;
+@@ -1367,8 +1375,8 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
+     }
+     try routeSpans(e, ch, lay, shared_id, sl, kc);
+     if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
+-    // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
+-    if (n < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
++    // routed(): a chunk of fewer than EXACT_ROWS rows (Engine.window_rows) takes the decode window's fused path and scratch
++    if (prompt_rows.moeInWindow(n, e.window_rows)) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+ }
+ 
+diff --git a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+index ee4f94962..70bbf1293 100644
+--- a/zig/src/families/dsv41/prompt2d.zig
++++ b/zig/src/families/dsv41/prompt2d.zig
+@@ -17,7 +17,7 @@ const Config = @import("config.zig").Config;
+ const plan = @import("plan.zig");
+ const prompt = @import("prompt.zig");
+ const weights = @import("weights.zig");
+-const exl3_experts = @import("exl3_experts.zig");
++const prompt_rows = @import("prompt_rows.zig");
+ const exl3_experts2d = @import("exl3_experts2d.zig");
+ const ring2d = @import("ring2d.zig");
+ const round2d = @import("round2d.zig");
+@@ -264,7 +264,7 @@ pub const Two = struct {
+     pub fn experts(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
+         const c = e.c;
+         const n = ch.n;
+-        if (n < exl3_experts.exact_rows) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
++        if (prompt_rows.moeInWindow(n, e.window_rows)) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+         try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
+         try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
+         try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+diff --git a/zig/src/families/dsv41/prompt_rows.zig b/zig/src/families/dsv41/prompt_rows.zig
+new file mode 100644
+index 000000000..84a73acdb
+--- /dev/null
++++ b/zig/src/families/dsv41/prompt_rows.zig
+@@ -0,0 +1,123 @@
++//! The two row counts that decide which kernels a prompt chunk takes (TF_DS_PROMPT_WINDOW_ROWS, TF_DS_PROMPT_GEMM_ROWS;
++//! both off by default): the parsing and the path choices. Pure: no cuda import.
++//! The two paths round differently, so a token's bits can differ between them; unset, nothing changes.
++const std = @import("std");
++
++pub const window_env: [:0]const u8 = "TF_DS_PROMPT_WINDOW_ROWS";
++pub const gemm_env: [:0]const u8 = "TF_DS_PROMPT_GEMM_ROWS";
++
++/// Chunks under `window` rows take the MoE decode window; unset: the served 64 (exl3_experts.exact_rows).
++pub const default_window = 64;
++/// grouped_cp_launch refuses a member list past 32 * 4 warps rows.
++pub const max_window = 128;
++/// Chunks over `gemm` rows take the prefill GEMM for the dense linears; unset: the served 128.
++pub const default_gemm = 128;
++/// The glinear group takes 1..128 rows; a GEMM under 16 rows would be a 1-row tile of padding.
++pub const min_gemm = 16;
++pub const max_gemm = 128;
++
++pub const window_hint = std.fmt.comptimePrint("{s}: the rows under which a prompt chunk's MoE takes the decode window, {d} to {d}", .{ window_env, default_window, max_window });
++pub const gemm_hint = std.fmt.comptimePrint("{s}: the rows over which a prompt chunk's dense linears take the prefill GEMM, {d} to {d}", .{ gemm_env, min_gemm, max_gemm });
++
++pub fn validWindow(rows: usize) bool {
++    return rows >= default_window and rows <= max_window;
++}
++
++pub fn validGemm(rows: usize) bool {
++    return rows >= min_gemm and rows <= max_gemm;
++}
++
++/// TF_DS_PROMPT_WINDOW_ROWS's text as the window's rows (error.BadPromptWindowRows: not a number or outside 64..128).
++pub fn parseWindow(text: []const u8) error{BadPromptWindowRows}!usize {
++    const rows = std.fmt.parseInt(usize, std.mem.trim(u8, text, " "), 10) catch return error.BadPromptWindowRows;
++    if (!validWindow(rows)) return error.BadPromptWindowRows;
++    return rows;
++}
++
++/// TF_DS_PROMPT_GEMM_ROWS's text as the GEMM's switch (error.BadPromptGemmRows: not a number or outside 16..128).
++pub fn parseGemm(text: []const u8) error{BadPromptGemmRows}!usize {
++    const rows = std.fmt.parseInt(usize, std.mem.trim(u8, text, " "), 10) catch return error.BadPromptGemmRows;
++    if (!validGemm(rows)) return error.BadPromptGemmRows;
++    return rows;
++}
++
++/// The window's rows from the environment, the same read on every rank (unset: the default); a bad value is named on stderr.
++pub fn windowFromEnv() error{BadPromptWindowRows}!usize {
++    const v = std.c.getenv(window_env) orelse return default_window;
++    return parseWindow(std.mem.span(v)) catch |err| {
++        std.debug.print("{s}\n", .{window_hint});
++        return err;
++    };
++}
++
++/// The GEMM's switch from the environment, the same read on every rank (unset: the default); a bad value is named on stderr.
++pub fn gemmFromEnv() error{BadPromptGemmRows}!usize {
++    const v = std.c.getenv(gemm_env) orelse return default_gemm;
++    return parseGemm(std.mem.span(v)) catch |err| {
++        std.debug.print("{s}\n", .{gemm_hint});
++        return err;
++    };
++}
++
++/// Whether a chunk of `n` rows takes the MoE decode window (else exl3_experts.prompt).
++pub fn moeInWindow(n: usize, window: usize) bool {
++    return n < window;
++}
++
++/// Whether `m` rows of a dense linear take the prefill GEMM (else the glinear group).
++pub fn denseOnGemm(m: usize, gemm: usize) bool {
++    return m > gemm;
++}
++
++// -- tests -----------------------------------------------------------------------------------------------------------
++
++const expectEqual = std.testing.expectEqual;
++
++test "the window switch takes 64 to 128 rows and nothing else" {
++    try expectEqual(@as(usize, 64), try parseWindow("64"));
++    try expectEqual(@as(usize, 100), try parseWindow(" 100 "));
++    try expectEqual(@as(usize, 128), try parseWindow("128"));
++    for ([_][]const u8{ "", "0", "63", "129", "-64", "64.5", "x", "0x80", "64,", "1e2", "99999999999999999999" }) |bad| {
++        try std.testing.expectError(error.BadPromptWindowRows, parseWindow(bad));
++    }
++}
++
++test "the GEMM switch takes 16 to 128 rows and nothing else" {
++    try expectEqual(@as(usize, 16), try parseGemm("16"));
++    try expectEqual(@as(usize, 90), try parseGemm("90"));
++    try expectEqual(@as(usize, 128), try parseGemm(" 128"));
++    for ([_][]const u8{ "", "0", "1", "15", "129", "2048", "-16", "16.5", "x", "0x20", "32,", "99999999999999999999" }) |bad| {
++        try std.testing.expectError(error.BadPromptGemmRows, parseGemm(bad));
++    }
++}
++
++test "the defaults keep the served paths" {
++    // the MoE window is the 63 rows and fewer, the dense GEMM the 129 rows and more
++    try std.testing.expect(moeInWindow(63, default_window) and !moeInWindow(64, default_window));
++    try std.testing.expect(!denseOnGemm(128, default_gemm) and denseOnGemm(129, default_gemm));
++}
++
++test "the MoE path at 63, 64, 100, 128 and 129 rows" {
++    const rows = [_]usize{ 63, 64, 100, 128, 129 };
++    const unset = [_]bool{ true, false, false, false, false };
++    const w101 = [_]bool{ true, true, true, false, false };
++    const w128 = [_]bool{ true, true, true, false, false };
++    for (rows, unset, w101, w128) |n, a, b, c| {
++        try expectEqual(a, moeInWindow(n, default_window));
++        try expectEqual(b, moeInWindow(n, 101));
++        try expectEqual(c, moeInWindow(n, max_window));
++    }
++    try expectEqual(true, moeInWindow(127, max_window));
++}
++
++test "the dense path at 63, 64, 100, 128 and 129 rows" {
++    const rows = [_]usize{ 63, 64, 100, 128, 129 };
++    const unset = [_]bool{ false, false, false, false, true };
++    const g64 = [_]bool{ false, false, true, true, true };
++    const g16 = [_]bool{ true, true, true, true, true };
++    for (rows, unset, g64, g16) |n, a, b, c| {
++        try expectEqual(a, denseOnGemm(n, default_gemm));
++        try expectEqual(b, denseOnGemm(n, 64));
++        try expectEqual(c, denseOnGemm(n, min_gemm));
++    }
++}

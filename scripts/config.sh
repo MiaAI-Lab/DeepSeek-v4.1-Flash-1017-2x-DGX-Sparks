@@ -139,6 +139,10 @@ REASONING_EFFORT="${REASONING_EFFORT:-}"
 # cap). A request's own thinking_budget wins. With no cap, a turn on a hard task can spend its whole MAX_TOKENS thinking and end
 # with no text and no tool call (finish_reason length).
 THINKING_BUDGET="${THINKING_BUDGET:-}"
+# 1: the chat template sees no assistant turn's reasoning_content (tensorfold-native --drop-reasoning-history, patch 0057). A client
+# that replays every turn's reasoning in a tool loop (omp does; the template keeps it all once tools are present) otherwise shows
+# the model its own earlier thinking at every step, and long agent runs drifted into flat, then repeating reasoning (loops).
+DROP_REASONING_HISTORY="${DROP_REASONING_HISTORY:-0}"
 # The family's measured sampling (BertholomusAI's two-node launch): temperature 1.0, top_p 0.95, from the 20 likeliest
 # tokens (the family's exact sampler needs a top-k). A request's own values win.
 TEMPERATURE="${TEMPERATURE:-1.0}"
@@ -210,9 +214,9 @@ HEAD_NFS_SERVER="${HEAD_NFS_SERVER:-}"
 # Engram's tables on this Spark's own disk (a folder with the base model's shards 47 and 48, as WORKER_ENGRAM_DIR is on the worker),
 # mounted into rank 0 at /engram. Without it rank 0 reads them from HF_CACHE: over NFS a random 4 KiB read took 942 us here
 # against 90 us from the worker's local copy, and a decode round or a prefill chunk makes many of them. Empty: HF_CACHE.
-# With the spill tier on, the engine's rank fingerprint compares this folder's regular files with the worker's (name and
-# size; symlinks are skipped), so leaving it empty makes rank 0 list nothing against WORKER_ENGRAM_DIR's files and the
-# pair refuses to load with FingerprintMismatch in engram (start.sh's port_engram_check; issue #61).
+# With the spill tier on, the engine's rank fingerprint compares this folder's files with the worker's (name and size,
+# read through symlinks), so the HF snapshot rank 0 reads when this is empty lists the same files as WORKER_ENGRAM_DIR;
+# start.sh's port_engram_check refuses folders that differ before anything is stopped (issue #61).
 HEAD_ENGRAM_DIR="${HEAD_ENGRAM_DIR:-}"
 HEAD_NFS_VOLUME="${HEAD_NFS_VOLUME:-dsv41-hf-head}"
 

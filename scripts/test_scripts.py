@@ -327,6 +327,22 @@ detect_links() {
         self.assertEqual(sorted(self.launched()), ["head", "w1"], out)
         self.assertIn("is now LIVE", out)
 
+    def test_graphs_with_a_pool_off_the_4096_grid_warns(self):
+        # issues #65 and #63: a round's context bucket is capped at the pool, so a pool off the 4,096 grid gives the
+        # indexer's _index_score a tile count the kit has no captured variant for (MissingTritonVariant, then 901)
+        for context, warned in [("400000", True), ("500000", True), ("524288", False), ("262144", False)]:
+            with self.subTest(context=context):
+                code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "CONTEXT": context})
+                self.assertEqual(code, 0, out)
+                self.assertEqual("not a multiple of 4096" in out, warned, out)
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "CONTEXT": "524288", "POOL": "1050000"})
+        self.assertEqual(code, 0, out)
+        self.assertIn("the pool (POOL=1050000) is not a multiple of 4096", out)
+        self.assertIn("past 1048576 positions", out)
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "CONTEXT": "400000", "GRAPHS": "0"})
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("not a multiple of 4096", out)
+
     def test_restart_stops_when_a_rank_cannot_be_stopped(self):
         for h in ["head", "w1"]:
             self.containers(h, NAME)

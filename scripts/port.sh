@@ -549,20 +549,22 @@ port_spill_check() {
   if ! port_spill_judge 1 "$(worker_host 1)" "$line"; then port_spill_default_off "$PORT_SPILL_WHY"; return 0; fi
   log "Spill tier: $SPILL_GIB GiB a Spark, floor $SPILL_FLOOR_GIB GiB, quota ${SPILL_QUOTA_GIB} GiB; rank 0 ${PORT_SPILL_REAL[0]}, rank 1 ${PORT_SPILL_REAL[1]}"
 }
-# engram_listing <dir>: what the engine's rank fingerprint reads from an Engram folder — every regular file at its top
-# as name:size;, sorted, symlinks skipped (zig/patches/0016, fingerprint.zig listing(): `if (e.kind != .file) continue`).
-# A HF snapshot holds symlinks into blobs/, so it lists nothing. Portable: stat -c on Linux, -f on BSD.
+# engram_listing <dir>: what the engine's rank fingerprint reads from an Engram folder — every entry at its top but a
+# directory, dotfiles too, as name:size; with the size read through symlinks, sorted (rebased zig/patches/0016,
+# rank_identity.zig listing(): `if (e.kind == .directory) continue`, then statFile, which follows links). A HF snapshot's
+# symlinks into blobs/ list as their blobs, like the worker's copied files (issue #61). Portable: stat -c on Linux, -f on BSD.
 engram_listing() {
-  local d=$1 f n s out=""
+  local d=$1 f n s out="" restore
   [[ -d "$d" ]] || return 1
+  restore=$(shopt -p dotglob nullglob)
+  shopt -s dotglob nullglob
   for f in "$d"/*; do
-    [[ -e "$f" ]] || continue
-    [[ -L "$f" ]] && continue
-    [[ -f "$f" ]] || continue
+    [[ -d "$f" && ! -L "$f" ]] && continue
     n=${f##*/}
-    s=$(stat -c %s "$f" 2>/dev/null) || s=$(stat -f %z "$f" 2>/dev/null) || return 1
+    s=$(stat -L -c %s "$f" 2>/dev/null) || s=$(stat -L -f %z "$f" 2>/dev/null) || { eval "$restore"; return 1; }
     out+="$n:$s;"$'\n'
   done
+  eval "$restore"
   printf '%s' "$out" | LC_ALL=C sort
 }
 
@@ -578,9 +580,9 @@ head_engram_dir() {
 
 # port_engram_check: with the spill tier on, both ranks must list the same Engram files, because the engine's rank
 # fingerprint compares exactly that (0016: revision | digest(kit/engram.json) | listing(engram dir)). Rank 0 reads
-# HEAD_ENGRAM_DIR, else the HF snapshot — whose entries are symlinks into blobs/, which listing() skips, so it lists
-# nothing while the worker's copied folder lists its files: the pair then refuses to load with FingerprintMismatch in
-# engram (issue #61), and only after the running server has been stopped. Checked here, before anything is stopped.
+# HEAD_ENGRAM_DIR, else the HF snapshot, whose symlinks list as their blobs (issue #61: before the rebased 0016 they were
+# skipped). Folders that differ make the pair refuse to load with FingerprintMismatch in engram, and only after the
+# running server has been stopped. Checked here, before anything is stopped.
 # Silent when a folder is not there yet (prepare.sh writes both); KV sharding alone is not affected (its shard
 # agreement marks engram "shard-only", 0018).
 port_engram_check() {
@@ -601,7 +603,7 @@ port_engram_check() {
   snap="$HF_CACHE/hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)"
   fix="$HOME/.cache/dsv41-tensorfold/engram-$(engram_rev | cut -c1-8)"
   for s in $ENGRAM_SHARDS; do shards+=" $snap/$s"; done
-  die "the ranks' Engram folders list different files, and the engine's rank fingerprint compares exactly that (the revision, the kit's engram.json and the folder's regular files by name and size; symlinks are skipped). rank 0 ($head) lists [$(printf '%s' "$hlist" | tr '\n' ' ')], rank 1 ($(worker_host 1), $WORKER_ENGRAM_DIR) lists [$(printf '%s' "$wlist" | tr '\n' ' ')]. With SPILL_GIB on and HEAD_ENGRAM_DIR empty, rank 0 reads the HF snapshot, whose entries are symlinks into blobs/ and so list nothing: put the same files on this Spark's disk and point HEAD_ENGRAM_DIR at that folder (hardlinks, no extra disk) — mkdir -p $fix && cp -lL $snap/config.json $snap/model.safetensors.index.json$shards $fix/ && echo \"HEAD_ENGRAM_DIR=$fix\" >> scripts/local.sh — then run ./start.sh restart (issue #61). Nothing was stopped."
+  die "the ranks' Engram folders list different files, and the engine's rank fingerprint compares exactly that (the revision, the kit's engram.json and the folder's files by name and size, read through symlinks). rank 0 ($head) lists [$(printf '%s' "$hlist" | tr '\n' ' ')], rank 1 ($(worker_host 1), $WORKER_ENGRAM_DIR) lists [$(printf '%s' "$wlist" | tr '\n' ' ')]. Make the two folders hold the same files, or put rank 0's on this Spark's disk and point HEAD_ENGRAM_DIR at that folder (hardlinks, no extra disk) — mkdir -p $fix && cp -lL $snap/config.json $snap/model.safetensors.index.json$shards $fix/ && echo \"HEAD_ENGRAM_DIR=$fix\" >> scripts/local.sh — then run ./start.sh restart (issue #61). Nothing was stopped."
 }
 
 # NFS_PATH when it is a real path ("/" is an NFSv4 pseudo-root, not a folder of this Spark)

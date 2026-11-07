@@ -1,0 +1,130 @@
+From d1d55d22f18204cd2d5bb0d8baa7d5ebabeb6501 Mon Sep 17 00:00:00 2001
+From: nuk3s <44327449+nuk3s@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 11:03:09 +0000
+Subject: [PATCH] server: an assistant turn's reasoning field reaches the chat
+ template, as vLLM reads it
+
+vLLM takes replayed thinking from an assistant message's `reasoning` field: its chat_utils gives the chat template the
+text as both `reasoning` and `reasoning_content`. The engine read only `reasoning_content`, so a client that replays
+its thinking as `reasoning` lost it, and the turn rendered as an empty think block, `<think></think>` and then the
+answer. LiteLLM's hosted_vllm provider (1.103.4) removes `reasoning_content` from assistant messages and keeps
+`reasoning`, so a client behind it lost all of its replayed thinking. With tools the dsv41 template keeps the reasoning
+of every turn, so a long agent session showed the model a history in which it never thought, and the model stopped
+thinking. Measured on a pair, one 22-turn tool session that grows from 0.6K to 171K tokens, temperature 0, sent direct
+to the engine: with each turn's reasoning in reasoning_content the next reply thought at 22 of 22 points; with the same
+turns rendered empty it thought at 6 of 22 (0 of 9 above 100K). At temperature 1 above 100K: 60 of 60 against 14 of 54.
+
+messages.normalize and normalizeImages: an assistant message whose `reasoning` is a non-empty string and whose
+`reasoning_content` is absent, null or empty gets `reasoning_content` = `reasoning` (a copy of the message; the
+request is not changed). A client's own reasoning_content wins. Other roles, and messages without `reasoning`, come
+back as they were (no copy). The image path gets the turn before the placeholder escape.
+
+No switch. A request without an assistant `reasoning` field renders and encodes byte for byte as before.
+
+Tests (messages.zig): the field reaches the template on the text path and the image path, and a template with the
+kit's assistant line renders `<think>r</think>a`. Without the messages.zig change both tests fail (zig_test.sh: 91
+passed, 2 failed); with it 93/93 and 95/95. Only rank 0's tensorfold-native changes (rank 1's tf-dsv41-lanes does not
+import the server).
+---
+ zig/src/server/messages.zig | 62 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 58 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/server/messages.zig b/zig/src/server/messages.zig
+index 810121bb..4451538c 100644
+--- a/zig/src/server/messages.zig
++++ b/zig/src/server/messages.zig
+@@ -55,6 +55,20 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
+     return copy;
+ }
+ 
++/// An assistant turn's replayed thinking under vLLM's input name: vLLM's chat_utils reads an assistant message's
++/// `reasoning` and gives the template both `reasoning` and `reasoning_content`, while the chat templates here read only
++/// `reasoning_content`. A gateway in front of vLLM sends `reasoning` (LiteLLM's hosted_vllm transform removes
++/// `reasoning_content` from assistant messages), so without this every replayed turn rendered an empty think block.
++/// An assistant message whose `reasoning` is a non-empty string and whose `reasoning_content` is absent, null or empty
++/// gains `reasoning_content` = `reasoning`; any other message comes back as it was (no copy).
++fn replayedReasoning(cx: *Cx, o: *json.Object, role: []const u8) !*json.Object {
++    if (!std.mem.eql(u8, role, "assistant")) return o;
++    const r = o.get("reasoning") orelse return o;
++    if (r != .string or r.string.len == 0) return o;
++    if (o.get("reasoning_content")) |rc| if (rc.truthy()) return o;
++    return withField(cx, o, "reasoning_content", r);
++}
++
+ /// A request's images as normalize meets them when the server takes images (its engine's Info.vision): each image
+ /// part's bytes in prompt order, the part itself the placeholder in its message's text.
+ pub const Images = struct {
+@@ -222,7 +236,7 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
+             const im = images.?;
+             // a message's own text holding the placeholder is escaped to plain text: its special id would
+             // otherwise add image tokens the prompt's span count does not know
+-            var obj: *json.Object = message.object;
++            var obj: *json.Object = try replayedReasoning(cx, message.object, role.?.string);
+             for ([_][]const u8{ "content", "reasoning_content" }) |key| if (obj.get(key)) |v| if (v == .string and std.mem.indexOf(u8, v.string, im.placeholder) != null) {
+                 obj = try withField(cx, obj, key, .{ .string = try escape(cx, v.string, im.placeholder) });
+             };
+@@ -260,7 +274,8 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
+         }
+         if (fields.hasMedia(message)) return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
+         const content = message.get("content");
+-        var item: *json.Object = message.object;
++        const base = try replayedReasoning(cx, message.object, role.?.string);
++        var item: *json.Object = base;
+         if (content != null and content.? == .array) {
+             var text: std.ArrayList(u8) = .empty;
+             for (content.?.array) |part| {
+@@ -270,9 +285,9 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
+                 if (t != .string) return cx.refuse("a text content part must contain a text string");
+                 try text.appendSlice(cx.a, t.string);
+             }
+-            item = try withField(cx, message.object, "content", .{ .string = text.items });
++            item = try withField(cx, base, "content", .{ .string = text.items });
+         } else if (content == null or content.? == .null) {
+-            item = try withField(cx, message.object, "content", .{ .string = "" });
++            item = try withField(cx, base, "content", .{ .string = "" });
+         } else if (content.? != .string) {
+             return cx.refuse("message content must be text or an array of text parts");
+         }
+@@ -491,3 +506,42 @@ test "maskControls marks a client's control spellings in every string, and copie
+     try std.testing.expectEqualStrings("see <x>", dirty.array[1].get("content").?.array[0].get("text").?.string); // the request itself unchanged
+     try std.testing.expectEqualStrings("user", out.array[0].get("role").?.string);
+ }
++
++test "an assistant turn's reasoning field reaches the template as reasoning_content, as vLLM reads it" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    const messages = (try json.parse(cx.a,
++        \\[{"role": "user", "content": "run it"}, {"role": "assistant", "content": "", "reasoning": "plan: call f", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "assistant", "content": "done", "reasoning": "read 42", "reasoning_content": "own text"}, {"role": "assistant", "content": "x", "reasoning": ""}, {"role": "user", "content": "more", "reasoning": "not a turn of thinking"}]
++    )).ok;
++    const out = try normalize(&cx, messages, "system", true);
++    try std.testing.expect(out.array[1].get("reasoning_content") != null);
++    try std.testing.expectEqualStrings("plan: call f", out.array[1].get("reasoning_content").?.string);
++    try std.testing.expectEqualStrings("own text", out.array[3].get("reasoning_content").?.string); // a client's reasoning_content wins
++    try std.testing.expect(out.array[4].get("reasoning_content") == null); // an empty reasoning adds nothing
++    try std.testing.expect(out.array[5].get("reasoning_content") == null); // only assistant turns
++    try std.testing.expect(messages.array[1].get("reasoning_content") == null); // the request itself unchanged
++    // the image path (a server that takes images, a request with one) gives the same turn
++    var images: Images = .{ .placeholder = "<\u{ff5c}deepseek_image\u{ff5c}>" };
++    const with_image = (try json.parseText(cx.a,
++        "[{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"see\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,aGVsbG8=\"}}]}, {\"role\": \"assistant\", \"content\": \"ok\", \"reasoning\": \"an image of hello\"}]"
++    )).ok;
++    const out2 = try normalizeImages(&cx, with_image, "system", false, &images);
++    try std.testing.expect(out2.array[1].get("reasoning_content") != null);
++    try std.testing.expectEqualStrings("an image of hello", out2.array[1].get("reasoning_content").?.string);
++}
++
++test "a replayed reasoning field renders inside the history turn's think block" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    // the assistant line of the dsv41 kit's model/chat_template.jinja (tools keep reasoning in every turn)
++    const source = "{% for m in messages %}{% if m.role == 'assistant' %}<think>{{ m.reasoning_content if m.reasoning_content else '' }}</think>{{ m.content }}{% else %}[{{ m.role }}]{{ m.content }}{% endif %}{% endfor %}";
++    const messages = (try json.parse(cx.a,
++        \\[{"role": "user", "content": "q"}, {"role": "assistant", "content": "a", "reasoning": "r"}, {"role": "user", "content": "q2"}]
++    )).ok;
++    const out = try normalize(&cx, messages, "system", false);
++    const hf_text = @import("hf_text.zig");
++    const rendered = try @import("template").renderChat(cx.a, source, try hf_text.toStd(cx.a, out), .null, .{ .object = .empty }, false, null);
++    try std.testing.expectEqualStrings("[user]q<think>r</think>a[user]q2", rendered);
++}
