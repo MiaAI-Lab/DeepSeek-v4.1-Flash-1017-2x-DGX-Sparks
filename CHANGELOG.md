@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `zig/patches/0063-long-session-cache.patch` (unsharded placement, with or without spill): a cached prefix no longer
+  evicts itself when its continuation needs more than half the pool and a separate copy cannot fit. Under pressure it
+  grows in place, invalidating only idle states in the overwritten tail; live streams and loading restores are
+  protected, and shared-prefix forks still copy when room exists. On a pair a controlled growing request went from
+  0 cached tokens / 132.220 s to 282624 cached / 0.835 s; a shared-prefix test preserved 282624 tokens and returned
+  the same output-token hash as a cold run, and the longer branch then restored 296960 tokens from spill. Replies
+  matched the cold run's token hash in the tested case; this does not establish bit-identity for every workload. This
+  is a partial fix: it helps when the prefix has room after it, while a prefix at the pool end can still fall back to
+  a full prefill. The root cause — restore/keep placement reserving only the prefix, not the full continuation — is a
+  follow-up. Unsharded only: #27 and #75 stay open. Includes three placement regressions; claim
+  `tools/claims/0063-growth-exact.py` (its default quick mode uses an 8192-position pool and 4-8K-token prompts;
+  `--long` runs the 524288-position check).
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
