@@ -1,12 +1,13 @@
 # Abliterated mode
 
-Optional: `ABLIT=1` applies the matching Keys overlay by drowzeys on top of the default EAQ v1 pack.
+Optional: `ABLIT=1` applies the matching Keys overlay by drowzeys on top of EAQ v1 or the pinned EAQ v1.1 pack.
 
 `ABLIT` accepts **`0` or `1`** (default `0`). Set it in the environment, `scripts/local.sh` or `.env`.
 `ABLIT=0` serves the stock checkpoint (`MODEL_ID`/`MODEL_REVISION`; the default is Mia EAQ v1 2.9 bpw).
-`ABLIT=1` keeps the **EAQ v1** 2.9 bpw checkpoint and applies `exl3_wo_b_l10_35_mia29.safetensors` from
+`ABLIT=1` keeps the selected **EAQ v1 / v1.1** 2.9 bpw checkpoint and applies `exl3_wo_b_l10_35_mia29.safetensors` from
 [`drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated`](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated);
-it is refused when `EAQ_V1_1=1`, so leave `EAQ_V1_1=0` (the default) for it.
+For v1.1, use `EAQ_V1_1=1 ABLIT=1`. Compatibility is restricted to stock revision
+`aee640e2afba93be683bb5b9b420115fe7fbac20` and the overlay pin below.
 This repository supplies overlays, not a full checkpoint. The recipe uses its **matching Mia 2.9 bpw** overlay and
 `apply_mia29_wo_b_graft.py`; the FP8, LibertAI 3.5 bpw and Jayleaton 2.8 bpw sidecars are for other packs.
 
@@ -50,6 +51,19 @@ preparation hardlinks unchanged shards and writes changed shards under a separat
 `$HF_CACHE/tensorfold-dsv41/<model-revision>-ablit-<overlay-revision>/checkpoint` directory. **Allow extra disk space for
 rewritten shards (up to another checkpoint's size), the ~651 MiB sidecar, and a separate ~106 GB rank cache on each Spark.**
 Applying the overlay runs on CPU using the image's Python, PyTorch and safetensors.
+
+The v1.1 pack's 27 BF16 indexer/compressor linears do not overlap the 104 EXL3 `wo_b` targets.
+`scripts/ablit_validate.py` checks the sidecar's exact key set, shapes, dtypes and quantization settings before applying it.
+After stock dtype restoration, it verifies every target against the sidecar and every other tensor against stock
+byte for byte (unchanged hardlinks share the original bytes). This includes BF16 linears and MTP tensors.
+It also checks the config, index and tokenizer assets. A failure stops preparation before `.ablit-ready` or rank caches
+are written. A successful scan records `.ablit-verified.json`; subsequent preparation reuses it only while the validator
+and file identities, sizes and timestamps are unchanged. Changing the validator invalidates the prepared marker.
+These checks establish graft integrity; they do not establish model quality or equivalence to an upstream v1.1 evaluation.
+
+For offline nodes, download the pinned repositories on an authenticated machine and transfer only their HF cache
+directories (including blobs and snapshot symlinks). Set `export HF_HUB_OFFLINE=1` on the head; cached preparation
+requires no login or credential transfer. The API listens on `HOST=0.0.0.0`, `PORT=8888` by default.
 
 Both ranks build their caches from the modified checkpoint. Abliterated data and worker cache paths include the overlay
 revision, including when `WORKER_CACHE_DIR` is customized, so stock caches cannot be reused accidentally. Keep the same

@@ -102,7 +102,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; every setting 
 | `THINKING`, `REASONING_EFFORT` | 1, empty | think first unless a request turns it off; the default effort |
 | `DRAFTS` | 1 | the checkpoint's DSpark draft blocks (drafted replies equal plain ones) |
 | `EAQ_V1_1` | 0 | `1` switches to the experimental EAQ v1.1 pack |
-| `ABLIT` | 0 | `1` applies the Keys overlay ([abliterated mode](docs/abliterated.md)) |
+| `ABLIT` | 0 | `1` applies the Keys overlay; supports the pinned v1.1 pack with `EAQ_V1_1=1` ([validation and setup](docs/abliterated.md)) |
 | `API_KEY` | 0 | `1` makes rank 0 require a key; the API is open on the network by default |
 | `HOST`, `PORT`, `SERVED_NAME` | 0.0.0.0, 8888, `DeepSeek-V4.1-Flash-1017` | |
 | `MIN_AVAIL_GIB`, `MEMGUARD_GIB` | 112, 2.5 | the memory `start.sh` demands, and the floor under which `scripts/memguard.sh` kills a rank |
