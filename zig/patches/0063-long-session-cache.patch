@@ -1,8 +1,8 @@
-# port-patches.sh: port/long-session-cache-0063 @ c479b3e46a8a over 44e969ceda7f (squash 44e969ceda7f..c479b3e46a8a)
+# port-patches.sh: port/long-session-cache-0063 @ fed1647cc105 over 44e969ceda7f (squash 44e969ceda7f..fed1647cc105)
 # Preserve an unsharded cached prefix when a separate full-request copy cannot fit: grow in place under pressure, guarding idle tail victims and protecting live streams and loading restores; shared-prefix forks still copy when room exists. Includes placement regressions. Rebased onto main: the placement runs before 0045-cut-in-tail, whose resume_at reads sn.stale.
 # Applied by zig/Dockerfile with git apply after the hand-written patches; regenerate with scripts/port-patches.sh, do not edit.
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index 40006aaecadbf74d26454cef0dc22e337ba04ce3..3c79f33f16c601023a1b3abff624d99ca943c54e 100644
+index 40006aaecadbf74d26454cef0dc22e337ba04ce3..830026444d581084afba140c3c18f3327212699d 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
 @@ -924,13 +924,17 @@ pub const Lanes = struct {
@@ -88,7 +88,7 @@ index 40006aaecadbf74d26454cef0dc22e337ba04ce3..3c79f33f16c601023a1b3abff624d99c
  test "a prefix two conversations share: the second one resuming it in place would stale the first one's later marks" {
      var m: Model = undefined;
      m.pool_cap = 1 << 20;
-@@ -2134,6 +2172,43 @@ test "a prefix two conversations share: the second one resuming it in place woul
+@@ -2134,6 +2172,47 @@ test "a prefix two conversations share: the second one resuming it in place woul
      try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
  }
  
@@ -112,6 +112,10 @@ index 40006aaecadbf74d26454cef0dc22e337ba04ce3..3c79f33f16c601023a1b3abff624d99c
 +    try std.testing.expect(!ln.canGrowHere(&.{.{ 0, 270336 }}, 274432, &source));
 +    source.base = m.pool_cap - source.at; // the prefix fits here, but its continuation does not
 +    try std.testing.expect(!ln.canGrowHere(&.{}, 274432, &source));
++    // no room after it: the old path stales the source and places the prompt from 0
++    const base = try ln.placeKept(&.{}, 274432, &source);
++    try std.testing.expectEqual(@as(usize, 0), base);
++    try std.testing.expect(source.stale);
 +}
 +
 +test "a shared prefix still copies without evicting later marks when there is room" {

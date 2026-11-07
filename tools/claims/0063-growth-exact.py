@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Compare a cold long request with the same request resumed under placement pressure.
 
-Run on an otherwise idle, unsharded server with CONTEXT=524288 and POOL unset.
-First start with SPILL_GIB=0 and run `--phase cold`. Restart with spill enabled,
-then run `--phase pressure`. Use the same new --seed for both phases. The
-pressure phase creates a prefix and a competing tail, and fails unless the
-long request actually resumes. Save server logs to verify placement separately.
+Run on an otherwise idle, unsharded server with CONTEXT equal to --context and
+POOL unset. First start with SPILL_GIB=0 and run `--phase cold`. Restart with
+spill enabled, then run `--phase pressure`. Use the same new --seed for both
+phases. The pressure phase creates a prefix and a competing tail, and fails
+unless the long request actually resumes. Save server logs to verify placement
+separately.
+
+By default this is the quick check: CONTEXT=8192 and 4-8K-token prompts. Pass
+--long for the long check: CONTEXT=524288 and a ~282K-token prefix. The server's
+CONTEXT must match --context in either mode.
 
   python3 -I tools/claims/0063-growth-exact.py --phase cold --scenario fork --seed 12345 --out cold.json
   python3 -I tools/claims/0063-growth-exact.py --phase pressure --scenario fork --seed 12345 --reference cold.json --out pressure.json
+  python3 -I tools/claims/0063-growth-exact.py --long --phase cold --scenario fork --seed 12345 --out cold.json
+  python3 -I tools/claims/0063-growth-exact.py --long --phase pressure --scenario fork --seed 12345 --reference cold.json --out pressure.json
 
 A cached-token count alone does not prove that the in-place fallback ran;
 confirm it separately with an instrumented engine or a placement regression.
@@ -49,11 +56,24 @@ def main():
     ap.add_argument('--scenario', choices=('tail', 'fork'), default='tail')
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--reference', type=pathlib.Path)
+    ap.add_argument('--quick', action='store_true', help='use the default small 8192-position pool and 4-8K-token prompts')
+    ap.add_argument('--long', action='store_true', help='use the long 524288-position pool and ~282K-token prefix')
+    ap.add_argument('--context', type=int, default=8192, help='the server CONTEXT/POOL (default 8192; --long: 524288)')
+    ap.add_argument('--size', type=int, default=6000, help='prose characters for the prefix (default 6000; --long: 360000)')
+    ap.add_argument('--max-tokens', type=int, default=1024, help='the target request output reservation (default 1024; --long: 131072)')
+    ap.add_argument('--branch-size', type=int, default=1000, help='prose characters for fork A (default 1000; --long: 20000)')
+    ap.add_argument('--tail-size', type=int, default=1000, help='prose characters for the competing tail (default 1000; --long: 50000)')
     args = ap.parse_args()
+    if args.long:
+        args.context, args.size, args.max_tokens = 524288, 360000, 131072
+        args.branch_size, args.tail_size = 20000, 50000
+    elif args.quick:
+        args.context, args.size, args.max_tokens = 8192, 6000, 1024
+        args.branch_size, args.tail_size = 1000, 1000
     if args.phase == 'pressure' and not args.reference:
         ap.error('pressure requires --reference')
     system = {'role': 'system', 'content': 'Answer the final question with one concise sentence.'}
-    material = prose(360000, args.seed)
+    material = prose(args.size, args.seed)
     prefix = 'Material:\n' + material
     question = '\nQuestion: Name three distinct words found in the material.'
     messages = [system, {'role': 'user', 'content': prefix +
@@ -76,34 +96,38 @@ def main():
                   'finish_reason': reply['choices'][0]['finish_reason'],
                   'token_sha': reply.get('tensorfold', {}).get('token_sha')}
         results.append(result)
-        args.out.write_text(json.dumps({'phase': args.phase, 'scenario': args.scenario, 'seed': args.seed, 'results': results}, indent=2) + '\n')
+        args.out.write_text(json.dumps({'phase': args.phase, 'scenario': args.scenario, 'seed': args.seed,
+                                        'context': args.context, 'results': results}, indent=2) + '\n')
         print(json.dumps(result), flush=True)
         return result
 
     if args.phase == 'pressure':
         reference = json.loads(args.reference.read_text())
-        if reference['phase'] != 'cold' or reference['seed'] != args.seed or reference.get('scenario', 'tail') != args.scenario:
-            raise SystemExit('reference phase or seed mismatch')
+        if (reference['phase'] != 'cold' or reference['seed'] != args.seed or
+                reference.get('scenario', 'tail') != args.scenario or
+                reference.get('context', args.context) != args.context):
+            raise SystemExit('reference phase, seed, scenario or context mismatch')
         seed = [system, {'role': 'user', 'content': prefix + question}] if args.scenario == 'fork' else messages
         seeded = request('seed', seed, 8)
         drain_writes()
         if args.scenario == 'fork':
-            fork = [system, {'role': 'user', 'content': prefix + '\nBranch A:\n' + prose(20000, args.seed + 1) + question}]
+            fork = [system, {'role': 'user', 'content': prefix + '\nBranch A:\n' + prose(args.branch_size, args.seed + 1) + question}]
             branch = request('fork-a', fork, 8)
             if branch['cached'] is None or branch['cached'] < (seeded['prompt'] - 1) // 2048 * 2048:
                 raise SystemExit('fork A did not reuse the shared prefix')
         else:
-            request('tail', [system, {'role': 'user', 'content': prose(50000, args.seed + 1)}], 8)
+            request('tail', [system, {'role': 'user', 'content': prose(args.tail_size, args.seed + 1)}], 8)
         drain_writes()
-    target = request('target', messages, 131072)
-    if target['prompt'] <= 262144 or target['cached'] is None:
+    target = request('target', messages, args.max_tokens)
+    if target['prompt'] <= args.context // 2 or target['cached'] is None:
         raise SystemExit('missing cache count or prompt too short')
     if args.phase == 'cold':
         if target['cached'] != 0:
             raise SystemExit('reference was not cold')
     else:
         cold = reference['results'][-1]
-        if target['cached'] / target['prompt'] < .95:
+        expected = (target['prompt'] - 1) // 2048 * 2048
+        if target['cached'] is None or target['cached'] < expected:
             raise SystemExit('pressure request did not resume the long prefix')
         for field in ('prompt', 'completion_tokens', 'message', 'finish_reason'):
             if target[field] != cold[field]:
