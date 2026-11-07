@@ -1,0 +1,636 @@
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 0fddce7..4851a42 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -42,6 +42,7 @@ pub const Sink = struct {
+     ctx: *anyopaque,
+     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
+     ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
++    max_calls: ?usize = null,
+ };
+ 
+ /// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill).
+@@ -256,7 +257,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
++        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools, sink.?.max_calls) catch |e| break :blk e;
+         gen.loop(gone) catch |e| break :blk e;
+         break :blk gen.finish(cx, prepared.prompt_len, received, submitted, thinking, effort, prepared.sampled, prepared.drafts);
+     };
+@@ -430,7 +431,8 @@ const Generation = struct {
+         }
+         if (g.calls) |*c| {
+             var out: std.ArrayList(Value) = .empty;
+-            try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
++            try c.feed(tool_parse.beforeDsml(answer), &out); // a legacy call quoted inside DSML is argument text, not a call
++            try c.feedDsml(answer, arrived, g.collected.items.len, &out);
+             for (out.items) |d| try g.emit(sink, d);
+         }
+     }
+@@ -456,6 +458,16 @@ const Generation = struct {
+         g.last_out_ns = now;
+     }
+ 
++    /// Flush DSML arguments on their time budget even when a decode round has not arrived.
++    fn flushCallsIfDue(g: *Generation) Failure!void {
++        const sink = g.sink orelse return;
++        if (g.calls) |*c| {
++            var out: std.ArrayList(Value) = .empty;
++            try c.flushDsmlDue(nowNs(g.srv.io), g.collected.items.len, &out);
++            for (out.items) |d| try g.emit(sink, d);
++        }
++    }
++
+     /// Ends the request and waits for the engine; one it ended unfinished counts as a disconnect, as the Mac scheduler counts it.
+     fn cancel(g: *Generation) void {
+         if (!g.engine_done) g.srv.engine.cancel(g.id);
+@@ -499,6 +511,7 @@ const Generation = struct {
+                 return error.Cancelled;
+             }
+             const tokens = chunk orelse {
++                try g.flushCallsIfDue();
+                 try g.pingIfSilent();
+                 continue;
+             };
+@@ -552,8 +565,15 @@ const Generation = struct {
+                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
+                 var out: std.ArrayList(Value) = .empty;
+                 try c.feed(if (g.thinking) content else text, &out);
++                try c.feedDsml(if (g.thinking) content else text, nowNs(g.srv.io), g.collected.items.len, &out);
+                 for (out.items) |d| try g.emit(sink, d);
+             };
++            if (g.calls) |*c| {
++                var out: std.ArrayList(Value) = .empty;
++                if (!try c.finishDsml(nowNs(g.srv.io), g.collected.items.len, &out))
++                    return cx.fail(.server, "a streamed DSML tool call ended with malformed framing", .{});
++                for (out.items) |d| try g.emit(sink, d);
++            }
+         }
+         const prefilled = m.prefilled_ns;
+         const total = seconds(finished_ns - submitted);
+@@ -601,7 +621,7 @@ const Generation = struct {
+             .content = content,
+             .stop_sequence = g.stops.matched(raw),
+             .reasoning = reasoning,
+-            .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
++            .tool_calls_streamed = g.calls != null and g.calls.?.delivered(),
+             .finish_reason = reason,
+             .prompt_tokens = prompt_len,
+             .cached_tokens = m.cached orelse 0,
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index b87e594..da388f8 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -316,7 +316,6 @@ const Run = struct {
+         };
+         reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+         reply.finish_reason = "tool_calls";
+-        if (r.plan.policy.single) reply.tool_calls_streamed = false;
+         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+     }
+ 
+@@ -418,9 +417,10 @@ const Run = struct {
+         }
+     };
+ 
+-    /// The one-call policy on a streamed delta: text filtered, tool_calls dropped; null when nothing is left.
++    /// The one-call policy on a streamed delta: text filtered; the streamer itself is capped at one validated call.
+     fn policyDelta(r: *Run, delta: Value) Allocator.Error!?Value {
+-        if (!r.plan.policy.single) return if (delta.truthy()) delta else null;
++        const dsml = delta == .object and delta.has(tool_stream.dsml_marker);
++        if (!r.plan.policy.single and !dsml) return if (delta.truthy()) delta else null;
+         if (delta == .string) {
+             const t = try r.plan.policy.text(r.a, delta.string);
+             return if (t.len > 0) Value{ .string = t } else null;
+@@ -428,7 +428,8 @@ const Run = struct {
+         const o = try json.newObject(r.a);
+         var content: ?[]const u8 = null;
+         for (delta.object.keys(), delta.object.values()) |k, v| {
+-            if (std.mem.eql(u8, k, "tool_calls")) continue;
++            if (std.mem.eql(u8, k, tool_stream.dsml_marker)) continue;
++            if (std.mem.eql(u8, k, "tool_calls") and r.plan.policy.single and !dsml) continue;
+             if (std.mem.eql(u8, k, "content") and v == .string) {
+                 content = v.string;
+                 continue;
+@@ -473,7 +474,12 @@ const Run = struct {
+         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+         var sink_state: StreamSink = .{ .run = r, .tools = tools };
+         handed = true;
+-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping }, gone) catch |e| {
++        var reply = chat.generate(r.srv, &cx, prepared, .{
++            .ctx = &sink_state,
++            .call = StreamSink.call,
++            .ping = StreamSink.ping,
++            .max_calls = r.plan.policy.maxCalls(),
++        }, gone) catch |e| {
+             switch (e) {
+                 error.Cancelled => return,
+                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
+diff --git a/zig/src/server/stream_preflight_test.zig b/zig/src/server/stream_preflight_test.zig
+index dad6b70..b3f8328 100644
+--- a/zig/src/server/stream_preflight_test.zig
++++ b/zig/src/server/stream_preflight_test.zig
+@@ -264,6 +264,7 @@ const SpaceSeen = struct {
+                 if (f == .string and std.mem.eql(u8, f.string, "tool_calls")) s.call_finish = true;
+             }
+             const delta = choice.get("delta") orelse continue;
++            if (delta.get("_tensorfold_dsml_stream") != null) s.failed = true;
+             if (delta.get("content")) |c| if (c == .string) {
+                 s.content.appendSlice(s.a, c.string) catch return error.Closed;
+             };
+@@ -289,7 +290,7 @@ fn exerciseSpace(answer: []const u8, expected: []const u8, called: bool, tools:
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+-    const tool_list = if (tools) ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}}}]" else "";
++    const tool_list = if (tools) ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}}}],\"parallel_tool_calls\":false" else "";
+     const body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":2048", tool_list, "}" });
+     const raw = (try json.parse(a, body)).ok;
+     var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index a02ee06..6791fb2 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -9,6 +9,26 @@ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+ 
+ const space = reply_text.isSpaceByte;
++const dsml41_open = "<\u{ff5c}DSML\u{ff5c} calls>";
++const dsml41_close = "</\u{ff5c}DSML\u{ff5c} calls>";
++const invoke41_open = "<\u{ff5c}DSML\u{ff5c} invoke name=\"";
++const invoke41_close = "</\u{ff5c}DSML\u{ff5c} invoke>";
++const param41_open = "<\u{ff5c}DSML\u{ff5c} parameter name=\"";
++const param41_close = "</\u{ff5c}DSML\u{ff5c} parameter>";
++const dsml_flush_tokens: usize = 256;
++const dsml_flush_ns: i96 = 200 * std.time.ns_per_ms;
++pub const dsml_marker = "_tensorfold_dsml_stream";
++
++const DsmlState = enum {
++    outside,
++    calls,
++    invoke,
++    string_value,
++    raw_value,
++    skip_invoke,
++    skip_parameter,
++    abort,
++};
+ 
+ /// ``\s*<TAG=([^>\n]+)>\n?`` at the start of ``rest``: the name and the bytes matched.
+ fn opening(rest: []const u8, tag: []const u8) ?struct { name: []const u8, len: usize, newline: bool } {
+@@ -37,6 +57,7 @@ pub const Streamer = struct {
+     a: Allocator,
+     schemas: tool_params.Schemas,
+     known: std.StringHashMapUnmanaged([]const u8) = .empty,
++    max_calls: ?usize,
+     current: []const u8 = "",
+     value_schema: Value = .null,
+     typed: bool = false,
+@@ -49,9 +70,20 @@ pub const Streamer = struct {
+     held: []const u8 = "",
+     streamed: bool = false,
+     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
++    dsml_state: DsmlState = .outside,
++    dsml_pos: usize = 0,
++    dsml_searched: usize = 0,
++    dsml_started: bool = false,
++    dsml_block_disabled: bool = false,
++    dsml_arg_count: usize = 0,
++    dsml_pending: std.ArrayList(u8) = .empty,
++    dsml_pending_ns: i96 = 0,
++    dsml_pending_tokens: usize = 0,
++    dsml_raw: std.ArrayList(u8) = .empty,
++    dsml_seen: std.StringHashMapUnmanaged(void) = .empty,
+ 
+-    pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
+-        var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools) };
++    pub fn init(a: Allocator, tools: []const Value, max_calls: ?usize) Allocator.Error!Streamer {
++        var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools), .max_calls = max_calls };
+         for (tools) |tool| {
+             if (tool != .object) continue;
+             const spec = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
+@@ -62,6 +94,28 @@ pub const Streamer = struct {
+         return s;
+     }
+ 
++    fn atLimit(s: *const Streamer) bool {
++        const limit = s.max_calls orelse return false;
++        return @as(usize, @intCast(s.index + 1)) >= limit;
++    }
++
++    fn head(s: *Streamer, name: []const u8, dsml: bool, out: *std.ArrayList(Value)) Allocator.Error!void {
++        s.current = name;
++        s.index += 1;
++        s.streamed = true;
++        const function = try json.newObject(s.a);
++        try function.put(s.a, "name", .{ .string = name });
++        try function.put(s.a, "arguments", .{ .string = "" });
++        const one = try json.newObject(s.a);
++        try one.put(s.a, "index", try json.intValue(s.a, s.index));
++        try one.put(s.a, "id", .{ .string = try ids.make(s.a, "call_", 24) });
++        try one.put(s.a, "type", .{ .string = "function" });
++        try one.put(s.a, "function", .{ .object = function });
++        const delta = try wrap(s.a, .{ .object = one });
++        if (dsml) try delta.object.put(s.a, dsml_marker, .{ .bool = true });
++        try out.append(s.a, delta);
++    }
++
+     fn args(s: *Streamer, fragment: []const u8) Allocator.Error!Value {
+         const function = try json.newObject(s.a);
+         try function.put(s.a, "arguments", .{ .string = fragment });
+@@ -102,18 +156,11 @@ pub const Streamer = struct {
+                         s.state = .abort;
+                         return;
+                     };
+-                    s.current = name;
+-                    s.index += 1;
+-                    s.streamed = true;
+-                    const function = try json.newObject(s.a);
+-                    try function.put(s.a, "name", .{ .string = name });
+-                    try function.put(s.a, "arguments", .{ .string = "" });
+-                    const one = try json.newObject(s.a);
+-                    try one.put(s.a, "index", try json.intValue(s.a, s.index));
+-                    try one.put(s.a, "id", .{ .string = try ids.make(s.a, "call_", 24) });
+-                    try one.put(s.a, "type", .{ .string = "function" });
+-                    try one.put(s.a, "function", .{ .object = function });
+-                    try out.append(s.a, try wrap(s.a, .{ .object = one }));
++                    if (s.atLimit()) {
++                        s.state = .abort;
++                        return;
++                    }
++                    try s.head(name, false, out);
+                     s.args_open = false;
+                     s.pos += m.len;
+                     s.state = .function;
+@@ -179,6 +226,235 @@ pub const Streamer = struct {
+             }
+         }
+     }
++
++    fn appendDsml(s: *Streamer, bytes: []const u8, now_ns: i96, tokens: usize) Allocator.Error!void {
++        if (bytes.len == 0) return;
++        if (s.dsml_pending.items.len == 0) {
++            s.dsml_pending_ns = now_ns;
++            s.dsml_pending_tokens = tokens;
++        }
++        try s.dsml_pending.appendSlice(s.a, bytes);
++    }
++
++    fn appendDsmlString(s: *Streamer, bytes: []const u8, now_ns: i96, tokens: usize) Allocator.Error!void {
++        if (bytes.len == 0) return;
++        const quoted = try json.quote(s.a, bytes, .{ .ascii = false });
++        try s.appendDsml(quoted[1 .. quoted.len - 1], now_ns, tokens);
++    }
++
++    fn flushDsml(s: *Streamer, now_ns: i96, tokens: usize, force: bool, out: *std.ArrayList(Value)) Allocator.Error!void {
++        if (s.dsml_pending.items.len == 0) return;
++        if (!force and tokens -| s.dsml_pending_tokens < dsml_flush_tokens and now_ns - s.dsml_pending_ns < dsml_flush_ns) return;
++        const fragment = try s.a.dupe(u8, s.dsml_pending.items);
++        s.dsml_pending.clearRetainingCapacity();
++        const delta = try s.args(fragment);
++        try delta.object.put(s.a, dsml_marker, .{ .bool = true });
++        try out.append(s.a, delta);
++    }
++
++    fn dsmlMalformed(s: *Streamer) void {
++        s.dsml_state = .abort;
++        s.dsml_pending.clearRetainingCapacity();
++    }
++
++    fn nextDsmlTag(text: []const u8, from: usize, a: []const u8, b: []const u8) ?struct { at: usize, first: bool } {
++        const x = reply_text.findTag(text, from, a);
++        const y = reply_text.findTag(text, from, b);
++        if (x == null) return if (y) |at| .{ .at = at, .first = false } else null;
++        if (y == null or x.? <= y.?) return .{ .at = x.?, .first = true };
++        return .{ .at = y.?, .first = false };
++    }
++
++    /// DeepSeek-V4.1 DSML calls as OpenAI argument deltas. A call becomes irreversible only after its
++    /// envelope and offered function name are known; malformed framing after that makes finishDsml fail.
++    pub fn feedDsml(s: *Streamer, text: []const u8, now_ns: i96, tokens: usize, out: *std.ArrayList(Value)) Allocator.Error!void {
++        while (s.dsml_state != .abort) {
++            switch (s.dsml_state) {
++                .outside => {
++                    if (text.len < s.dsml_searched) s.dsml_searched = s.dsml_pos;
++                    const from = @min(text.len, @max(s.dsml_pos, s.dsml_searched -| (dsml41_open.len - 1)));
++                    const at = reply_text.findTag(text, from, dsml41_open) orelse {
++                        s.dsml_searched = text.len;
++                        break;
++                    };
++                    s.dsml_pos = at + dsml41_open.len;
++                    s.dsml_state = .calls;
++                },
++                .calls => {
++                    const tag = nextDsmlTag(text, s.dsml_pos, invoke41_open, dsml41_close) orelse break;
++                    if (!tag.first) {
++                        s.dsml_pos = tag.at + dsml41_close.len;
++                        s.dsml_block_disabled = false;
++                        s.dsml_state = .outside;
++                        continue;
++                    }
++                    const name_start = tag.at + invoke41_open.len;
++                    const q = std.mem.indexOfScalarPos(u8, text, name_start, '"') orelse break;
++                    if (q == name_start or q + 2 > text.len) break;
++                    if (!std.mem.startsWith(u8, text[q..], "\">")) {
++                        if (s.dsml_started) s.dsmlMalformed() else s.dsml_pos = tag.at + 1;
++                        continue;
++                    }
++                    const lower = try std.ascii.allocLowerString(s.a, reply_text.pyStrip(text[name_start..q]));
++                    const name = s.known.get(lower);
++                    if (name == null) {
++                        if (s.max_calls == null) {
++                            if (s.streamed) {
++                                s.dsmlMalformed();
++                                continue;
++                            }
++                            s.dsml_block_disabled = true;
++                        }
++                        s.dsml_pos = q + 2;
++                        s.dsml_state = .skip_invoke;
++                        continue;
++                    }
++                    if (s.dsml_block_disabled or s.atLimit()) {
++                        s.dsml_pos = q + 2;
++                        s.dsml_state = .skip_invoke;
++                        continue;
++                    }
++                    try s.head(name.?, true, out);
++                    s.dsml_started = true;
++                    s.dsml_arg_count = 0;
++                    s.dsml_seen.clearRetainingCapacity();
++                    try s.appendDsml("{", now_ns, tokens);
++                    s.dsml_pos = q + 2;
++                    s.dsml_state = .invoke;
++                },
++                .invoke => {
++                    const tag = nextDsmlTag(text, s.dsml_pos, param41_open, invoke41_close) orelse break;
++                    if (!tag.first) {
++                        try s.appendDsml("}", now_ns, tokens);
++                        s.dsml_pos = tag.at + invoke41_close.len;
++                        s.dsml_state = .calls;
++                        try s.flushDsml(now_ns, tokens, true, out);
++                        continue;
++                    }
++                    const name_start = tag.at + param41_open.len;
++                    const q = std.mem.indexOfScalarPos(u8, text, name_start, '"') orelse break;
++                    const after = text[q + 1 ..];
++                    const string_suffix = " string=\"true\">";
++                    const raw_suffix = " string=\"false\">";
++                    const plain_suffix = ">";
++                    const kind: enum { string, raw } = if (std.mem.startsWith(u8, after, string_suffix))
++                        .string
++                    else if (std.mem.startsWith(u8, after, raw_suffix))
++                        .raw
++                    else if (std.mem.startsWith(u8, after, plain_suffix))
++                        .string
++                    else {
++                        if (std.mem.startsWith(u8, string_suffix, after) or
++                            std.mem.startsWith(u8, raw_suffix, after) or
++                            std.mem.startsWith(u8, plain_suffix, after)) break;
++                        s.dsml_pos = q + 1;
++                        s.dsml_state = .skip_parameter;
++                        continue;
++                    };
++                    const suffix_len = switch (kind) {
++                        .string => if (std.mem.startsWith(u8, after, string_suffix)) string_suffix.len else plain_suffix.len,
++                        .raw => raw_suffix.len,
++                    };
++                    const key = text[name_start..q];
++                    if (key.len == 0) {
++                        s.dsml_pos = q + 1 + suffix_len;
++                        s.dsml_state = .skip_parameter;
++                        continue;
++                    }
++                    if (s.dsml_seen.contains(key)) {
++                        s.dsmlMalformed();
++                        continue;
++                    }
++                    try s.dsml_seen.put(s.a, try s.a.dupe(u8, key), {});
++                    if (s.dsml_arg_count > 0) try s.appendDsml(",", now_ns, tokens);
++                    try s.appendDsml(try json.quote(s.a, key, .{ .ascii = false }), now_ns, tokens);
++                    try s.appendDsml(":", now_ns, tokens);
++                    s.dsml_pos = q + 1 + suffix_len;
++                    switch (kind) {
++                        .string => {
++                            try s.appendDsml("\"", now_ns, tokens);
++                            s.dsml_state = .string_value;
++                        },
++                        .raw => {
++                            s.dsml_raw.clearRetainingCapacity();
++                            s.dsml_state = .raw_value;
++                        },
++                    }
++                },
++                .string_value => {
++                    const rest = text[@min(s.dsml_pos, text.len)..];
++                    const end = reply_text.findTag(rest, 0, param41_close);
++                    const hold = if (end == null) reply_text.partialTag(rest, param41_close) else 0;
++                    const piece = rest[0..if (end) |at| at else rest.len - hold];
++                    try s.appendDsmlString(piece, now_ns, tokens);
++                    s.dsml_pos += piece.len;
++                    if (end == null) break;
++                    try s.appendDsml("\"", now_ns, tokens);
++                    s.dsml_arg_count += 1;
++                    s.dsml_pos += param41_close.len;
++                    s.dsml_state = .invoke;
++                },
++                .raw_value => {
++                    const rest = text[@min(s.dsml_pos, text.len)..];
++                    const end = reply_text.findTag(rest, 0, param41_close);
++                    const hold = if (end == null) reply_text.partialTag(rest, param41_close) else 0;
++                    const piece = rest[0..if (end) |at| at else rest.len - hold];
++                    try s.dsml_raw.appendSlice(s.a, piece);
++                    s.dsml_pos += piece.len;
++                    if (end == null) break;
++                    const value: Value = switch (try json.parseText(s.a, s.dsml_raw.items)) {
++                        .ok => |v| v,
++                        .err => .{ .string = try s.a.dupe(u8, s.dsml_raw.items) },
++                    };
++                    try s.appendDsml(try json.stringify(s.a, value, .{ .ascii = false, .compact = true }), now_ns, tokens);
++                    s.dsml_arg_count += 1;
++                    s.dsml_pos += param41_close.len;
++                    s.dsml_state = .invoke;
++                },
++                .skip_invoke => {
++                    const at = reply_text.findTag(text, s.dsml_pos, invoke41_close) orelse break;
++                    s.dsml_pos = at + invoke41_close.len;
++                    s.dsml_state = .calls;
++                },
++                .skip_parameter => {
++                    const tag = nextDsmlTag(text, s.dsml_pos, param41_close, invoke41_close) orelse break;
++                    if (tag.first) {
++                        s.dsml_pos = tag.at + param41_close.len;
++                        s.dsml_state = .invoke;
++                    } else {
++                        try s.appendDsml("}", now_ns, tokens);
++                        s.dsml_pos = tag.at + invoke41_close.len;
++                        s.dsml_state = .calls;
++                        try s.flushDsml(now_ns, tokens, true, out);
++                    }
++                },
++                .abort => unreachable,
++            }
++        }
++        try s.flushDsml(now_ns, tokens, false, out);
++    }
++
++    /// Emits a time/token-due arguments suffix even when the engine has not produced another token.
++    pub fn flushDsmlDue(s: *Streamer, now_ns: i96, tokens: usize, out: *std.ArrayList(Value)) Allocator.Error!void {
++        try s.flushDsml(now_ns, tokens, false, out);
++    }
++
++    /// A DSML call whose head escaped cannot fall back to ordinary text or a different final call.
++    pub fn finishDsml(s: *Streamer, now_ns: i96, tokens: usize, out: *std.ArrayList(Value)) Allocator.Error!bool {
++        if (s.dsml_state == .abort and s.streamed) return false;
++        if (!s.dsml_started) return true;
++        if (s.dsml_state != .outside) {
++            s.dsml_pending.clearRetainingCapacity();
++            return false;
++        }
++        try s.flushDsml(now_ns, tokens, true, out);
++        return true;
++    }
++
++    /// Whether this request's sink actually received tool deltas. Single-call policy accepts only validated DSML.
++    pub fn delivered(s: *const Streamer) bool {
++        return if (s.max_calls != null) s.dsml_started else s.streamed;
++    }
+ };
+ 
+ /// Bytes of ``rest`` that cannot be the start of a ``tail``-byte closer (Python slices characters).
+@@ -364,6 +640,18 @@ test "a streamed call cut inside a value stays open" {
+     try std.testing.expect((try tool_params.closedJson(a, sent)) == null);
+ }
+ 
++test "single-call policy keeps legacy XML deferred while DSML may stream" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
++    var s = try Streamer.init(a, tools, 1);
++    var out: std.ArrayList(Value) = .empty;
++    try s.feed("<tool_call><function=lookup><parameter=q>fast</parameter></function></tool_call>", &out);
++    try std.testing.expect(s.streamed);
++    try std.testing.expect(!s.delivered());
++}
++
+ test "a one-call reply drops an unoffered call and still hides an unclosed one" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+@@ -388,7 +676,7 @@ const tool_parse = @import("tool_parse.zig");
+ 
+ /// The deltas one streamer sends while the reply grows through ``texts``.
+ fn streamed(a: Allocator, tools: []const Value, texts: []const []const u8) Allocator.Error![]Value {
+-    var s = try Streamer.init(a, tools);
++    var s = try Streamer.init(a, tools, null);
+     var out: std.ArrayList(Value) = .empty;
+     for (texts) |t| try s.feed(t, &out);
+     return out.items;
+@@ -402,3 +690,105 @@ fn sentArguments(a: Allocator, deltas: []const Value) Allocator.Error![]const u8
+     };
+     return out.items;
+ }
++
++test "DeepSeek-V4.1 DSML arguments flush by token or time and reconstruct byte-for-byte" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a,
++        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"meta":{"type":"object"}}}}}]
++    )).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const prefix = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\"write\">" ++
++        "<" ++ D ++ " parameter name=\"path\" string=\"true\">/tmp/index.html</" ++ D ++ " parameter>" ++
++        "<" ++ D ++ " parameter name=\"content\" string=\"true\">";
++    const first = prefix ++ "alpha \"quoted\" \\\\ ";
++    const second = first ++ "\u{96ea}";
++    const third = second ++ "\nlast";
++    const full = third ++ "</" ++ D ++ " parameter>" ++
++        "<" ++ D ++ " parameter name=\"meta\" string=\"false\"> { \"n\": [1, 2] } </" ++ D ++ " parameter>" ++
++        "</" ++ D ++ " invoke></" ++ D ++ " calls>";
++
++    var s = try Streamer.init(a, tools, null);
++    var out: std.ArrayList(Value) = .empty;
++    try s.feedDsml(prefix, 0, 0, &out);
++    try std.testing.expectEqual(@as(usize, 1), out.items.len); // one head, no arguments yet
++    try s.feedDsml(first, 100 * std.time.ns_per_ms, 255, &out);
++    try std.testing.expectEqual(@as(usize, 1), out.items.len);
++    try s.feedDsml(second, 100 * std.time.ns_per_ms, 256, &out);
++    try std.testing.expectEqual(@as(usize, 2), out.items.len); // token budget won
++    try s.feedDsml(third, 101 * std.time.ns_per_ms, 300, &out);
++    try s.flushDsmlDue(300 * std.time.ns_per_ms, 300, &out);
++    try std.testing.expectEqual(@as(usize, 2), out.items.len);
++    try s.flushDsmlDue(301 * std.time.ns_per_ms, 300, &out);
++    try std.testing.expectEqual(@as(usize, 3), out.items.len); // time budget won
++    try s.feedDsml(full, 302 * std.time.ns_per_ms, 320, &out);
++    try std.testing.expect(try s.finishDsml(302 * std.time.ns_per_ms, 320, &out));
++
++    const parsed = try tool_parse.parse(a, full, tools, null);
++    const expected = parsed.calls.?[0].get("function").?.get("arguments").?.string;
++    try std.testing.expectEqualStrings(expected, try sentArguments(a, out.items));
++    try std.testing.expectEqual(@as(usize, 1), countHeads(out.items));
++}
++
++test "DeepSeek-V4.1 DSML single-call cap streams only the first offered invoke" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}},{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const first = "<" ++ D ++ " invoke name=\"write\"><" ++ D ++ " parameter name=\"path\">/tmp/a</" ++ D ++ " parameter></" ++ D ++ " invoke>";
++    const second = "<" ++ D ++ " invoke name=\"lookup\"><" ++ D ++ " parameter name=\"q\">later</" ++ D ++ " parameter></" ++ D ++ " invoke>";
++    const full = "<" ++ D ++ " calls>" ++ first ++ second ++ "</" ++ D ++ " calls>";
++    var s = try Streamer.init(a, tools, 1);
++    var out: std.ArrayList(Value) = .empty;
++    try s.feedDsml(full, 0, 1000, &out);
++    try std.testing.expect(try s.finishDsml(0, 1000, &out));
++    try std.testing.expectEqual(@as(usize, 1), countHeads(out.items));
++    const parsed = try tool_parse.parse(a, full, tools, 1);
++    try std.testing.expectEqualStrings(
++        parsed.calls.?[0].get("function").?.get("arguments").?.string,
++        try sentArguments(a, out.items),
++    );
++}
++
++test "DeepSeek-V4.1 DSML does not commit an unoffered call and rejects malformed framing after a head" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const unknown = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\"launch\"></" ++ D ++ " invoke></" ++ D ++ " calls>";
++    var skipped = try Streamer.init(a, tools, null);
++    var none: std.ArrayList(Value) = .empty;
++    try skipped.feedDsml(unknown, 0, 0, &none);
++    try std.testing.expectEqual(@as(usize, 0), none.items.len);
++    try std.testing.expect(try skipped.finishDsml(0, 0, &none));
++
++    const mixed = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\"launch\"></" ++ D ++ " invoke>" ++
++        "<" ++ D ++ " invoke name=\"write\"><" ++ D ++ " parameter name=\"path\">/tmp/a</" ++ D ++ " parameter></" ++ D ++ " invoke></" ++ D ++ " calls>";
++    var deferred = try Streamer.init(a, tools, null);
++    var batch: std.ArrayList(Value) = .empty;
++    try deferred.feedDsml(mixed, 0, 1000, &batch);
++    try std.testing.expectEqual(@as(usize, 0), batch.items.len);
++    try std.testing.expect(try deferred.finishDsml(0, 1000, &batch));
++    try std.testing.expectEqual(@as(usize, 2), (try tool_parse.parse(a, mixed, tools, null)).calls.?.len);
++
++    const open = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\"write\"><" ++ D ++ " parameter name=\"content\">unfinished";
++    var broken = try Streamer.init(a, tools, null);
++    var sent: std.ArrayList(Value) = .empty;
++    try broken.feedDsml(open, 0, 0, &sent);
++    try std.testing.expectEqual(@as(usize, 1), countHeads(sent.items));
++    try broken.flushDsmlDue(201 * std.time.ns_per_ms, 0, &sent);
++    try std.testing.expect(sent.items.len > 1);
++    try std.testing.expect(!try broken.finishDsml(202 * std.time.ns_per_ms, 0, &sent));
++}
++
++fn countHeads(deltas: []const Value) usize {
++    var count: usize = 0;
++    for (deltas) |d| for (d.get("tool_calls").?.array) |one| {
++        const function = one.get("function") orelse continue;
++        if (one.get("id") != null and function.get("name") != null) count += 1;
++    };
++    return count;
++}
