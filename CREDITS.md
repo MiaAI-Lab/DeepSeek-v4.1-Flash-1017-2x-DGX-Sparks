@@ -45,6 +45,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 - **`zig/patches/0064-dsml-opener-short-payload.patch`** (a tool-call block too short to hold the DSML block it opens with is no
   longer cut as one) was authored by **Hector Isaza** ([hecisaza](https://github.com/hecisaza)), first as `0053` of the 4-Spark recipe in
   [pull request #50](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/50).
+- **`zig/patches/0065-dsml-value-holds-closer.patch`** (a DSML parameter value that holds its block's own closer keeps
+  its call, streamed live or held by `TENSORFOLD_TOOL_STREAM`) was authored by **Hector Isaza**
+  ([hecisaza](https://github.com/hecisaza)), its parse first as `0052` of the 4-Spark recipe in
+  [pull request #49](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/49); its live
+  mode keeps the live call streaming of `0048` by **[nuk3s](https://github.com/nuk3s)**.
 - **`tools/claims/0046-server-get-delete-body-discard.sh`** (checks that patch on a running server) was written by **Hector Isaza**
   ([hecisaza](https://github.com/hecisaza)) with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit), in
   [hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold)

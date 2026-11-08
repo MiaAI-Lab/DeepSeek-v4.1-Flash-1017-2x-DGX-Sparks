@@ -110,6 +110,8 @@ Settings come from the environment, `scripts/local.sh` or `.env`; every setting 
 
 Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after the defaults; every `TENSORFOLD_*`, `TF_DS_*`,
 `TF_FILL_*` and `TF_SPILL_*` variable you set goes to both ranks.
+`TENSORFOLD_TOOL_STREAM=hold` makes a stream with tools send its tool calls whole when the reply ends instead of as they
+decode (`live`, the default; `zig/patches/README.md`, `0065`).
 
 ## Documentation
 
@@ -202,7 +204,9 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   refused at start, and the Engram readers and the AIO, `Model.open`, `Pool.init` and `Tables.open` failure paths release what they made.
   Hector Isaza also wrote `tools/claims/0046-server-get-delete-body-discard.sh`, with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit).
   He also authored `zig/patches/0064-dsml-opener-short-payload.patch`, the parser guard first written as `0053` of the
-  4-Spark recipe ([pull request #50](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/50)).
+  4-Spark recipe ([pull request #50](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/50)),
+  and `zig/patches/0065-dsml-value-holds-closer.patch`, the DSML value fix first written as `0052` there
+  ([pull request #49](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/49)).
 - **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0049-first-draft-depth.patch` (a stream's first drafts after its prompt take the head's depth), in [pull request #104](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/104).
 - **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0050-draft-calibration.patch` (`TF_DS_T25_DRAFT_CAL`, the per-stream draft calibration), in [pull request #105](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/105).
 - **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0051-prompt-rows.patch` (`TF_DS_PROMPT_WINDOW_ROWS` and `TF_DS_PROMPT_GEMM_ROWS`), in [pull request #106](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/106).
