@@ -449,3 +449,11 @@
   return valid tool calls, auto/none/absent are unchanged).
 - `RANK1_PROFILE` (rank 1 `--profile`); both GPUs must share one clock ceiling; each Spark can run from a local copy of the
   cache (no NFS), with `PREPARE=0`.
+- `zig/patches/0064-dsml-opener-short-payload.patch` (always on): a tool-call block (`<tool_call>`, `<|tool_call>` or
+  `<x:tool_call>`) whose payload opens with a DSML opener but is shorter than that opener and its closer together made
+  the parser cut both from it, a slice past the payload's start; a safety-checked build panics there, and the served
+  build has no such checks and reads out of bounds. Such a payload now reads as no DSML block, and the block is handled
+  as any other tool-call block that is not a call. Every payload long enough parses exactly as before: the guard returns
+  the same slice. Tests in `zig/src/server/tool_parse_test.zig` and, end to end through the chat, Responses and
+  Messages routes, `zig/src/server/dsml_stream_test.zig`. The same fix as `0053` of the 4-Spark recipe
+  ([pull request #50](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/50)). By **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.

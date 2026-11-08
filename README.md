@@ -201,6 +201,8 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   an Engram prompt read that fails on one rank ends the pair instead of hanging it, a table shorter than the hasher's row range is
   refused at start, and the Engram readers and the AIO, `Model.open`, `Pool.init` and `Tables.open` failure paths release what they made.
   Hector Isaza also wrote `tools/claims/0046-server-get-delete-body-discard.sh`, with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit).
+  He also authored `zig/patches/0064-dsml-opener-short-payload.patch`, the parser guard first written as `0053` of the
+  4-Spark recipe ([pull request #50](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/50)).
 - **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0049-first-draft-depth.patch` (a stream's first drafts after its prompt take the head's depth), in [pull request #104](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/104).
 - **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0050-draft-calibration.patch` (`TF_DS_T25_DRAFT_CAL`, the per-stream draft calibration), in [pull request #105](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/105).
 - **Lukasz Raczylo** ([lukaszraczylo](https://github.com/lukaszraczylo)) authored `zig/patches/0051-prompt-rows.patch` (`TF_DS_PROMPT_WINDOW_ROWS` and `TF_DS_PROMPT_GEMM_ROWS`), in [pull request #106](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/106).

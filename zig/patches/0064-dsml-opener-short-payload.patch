@@ -1,0 +1,327 @@
+From e2283178c0db04d5a857d96920e31f54466a7a72 Mon Sep 17 00:00:00 2001
+From: Hector Isaza <76170012+hecisaza@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 12:27:53 +0000
+Subject: [PATCH] server: a tool-call block too short to hold the DSML block it
+ opens with is read as no DSML block, not a slice past the payload's start
+
+tool_parse.parseEnvelopes read any envelope payload that opens with a DSML opener as a whole DSML block, cutting the opener from its start and a closer's length from its end. A <tool_call> (or <|tool_call>, <x:tool_call>) payload can open with a DSML opener and be shorter than opener and closer together; the slice's end then falls before its start. dsmlBlock returns that slice only when the payload is long enough. A shorter one goes the way of any tool-call block that is not a call: no call; a whole reply with no call limit keeps it as text, a one-call reply drops it. Every payload long enough reads exactly as before.
+
+Tests: tool_parse_test.zig (the parse, both spellings, the boundaries, the call limits, both live streamers) and dsml_stream_test.zig (end to end: the chat route whole and streamed at four round sizes, with and without the one-call policy and reasoning first, then the next request on the same server; and over HTTP through the chat, Responses and Messages routes).
+---
+ zig/src/server/dsml_stream_test.zig | 176 ++++++++++++++++++++++++++++
+ zig/src/server/tool_parse.zig       |  16 ++-
+ zig/src/server/tool_parse_test.zig  |  72 ++++++++++++
+ 3 files changed, 260 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/server/dsml_stream_test.zig b/zig/src/server/dsml_stream_test.zig
+index 5af05cb..6c5715d 100644
+--- a/zig/src/server/dsml_stream_test.zig
++++ b/zig/src/server/dsml_stream_test.zig
+@@ -755,3 +755,179 @@ test "an XML call after a DSML block that the end token leaves open goes out onc
+         }
+     }
+ }
++
++/// One server for many requests, its replies scripted byte by byte (`ByteText`), each request through the chat route.
++const ByteServer = struct {
++    text: ByteText = .{},
++    backend: ScriptEngine = .{ .ids = &.{}, .pattern = &.{5}, .cut = false },
++    srv: *server.Server = undefined,
++
++    fn init(b: *ByteServer, thinking: bool) !void {
++        b.srv = try server.Server.init(std.testing.allocator, std.testing.io, b.backend.engine(), b.text.text(), .{
++            .served_name = "test-model",
++            .model_ids = &.{"test-model"},
++            .enable_thinking = thinking,
++            .use_drafts = false,
++        }, null);
++    }
++
++    fn deinit(b: *ByteServer) void {
++        b.srv.deinit();
++    }
++
++    const Got = struct { content: []const u8, reasoning: []const u8, calls: usize, finish: []const u8, done: bool, errors: usize };
++
++    /// `answer` through the chat route with the tools above: whole, or streamed in rounds of `pattern` bytes; `single` is
++    /// `parallel_tool_calls: false`. What a client gets: the content and reasoning joined, the calls, the finish reason.
++    fn chat(b: *ByteServer, a: Allocator, answer: []const u8, stream: bool, single: bool, pattern: []const usize) !Got {
++        const ids = try a.alloc(u32, answer.len);
++        for (answer, ids) |c, *id| id.* = c;
++        b.backend.ids = ids;
++        b.backend.pattern = pattern;
++        const body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":", if (stream) "true" else "false", if (single) ",\"parallel_tool_calls\":false" else "", ",\"max_tokens\":4096,\"tools\":" ++ tools_json ++ "}" });
++        var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++        var seen: Seen = .{ .a = a };
++        openai.run(b.srv, a, seen.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
++        var content: std.ArrayList(u8) = .empty;
++        var reasoning: std.ArrayList(u8) = .empty;
++        var got: Got = .{ .content = "", .reasoning = "", .calls = 0, .finish = "", .done = seen.done, .errors = 0 };
++        if (!stream) {
++            const whole = seen.whole orelse return error.NoReply;
++            if (whole.has("error")) got.errors += 1;
++            const c = whole.get("choices").?.array[0];
++            const m = c.get("message").?;
++            try content.appendSlice(a, m.strField("content") orelse "");
++            try reasoning.appendSlice(a, m.strField("reasoning_content") orelse "");
++            if (m.get("tool_calls")) |t| got.calls = t.array.len;
++            got.finish = c.strField("finish_reason") orelse "";
++        } else for (seen.events.items) |e| {
++            const v = (try json.parse(a, e)).ok;
++            if (v.has("error")) got.errors += 1;
++            const cs = v.get("choices") orelse continue;
++            if (cs.array.len == 0) continue;
++            const d = cs.array[0].get("delta") orelse continue;
++            try content.appendSlice(a, d.strField("content") orelse "");
++            try reasoning.appendSlice(a, d.strField("reasoning_content") orelse "");
++            if (d.get("tool_calls")) |t| got.calls += t.array.len;
++            if (cs.array[0].strField("finish_reason")) |f| got.finish = f;
++        }
++        got.content = content.items;
++        got.reasoning = reasoning.items;
++        return got;
++    }
++};
++
++// A tool-call block too short to hold the DSML block it opens with (patch 0064): before the length guard the final parse
++// sliced past the payload's start. Through the chat route, whole and streamed in rounds of 1, 5, 3-and-4 bytes and in
++// one round, with and without the one-call policy and with and without reasoning first: no call, no error, finish "stop",
++// a stream that ends with [DONE], and the content each kind of client got before (the stream filter hides an unclosed
++// DSML block from its opener on; when it showed nothing the route sends the whole content at the end, unless reasoning
++// went out first; a one-call reply drops the block). The same server then answers the next request.
++test "a reply holding a too-short DSML tool-call block: no call, no error, the content each client got before, and the server answers the next request" {
++    if (builtin.os.tag != .linux) return error.SkipZigTest;
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const short = [_][]const u8{
++        "<tool_call><" ++ D ++ " calls></tool_call>",
++        "<tool_call><" ++ D ++ "tool_calls></tool_call>",
++        "Sure: <tool_call> <" ++ D ++ " calls> x </tool_call>",
++        "<TOOL_CALL><" ++ D ++ " calls></TOOL_CALL>",
++        "<|tool_call><" ++ D ++ " calls><tool_call|>",
++        "<ns:tool_call><" ++ D ++ "tool_calls></ns:tool_call>",
++        "<tool_call><" ++ D ++ " calls></" ++ D ++ " calls</tool_call>", // one byte short
++        "<tool_call><" ++ D ++ "tool_calls></" ++ D ++ "tool_calls</tool_call>", // one byte short, V4
++        "P<tool_call><" ++ D ++ " calls></tool_call>",
++    };
++    // streamed with no limit, by case: no reasoning first, then reasoning first
++    const streamed = [2][9][]const u8{
++        .{ short[0], short[1], "Sure: ", "<TOOL_CALL>", short[4], "<ns:tool_call>", short[6], short[7], "P" },
++        .{ "", "", "Sure: ", "<TOOL_CALL>", "", "<ns:tool_call>", "", "", "P" },
++    };
++    const single_whole = [9][]const u8{ "", "", "Sure:", "", "", "", "", "", "P" };
++    const single_stream = [9][]const u8{ "", "", "Sure: ", "", "", "", "", "", "P" };
++    for ([_]bool{ false, true }, 0..) |thinking, ti| {
++        var bs: ByteServer = .{};
++        try bs.init(thinking);
++        defer bs.deinit();
++        for (short, 0..) |t, i| for ([_]bool{ false, true }) |single| for ([_]bool{ false, true }) |stream| {
++            const answer = if (thinking) try std.mem.concat(a, u8, &.{ "r</think>", t }) else t;
++            const want = if (single) (if (stream) single_stream[i] else single_whole[i]) else if (stream) streamed[ti][i] else t;
++            for ([_][]const usize{ &.{1}, &.{5}, &.{ 3, 4 }, &.{answer.len} }, 0..) |pattern, pi| {
++                if (!stream and pi > 0) continue;
++                const g = try bs.chat(a, answer, stream, single, pattern);
++                try std.testing.expectEqual(@as(usize, 0), g.calls);
++                try std.testing.expectEqual(@as(usize, 0), g.errors);
++                try std.testing.expectEqualStrings("stop", g.finish);
++                if (stream) try std.testing.expect(g.done);
++                try std.testing.expectEqualStrings(want, g.content);
++                try std.testing.expectEqualStrings(if (thinking) "r" else "", g.reasoning);
++            }
++        };
++        const next = try bs.chat(a, if (thinking) "r</think>OK" else "OK", false, false, &.{5});
++        try std.testing.expectEqualStrings("OK", next.content);
++        try std.testing.expectEqualStrings("stop", next.finish);
++    }
++}
++
++/// `body` POSTed to `path` through the server's route dispatch over a socket, as a client reads the bytes.
++fn wirePost(a: Allocator, srv: *server.Server, path: []const u8, body: []const u8) ![]const u8 {
++    const linux = std.os.linux;
++    var fds: [2]i32 = undefined;
++    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SocketPair;
++    var got: std.ArrayList(u8) = .empty;
++    defer got.deinit(std.heap.page_allocator);
++    const reader = try std.Thread.spawn(.{}, drain, .{ fds[1], &got });
++    var headers = [_]@import("http_conn.zig").Header{.{ .name = "Content-Length", .value = try std.fmt.allocPrint(a, "{d}", .{body.len}) }};
++    var conn: Conn = .{ .fd = fds[0], .peer = "", .buf = try a.dupe(u8, body), .end = body.len, .gpa = a, .headers = &headers, .path = path, .method = "POST", .version = "HTTP/1.1" };
++    @import("routes.zig").dispatch(srv, &conn, a);
++    _ = std.posix.system.close(fds[0]);
++    reader.join();
++    _ = std.posix.system.close(fds[1]);
++    return a.dupe(u8, got.items);
++}
++
++test "the same too-short block over HTTP through the chat, Responses and Messages routes: 200, no call, a normal end, and the next request answered" {
++    if (builtin.os.tag != .linux) return error.SkipZigTest;
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    var bs: ByteServer = .{};
++    try bs.init(false);
++    defer bs.deinit();
++    const schema = "{\"type\":\"object\",\"properties\":{\"content\":{\"type\":\"string\"}}}";
++    // end_whole: the field of the whole reply that says it ended normally, and its value
++    const Route = struct { path: []const u8, body: []const u8, end_whole: [2][]const u8, end_stream: []const u8, call: []const u8 };
++    for ([_][]const u8{ "<tool_call><" ++ D ++ " calls></tool_call>", "P<tool_call><" ++ D ++ "tool_calls></tool_call>", "OK" }) |answer| {
++        for ([_]bool{ false, true }) |stream| {
++            const st = if (stream) "true" else "false";
++            const routes = [_]Route{
++                .{ .path = "/v1/chat/completions", .body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":", st, ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), .end_whole = .{ "finish_reason", "stop" }, .end_stream = "data: [DONE]", .call = "\"tool_calls\"" },
++                .{ .path = "/v1/responses", .body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"input\":\"x\",\"max_output_tokens\":4096,\"stream\":", st, ",\"tools\":[{\"type\":\"function\",\"name\":\"write\",\"parameters\":", schema, "}]}" }), .end_whole = .{ "status", "completed" }, .end_stream = "response.completed", .call = "\"function_call\"" },
++                .{ .path = "/v1/messages", .body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":", st, ",\"tools\":[{\"name\":\"write\",\"input_schema\":", schema, "}]}" }), .end_whole = .{ "stop_reason", "end_turn" }, .end_stream = "message_stop", .call = "\"tool_use\"" },
++            };
++            for (routes) |r| {
++                const ids = try a.alloc(u32, answer.len);
++                for (answer, ids) |c, *id| id.* = c;
++                bs.backend.ids = ids;
++                bs.backend.pattern = &.{3};
++                const wire = try wirePost(a, bs.srv, r.path, r.body);
++                std.testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 200 ")) catch |e| {
++                    std.debug.print("{s} stream={}: {s}\n", .{ r.path, stream, wire[0..@min(wire.len, 300)] });
++                    return e;
++                };
++                try std.testing.expect(std.mem.indexOf(u8, wire, r.call) == null);
++                if (stream) {
++                    try std.testing.expect(std.mem.indexOf(u8, wire, r.end_stream) != null);
++                } else {
++                    const body = wire[(std.mem.indexOf(u8, wire, "\r\n\r\n") orelse return error.NoBody) + 4 ..];
++                    const v = (try json.parse(a, body)).ok;
++                    const holder = if (std.mem.eql(u8, r.end_whole[0], "finish_reason")) v.get("choices").?.array[0] else v;
++                    try std.testing.expectEqualStrings(r.end_whole[1], holder.strField(r.end_whole[0]) orelse "");
++                }
++            }
++        }
++    }
++}
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index bc7f04f..4025bbf 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -144,14 +144,13 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+     for (envs) |env| {
+         try residue.appendSlice(a, text[cursor..env.start]);
+         cursor = env.end;
+-        if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
+-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls);
++        if (dsmlBlock(env.payload, dsml41_open, dsml41_close)) |inner| {
++            try dsml41Calls(a, inner, &known, max_calls, &calls);
+             continue;
+         }
+         if (max_calls) |m| if (calls.items.len >= m) continue;
+         const parsed: ?[]Call = blk: {
+-            if (std.mem.startsWith(u8, env.payload, dsml_open)) {
+-                const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
++            if (dsmlBlock(env.payload, dsml_open, dsml_close)) |inner| {
+                 break :blk dsmlCalls(a, inner) catch |e| switch (e) {
+                     error.OutOfMemory => return error.OutOfMemory,
+                     error.Invalid => null,
+@@ -199,6 +198,15 @@ pub fn closeCall(a: Allocator, text: []const u8, tools: []const Value) Allocator
+     return std.mem.concat(a, u8, &.{ tail, "</tool_call>" });
+ }
+ 
++/// The inside of ``body`` (an envelope's payload) when it opens with a DSML opener, read as it always was: the opener cut
++/// from its start and a closer's length from its end. The payload of a ``<tool_call>`` block (or another tool-call
++/// envelope) can open with a DSML opener and be too short to hold a closer as well; cutting both from it would slice past
++/// its own start, so it reads as no DSML block. Every payload long enough reads as before.
++fn dsmlBlock(body: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
++    if (body.len < open.len + close.len or !std.mem.startsWith(u8, body, open)) return null;
++    return body[open.len .. body.len - close.len];
++}
++
+ /// What a call's arguments lack to close: XML's ``
+ fn argumentsClose(a: Allocator, body: []const u8) Allocator.Error![]const u8 {
+     if (std.ascii.startsWithIgnoreCase(body, "<function=")) return if (std.ascii.endsWithIgnoreCase(body, "</function>")) "" else "</function>";
+diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
+index 292c0d0..4c73cfb 100644
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -4,6 +4,8 @@ const json = @import("json.zig");
+ const tool_parse = @import("tool_parse.zig");
+ const parse = tool_parse.parse;
+ const closeCall = tool_parse.closeCall;
++const reply_text = @import("reply_text.zig");
++const tool_stream = @import("tool_stream.zig");
+ 
+ test "families" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+@@ -180,3 +182,73 @@ test "a DSML block is read from its own tags: <tool_call> text around it or in a
+     try std.testing.expectEqualStrings("Hi. ", tool_parse.beforeDsml("Hi. " ++ block ++ " more"));
+     try std.testing.expectEqualStrings("no block", tool_parse.beforeDsml("no block"));
+ }
++
++test "a tool-call block too short to hold the DSML block it opens with is no DSML block: no call, text in a whole reply, dropped in a one-call reply, no stream sends a call" {
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
++    const short = [_][]const u8{
++        "<tool_call><" ++ D ++ " calls></tool_call>",
++        "<tool_call><" ++ D ++ "tool_calls></tool_call>",
++        "Sure: <tool_call> <" ++ D ++ " calls> x </tool_call>",
++        "<TOOL_CALL><" ++ D ++ " calls></TOOL_CALL>",
++        "<|tool_call><" ++ D ++ " calls><tool_call|>",
++        "<ns:tool_call><" ++ D ++ "tool_calls></ns:tool_call>",
++        "<tool_call><" ++ D ++ " calls></" ++ D ++ " calls</tool_call>", // one byte short
++        "<tool_call><" ++ D ++ "tool_calls></" ++ D ++ "tool_calls</tool_call>", // one byte short, V4
++    };
++    // the stream filter's text at the end of each reply: it hides an unclosed DSML block from its opener on
++    const streamed_text = [_][]const u8{ "", "", "Sure:", "<TOOL_CALL>", "", "<ns:tool_call>", "", "" };
++    for (short, streamed_text) |text, shown| {
++        // with no limit the block stays the reply's text; a one-call reply drops it and keeps the prose before it
++        const r = try parse(a, text, tools, null);
++        try std.testing.expect(r.calls == null);
++        try std.testing.expectEqualStrings(text, r.content);
++        const one = try parse(a, text, tools, 1);
++        try std.testing.expect(one.calls == null);
++        try std.testing.expectEqualStrings(if (std.mem.startsWith(u8, text, "Sure:")) "Sure:" else "", one.content);
++        try std.testing.expectEqualStrings(shown, std.mem.trim(u8, try reply_text.hideToolCalls(a, text, true), " \t\r\n"));
++        // the live streamers, fed byte by byte, send no call: the <tool_call> one and the DSML one
++        var st = try tool_stream.Streamer.init(a, tools);
++        var out: std.ArrayList(json.Value) = .empty;
++        for (1..text.len + 1) |n| {
++            try st.feed(text[0..n], &out);
++            try st.feedDsml(text[0..n], &out);
++        }
++        try std.testing.expect(!st.streamed);
++        try std.testing.expectEqual(@as(usize, 0), out.items.len);
++    }
++    // after an offered call, either spelling, each limit: a V4 block is read after the limit is checked, a V4.1 block
++    // before it, so before the guard a V4.1 block crashed the parser at any limit and a V4 block only with no limit
++    const call = "<tool_call>{\"name\": \"write\", \"arguments\": {}}</tool_call>";
++    for ([_][]const u8{ "<tool_call><" ++ D ++ "tool_calls></tool_call>", "<tool_call><" ++ D ++ " calls></tool_call>" }) |block| {
++        const text = try std.mem.concat(a, u8, &.{ call, "\n", block });
++        const unlimited = try parse(a, text, tools, null);
++        try std.testing.expectEqual(@as(usize, 1), unlimited.calls.?.len);
++        try std.testing.expectEqualStrings(block, unlimited.content);
++        const none = try parse(a, text, tools, 0);
++        try std.testing.expect(none.calls == null);
++        try std.testing.expectEqualStrings("", none.content);
++        const one = try parse(a, text, tools, 1);
++        try std.testing.expectEqual(@as(usize, 1), one.calls.?.len);
++        try std.testing.expectEqualStrings("", one.content);
++    }
++    // long enough, a payload reads exactly as it always did, with or without a closer at its end: these are the parser's
++    // results before the guard, unchanged (content with no limit, then with a one-call limit; no call in any of them)
++    const long_enough = [_][3][]const u8{
++        .{ "<tool_call><" ++ D ++ " calls></" ++ D ++ " calls></tool_call>", "<tool_call></tool_call>", "<tool_call></tool_call>" },
++        .{ "<tool_call><" ++ D ++ "tool_calls></" ++ D ++ "tool_calls></tool_call>", "<tool_call><" ++ D ++ "tool_calls></" ++ D ++ "tool_calls></tool_call>", "" },
++        .{ "<tool_call><" ++ D ++ " calls>0123456789012345678901</tool_call>", "", "" },
++        .{ "<tool_call><" ++ D ++ "tool_calls>01234567890123456789012345</tool_call>", "<tool_call><" ++ D ++ "tool_calls>01234567890123456789012345</tool_call>", "" },
++    };
++    for (long_enough) |c| {
++        const r = try parse(a, c[0], tools, null);
++        try std.testing.expect(r.calls == null);
++        try std.testing.expectEqualStrings(c[1], r.content);
++        const one = try parse(a, c[0], tools, 1);
++        try std.testing.expect(one.calls == null);
++        try std.testing.expectEqualStrings(c[2], one.content);
++    }
++}
+-- 
+2.34.1
+
