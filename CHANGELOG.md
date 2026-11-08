@@ -457,3 +457,28 @@
   the same slice. Tests in `zig/src/server/tool_parse_test.zig` and, end to end through the chat, Responses and
   Messages routes, `zig/src/server/dsml_stream_test.zig`. The same fix as `0053` of the 4-Spark recipe
   ([pull request #50](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/50)). By **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
+- `zig/patches/0065-dsml-value-holds-closer.patch` (always on): DeepSeek-V4.1 writes DSML parameter values unescaped, so
+  a value can hold its block's own closer (a file about DSML). The parser ended the block at that closer, inside the value:
+  the call was lost and the tags after the value reached the reply's text. The parse now reads a reply two ways,
+  its blocks ended at their first closer and ended past any closer inside a parameter value, and takes the second
+  reading only when it gives more calls after the call limit, so the reading taken never has fewer calls; on a tie, and
+  for a block it cannot read, the first closer ends the block as before, and a reply whose blocks read the same both ways
+  parses exactly as before. `TENSORFOLD_TOOL_STREAM` (read at startup) picks how a stream with tools sends the calls.
+  `live`, the default, keeps `0048`'s live streaming (a call's header when its invoke name is whole, string values as
+  they decode): at a closer inside a value the stream sends the value up to that closer, waits until the text says where
+  the block ends and streams the rest of the value, and completes such a block's calls when the reply ends, only if the
+  whole reply's parse returns exactly those calls (otherwise they stay open). A stream that hits `max_tokens` ends as
+  `length` (Messages `max_tokens`, Responses `incomplete`) whatever calls it sent. A reply cut inside a call or a
+  misformatted block can still leave a partial call, as before this patch.
+  `hold` sends the prose up to the first tool-call opener and, when the reply ends, the rest of the content and the
+  calls the whole reply has (the 4-Spark recipe's streaming): no partial calls, at the cost of the call's first bytes
+  arriving at the reply's end. On a pair, The Grill's streamed fixed-tool step (a 41-token call): first tool bytes
+  587/592 ms live, 813 ms hold (main 599 ms); a 14,896-character Write's first bytes at 0.8 s live, 45.7 s hold. In
+  both modes the keep-alive ping counts the silence the client hears, and `/v1/responses` streams get it too; requests
+  without tools and non-streamed replies are the same in both. Tests in `zig/src/server/tool_parse_test.zig`,
+  `dsml_stream_test.zig` (the chat, Responses and Messages routes, every two-round split, replies cut by `max_tokens`,
+  an end token or a stop string), `dsml_fuzz_test.zig` (6,000 random replies whose values hold the closer stream the
+  parse's calls byte for byte) and `dsml_hold_test.zig` (`hold` against the hold-only build, event for event). The same
+  parse as `0052` of the 4-Spark recipe
+  ([pull request #49](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/49)); the
+  live streaming is `0048`, by **[nuk3s](https://github.com/nuk3s)**. By **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
