@@ -19,8 +19,10 @@
   `MIN_AVAIL_GIB` 80; the spill tier, KV sharding, EAQ v1.1, `GRAPH_CAP`, `RDMA_IDLE_S`, `RDMA_NAP_US`,
   `PREFILL_INTERLEAVE_MS`, `TF_DS_CONNECT_S`, `DROP_REASONING_HISTORY=1` and `HEAD_ENGRAM_DIR` are refused. At `TP=3`
   rank 0 serves LakyFx's qualified 1017 chat template (sha256 `7d135667`, downloaded from its model repository at a
-  pinned revision), which the runtime's model-file step requires; `TP=2` keeps `model/chat_template.jinja`. **Not yet
-  run on three Sparks** ([docs/tp3.md](docs/tp3.md)). At `TP=2` nothing changes: `scripts/test_tp3.py` compares
+  pinned revision), which the runtime's model-file step requires; `TP=2` keeps `model/chat_template.jinja`. Run once on
+  three Sparks: prepared, loaded in 128.5 s, smoke test and `tools/validate.py` pass but video (LakyFx's engine
+  refuses video parts), 60.7 tokens/s for one 1,000-token reply; the workers' copies were made over ssh, not NFS
+  ([docs/tp3.md](docs/tp3.md)). At `TP=2` nothing changes: `scripts/test_tp3.py` compares
   `start.sh` and `stop.sh` with the tree before (`9912367`), and tests the settings, the pairing, the rank commands
   and starts with fakes; `scripts/test_tp3_inputs.py` tests the Python tools. An `ABLIT=1` shard the overlay leaves as
   a symbolic link becomes the stock shard's file itself before the dtype step (at either `TP`).

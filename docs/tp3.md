@@ -1,8 +1,8 @@
 # Three Sparks (TP=3, experimental)
 
 `TP=3` serves the same checkpoint on **three** DGX Sparks cabled as a triangle (each Spark's two ConnectX-7 ports to
-the other two, three cables, no switch). It is opt-in and experimental: **it has not been run on three Sparks in this
-form yet** (below: what was checked, and what is left). `TP=2`, the default, is unchanged.
+the other two, three cables, no switch). It is opt-in and experimental: it has served on three Sparks once, for a
+short test (below: what was checked, and what is left). `TP=2`, the default, is unchanged.
 
 BertholomusAI's engine at `TF_REF` runs the dsv41 family over two or four ranks, not three. At `TP=3` the image is
 **LakyFx's TensorFold TP3 port** instead: [`LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark`](https://github.com/LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark)
@@ -151,9 +151,25 @@ Checked without the Sparks:
   ssh commands and docker calls), `scripts/test_tp3_inputs.py` (the plan, the manifest, the RoPE cut, `SOURCE.json`, the
   receipt check against LakyFx's own `source_verify.py`), and the existing suites.
 
-Not run yet on three Sparks: the image build, `scripts/prepare-tp3.sh` end to end (the receipt, the RoPE tables, the
-rank files, the Engram rows, the copies), the launch, the smoke test, `ABLIT=1` at `TP=3`, the memory left on each
-Spark, and any speed or quality measurement. Until then `TP=3` is a recipe for testing, not for serving.
+Run on three DGX Sparks (GB10, a switchless ConnectX-7 triangle, driver 580.173.02), at this commit's defaults with
+`ABLIT=0`:
+
+- `scripts/prepare.sh` at `TP=3`: the image build, the receipt (every shard re-hashed by `source_verify.py`), the plan,
+  the RoPE tables, the model folder, the three weight files (each re-read in full by `rank_verify.py`) and Engram rows.
+  The workers' copies were **not** made over NFS: that head exports nothing, so each worker's kit, model folder,
+  Engram rows and weight file were copied with `rsync` over ssh, and `prepare-tp3.sh` then checked every file on each
+  worker against the head's sha256 and took them as ready. The NFS copy itself is not tested.
+- `start.sh`: the triangle and its routes found, the three ranks loaded in 128.5 s (the API answered after 132 s), and
+  the smoke test through all three ranks. Memory left after the load: 29.5 GiB on rank 0, 37.9 and 37.1 GiB on the
+  workers (`POOL` 3300000, 8 streams).
+- `tools/validate.py`: text, thinking, a tool call and its result, an image, a long prompt (21,875 tokens, 11.9 s) and
+  eight concurrent greedy replies equal to the solo ones all pass. **Video fails**: LakyFx's engine refuses a video
+  part with a 400 ("this server accepts text parts only; image, audio and video inputs are unsupported"), while images
+  work.
+- Speed: one greedy 1,000-token reply (thinking on, drafts on) in 16.5 s, 60.7 tokens/s end to end.
+
+Not run yet: `ABLIT=1` at `TP=3`, the NFS copy of step 7, a benchmark beyond that one reply, and a long-running serve.
+`TP=3` is still experimental.
 
 ## Credits
 
