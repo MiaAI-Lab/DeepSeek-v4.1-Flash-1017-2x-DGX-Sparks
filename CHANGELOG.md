@@ -17,13 +17,13 @@
   `TF_RDMA_PEER_MASKS`, ...) and the four switchless NCCL settings three Sparks needed. Defaults at `TP=3`: LakyFx's
   qualified TF29 profile (`POOL` 3300000, `CONTEXT` 401408, `PARALLEL` 8, 16-row rounds, a 1 GiB prompt cache),
   `MIN_AVAIL_GIB` 80; the spill tier, KV sharding, EAQ v1.1, `GRAPH_CAP`, `RDMA_IDLE_S`, `RDMA_NAP_US`,
-  `PREFILL_INTERLEAVE_MS`, `TF_DS_CONNECT_S` and `HEAD_ENGRAM_DIR` are refused. At `TP=3` rank 0 serves LakyFx's
-  qualified 1017 chat template (sha256 `7d135667`, downloaded from its model repository at a pinned revision), which
-  the runtime's model-file step requires; `TP=2` keeps `model/chat_template.jinja`. **Not yet run on three Sparks**
-  ([docs/tp3.md](docs/tp3.md)). At `TP=2` nothing changes: `scripts/test_tp3.py` compares `start.sh` and `stop.sh`
-  with the tree before (`9912367`), and tests the settings, the pairing, the rank commands and starts with fakes;
-  `scripts/test_tp3_inputs.py` tests the Python tools. An `ABLIT=1` shard the overlay leaves as a symbolic link becomes
-  the stock shard's file itself before the dtype step (at either `TP`).
+  `PREFILL_INTERLEAVE_MS`, `TF_DS_CONNECT_S`, `DROP_REASONING_HISTORY=1` and `HEAD_ENGRAM_DIR` are refused. At `TP=3`
+  rank 0 serves LakyFx's qualified 1017 chat template (sha256 `7d135667`, downloaded from its model repository at a
+  pinned revision), which the runtime's model-file step requires; `TP=2` keeps `model/chat_template.jinja`. **Not yet
+  run on three Sparks** ([docs/tp3.md](docs/tp3.md)). At `TP=2` nothing changes: `scripts/test_tp3.py` compares
+  `start.sh` and `stop.sh` with the tree before (`9912367`), and tests the settings, the pairing, the rank commands
+  and starts with fakes; `scripts/test_tp3_inputs.py` tests the Python tools. An `ABLIT=1` shard the overlay leaves as
+  a symbolic link becomes the stock shard's file itself before the dtype step (at either `TP`).
 - The scripts take their workers as a list, so that three Sparks can follow: `scripts/nodes.sh`'s `worker_ids` (the
   GLM-5.3 3x and the 4x recipes' form; the one worker at `TP=2`). Every step that reached worker 1 now takes each
   worker in turn and names the one that fails: `start.sh`'s running-pair check, stops, NFS check, launch, load,

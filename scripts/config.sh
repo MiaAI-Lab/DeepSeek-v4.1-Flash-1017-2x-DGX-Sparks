@@ -356,11 +356,13 @@ tp3_rope_rows() { echo $(( (POOL + 49 + 4095) / 4096 * 4096 )); }
 
 # tp3_check: at TP=3, refuse what LakyFx's engine does not have (the two-Spark engine's zig/patches and scripts/port.sh:
 # spill v2, KV sharding, the EAQ v1.1 mixed-pack loader, the graph cap, the RDMA nap, the prefill interleave, the
-# connect window; rank 0's own Engram folder), and a pool its RoPE tables and engine cannot hold. Nothing at TP=2.
+# connect window, the reasoning-history drop; rank 0's own Engram folder), and a pool its RoPE tables and engine cannot
+# hold. Nothing at TP=2.
 tp3_check() {
   [[ "$TP" == 3 ]] || return 0
   local bad=(${TP3_REFUSED[@]+"${TP3_REFUSED[@]}"})
   [[ "$EAQ_V1_1" != 1 ]] || bad+=("EAQ_V1_1=1")
+  [[ "$DROP_REASONING_HISTORY" != 1 ]] || bad+=("DROP_REASONING_HISTORY=1")
   [[ "$KV_SHARD" == 0 ]] || bad+=("KV_SHARD=$KV_SHARD")
   ! port_spill_on || bad+=("SPILL_GIB=$SPILL_GIB")
   (( ${#bad[@]} == 0 )) || die "TP=3 runs LakyFx's TP3 engine, which has none of: ${bad[*]} (they are the two-Spark engine's: zig/patches, scripts/port.sh). Unset them for TP=3 (docs/tp3.md)"

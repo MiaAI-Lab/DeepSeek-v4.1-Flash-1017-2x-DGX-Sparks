@@ -87,7 +87,8 @@ class Settings(ts.ScriptTest):
                             ({"RDMA_NAP_US": "100"}, "RDMA_NAP_US=100"), ({"PREFILL_INTERLEAVE_MS": "0"}, "PREFILL_INTERLEAVE_MS=0"),
                             ({"TF_DS_CONNECT_S": "60"}, "TF_DS_CONNECT_S=60"), ({"HEAD_ENGRAM_DIR": "/x"}, "HEAD_ENGRAM_DIR=/x"),
                             ({"KV_SHARD": "1"}, "KV_SHARD=1"), ({"SPILL_GIB": "64"}, "SPILL_GIB=64"),
-                            ({"EAQ_V1_1": "1"}, "EAQ_V1_1=1")]:
+                            ({"EAQ_V1_1": "1"}, "EAQ_V1_1=1"),
+                            ({"DROP_REASONING_HISTORY": "1"}, "DROP_REASONING_HISTORY=1")]:
             with self.subTest(extra=extra):
                 code, out = self.bash("tp3_check; echo ok", {"TP": "3", "WORKER2": "w2", **extra})
                 self.assertEqual(code, 1, out)

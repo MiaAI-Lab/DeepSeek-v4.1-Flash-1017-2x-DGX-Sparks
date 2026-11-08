@@ -84,10 +84,11 @@ The serving settings (`THINKING`, `REASONING_EFFORT`, `THINKING_BUDGET`, `TEMPER
 `RDMA`, `MEMGUARD_*`, `HEAD_NFS_SERVER`) work as at `TP=2`. **Refused at `TP=3`**, before anything is stopped, because
 only the two-Spark engine has them (its `zig/patches` and `scripts/port.sh`): `SPILL_GIB` above 0, `KV_SHARD=1`,
 `EAQ_V1_1=1` (the mixed-pack loader), `GRAPH_CAP` (0033), `RDMA_IDLE_S` and `RDMA_NAP_US` (0010),
-`PREFILL_INTERLEAVE_MS` (0005), `TF_DS_CONNECT_S` (0037) and `HEAD_ENGRAM_DIR` (rank 0 reads its own Engram rows).
-The patches that change server behavior without a setting (the Anthropic API's leniencies, the stream keepalive
-pings, the `GET`/`DELETE` body discard of 0046, the cached-prompt metrics, the Engram failure paths of 0035) are not in
-LakyFx's engine either.
+`PREFILL_INTERLEAVE_MS` (0005), `TF_DS_CONNECT_S` (0037), `DROP_REASONING_HISTORY=1` (0057) and `HEAD_ENGRAM_DIR`
+(rank 0 reads its own Engram rows). The patches that change server behavior without a setting (the Anthropic API's
+leniencies, the stream keepalive pings, the `GET`/`DELETE` body discard of 0046, the cached-prompt metrics, the Engram
+failure paths of 0035, the replayed `reasoning` field of 0047, the streamed tool calls of 0048, `/v1/responses`'
+`include` of 0058) are not in LakyFx's engine either.
 
 ## What prepare.sh does at TP=3
 
