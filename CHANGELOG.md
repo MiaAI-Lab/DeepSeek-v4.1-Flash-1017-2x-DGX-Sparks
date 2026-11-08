@@ -466,9 +466,10 @@
   parses exactly as before. `TENSORFOLD_TOOL_STREAM` (read at startup) picks how a stream with tools sends the calls.
   `live`, the default, keeps `0048`'s live streaming (a call's header when its invoke name is whole, string values as
   they decode): at a closer inside a value the stream sends the value up to that closer, waits until the text says where
-  the block ends, then completes the call to the whole reply's bytes. A stream that hits `max_tokens` ends as `length`
-  (Messages `max_tokens`, Responses `incomplete`) whatever calls it sent, and a call the parse rejects is never
-  completed; a reply cut inside a call or a misformatted block can still leave a partial call, as before this patch.
+  the block ends and streams the rest of the value, and completes such a block's calls when the reply ends, only if the
+  whole reply's parse returns exactly those calls (otherwise they stay open). A stream that hits `max_tokens` ends as
+  `length` (Messages `max_tokens`, Responses `incomplete`) whatever calls it sent. A reply cut inside a call or a
+  misformatted block can still leave a partial call, as before this patch.
   `hold` sends the prose up to the first tool-call opener and, when the reply ends, the rest of the content and the
   calls the whole reply has (the 4-Spark recipe's streaming): no partial calls, at the cost of the call's first bytes
   arriving at the reply's end. On a pair, The Grill's streamed fixed-tool step (a 41-token call): first tool bytes

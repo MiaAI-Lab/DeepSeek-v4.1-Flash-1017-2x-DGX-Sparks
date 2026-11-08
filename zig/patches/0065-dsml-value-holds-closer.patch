@@ -1,6 +1,6 @@
-From fd902af96d9a19d395ed7b3968263de3be2f7f74 Mon Sep 17 00:00:00 2001
+From 3ed74004d8a8c5256d76680c3297e8fd4a1e032f Mon Sep 17 00:00:00 2001
 From: Hector Isaza <76170012+hecisaza@users.noreply.github.com>
-Date: Sun, 8 Nov 2026 17:47:41 +0000
+Date: Sun, 8 Nov 2026 21:14:03 +0000
 Subject: [PATCH] server: a DSML value that holds its block's closer keeps its
  call, streamed live or held
 
@@ -17,7 +17,11 @@ live; otherwise exactly live or hold, else the server refuses to start).
 
 live (the default) keeps 0048's live streaming: a call's header when its invoke name is whole, string values as they
 decode. The streamer now ends a block where reply_text.blockEnd ends it: at a closer inside a value it sends the pieces up
-to that closer, waits until the text says where the block ends, then completes the call to the whole reply's bytes. The
+to that closer, waits until the text says where the block ends, and streams the rest of the value; what completes such a
+block's calls (each call's closing brace, the block's later calls) waits for the reply's end and goes out only when the
+parse's first calls are, byte for byte, the calls that went out, so such a block never hands a client a completed call
+the parse does not return. Ordinary blocks complete as soon as they close. The stream filter and the round's opener searches go on from
+where the last round stopped. The
 search for the closer is incremental, as before. A stream that hits max_tokens ends as length (Messages max_tokens,
 Responses incomplete) whatever calls it sent, and a call whose arguments the parse rejects is left open, never completed.
 Where a stream still differs from the whole reply (a reply cut inside a call, a misformatted block, a repeated
@@ -38,13 +42,13 @@ well-formed replies whose values hold the block's closer stream the parse's call
 (hold: the streams of the hold-only build, event for event over 312 replies, endings, routes and round sizes, against
 testdata/hold_golden.txt; how to regenerate it is in the test); serve.zig (the setting's accepted values).
 ---
- zig/src/server/chat.zig                 |   60 +-
+ zig/src/server/chat.zig                 |  114 +-
  zig/src/server/cli.zig                  |    5 +-
- zig/src/server/dsml_fuzz_test.zig       |   32 +-
+ zig/src/server/dsml_fuzz_test.zig       |  140 +-
  zig/src/server/dsml_hold_test.zig       | 1577 ++++++++
- zig/src/server/dsml_stream_test.zig     | 1061 +++++-
- zig/src/server/openai.zig               |   85 +-
- zig/src/server/reply_text.zig           |  166 +-
+ zig/src/server/dsml_stream_test.zig     | 1209 ++++++-
+ zig/src/server/openai.zig               |  122 +-
+ zig/src/server/reply_text.zig           |  224 +-
  zig/src/server/responses.zig            |   15 +-
  zig/src/server/root.zig                 |    1 +
  zig/src/server/serve.zig                |   22 +
@@ -52,17 +56,17 @@ testdata/hold_golden.txt; how to regenerate it is in the test); serve.zig (the s
  zig/src/server/testdata/hold_golden.txt | 4341 +++++++++++++++++++++++
  zig/src/server/tool_parse.zig           |   47 +-
  zig/src/server/tool_parse_test.zig      |  133 +
- zig/src/server/tool_stream.zig          |  108 +-
+ zig/src/server/tool_stream.zig          |  161 +-
  zig/src/server/tool_streaming.zig       |   29 +
- 16 files changed, 7600 insertions(+), 85 deletions(-)
+ 16 files changed, 8024 insertions(+), 119 deletions(-)
  create mode 100644 zig/src/server/dsml_hold_test.zig
  create mode 100644 zig/src/server/testdata/hold_golden.txt
 
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 7dacd78..94bda35 100644
+index 7dacd78..a1ab375 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
-@@ -37,15 +37,17 @@ pub const Input = struct {
+@@ -37,15 +37,18 @@ pub const Input = struct {
      images: []const []const u8 = &.{},
  };
  
@@ -74,6 +78,7 @@ index 7dacd78..94bda35 100644
 -    call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
 +    call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!bool,
      ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
++    calls_live: bool = true, // the route sends DSML call deltas as they come (the one-call policy drops them)
  };
  
 -/// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill).
@@ -84,17 +89,31 @@ index 7dacd78..94bda35 100644
  
  pub const Reply = struct {
      content: []const u8,
-@@ -54,6 +56,9 @@ pub const Reply = struct {
+@@ -54,6 +57,14 @@ pub const Reply = struct {
      tool_calls_streamed: bool,
      /// The DSML calls a stream sent as they decoded, for the finish to check against the parse.
      streamed_calls: []const tool_stream.SentCall = &.{},
 +    /// A stream with tools held its answer from the first call's opener on (TENSORFOLD_TOOL_STREAM=hold): the route sends
 +    /// the rest of the answer and its calls as the reply's parse settles them, the content and calls a whole reply gets.
++    /// Live, the answer from the end of a block read past a closer inside a value (``withheld``) waits the same way.
 +    answer_deferred: bool = false,
++    /// Live, a block read past a closer inside a value: what completes its calls, sent only if the parse takes them, and
++    /// the calls the client has if it never goes out.
++    withheld: []const Value = &.{},
++    wire_calls: []const tool_stream.SentCall = &.{},
      finish_reason: []const u8,
      prompt_tokens: usize,
      cached_tokens: usize,
-@@ -346,6 +351,7 @@ const Generation = struct {
+@@ -343,9 +354,16 @@ const Generation = struct {
+     token_ids: bool = false, // the request asked for its ids back (Input.token_ids)
+     visible: reply_text.Incremental = .{},
+     hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
++    hide: reply_text.Hide = .{}, // what the stream filter read of the answer in the rounds before
++    answer_at: ?[*]const u8 = null, // the answer's buffer last round: the searches below go on only in the same one
++    answer_len: usize = 0,
++    channel_from: usize = 0, // where the search for a Harmony marker in the answer goes on
++    dsml_from: usize = 0, // where the search for the answer's first DSML opener goes on
++    dsml_at: ?usize = null, // the answer's first DSML opener, once found
      streamed: Shown = .{}, // what content streamed, kept apart from the decode buffer that grows under slices
      streamed_reasoning: Shown = .{},
      streaming_done: bool = false,
@@ -102,18 +121,75 @@ index 7dacd78..94bda35 100644
      first_ns: ?i96 = null,
      last_ns: ?i96 = null,
      reason: ?[]const u8 = null, // the server ended the reply (a stop string, the length) before the engine said so
-@@ -415,6 +421,10 @@ const Generation = struct {
+@@ -415,7 +433,18 @@ const Generation = struct {
              }
              answer = split.answer;
          }
-+        if (g.calls != null and g.srv.config.tool_stream == .hold and (g.held or reply_text.firstCall(answer) != null)) {
+-        const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
++        if (g.calls != null and (g.held or (g.srv.config.tool_stream == .hold and reply_text.firstCall(answer) != null))) {
 +            g.held = true;
 +            return;
 +        }
-         const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
++        if (answer.ptr != g.answer_at or answer.len < g.answer_len) {
++            g.channel_from = 0;
++            g.dsml_from = 0;
++            g.dsml_at = null;
++        }
++        g.answer_at = answer.ptr;
++        g.answer_len = answer.len;
++        const shown = if (g.calls != null) try reply_text.hideIntoResume(g.a, &g.hidden, answer, &g.hide) else answer;
          const visible_content = reply_text.streamingVisible(shown);
          // Hold leading whitespace while a tool-only reply is still possible; later prose sends it intact.
-@@ -447,10 +457,26 @@ const Generation = struct {
+         const vis = if (g.calls != null and g.streamed.text.items.len == 0 and
+@@ -424,13 +453,17 @@ const Generation = struct {
+         if (g.calls) |*c| {
+             // thinking off, the finish reads Harmony channels out of a text that holds their marker, so its parse no
+             // longer reads this answer: the DSML streamer stops, and the finish follows the parse
+-            if (!g.thinking and std.mem.indexOf(u8, answer, "<|channel|>") != null) c.dsml.off = true;
++            if (!g.thinking) {
++                if (std.mem.indexOfPos(u8, answer, g.channel_from, "<|channel|>") != null) c.dsml.off = true;
++                g.channel_from = @max(g.channel_from, answer.len -| ("<|channel|>".len - 1));
++            }
+             // a block under way ends before this round's prose, which can only come after it: a text delta between a
+             // call's header and its last piece ends that call for a client (LiteLLM's Messages stream, /v1/responses)
+             if (c.dsml.midCall()) {
+                 var early: std.ArrayList(Value) = .empty;
+                 try c.feedDsmlBlock(answer, &early);
+                 for (early.items) |d| try g.emit(sink, d);
++                if (g.deferCalls(sink)) return;
+             }
+         }
+         const delta = g.streamed.after(vis, !copied);
+@@ -440,17 +473,54 @@ const Generation = struct {
+         }
+         if (g.calls) |*c| {
+             var out: std.ArrayList(Value) = .empty;
+-            try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
++            try c.feed(g.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
+             try c.feedDsml(answer, &out); // DeepSeek-V4.1's DSML calls as they decode, never the reasoning
+             for (out.items) |d| try g.emit(sink, d);
++            _ = g.deferCalls(sink);
++        }
++    }
++
++    /// The streamer withheld a block's completion (``Dsml.deferred``): the rest of the answer waits for the reply's end, so
++    /// no prose goes out between a call's pieces and what completes it. The one-call policy sends no call deltas.
++    fn deferCalls(g: *Generation, sink: Sink) bool {
++        const c = &(g.calls orelse return false);
++        if (!c.dsml.deferred or !sink.calls_live) return false;
++        g.held = true;
++        return true;
++    }
++
++    /// ``tool_parse.beforeDsml`` of an answer that grows in place round by round: an opener found stays the first one.
++    fn beforeDsml(g: *Generation, answer: []const u8) []const u8 {
++        if (g.dsml_at == null) {
++            const v41 = std.mem.indexOfPos(u8, answer, g.dsml_from, tool_parse.dsml41_open);
++            const v4 = std.mem.indexOfPos(u8, answer, g.dsml_from, tool_parse.dsml_open);
++            g.dsml_at = if (v41 != null and v4 != null) @min(v41.?, v4.?) else v41 orelse v4;
++            if (g.dsml_at == null) g.dsml_from = answer.len -| (@max(tool_parse.dsml41_open.len, tool_parse.dsml_open.len) - 1);
+         }
++        return answer[0 .. g.dsml_at orelse answer.len];
      }
  
      fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
@@ -141,7 +217,7 @@ index 7dacd78..94bda35 100644
      }
  
      /// Ends the request and waits for the engine; one it ended unfinished counts as a disconnect, as the Mac scheduler counts it.
-@@ -496,20 +522,11 @@ const Generation = struct {
+@@ -496,20 +566,11 @@ const Generation = struct {
                  return error.Cancelled;
              }
              const tokens = chunk orelse {
@@ -164,7 +240,7 @@ index 7dacd78..94bda35 100644
          }
      }
  
-@@ -542,10 +559,14 @@ const Generation = struct {
+@@ -542,10 +603,14 @@ const Generation = struct {
              content = h.content;
              reasoning = h.reasoning;
          }
@@ -180,9 +256,11 @@ index 7dacd78..94bda35 100644
              var shown = if (g.calls != null) try reply_text.hideToolCalls(a, content, true) else content;
              // Drop held whitespace only after a real call parsed; whitespace-only answers are still sent.
              if (g.calls != null and g.streamed.text.items.len == 0 and reply_text.pyStrip(shown).len == 0) {
-@@ -564,7 +585,9 @@ const Generation = struct {
+@@ -563,8 +628,11 @@ const Generation = struct {
+                     for (early.items) |d| try g.emit(sink, d);
                  }
              };
++            if (g.deferCalls(sink)) break :emit;
              if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
 -            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0) {
 +            // thinking off, the parse reads the final Harmony channel: a call only the text outside it holds is none
@@ -191,11 +269,21 @@ index 7dacd78..94bda35 100644
                  // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas (after
                  // DSML calls went out, the finish's check sends such a call under the next index instead)
                  var out: std.ArrayList(Value) = .empty;
-@@ -627,6 +650,7 @@ const Generation = struct {
+@@ -578,6 +646,7 @@ const Generation = struct {
+                 try c.feedDsml(content, &out);
+                 for (out.items) |d| try g.emit(sink, d);
+             };
++            _ = g.deferCalls(sink);
+         }
+         const prefilled = m.prefilled_ns;
+         const total = seconds(finished_ns - submitted);
+@@ -627,6 +696,9 @@ const Generation = struct {
              .reasoning = reasoning,
              .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
              .streamed_calls = if (g.calls) |*c| c.dsml.streamed() else &.{},
 +            .answer_deferred = g.held,
++            .withheld = if (g.calls) |*c| c.dsml.withheld.items else &.{},
++            .wire_calls = if (g.calls) |*c| try c.dsml.wire(a) else &.{},
              .finish_reason = reason,
              .prompt_tokens = prompt_len,
              .cached_tokens = m.cached orelse 0,
@@ -223,21 +311,36 @@ index 129607f..c9688a9 100644
  }
  
 diff --git a/zig/src/server/dsml_fuzz_test.zig b/zig/src/server/dsml_fuzz_test.zig
-index cfc7b43..19a5431 100644
+index cfc7b43..fa5302c 100644
 --- a/zig/src/server/dsml_fuzz_test.zig
 +++ b/zig/src/server/dsml_fuzz_test.zig
-@@ -2,7 +2,9 @@
- //! tool_parse.parse of the same text. Well-formed replies stream the parse's calls byte for byte. In every reply (odd
- //! markup, closers inside values, replies cut anywhere) each call the stream completed (its brace went out, its pieces
- //! did not stop) is one of the parse's calls, in order: no whole call goes out for a block the parse rejects. A repeated
+@@ -1,8 +1,11 @@
+ //! Random DeepSeek-V4.1 replies fed to tool_stream's DSML streamer at random split points, against
+-//! tool_parse.parse of the same text. Well-formed replies stream the parse's calls byte for byte. In every reply (odd
+-//! markup, closers inside values, replies cut anywhere) each call the stream completed (its brace went out, its pieces
+-//! did not stop) is one of the parse's calls, in order: no whole call goes out for a block the parse rejects. A repeated
 -//! parameter goes out twice, so there the check reads the arguments as JSON with the last value kept.
++//! tool_parse.parse of the same text, the reply's end settled as the route settles it. Well-formed replies stream the
++//! parse's calls byte for byte. In every reply (odd markup, closers inside values, replies cut anywhere) each call a
++//! client can read whole (its arguments JSON) is one of the parse's calls, in order: no whole call goes out that the
++//! parse does not return. A repeated
 +//! parameter goes out twice, so there the check reads the arguments as JSON with the last value kept. Well-formed replies
 +//! whose values hold the block's own closer (a file about DSML) and no other DSML tag stream the parse's calls byte for
 +//! byte as well: the stream reads past such a closer as the parse's longer reading does.
  const std = @import("std");
  const json = @import("json.zig");
  const tool_parse = @import("tool_parse.zig");
-@@ -23,14 +25,19 @@ const names = [_][]const u8{ "Bash", " bash ", "Write", "Unknown", "", "  ", "WR
+@@ -17,20 +20,29 @@ const tools_text =
+ ;
+ 
+ const bits = [_][]const u8{ "ls -la", "a\"b", "back\\slash", "\n", "\r\n", "\t", "\x01", "\x7f", "\u{6d77}", "\u{1f30a}", "\u{1f469}\u{200d}\u{1f4bb}", "</" ++ D ++ " par", "</" ++ D ++ " parameter", "</" ++ D, "</", "<", "\"", "}", "{", "\\u0041", " ", "string=\"true\"", "<" ++ D ++ " parameter name=\"x\" string=\"true\">", "<" ++ D ++ " invoke name=\"Bash\">", "<" ++ D ++ " calls>", "</" ++ D ++ " invo", "</" ++ D ++ " cal", "\u{ff5c}", "<|channel|", "<tool_call" };
++const tie_calls = [_][]const u8{
++    "</" ++ D ++ " calls>\n<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}</tool_call>\n",
++    "</" ++ D ++ " calls> <tool_call>{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/a\"}}</tool_call>",
++};
+ const closers = [_][]const u8{ "</" ++ D ++ " invoke>", "</" ++ D ++ " calls>", "</" ++ D ++ " parameter>" };
+ const json_values = [_][]const u8{ "5", " 120000 ", "{\"a\":[1,2]}", "true", "null", "NaN", "1e5", "-0", "1.0", "\"str\"", "not json", "", "[1, 2 ,3]", "{\"k\": \"v\\n\"}", "\"\\u00e9\"", "12345678901234567890" };
+ const names = [_][]const u8{ "Bash", " bash ", "Write", "Unknown", "", "  ", "WRITE" };
  const params = [_][]const u8{ "command", "timeout", "content", "file_path", "x", "\u{6d77}", "a\\b" };
  const flags = [_][]const u8{ " string=\"true\"", " string=\"false\"", "", " string=\"maybe\"", " string=\"true\" x" };
  
@@ -245,10 +348,10 @@ index cfc7b43..19a5431 100644
 +/// ``plain``: of the DSML tags, values hold only the block's own closer (no opener, invoke or parameter tag, no other call
 +/// form's), as a file about DSML does; the parse's longer reading then wins outright.
 +pub const Mode = struct { closers: bool = false, malformed: bool = false, cut: bool = false, plain: bool = false };
++
++const plain_bits = [_][]const u8{ "ls -la", "a\"b", "back\\slash", "\n", "\r\n", "\t", "\x01", "\x7f", "\u{6d77}", "\u{1f30a}", "\u{1f469}\u{200d}\u{1f4bb}", "</" ++ D ++ " par", "</" ++ D ++ " parameter", "</" ++ D, "</", "<", "\"", "}", "{", "\\u0041", " ", "string=\"true\"", "</" ++ D ++ " invo", "</" ++ D ++ " cal", "\u{ff5c}", "calls>", " calls" };
  
 -const Gen = struct {
-+const plain_bits = [_][]const u8{ "ls -la", "a\"b", "back\\slash", "\n", "\r\n", "\t", "\x01", "\x7f", "\u{6d77}", "\u{1f30a}", "\u{1f469}\u{200d}\u{1f4bb}", "</" ++ D ++ " par", "</" ++ D ++ " parameter", "</" ++ D, "</", "<", "\"", "}", "{", "\\u0041", " ", "string=\"true\"", "</" ++ D ++ " invo", "</" ++ D ++ " cal", "\u{ff5c}", "calls>", " calls" };
-+
 +pub const Gen = struct {
      r: std.Random,
      a: Allocator,
@@ -259,7 +362,7 @@ index cfc7b43..19a5431 100644
      used: [params.len]bool = @splat(false),
  
      fn add(g: *Gen, s: []const u8) !void {
-@@ -55,7 +62,12 @@ const Gen = struct {
+@@ -55,7 +67,15 @@ const Gen = struct {
          if (std.mem.eql(u8, flag, " string=\"false\"")) {
              try g.add(g.pick([]const u8, &json_values, json_values.len));
          } else for (0..g.r.uintLessThan(usize, 6)) |_| {
@@ -269,11 +372,14 @@ index cfc7b43..19a5431 100644
 +                    try g.add("</" ++ D ++ " calls>");
 +                    g.closer_in_value = true;
 +                } else try g.add(g.pick([]const u8, &plain_bits, plain_bits.len));
++            } else if (g.m.closers and g.chance(0.02)) {
++                // the block's closer and then a whole call in another form: a reading cut there ties the longer one
++                try g.add(g.pick([]const u8, &tie_calls, tie_calls.len));
 +            } else try g.add(if (g.m.closers and g.chance(0.04)) g.pick([]const u8, &closers, closers.len) else g.pick([]const u8, &bits, bits.len));
          }
          if (!(g.m.malformed and g.chance(0.08))) try g.add("</" ++ D ++ " parameter>");
          if (g.chance(0.8)) try g.add("\n");
-@@ -74,7 +86,7 @@ const Gen = struct {
+@@ -74,7 +94,7 @@ const Gen = struct {
          for (0..1 + g.r.uintLessThan(usize, 3)) |_| try g.invoke();
          if (!(g.m.malformed and g.chance(0.1))) try g.add("</" ++ D ++ " calls>");
      }
@@ -282,7 +388,66 @@ index cfc7b43..19a5431 100644
          if (g.chance(0.5)) try g.add("Running it.");
          if (g.m.malformed and g.chance(0.05)) try g.add("Use `<" ++ D ++ " calls>` like:");
          try g.block();
-@@ -130,7 +142,7 @@ fn arguments(v: Value) []const u8 {
+@@ -93,10 +113,14 @@ const Gen = struct {
+     }
+ };
+ 
+-/// The text fed as it grows by 1 to 12 bytes (kept to whole characters), then whole; the deltas' shape checked: each
+-/// header once and in order, pieces for the newest call (a held call's brace for the one before it), valid UTF-8,
+-/// joined to the streamer's record.
+-fn feed(a: Allocator, tools: []const Value, text: []const u8, r: std.Random) !tool_stream.Streamer {
++/// What a client got of the calls: each call's name and its arguments joined from the deltas.
++const Wire = struct { names: []const []const u8, args: []const []const u8 };
++
++/// The text fed as it grows by 1 to 12 bytes (kept to whole characters), then whole, then settled as the route settles
++/// a reply's end (what a block read past a closer inside a value withheld goes out only when the parse takes the calls
++/// that went out); the deltas' shape checked: each header once and in order, pieces for the newest call (a held call's
++/// brace for the one before it), valid UTF-8, joined to the streamer's record of what the client has.
++fn feed(a: Allocator, tools: []const Value, text: []const u8, parsed: []const Value, r: std.Random) !Wire {
+     var s = try tool_stream.Streamer.init(a, tools);
+     var out: std.ArrayList(Value) = .empty;
+     var end: usize = 0;
+@@ -106,22 +130,35 @@ fn feed(a: Allocator, tools: []const Value, text: []const u8, r: std.Random) !to
+         try s.feedDsml(text[0..end], &out);
+     }
+     try s.feedDsml(text, &out);
++    const takes = tool_stream.parseTakes(s.dsml.streamed(), parsed);
++    if (s.dsml.deferred and takes) try out.appendSlice(a, s.dsml.withheld.items);
++    var called: std.ArrayList([]const u8) = .empty;
+     var joined: std.ArrayList(std.ArrayList(u8)) = .empty;
+     for (out.items) |d| for (d.get("tool_calls").?.array) |one| {
+         const index: usize = @intCast(one.get("index").?.int64().?);
+-        const piece = one.get("function").?.strField("arguments").?;
++        const function = one.get("function").?;
++        const piece = function.strField("arguments").?;
+         try std.testing.expect(std.unicode.utf8ValidateSlice(piece));
+         if (one.get("id") != null) {
+             try std.testing.expectEqual(joined.items.len, index);
++            try called.append(a, function.strField("name").?);
+             try joined.append(a, .empty);
+             continue;
+         }
+         try std.testing.expect(index + 1 == joined.items.len or index + 2 == joined.items.len);
+         try joined.items[index].appendSlice(a, piece);
+     };
+-    try std.testing.expectEqual(s.dsml.streamed().len, joined.items.len);
+-    for (s.dsml.streamed(), joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
+-    return s;
++    const client = if (takes) s.dsml.streamed() else try s.dsml.wire(a);
++    try std.testing.expectEqual(client.len, joined.items.len);
++    for (client, joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
++    var args: std.ArrayList([]const u8) = .empty;
++    for (joined.items) |j| try args.append(a, j.items);
++    // the route's settle: when the parse takes what went out, its later calls follow whole
++    if (takes) for (parsed[client.len..]) |p| {
++        try called.append(a, p.get("function").?.strField("name").?);
++        try args.append(a, arguments(p));
++    };
++    return .{ .names = called.items, .args = args.items };
+ }
+ 
+ fn arguments(v: Value) []const u8 {
+@@ -130,7 +167,7 @@ fn arguments(v: Value) []const u8 {
  
  /// The same arguments for a client: the same bytes, or the same JSON with a repeated key's last value kept (both
  /// holding NaN, which the parse writes bare and a JSON reader refuses, counts as the same).
@@ -291,17 +456,56 @@ index cfc7b43..19a5431 100644
      if (std.mem.eql(u8, parsed, sent)) return true;
      if (std.mem.indexOf(u8, parsed, "NaN") != null and std.mem.indexOf(u8, sent, "NaN") != null) return true;
      const x = try json.parseText(a, parsed);
-@@ -151,7 +163,8 @@ fn run(seed: u64, count: usize, m: Mode) !void {
-         const s = try feed(a, tools, text, r);
+@@ -148,36 +185,81 @@ fn run(seed: u64, count: usize, m: Mode) !void {
+         const tools = (try json.parse(a, tools_text)).ok.array;
+         var g: Gen = .{ .r = r, .a = a, .m = m };
+         const text = try g.reply();
+-        const s = try feed(a, tools, text, r);
          const parsed = (try tool_parse.parse(a, text, tools, null)).calls orelse &.{};
-         const sent = s.dsml.streamed();
+-        const sent = s.dsml.streamed();
 -        if (!m.closers and !m.malformed and !m.cut and !g.repeated) {
+-            try std.testing.expectEqual(parsed.len, sent.len);
+-            for (parsed, sent) |p, *c| try std.testing.expect(c.same(p));
+-            continue;
+-        }
+-        // every whole call the client got is the parse's, in order
++        const got = try feed(a, tools, text, parsed, r);
++        // every call the client can read whole (its arguments JSON) is the parse's, in order
+         var at: usize = 0;
+-        for (sent) |c| {
+-            if (c.held or !c.closed) continue;
++        for (got.names, got.args) |n, args| {
++            if (!try readable(a, args)) continue;
+             while (at < parsed.len) : (at += 1) {
+                 const p = parsed[at];
+-                if (std.mem.eql(u8, p.get("function").?.strField("name").?, c.name) and try sameArguments(a, arguments(p), c.arguments.items)) break;
++                if (std.mem.eql(u8, p.get("function").?.strField("name").?, n) and try sameArguments(a, arguments(p), args)) break;
+             } else {
+-                std.debug.print("a whole streamed call the parse does not return: {s} {s} in {f}\n", .{ c.name, c.arguments.items, std.zig.fmtString(text) });
++                std.debug.print("a whole streamed call the parse does not return: {s} {s} in {f}\n", .{ n, args, std.zig.fmtString(text) });
+                 return error.WholeCallNotParsed;
+             }
+             at += 1;
+         }
 +        if ((!m.closers or m.plain) and !m.malformed and !m.cut and !g.repeated) {
 +            errdefer std.debug.print("the stream is not the parse: {f}\n", .{std.zig.fmtString(text)});
-             try std.testing.expectEqual(parsed.len, sent.len);
-             for (parsed, sent) |p, *c| try std.testing.expect(c.same(p));
-             continue;
-@@ -176,6 +189,11 @@ test "random well-formed DSML replies stream the parse's calls byte for byte at
++            try std.testing.expectEqual(parsed.len, got.names.len);
++            for (parsed, got.names, got.args) |p, n, args| {
++                try std.testing.expectEqualStrings(p.get("function").?.strField("name").?, n);
++                try std.testing.expectEqualStrings(arguments(p), args);
++            }
++        }
+     }
+ }
+ 
++/// A client can read ``args`` as a whole call's arguments: JSON, or JSON but for a bare NaN (which the parse writes).
++fn readable(a: Allocator, args: []const u8) Allocator.Error!bool {
++    if (try json.parseText(a, args) == .ok) return true;
++    if (std.mem.indexOf(u8, args, "NaN") == null) return false;
++    return try json.parseText(a, try std.mem.replaceOwned(u8, a, args, "NaN", "0")) == .ok;
++}
++
+ test "random well-formed DSML replies stream the parse's calls byte for byte at random splits" {
      try run(1, 4000, .{});
  }
  
@@ -313,6 +517,39 @@ index cfc7b43..19a5431 100644
  test "random replies with odd markup, closers inside values, or a cut anywhere send no whole call the parse does not return" {
      try run(2, 3000, .{ .malformed = true });
      try run(3, 3000, .{ .closers = true });
+     try run(4, 4000, .{ .closers = true, .malformed = true, .cut = true });
+ }
++
++const reply_text = @import("reply_text.zig");
++
++test "the stream filter, going on from the round before, hides what it hides reading each round's text whole" {
++    var prng = std.Random.DefaultPrng.init(7);
++    const r = prng.random();
++    const modes = [_]Mode{ .{}, .{ .closers = true, .plain = true }, .{ .malformed = true }, .{ .closers = true }, .{ .closers = true, .malformed = true, .cut = true } };
++    const others = [_][]const u8{ "", "<tool_call>{\"name\":\"Bash\"}</tool_call>", "<|tool_call>call:Bash{}<tool_call|>", "<" ++ D ++ "tool_calls>\n</" ++ D ++ "tool_calls>", "<tool_call>open", "prose " };
++    for (0..2000) |i| {
++        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++        defer arena.deinit();
++        const a = arena.allocator();
++        var g: Gen = .{ .r = r, .a = a, .m = modes[i % modes.len] };
++        const body = try g.reply();
++        const text = try std.mem.concat(a, u8, &.{ others[r.uintLessThan(usize, others.len)], body, others[r.uintLessThan(usize, others.len)] });
++        var h: reply_text.Hide = .{};
++        var whole: std.ArrayList(u8) = .empty;
++        var resumed: std.ArrayList(u8) = .empty;
++        var end: usize = 0;
++        while (end < text.len) {
++            end = @min(text.len, end + 1 + r.uintLessThan(usize, 12));
++            while (end < text.len and text[end] & 0xc0 == 0x80) end += 1;
++            const want = try reply_text.hideInto(a, &whole, text[0..end], false);
++            const got = try reply_text.hideIntoResume(a, &resumed, text[0..end], &h);
++            std.testing.expectEqualStrings(want, got) catch |e| {
++                std.debug.print("at {d} of {f}\n", .{ end, std.zig.fmtString(text) });
++                return e;
++            };
++        }
++    }
++}
 diff --git a/zig/src/server/dsml_hold_test.zig b/zig/src/server/dsml_hold_test.zig
 new file mode 100644
 index 0000000..e3e8fd9
@@ -1897,7 +2134,7 @@ index 0000000..e3e8fd9
 +    }
 +}
 diff --git a/zig/src/server/dsml_stream_test.zig b/zig/src/server/dsml_stream_test.zig
-index 6c5715d..9627aef 100644
+index 6c5715d..f4ca00d 100644
 --- a/zig/src/server/dsml_stream_test.zig
 +++ b/zig/src/server/dsml_stream_test.zig
 @@ -2,7 +2,9 @@
@@ -1999,15 +2236,16 @@ index 6c5715d..9627aef 100644
      try std.testing.expectEqualStrings(w2.content, @import("reply_text.zig").pyStrip(r2.content.items));
      try std.testing.expectEqual(@as(usize, 2), r2.calls.items.len);
      try std.testing.expectEqualStrings(w2.calls[0].get("function").?.strField("arguments").?, r2.calls.items[0].arguments.items);
-@@ -761,6 +801,7 @@ const ByteServer = struct {
+@@ -761,6 +801,8 @@ const ByteServer = struct {
      text: ByteText = .{},
      backend: ScriptEngine = .{ .ids = &.{}, .pattern = &.{5}, .cut = false },
      srv: *server.Server = undefined,
 +    mode: tool_streaming.Mode = .live,
++    max_tokens: usize = 4096,
  
      fn init(b: *ByteServer, thinking: bool) !void {
          b.srv = try server.Server.init(std.testing.allocator, std.testing.io, b.backend.engine(), b.text.text(), .{
-@@ -768,6 +809,7 @@ const ByteServer = struct {
+@@ -768,6 +810,7 @@ const ByteServer = struct {
              .model_ids = &.{"test-model"},
              .enable_thinking = thinking,
              .use_drafts = false,
@@ -2015,7 +2253,7 @@ index 6c5715d..9627aef 100644
          }, null);
      }
  
-@@ -775,10 +817,22 @@ const ByteServer = struct {
+@@ -775,22 +818,36 @@ const ByteServer = struct {
          b.srv.deinit();
      }
  
@@ -2040,7 +2278,13 @@ index 6c5715d..9627aef 100644
      fn chat(b: *ByteServer, a: Allocator, answer: []const u8, stream: bool, single: bool, pattern: []const usize) !Got {
          const ids = try a.alloc(u32, answer.len);
          for (answer, ids) |c, *id| id.* = c;
-@@ -791,6 +845,8 @@ const ByteServer = struct {
+         b.backend.ids = ids;
+         b.backend.pattern = pattern;
+-        const body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":", if (stream) "true" else "false", if (single) ",\"parallel_tool_calls\":false" else "", ",\"max_tokens\":4096,\"tools\":" ++ tools_json ++ "}" });
++        const body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":", if (stream) "true" else "false", if (single) ",\"parallel_tool_calls\":false" else "", try std.fmt.allocPrint(a, ",\"max_tokens\":{d},\"tools\":", .{b.max_tokens}), tools_json ++ "}" });
+         var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+         var seen: Seen = .{ .a = a };
+         openai.run(b.srv, a, seen.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
          var content: std.ArrayList(u8) = .empty;
          var reasoning: std.ArrayList(u8) = .empty;
          var got: Got = .{ .content = "", .reasoning = "", .calls = 0, .finish = "", .done = seen.done, .errors = 0 };
@@ -2049,7 +2293,7 @@ index 6c5715d..9627aef 100644
          if (!stream) {
              const whole = seen.whole orelse return error.NoReply;
              if (whole.has("error")) got.errors += 1;
-@@ -798,7 +854,11 @@ const ByteServer = struct {
+@@ -798,7 +855,11 @@ const ByteServer = struct {
              const m = c.get("message").?;
              try content.appendSlice(a, m.strField("content") orelse "");
              try reasoning.appendSlice(a, m.strField("reasoning_content") orelse "");
@@ -2062,7 +2306,7 @@ index 6c5715d..9627aef 100644
              got.finish = c.strField("finish_reason") orelse "";
          } else for (seen.events.items) |e| {
              const v = (try json.parse(a, e)).ok;
-@@ -806,11 +866,30 @@ const ByteServer = struct {
+@@ -806,11 +867,30 @@ const ByteServer = struct {
              const cs = v.get("choices") orelse continue;
              if (cs.array.len == 0) continue;
              const d = cs.array[0].get("delta") orelse continue;
@@ -2095,7 +2339,7 @@ index 6c5715d..9627aef 100644
          got.content = content.items;
          got.reasoning = reasoning.items;
          return got;
-@@ -931,3 +1010,967 @@ test "the same too-short block over HTTP through the chat, Responses and Message
+@@ -931,3 +1011,1112 @@ test "the same too-short block over HTTP through the chat, Responses and Message
          }
      }
  }
@@ -2173,11 +2417,12 @@ index 6c5715d..9627aef 100644
 +// A DSML value that holds its block's closer and, after it, a call in another form: read to its first closer the block
 +// gives no call and the other form's call follows it; read past it the block gives its own call. Each reading has one
 +// call, and on a tie the parse keeps the reading cut at the first closer, so the whole reply's call is the other form's
-+// (Read). A V4.1 stream reads the block as reply_text.blockEnd does, past the closer, and sends the Write whole as it
-+// decodes: a complete call the parse does not return (EXPOSURE.md), tool_calls as its finish, the settle warning logged.
-+// With the one-call policy the calls go out at the end, the parse's; a V4 block is another call form to the stream, so
-+// its calls go out at the end too: Read, as the whole reply has it.
-+test "a DSML value holding its closer and then a call in another form: the parse keeps that call on a tie; a V4.1 stream sends its own Write whole instead" {
++// (Read). A V4.1 stream reads the block as reply_text.blockEnd does, past the closer, and sends the Write's header and
++// value as it decodes; what would complete it waits for the reply's end, and the parse does not take it: the Write stays
++// open (its arguments not JSON), no complete call the parse does not return goes out, and the stream ends as the reply
++// did (stop), the settle warning logged. With the one-call policy the calls go out at the end, the parse's; a V4 block is
++// another call form to the stream, so its calls go out at the end too: Read, as the whole reply has it.
++test "a DSML value holding its closer and then a call in another form: the parse keeps that call on a tie, and no stream completes a call the parse does not return" {
 +    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
 +    defer arena.deinit();
 +    const a = arena.allocator();
@@ -2197,13 +2442,82 @@ index 6c5715d..9627aef 100644
 +                try std.testing.expect(r.done);
 +                try std.testing.expectEqual(@as(usize, 0), r.errors);
 +                try std.testing.expectEqual(@as(usize, 1), r.calls);
-+                try std.testing.expectEqualStrings("tool_calls", r.finish);
++                try expectCompleteCallsParsed(a, r.names, r.args, whole.names, whole.args);
 +                if (single or si == 2) {
++                    try std.testing.expectEqualStrings("tool_calls", r.finish);
 +                    try std.testing.expectEqualStrings("Read", r.names[0]);
 +                    try std.testing.expectEqualStrings(whole.args[0], r.args[0]);
 +                } else {
++                    try std.testing.expectEqualStrings("stop", r.finish);
 +                    try std.testing.expectEqualStrings("Write", r.names[0]);
-+                    try std.testing.expectEqualStrings(value, (try json.parse(a, r.args[0])).ok.strField("content").?);
++                    try std.testing.expect((try json.parseText(a, r.args[0])) != .ok);
++                }
++            }
++        }
++    }
++}
++
++/// Every call a client can read whole (its arguments JSON) is one of the whole reply's calls, in order.
++fn expectCompleteCallsParsed(a: Allocator, names: []const []const u8, args: []const []const u8, whole_names: []const []const u8, whole_args: []const []const u8) !void {
++    var at: usize = 0;
++    for (names, args) |n, g| {
++        const got = switch (try json.parseText(a, g)) {
++            .ok => |v| v,
++            .err => continue,
++        };
++        while (at < whole_names.len) : (at += 1) {
++            const want = switch (try json.parseText(a, whole_args[at])) {
++                .ok => |v| v,
++                .err => continue,
++            };
++            if (std.mem.eql(u8, n, whole_names[at]) and json.equal(got, want)) break;
++        } else {
++            std.debug.print("a complete streamed call the whole reply does not have: {s} {s}\n", .{ n, g });
++            return error.CompleteCallNotParsed;
++        }
++        at += 1;
++    }
++}
++
++// The tie above over HTTP, on each streaming route, a byte a round and the whole reply in one: no route gives its client a
++// complete call the whole reply does not have; the Write the stream began stays incomplete (chat completions: arguments
++// that are not JSON; Messages: input that is not JSON; Responses: a function_call item that is not completed).
++test "over HTTP, the tie: no route's stream completes a call the whole reply does not return" {
++    if (builtin.os.tag != .linux) return error.SkipZigTest;
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var bs: ByteServer = .{};
++    try bs.init(false);
++    defer bs.deinit();
++    const schema = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}}}";
++    const user = "\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],";
++    const chat_body = "{\"model\":\"test-model\",\"max_tokens\":4096," ++ user ++ "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"Read\",\"parameters\":" ++ schema ++ "}},{\"type\":\"function\",\"function\":{\"name\":\"Write\",\"parameters\":" ++ schema ++ "}}]}";
++    const msg_body = "{\"model\":\"test-model\",\"max_tokens\":4096," ++ user ++ "\"tools\":[{\"name\":\"Read\",\"input_schema\":" ++ schema ++ "},{\"name\":\"Write\",\"input_schema\":" ++ schema ++ "}]}";
++    const resp_body = "{\"model\":\"test-model\",\"max_output_tokens\":4096,\"input\":\"x\",\"tools\":[{\"type\":\"function\",\"name\":\"Read\",\"parameters\":" ++ schema ++ "},{\"type\":\"function\",\"name\":\"Write\",\"parameters\":" ++ schema ++ "}]}";
++    for (spellings[0..2]) |sp| {
++        const value = try std.mem.concat(a, u8, &.{ "x", sp.close, "\n<tool_call>{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/etc/hosts\"}}</tool_call>\n" });
++        const answer = try std.mem.concat(a, u8, &.{ "Writing.", try spWrite(a, sp, "Write", value) });
++        const ids = try a.alloc(u32, answer.len);
++        for (answer, ids) |c, *id| id.* = c;
++        bs.backend.ids = ids;
++        for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/v1/responses" }, [_][]const u8{ chat_body, msg_body, resp_body }) |path, body| {
++            bs.backend.pattern = &.{answer.len};
++            const want = try wireReply(a, try wirePost(a, bs.srv, path, try withStream(a, body, false)), path, false);
++            try std.testing.expectEqual(@as(usize, 1), want.names.len);
++            try std.testing.expectEqualStrings("Read", want.names[0]);
++            for ([_][]const usize{ &.{1}, &.{answer.len} }) |pattern| {
++                bs.backend.pattern = pattern;
++                const wire = try wirePost(a, bs.srv, path, try withStream(a, body, true));
++                const got = try wireReply(a, wire, path, true);
++                try expectCompleteCallsParsed(a, got.names, got.args, want.names, want.args);
++                try std.testing.expectEqual(@as(usize, 1), got.names.len);
++                try std.testing.expectEqualStrings("Write", got.names[0]);
++                try std.testing.expect((try json.parseText(a, got.args[0])) != .ok);
++                if (std.mem.eql(u8, path, "/v1/responses")) {
++                    for ((try finalResponse(a, wire)).get("output").?.array) |item| {
++                        if (std.mem.eql(u8, item.strField("type").?, "function_call")) try std.testing.expect(!std.mem.eql(u8, item.strField("status").?, "completed"));
++                    }
 +                }
 +            }
 +        }
@@ -2401,7 +2715,9 @@ index 6c5715d..9627aef 100644
 +            } else return error.WholeCallNotParsed;
 +            at += 1;
 +        }
-+        if (cut_calls == 0) try std.testing.expectEqual(whole.calls, s.calls);
++        // a repeated parameter changes the bytes of a call that went out, and the finish sends no call after a changed one:
++        // the parse's later calls that had not streamed are left out (EXPOSURE.md, a repeated parameter)
++        if (cut_calls == 0 and !g.repeated) try std.testing.expectEqual(whole.calls, s.calls);
 +        // the same content when the markup is well formed (odd markup the stream hides as a block, as it decodes, the
 +        // parse leaves in the content; under the one-call policy the parse reads a later block, cut at a closer in its
 +        // value, as content): the stream's is then the reply's with some of it left out, never more
@@ -3063,8 +3379,81 @@ index 6c5715d..9627aef 100644
 +        };
 +    }
 +}
++
++// A long value with the block's closer near its start: while the block's end is undecided, each round's stream filter
++// resumes where the last left off, so the reply streams in time linear in its length, not a scan from the block's
++// start (or the reply's) every round.
++test "over the chat route, a 256 KiB value holding its block's closer near its start streams in time linear in its length" {
++    const clock = @import("clock.zig");
++    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var bs: ByteServer = .{ .max_tokens = 1 << 19 };
++    try bs.init(false);
++    defer bs.deinit();
++    const long = try a.alloc(u8, 1 << 18);
++    @memset(long, 'x');
++    const value = try std.mem.concat(a, u8, &.{ "end: ", spellings[0].close, " then ", long });
++    const answer = try std.mem.concat(a, u8, &.{ "Writing.", try spWrite(a, spellings[0], "Write", value) });
++    const started = clock.nowNs(std.testing.io);
++    const r = try bs.chat(a, answer, true, false, &.{16});
++    const took = clock.seconds(clock.nowNs(std.testing.io) - started);
++    try std.testing.expect(r.done);
++    try std.testing.expectEqual(@as(usize, 1), r.calls);
++    try std.testing.expectEqualStrings(value, (try json.parse(a, r.args[0])).ok.strField("content").?);
++    // a scan from the block's start every round took over 70 s here
++    std.testing.expect(took < 2.0) catch |e| {
++        std.debug.print("256 KiB value, closer near its start, 16-byte rounds: {d:.2} s\n", .{took});
++        return e;
++    };
++}
++
++// Prose that starts with whitespace, then a DSML call the max_tokens cut leaves open: the whole reply keeps the open block
++// as text after the prose, whitespace and all. The live stream sent the prose with its whitespace and hid the block; at
++// the end it sends the rest of the whole reply's text after exactly what it sent, so each route's stream ends with the
++// whole reply's text, the block's text not dropped and the prose not sent twice.
++test "over HTTP, prose with leading whitespace, then a DSML call cut by max_tokens: each route's stream ends with the whole reply's text" {
++    if (builtin.os.tag != .linux) return error.SkipZigTest;
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var bs: ByteServer = .{};
++    try bs.init(false);
++    defer bs.deinit();
++    bs.backend.cut = true;
++    const schema = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}}}";
++    const user = "\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],";
++    for ([_][]const u8{ " hello", "  \n hello", "\thello there" }) |prose| {
++        const answer = try std.mem.concat(a, u8, &.{ prose, b_open, "<" ++ BD ++ " invoke name=\"Write\">\n", bParam("file_path", "/a"), "<" ++ BD ++ " parameter name=\"content\" string=\"true\">half of it" });
++        const ids = try a.alloc(u32, answer.len);
++        for (answer, ids) |c, *id| id.* = c;
++        bs.backend.ids = ids;
++        const max = try std.fmt.allocPrint(a, "{{\"model\":\"test-model\",\"max_tokens\":{d},", .{answer.len});
++        const rmax = try std.fmt.allocPrint(a, "{{\"model\":\"test-model\",\"max_output_tokens\":{d},\"input\":\"x\",", .{answer.len});
++        const bodies = [_][]const u8{
++            try std.mem.concat(a, u8, &.{ max, user, "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"Write\",\"parameters\":", schema, "}}]}" }),
++            try std.mem.concat(a, u8, &.{ max, user, "\"tools\":[{\"name\":\"Write\",\"input_schema\":", schema, "}]}" }),
++            try std.mem.concat(a, u8, &.{ rmax, "\"tools\":[{\"type\":\"function\",\"name\":\"Write\",\"parameters\":", schema, "}]}" }),
++        };
++        for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/v1/responses" }, bodies) |path, body| {
++            bs.backend.pattern = &.{answer.len};
++            const want = try wireReply(a, try wirePost(a, bs.srv, path, try withStream(a, body, false)), path, false);
++            try std.testing.expectEqual(@as(usize, 0), want.names.len);
++            try std.testing.expect(std.mem.indexOf(u8, want.text, "<" ++ BD ++ " calls>") != null);
++            for ([_][]const usize{ &.{1}, &.{3}, &.{answer.len} }) |pattern| {
++                bs.backend.pattern = pattern;
++                const got = try wireReply(a, try wirePost(a, bs.srv, path, try withStream(a, body, true)), path, true);
++                std.testing.expectEqualStrings(want.text, got.text) catch |e| {
++                    std.debug.print("{s} rounds of {d}\n", .{ path, pattern[0] });
++                    return e;
++                };
++            }
++        }
++    }
++}
++
 diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
-index c1f50ac..b09f64a 100644
+index c1f50ac..f9baed3 100644
 --- a/zig/src/server/openai.zig
 +++ b/zig/src/server/openai.zig
 @@ -401,18 +401,20 @@ const Run = struct {
@@ -3093,7 +3482,7 @@ index c1f50ac..b09f64a 100644
          }
      };
  
-@@ -440,32 +442,47 @@ const Run = struct {
+@@ -440,32 +442,51 @@ const Run = struct {
          return if (o.count() > 0) Value{ .object = o } else null;
      }
  
@@ -3106,9 +3495,9 @@ index c1f50ac..b09f64a 100644
      /// out (the reply ended inside a block, the parse rejects an invoke, a repeated parameter): nothing more of the calls
      /// goes out, no brace closes what the parse rejects, and the content goes on to the parse's content.
 -    fn settle(r: *Run, reply: *const chat.Reply, calls: ?[]Value) Allocator.Error!void {
-+    fn settle(r: *Run, reply: *const chat.Reply, calls: ?[]Value) Allocator.Error!Settled {
++    fn settle(r: *Run, reply: *const chat.Reply, sent: []const tool_stream.SentCall, calls: ?[]Value) Allocator.Error!Settled {
          const a = r.a;
-         const sent = reply.streamed_calls;
+-        const sent = reply.streamed_calls;
          const parsed = calls orelse &.{};
 +        var stands = false;
 +        for (sent) |c| if (c.closed and !c.held) {
@@ -3128,6 +3517,9 @@ index c1f50ac..b09f64a 100644
 +            return .{ .stands = stands, .matched = true };
          }
          log.line("warning: {s}: the streamed tool call {d} is not the reply's parse ({d} sent, {d} parsed); its content follows the parse", .{ r.id, k, sent.len, parsed.len });
+-        const shown = reply_text.pyLstrip(r.prose_sent.items);
+-        if (!std.mem.startsWith(u8, reply.content, shown)) return;
+-        const rest = reply.content[shown.len..];
 +        try r.contentRest(reply);
 +        return .{ .stands = stands, .matched = false };
 +    }
@@ -3135,9 +3527,14 @@ index c1f50ac..b09f64a 100644
 +    /// The parse's content past the prose that streamed, when it starts with that prose: a block the stream hid that the
 +    /// parse keeps as text (one the reply never closed).
 +    fn contentRest(r: *Run, reply: *const chat.Reply) Allocator.Error!void {
-         const shown = reply_text.pyLstrip(r.prose_sent.items);
-         if (!std.mem.startsWith(u8, reply.content, shown)) return;
-         const rest = reply.content[shown.len..];
++        const sent = r.prose_sent.items;
++        const shown = reply_text.pyLstrip(sent); // a parsed content starts stripped
++        const rest = if (std.mem.startsWith(u8, reply.content, sent))
++            reply.content[sent.len..]
++        else if (std.mem.startsWith(u8, reply.content, shown))
++            reply.content[shown.len..]
++        else
++            return;
          if (reply_text.pyStrip(rest).len == 0) return;
          r.prose() catch return;
 -        try r.prose_sent.appendSlice(a, rest);
@@ -3145,12 +3542,44 @@ index c1f50ac..b09f64a 100644
          r.emit(try r.chunk(.{ .string = rest }, null)) catch return;
      }
  
-@@ -521,7 +538,44 @@ const Run = struct {
+@@ -500,7 +521,7 @@ const Run = struct {
+         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+         var sink_state: StreamSink = .{ .run = r, .tools = tools };
+         handed = true;
+-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping }, gone) catch |e| {
++        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping, .calls_live = !r.plan.policy.single }, gone) catch |e| {
+             switch (e) {
+                 error.Cancelled => return,
+                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
+@@ -521,7 +542,67 @@ const Run = struct {
              r.out.vt.event(r.out.ctx, null) catch {};
              return;
          };
 -        if (tools) {
-+        if (tools and reply.answer_deferred) {
++        if (tools and reply.answer_deferred and r.srv.config.tool_stream == .live) {
++            // a block read past a closer inside a value: its calls complete, and the parse's later calls follow, only when
++            // the parse takes what went out; the rest of the answer as the live stream shows it, between the two
++            const ended = reply.finish_reason;
++            const raw = reply.content;
++            const calls = r.attachCalls(&reply) catch return;
++            const takes = tool_stream.parseTakes(reply.streamed_calls, calls orelse &.{});
++            if (takes) for (reply.withheld) |d| r.emit(r.chunk(d, null) catch return) catch return;
++            const view = reply_text.hideToolCalls(a, raw, true) catch return;
++            const shown = r.prose_sent.items;
++            // whitespace alone, before any prose and with calls made, stays held, as the live finish holds it
++            const blank = shown.len == 0 and reply_text.pyStrip(view).len == 0;
++            if (!blank and std.mem.startsWith(u8, view, shown) and view.len > shown.len) {
++                r.prose() catch return;
++                r.prose_sent.appendSlice(a, view[shown.len..]) catch return;
++                r.emit(r.chunk(.{ .string = view[shown.len..] }, null) catch return) catch return;
++            }
++            const settled = r.settle(&reply, if (takes) reply.streamed_calls else reply.wire_calls, calls) catch return;
++            if (!settled.stands or (!settled.matched and std.mem.eql(u8, ended, "length"))) reply.finish_reason = ended;
++            if (std.mem.eql(u8, ended, "length")) {
++                r.contentRest(&reply) catch return;
++                reply.finish_reason = ended;
++            }
++        } else if (tools and reply.answer_deferred) {
 +            // the answer from its first call's opener on, held while the reply decoded, and its calls: the content and
 +            // calls a whole reply gets, after the prose that streamed
 +            const raw = reply.content; // the answer as the model wrote it; attachCalls makes it the parse's content
@@ -3191,14 +3620,14 @@ index c1f50ac..b09f64a 100644
              const calls = r.attachCalls(&reply) catch return;
              const tail = r.plan.policy.flush();
              if (tail.len > 0) {
-@@ -530,16 +584,25 @@ const Run = struct {
+@@ -530,16 +611,25 @@ const Run = struct {
                  r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
              }
              if (!r.plan.policy.single and reply.streamed_calls.len > 0) {
 -                r.settle(&reply, calls) catch return;
 +                // the reply's own reason stands when the client has no whole call, or holds a call the parse rejects
 +                // in a reply cut by the length
-+                const settled = r.settle(&reply, calls) catch return;
++                const settled = r.settle(&reply, reply.streamed_calls, calls) catch return;
 +                if (live and (!settled.stands or (!settled.matched and std.mem.eql(u8, ended, "length")))) reply.finish_reason = ended;
              } else if (calls != null and !reply.tool_calls_streamed) {
                  r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
@@ -3219,7 +3648,7 @@ index c1f50ac..b09f64a 100644
          const last = r.chunk(.{ .string = "" }, if (reply.finish_reason.len > 0) reply.finish_reason else "length") catch return;
          if (compaction) |s| compact.stamp(&cx, &reply, s) catch return;
 diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
-index 4e2cca7..8f45c0f 100644
+index 4e2cca7..ac0e0e1 100644
 --- a/zig/src/server/reply_text.zig
 +++ b/zig/src/server/reply_text.zig
 @@ -37,6 +37,150 @@ fn find(text: []const u8, tag: []const u8) ?usize {
@@ -3373,7 +3802,7 @@ index 4e2cca7..8f45c0f 100644
  pub fn isChannel(m: Markers) bool {
      return std.mem.eql(u8, m.close, channel_markers.close);
  }
-@@ -99,14 +243,33 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
+@@ -99,20 +243,95 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
      return .{ .reasoning = text[0 .. text.len - held], .answer = "" };
  }
  
@@ -3395,25 +3824,88 @@ index 4e2cca7..8f45c0f 100644
 +/// ``hideToolCalls`` with each block ended at its first closer, as the held stream's filter reads a reply.
 +pub fn hideToolCallsAtFirstCloser(a: Allocator, text: []const u8, finished: bool) Allocator.Error![]const u8 {
 +    var out: std.ArrayList(u8) = .empty;
-+    return hideWith(a, &out, text, finished, false);
++    return hideWith(a, &out, text, finished, false, null);
 +}
 +
  /// ``hideToolCalls`` into ``out`` (cleared first); text without a call block comes back as a slice of ``text``.
  pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool) Allocator.Error![]const u8 {
-+    return hideWith(a, out, text, finished, true);
++    return hideWith(a, out, text, finished, true, null);
 +}
 +
-+fn hideWith(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool, read_values: bool) Allocator.Error![]const u8 {
++/// What ``hideInto`` read of a streaming reply, for the next round to go on from: where each opener was found, or how far
++/// its search went, and each block's end once the text decides it (a decided end stays: ``blockEnd``'s decisions hold as
++/// the text grows), or how far the search for it went. A round then reads only the text the last one did not.
++pub const Hide = struct {
++    text: ?[*]const u8 = null, // the buffer read last: a round in another one starts over
++    len: usize = 0,
++    opens: std.ArrayList(Open) = .empty,
++    blocks: std.ArrayList(Block) = .empty,
++
++    const Open = struct { pos: usize, which: usize, from: usize, at: ?usize = null };
++    const Block = struct { start: usize, which: usize, close_from: usize, first: ?usize = null, walk: WalkResume = .{}, end: ?usize = null };
++
++    fn opener(h: *Hide, a: Allocator, text: []const u8, pos: usize, which: usize) Allocator.Error!?usize {
++        const o = for (h.opens.items) |*o| {
++            if (o.pos == pos and o.which == which) break o;
++        } else blk: {
++            try h.opens.append(a, .{ .pos = pos, .which = which, .from = pos });
++            break :blk &h.opens.items[h.opens.items.len - 1];
++        };
++        if (o.at) |at| return at;
++        const tag = calls[which][0];
++        o.at = findTag(text, o.from, tag);
++        if (o.at == null) o.from = @max(o.from, text.len -| (tag.len - 1));
++        return o.at;
++    }
++
++    fn end(h: *Hide, a: Allocator, text: []const u8, start: usize, which: usize) Allocator.Error!?usize {
++        const opener_tag = calls[which][0];
++        const closer = calls[which][1];
++        const b = for (h.blocks.items) |*b| {
++            if (b.start == start and b.which == which) break b;
++        } else blk: {
++            try h.blocks.append(a, .{ .start = start, .which = which, .close_from = start + opener_tag.len });
++            break :blk &h.blocks.items[h.blocks.items.len - 1];
++        };
++        if (b.end) |e| return e;
++        if (b.first == null) {
++            b.first = findTag(text, b.close_from, closer);
++            if (b.first == null) {
++                b.close_from = @max(b.close_from, text.len -| (closer.len - 1));
++                return null;
++            }
++        }
++        b.end = blockEndResume(text, start + opener_tag.len, opener_tag, closer, b.first.?, &b.walk);
++        return b.end;
++    }
++};
++
++/// ``hideInto`` while a reply streams, its text grown in place since the last round (a shorter one, or one in another
++/// buffer, starts over), going on from what ``h`` holds of the rounds before.
++pub fn hideIntoResume(a: Allocator, out: *std.ArrayList(u8), text: []const u8, h: *Hide) Allocator.Error![]const u8 {
++    if (text.len < h.len or h.text != text.ptr) h.* = .{ .text = text.ptr };
++    h.len = text.len;
++    return hideWith(a, out, text, false, true, h);
++}
++
++fn hideWith(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool, read_values: bool, h: ?*Hide) Allocator.Error![]const u8 {
      out.clearRetainingCapacity();
      var pos: usize = 0;
      while (true) {
-@@ -130,7 +293,8 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
+         var start: ?usize = null;
+         var which: usize = 0;
+-        for (calls, 0..) |c, i| if (findTag(text, pos, c[0])) |at| {
++        for (calls, 0..) |c, i| if (if (h) |r| try r.opener(a, text, pos, i) else findTag(text, pos, c[0])) |at| {
+             if (start == null or at < start.?) {
+                 start = at;
+                 which = i;
+@@ -130,7 +349,8 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
          }
          try out.appendSlice(a, text[pos..start.?]);
          const opener = calls[which][0];
 -        const end = findTag(text, start.? + opener.len, calls[which][1]) orelse return out.items;
 +        const from = start.? + opener.len;
-+        const end = (if (read_values) blockEnd(text, from, opener, calls[which][1], finished) else findTag(text, from, calls[which][1])) orelse return out.items;
++        const end = (if (!read_values) findTag(text, from, calls[which][1]) else if (h) |r| try r.end(a, text, start.?, which) else blockEnd(text, from, opener, calls[which][1], finished)) orelse return out.items;
          pos = end + calls[which][1].len;
      }
  }
@@ -8141,7 +8633,7 @@ index 4c73cfb..1aa464e 100644
 +    }
 +}
 diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
-index a7288e4..6bb40f5 100644
+index a7288e4..1695412 100644
 --- a/zig/src/server/tool_stream.zig
 +++ b/zig/src/server/tool_stream.zig
 @@ -197,18 +197,24 @@ pub const Streamer = struct {
@@ -8175,7 +8667,7 @@ index a7288e4..6bb40f5 100644
              switch (d.state) {
                  .outside => {
                      if (one_block) return;
-@@ -224,7 +230,11 @@ pub const Streamer = struct {
+@@ -224,13 +230,22 @@ pub const Streamer = struct {
                      }
                      d.pos = i.at + tool_parse.dsml41_open.len;
                      d.block_end = null;
@@ -8185,9 +8677,20 @@ index a7288e4..6bb40f5 100644
 +                    d.first_close = null;
 +                    d.walk = .{};
                      d.block_calls = 0;
++                    d.block_first = d.sent.items.len;
                      d.state = .block;
                  },
-@@ -267,7 +277,7 @@ pub const Streamer = struct {
+                 .block => switch (findIn(t, tool_parse.invoke41_open, d.pos, d.block_end)) {
+                     .wait => return,
+                     .none => {
++                        if (d.block_end.? != d.first_close.?) {
++                            try d.withhold(a);
++                            return;
++                        }
+                         // the block's closer: every invoke in it is decided, and the calls it held go out
+                         try d.closePending(a, out);
+                         try d.release(a, out);
+@@ -267,7 +282,7 @@ pub const Streamer = struct {
                          d.end_pending = true;
                          d.end_from = q + 2;
                          d.state = .skip;
@@ -8196,7 +8699,7 @@ index a7288e4..6bb40f5 100644
                          if (!d.end_pending and d.end == null) {
                              d.state = .block; // no closer in its block: the parse takes no call here
                              continue;
-@@ -390,8 +400,8 @@ pub const Streamer = struct {
+@@ -390,8 +405,8 @@ pub const Streamer = struct {
                                  .ok => |x| x,
                                  .err => .{ .string = raw },
                              };
@@ -8207,7 +8710,21 @@ index a7288e4..6bb40f5 100644
                              d.p = pe + tool_parse.param41_close.len;
                              d.state = .body;
                          },
-@@ -468,8 +478,13 @@ pub const Dsml = struct {
+@@ -408,6 +423,13 @@ pub const Streamer = struct {
+     }
+ };
+ 
++/// The parse takes every call ``sent`` holds, as its first calls: what a stream withheld for them may go out.
++pub fn parseTakes(sent: []const SentCall, parsed: []const Value) bool {
++    if (sent.len > parsed.len) return false;
++    for (sent, parsed[0..sent.len]) |*c, p| if (!c.same(p)) return false;
++    return true;
++}
++
+ /// A DSML call a stream sent: its name, the arguments text that went out, and whether it closed.
+ pub const SentCall = struct {
+     name: []const u8,
+@@ -468,8 +490,13 @@ pub const Dsml = struct {
      pos: usize = 0, // the parse's next invoke search (outside: its next block search)
      from: usize = 0, // where a search that waits starts again (the text before it holds no complete needle)
      gap: usize = 0, // the end of the last block: the text from here to the next one holds no other call form
@@ -8223,18 +8740,56 @@ index a7288e4..6bb40f5 100644
      name_start: usize = 0,
      q: usize = 0, // the invoke name's closing quote
      end: ?usize = null, // the invoke's closer (null and not end_pending: the block holds none)
-@@ -490,6 +505,10 @@ pub const Dsml = struct {
+@@ -489,6 +516,17 @@ pub const Dsml = struct {
+     queue: std.ArrayList(Value) = .empty, // the deltas that wait
      released: usize = 0, // the calls whose header went out: sent[0..released]
      late: ?usize = null, // the block's first call, whose brace waits in the queue
- 
++    block_first: usize = 0, // sent[block_first..]: the calls of the block being read
++    // a block read past a closer inside a value: the parse may still take another reading of the reply, so what completes
++    // the block's calls (their braces, its later calls) waits for the reply's end, and the stream stops there
++    deferred: bool = false,
++    withheld: std.ArrayList(Value) = .empty,
++    wire_released: usize = 0, // the calls whose header went out when the block closed
++    undo: std.ArrayList(Undo) = .empty, // each of the block's calls as it went out, before what is withheld
++
 +    fn visible(d: *const Dsml, text: []const u8) []const u8 {
 +        return if (d.cap) |c| text[0..@min(c, text.len)] else text;
 +    }
-+
+ 
      /// A call is under way: its block opened, or its brace waits.
      pub fn midCall(d: *const Dsml) bool {
-         return !d.off and (d.state != .outside or d.closing != null);
-@@ -528,17 +547,21 @@ pub const Dsml = struct {
+@@ -500,6 +538,30 @@ pub const Dsml = struct {
+         return d.sent.items[0..d.released];
+     }
+ 
++    const Undo = struct { i: usize, len: usize, closed: bool };
++
++    /// The calls the client has when what ``deferred`` withheld never goes out.
++    pub fn wire(d: *const Dsml, a: Allocator) Allocator.Error![]const SentCall {
++        if (!d.deferred) return d.streamed();
++        const out = try a.alloc(SentCall, d.wire_released);
++        @memcpy(out, d.sent.items[0..d.wire_released]);
++        for (d.undo.items) |u| if (u.i < out.len) {
++            out[u.i].arguments.items = out[u.i].arguments.items[0..u.len]; // a view: the copy shares the record's bytes
++            out[u.i].closed = u.closed;
++        };
++        return out;
++    }
++
++    /// The block closed past a closer inside a value: its calls complete only if the reply's parse takes them.
++    fn withhold(d: *Dsml, a: Allocator) Allocator.Error!void {
++        d.deferred = true;
++        d.wire_released = d.released;
++        for (d.sent.items[d.block_first..], d.block_first..) |c, i| try d.undo.append(a, .{ .i = i, .len = c.arguments.items.len, .closed = c.closed });
++        try d.closePending(a, &d.withheld);
++        try d.release(a, &d.withheld);
++        d.off = true;
++    }
++
+     /// The finish's ``text`` must extend the text the stream read, else its positions do not hold there: the streamer
+     /// turns off, and the finish follows the parse.
+     pub fn verify(d: *Dsml, text: []const u8) void {
+@@ -528,17 +590,21 @@ pub const Dsml = struct {
          return if (d.end_pending) null else d.end;
      }
  
@@ -8264,7 +8819,7 @@ index a7288e4..6bb40f5 100644
              .at => |i| {
                  d.end = i;
                  d.end_pending = false;
-@@ -547,7 +570,7 @@ pub const Dsml = struct {
+@@ -547,7 +613,7 @@ pub const Dsml = struct {
                  d.end = null;
                  d.end_pending = false;
              },
@@ -8273,7 +8828,7 @@ index a7288e4..6bb40f5 100644
          }
      }
  
-@@ -815,6 +838,7 @@ test "a one-call reply drops an unoffered call and still hides an unclosed one"
+@@ -815,6 +881,7 @@ test "a one-call reply drops an unoffered call and still hides an unclosed one"
  }
  
  const tool_parse = @import("tool_parse.zig");
@@ -8281,7 +8836,31 @@ index a7288e4..6bb40f5 100644
  
  /// The deltas one streamer sends while the reply grows through ``texts``.
  fn streamed(a: Allocator, tools: []const Value, texts: []const []const u8) Allocator.Error![]Value {
-@@ -959,7 +983,7 @@ test "where the parse drops or changes what already went out, the stream says so
+@@ -866,6 +933,11 @@ fn dsmlFeed(a: Allocator, text: []const u8, step: usize, chars: bool) !Streamer
+         try s.feedDsml(text[0..end], &out);
+     }
+     try s.feedDsml(text, &out);
++    // the reply's end, as the route settles it: what a block read past a closer inside a value withheld goes out only when
++    // the parse takes the calls that went out
++    const parsed = (try tool_parse.parse(a, text, (try json.parse(a, dsml_tools)).ok.array, null)).calls orelse &.{};
++    const takes = parseTakes(s.dsml.streamed(), parsed);
++    if (s.dsml.deferred and takes) try out.appendSlice(a, s.dsml.withheld.items);
+     var joined: std.ArrayList(std.ArrayList(u8)) = .empty;
+     for (out.items) |d| for (d.get("tool_calls").?.array) |one| {
+         const index: usize = @intCast(one.get("index").?.int64().?);
+@@ -881,8 +953,9 @@ fn dsmlFeed(a: Allocator, text: []const u8, step: usize, chars: bool) !Streamer
+         try joined.items[index].appendSlice(a, piece);
+     };
+     // what went out: the calls whose header went out (a block that never closes holds its later calls)
+-    try std.testing.expectEqual(s.dsml.streamed().len, joined.items.len);
+-    for (s.dsml.streamed(), joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
++    const client = if (takes) s.dsml.streamed() else try s.dsml.wire(a);
++    try std.testing.expectEqual(client.len, joined.items.len);
++    for (client, joined.items) |c, j| try std.testing.expectEqualStrings(c.arguments.items, j.items);
+     return s;
+ }
+ 
+@@ -959,7 +1032,7 @@ test "where the parse drops or changes what already went out, the stream says so
      const unclosed = comptime (calls_open ++ "<" ++ D ++ " invoke name=\"Bash\">\n" ++ dsmlParam("command", " string=\"true\"", "ls") ++ calls_close);
      try std.testing.expect((try tool_parse.parse(a, unclosed, tools, null)).calls == null);
      const u = try dsmlFeed(a, unclosed, 1, true);
@@ -8290,7 +8869,7 @@ index a7288e4..6bb40f5 100644
      // a value that holds an invoke's closer: the parse ends the invoke there and drops the value
      const cut = comptime (calls_open ++ dsmlInvoke("Write", dsmlParam("file_path", " string=\"true\"", "/a") ++ "<" ++ D ++ " parameter name=\"content\" string=\"true\">x</" ++ D ++ " invoke>y</" ++ D ++ " parameter>\n") ++ calls_close);
      const w = (try tool_parse.parse(a, cut, tools, null)).calls.?;
-@@ -972,6 +996,31 @@ test "where the parse drops or changes what already went out, the stream says so
+@@ -972,6 +1045,31 @@ test "where the parse drops or changes what already went out, the stream says so
      try std.testing.expect(x.dsml.off and x.dsml.sent.items.len == 0);
  }
  
@@ -8322,7 +8901,7 @@ index a7288e4..6bb40f5 100644
  test "a block's second call and the first call's brace wait for the block's closer; a block cut before it sends no whole call" {
      var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
      defer arena.deinit();
-@@ -1014,3 +1063,20 @@ test "a text that does not extend the one read turns the streamer off instead of
+@@ -1014,3 +1112,20 @@ test "a text that does not extend the one read turns the streamer off instead of
      t.dsml.verify("other text, longer than forty bytes, that does not start with the first");
      try std.testing.expect(t.dsml.off);
  }
