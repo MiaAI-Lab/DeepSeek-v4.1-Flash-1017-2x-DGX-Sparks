@@ -482,3 +482,17 @@
   parse as `0052` of the 4-Spark recipe
   ([pull request #49](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/49)); the
   live streaming is `0048`, by **[nuk3s](https://github.com/nuk3s)**. By **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
+- `zig/patches/0066-load-prefetch.patch` (`TF_DS_LOAD_PREFETCH`, on; `0` turns it off): the rank cache is read ahead of
+  the weight loader. The loader reads the entries it does not read as a span one at a time, in file order, each read
+  waiting on the disk; eight threads now `pread` those parts of the file in 32 MiB chunks up to 4 GiB past the loader's
+  furthest read and drop the bytes, so the loader's own reads come from the page cache. The weights are unchanged.
+  This engine reads each layer's expert entries whole with direct reads, which the page cache does not serve, so the
+  read-ahead skips them, and the gain is smaller than on the 4-Spark recipe: on a pair, each rank's weight file evicted
+  from the page cache before each of three cold starts, rank 0 loaded in 34.9 s on average against 36.5 s without the
+  patch (36.8 s with `TF_DS_LOAD_PREFETCH=0`); greedy replies identical, prefill, decode and The Grill's tool step
+  unchanged. A `pread` cannot be interrupted, so on a hard-mounted NFS file an outage would hold the load's end until the
+  read returns; the recipe reads its weight files from local disk. Tests in `zig/src/families/dsv41/weights.zig` (the
+  plan; the threads read every planned byte before the loader, which reads the same bytes; the lead holds them back
+  until the loader's reads move it; finish while they wait; a chunk past the file's end; a read that fails). The 4-Spark
+  recipe's `0046` ([pull request #20](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/20)),
+  by **[shalk3](https://github.com/shalk3)**; ported by **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
