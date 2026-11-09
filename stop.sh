@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stop the server that ./start.sh started and remove its containers on every Spark, freeing their GPU memory: here
-# (rank 0) and on the worker (WORKER).
+# (rank 0) and on each worker (WORKER; WORKER2 too when it is set, at TP=3 or not: every rank of a TP=3 server).
 # The ranks get STOP_TIMEOUT seconds (default 30) to shut down; requests still running are cut off (it does not drain
 # them), so stop.sh says when there are any. Each rank's log is saved first (docker rm deletes it), gzipped, in LOG_DIR
 # here (~/.cache/dsv41-tensorfold/logs) and ~/.cache/dsv41-tensorfold/logs on each worker; the newest LOG_KEEP (10) of

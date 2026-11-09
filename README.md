@@ -113,6 +113,23 @@ Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after t
 `TENSORFOLD_TOOL_STREAM=hold` makes a stream with tools send its tool calls whole when the reply ends instead of as they
 decode (`live`, the default; `zig/patches/README.md`, `0065`).
 
+## Three Sparks (experimental)
+
+`TP=3` serves the same checkpoint on three Sparks cabled as a triangle (each Spark's two ConnectX-7 ports to the other
+two, no switch), with `WORKER2` as rank 2. The two-Spark engine runs over two or four ranks only, so `TP=3` builds
+[LakyFx's TensorFold TP3 port](https://github.com/LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark) instead
+(`zig/Dockerfile.tp3`, with the switchless NCCL build), the way
+[easthambuilds' three-Spark recipe](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold)
+runs it, and cuts each rank's files from this checkpoint (`scripts/prepare-tp3.sh`): a third of the weights (66.8 GiB)
+on each Spark, a 3,300,000-token pool shared by 8 requests of up to 401,408 tokens (LakyFx's qualified profile).
+`ABLIT=1` works there too; the spill tier, KV sharding, EAQ v1.1 and the two-Spark engine's patches do not exist there
+and are refused. It is opt-in and **has not yet run on three Sparks in this form**: the cabling, the routes it needs,
+the settings, and what was and was not checked are in [docs/tp3.md](docs/tp3.md).
+
+```bash
+TP=3 WORKER2=user@192.0.2.3 DRY_RUN=1 ./start.sh   # the triangle it finds, missing routes, the three rank commands
+```
+
 ## Documentation
 
 - [Requirements](docs/requirements.md): hardware, link, ssh, disk, NFS and what gets downloaded
@@ -121,6 +138,7 @@ decode (`live`, the default; `zig/patches/README.md`, `0065`).
 - [Memory and safety](docs/memory-and-safety.md): `CONTEXT` and `POOL`, admission, `memguard`, the head's headroom
 - [Spill v2 and KV sharding](docs/spill-and-kv-sharding.md) (ported, off by default) and [the port's settings](docs/PORT-RECIPE.md)
 - [Abliterated mode](docs/abliterated.md)
+- [Three Sparks (TP=3, experimental)](docs/tp3.md)
 - [Status and measurements](docs/measurements.md): what was checked, benchmarks, the engine patches' results
 - [The engine](docs/zig-engine.md), [systemd](docs/systemd.md), [Hermes Agent](docs/hermes-agent.md), [fork deploys](docs/FORK-DEPLOY.md)
 - [Engine patches](zig/patches/README.md), [CHANGELOG](CHANGELOG.md), [CREDITS](CREDITS.md)
@@ -139,6 +157,9 @@ scripts/port_test.sh         checks of scripts/port.sh (no Sparks needed)
 scripts/port-patches.sh      exports engine work after the port's series as zig/patches/0024-..., checked on a clean TF_REF
 scripts/publish-image.sh     pushes the built image to ghcr.io (only on purpose)
 zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine (see `zig/patches/README.md`)
+zig/Dockerfile.tp3           TP=3's image: LakyFx's TensorFold TP3 runtime and the switchless NCCL (docs/tp3.md)
+scripts/prepare-tp3.sh       TP=3's preparation: each rank's kit, model folder, Engram rows and weight file
+scripts/tp3_plan.py, tp3_inputs.py   TP=3's checkpoint plan, source manifest, model folder, RoPE cut, Engram record
 model/chat_template.jinja    the chat template rank 0 serves
 tools/validate.py            an end-to-end check of a running server
 tools/bench.py               prefill, decode, multi-stream and needle measurements as JSON, with `--compare A.json B.json`

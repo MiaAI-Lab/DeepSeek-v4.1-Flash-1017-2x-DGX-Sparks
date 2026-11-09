@@ -30,13 +30,65 @@ unset _n _line _key _value
 # ---------------------------------------------------------------- the two Sparks
 # This machine serves rank 0 and the API; WORKER (an ssh target, key-based) is rank 1. The two are cabled directly
 # through their ConnectX-7 ports (scripts/nodes.sh finds the link).
-TP=2
+# TP: the ranks, one a Spark: 2 (the default), or 3, experimental: three Sparks cabled as a triangle on another engine
+# (below, and docs/tp3.md). Rank i runs on worker i: WORKER, then WORKER2 with its own NFS_SERVER2 (and FABRIC_PEER2 at
+# TP=2), as the GLM-5.3 3x and the 4x recipes name them. WORKER2 and its settings are read only when TP is 3.
+TP="${TP:-2}"
 WORKER="${WORKER:-}"; FABRIC_PEER="${FABRIC_PEER:-}"
+WORKER2="${WORKER2:-}"; FABRIC_PEER2="${FABRIC_PEER2:-}"
 MASTER_PORT="${MASTER_PORT:-29620}"  # the ranks' rendezvous port (keep it on the private link)
 # The rendezvous address: this node's address on the link to the worker (scripts/nodes.sh sets it from the link when it
 # is empty).
 MASTER_ADDR="${MASTER_ADDR:-}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-}"     # NCCL's bootstrap socket's netdev on both nodes (default: the link's)
+
+# ---------------------------------------------------------------- three Sparks (TP=3, experimental)
+# BertholomusAI's engine at TF_REF runs the dsv41 family over two or four ranks, not three. At TP=3 the image is
+# LakyFx's TensorFold TP3 port instead (LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark, named ...-tp3-spark when this tag
+# was made; GitHub sends the old name on): the TensorFold runtime snapshot its tag ships, checked by its extract.py,
+# built with Zig ZIG_VERSION, and NCCL 2.30.7 with the switchless patches for direct cables (alexellis/switchless-nccl
+# v0.0.1, sha256-checked), as easthambuilds' three-Spark recipe runs it
+# (easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-3x-DGX-Sparks-TensorFold). The checkpoint, Engram's tables, ABLIT=1 and
+# model/chat_template.jinja stay this recipe's. scripts/prepare-tp3.sh makes every rank's files, zig/Dockerfile.tp3 the
+# image; docs/tp3.md says what was and was not run on three Sparks.
+TP3_REPO="${TP3_REPO:-https://github.com/LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark.git}"
+TP3_TAG=v1.2.2TF                                                    # TP3_REV's tag (for the logs)
+TP3_REV="${TP3_REV:-14a6d49c7cb99b8ce25f9755541da7e7d57cb1d1}"
+TP3_SNAPSHOT="${TP3_SNAPSHOT:-61357debe730ac9ffe20e760edcddbc253b0e525}"   # the runtime snapshot extract.py must report
+NCCL_TGZ_URL="${NCCL_TGZ_URL:-https://github.com/alexellis/switchless-nccl/releases/download/v0.0.1/nccl-2.30.7-switchless-hardened-sm121-linux-arm64.tar.gz}"
+NCCL_TGZ_SHA256="${NCCL_TGZ_SHA256:-b4a686382a92e57b485ca1bf7cd0f9fde780a68f01ea902ac432b60505b2041f}"
+NCCL_LIB_SHA256="${NCCL_LIB_SHA256:-78cb83871792ec57d763d142e4cae26fc754ae284bcc81dcb2a7d50e17d4fa57}"   # libnccl.so.2.30.7 in it
+# The rank files' and the served config's name for this checkpoint in LakyFx's layout: Mia's EAQ v1 2.9 bpw, cut as
+# LakyFx's TF29 arm (Mia's earlier 2.9 bpw export, which it matches tensor for tensor: scripts/tp3_plan.py checks it).
+TP3_ARM=EAQ29
+# The chat template rank 0 serves at TP=3: LakyFx's qualified 1017 template (its port of DeepSeek's encoding.py, the one
+# its 1.2.0 profile and easthambuilds' recipe pin), not model/chat_template.jinja, which TP=2 keeps serving. LakyFx's
+# model-file step checks it: neither the checkpoint's own template nor this recipe's passes. prepare.sh downloads it from
+# LakyFx's 1017 model repository (public, MIT) at its pinned revision and checks its sha256.
+TP3_TEMPLATE_ID=LakyFx/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw-TensorFold
+TP3_TEMPLATE_REV=8621801c1fc74aece1fa83e67c6ade3fde1e7894
+TP3_TEMPLATE_SHA256=7d1356675e429ec4a55cbcc1a6fbeb40615dbeb257aca25b8c3705a42087f33e
+# The plan scripts/tp3_plan.py writes for the default checkpoint (ABLIT=0), computed from its 39 shards' published
+# headers: prepare.sh refuses another. Not checked for another MODEL_ID or MODEL_REVISION, nor ABLIT=1. Empty: no check.
+TP3_PLAN_FOR=Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw@45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b
+TP3_PLAN_SHA256="${TP3_PLAN_SHA256-709fe6c502be4b92fd33d35a6ef108b074e7744e27aa6835c93a69b7bc9257db}"
+# The settings only the two-Spark engine has (its zig/patches): set at TP=3 they are refused (tp3_check), so they are
+# read here, before their defaults below. TP=3 has its own defaults: LakyFx's qualified TF29 profile (a 3,300,000-token
+# pool, 401,408 tokens a request, 8 at once, 16-row rounds, a 1 GiB prompt cache on the head).
+TP3_REFUSED=()
+if [[ "$TP" == 3 ]]; then
+  for _n in GRAPH_CAP RDMA_IDLE_S RDMA_NAP_US PREFILL_INTERLEAVE_MS TF_DS_CONNECT_S HEAD_ENGRAM_DIR; do
+    [[ -z "${!_n:-}" ]] || TP3_REFUSED+=("$_n=${!_n}")
+  done
+  CONTEXT="${CONTEXT:-401408}"
+  POOL="${POOL:-3300000}"
+  PARALLEL="${PARALLEL:-8}"
+  ROUND_ROWS="${ROUND_ROWS:-16}"
+  # the weights a Spark holds at TP=3: a third of the 215,248,585,443 bytes of LakyFx's three TF29 rank files, 66.8
+  # GiB, and the engine's 12.2 GiB reserve (the memory notes below): 79 GiB, rounded up
+  MIN_AVAIL_GIB="${MIN_AVAIL_GIB:-80}"
+fi
+PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-1}"   # TP=3: rank 0's --prompt-cache-gib (kept prompt states on the head)
 
 # ---------------------------------------------------------------- the checkpoint, the engine, the kernel kit
 # The weights: Mia's AI Lab's EAQ EXL3 quantization of DeepSeek-V4.1-Flash-1017 at 2.9 bits a weight (39 shards,
@@ -92,15 +144,22 @@ ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd50
 # ZIG_SHA256 wins. Set but empty (ZIG_MIRRORS=): ziglang.org only. Not part of the image hash (the bytes are pinned).
 ZIG_MIRRORS="${ZIG_MIRRORS-https://zig.linus.dev/zig}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
+# (TP=3: zig/Dockerfile.tp3 and its pins; neither zig/patches nor TF_REF is in that image)
 image_hash() {
   ( cd "$_cfg_root" || exit 1
-    cat zig/patches/*.patch 2>/dev/null
-    cat zig/patches-inputs/*.patch 2>/dev/null
-    cat zig/Dockerfile
-    echo "$TF_REPO $TF_REF $INPUTS_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
+    if [[ "$TP" == 3 ]]; then
+      cat zig/Dockerfile.tp3
+      echo "$TP3_REPO $TP3_REV $TP3_SNAPSHOT $NCCL_TGZ_URL $NCCL_TGZ_SHA256 $NCCL_LIB_SHA256 zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
+    else
+      cat zig/patches/*.patch 2>/dev/null
+      cat zig/patches-inputs/*.patch 2>/dev/null
+      cat zig/Dockerfile
+      echo "$TF_REPO $TF_REF $INPUTS_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
+    fi
   ) | sha256sum | cut -c1-12
 }
 TAG_BASE="exl3-tp2"             # the image tag's prefix: <TAG_BASE>-<image hash>
+[[ "$TP" != 3 ]] || TAG_BASE="exl3-tp3"
 IMAGE="${IMAGE:-tensorfold-dsv41:$TAG_BASE-$(image_hash)}"
 # A published image of these pins, if any (scripts/publish-image.sh pushes it; the registry handling is the GLM-5.3-Flash
 # recipe's): prepare.sh pulls $GHCR_IMAGE:<TAG_BASE>-<hash>, or, when IMAGE_TAG names that tag and IMAGE_DIGEST is set,
@@ -184,19 +243,30 @@ KIT_SUB="tensorfold-dsv41/kit-${KIT_REF:0:8}"
 # The worker reads this Spark's HF_CACHE over NFS (the recipe's only mode: one copy of the 196 GiB checkpoint, here): a
 # read-only docker volume NFS_VOLUME on the worker that prepare.sh creates (no sudo there). This Spark must export
 # NFS_PATH (default: HF_CACHE; "/" for an NFSv4 export with fsid=0) to the worker's address on its link. NFS_SERVER: the
-# head's address the worker mounts from (default: the head's address on the link, found by scripts/nodes.sh).
+# head's address the worker mounts from (default: the head's address on the link, found by scripts/nodes.sh);
+# NFS_SERVER2 is WORKER2's.
 NFS_PATH="${NFS_PATH:-$HF_CACHE}"
-NFS_SERVER="${NFS_SERVER:-}"
+NFS_SERVER="${NFS_SERVER:-}"; NFS_SERVER2="${NFS_SERVER2:-}"
 NFS_VOLUME="${NFS_VOLUME:-dsv41-1017-exl3-hf}"
-# On the worker's own disk (paths on the worker): Engram's tables (a decode round reads ~70 random 4 KiB rows from
-# them; over NFS that took most of a round), and its weight file (~106 GB; written there by prepare.sh from the
-# checkpoint over NFS, so it never crosses the network twice).
+# On the worker's own disk (paths on the worker, the same on every worker): Engram's tables (a decode round reads ~70
+# random 4 KiB rows from them; over NFS that took most of a round), and its weight file (~106 GB; written there by
+# prepare.sh from the checkpoint over NFS, so it never crosses the network twice).
 WORKER_ENGRAM_DIR="${WORKER_ENGRAM_DIR:-\$HOME/.cache/dsv41-tensorfold/engram-${ENGRAM_REVISION:0:8}}"
 WORKER_CACHE_DIR="${WORKER_CACHE_DIR:-\$HOME/.cache/dsv41-tensorfold/rank-cache-${MODEL_REVISION:0:8}}"
 # Keep stock and abliterated weights separate even when the user sets WORKER_CACHE_DIR.
 if [[ "$ABLIT" == 1 && "$WORKER_CACHE_DIR" != *"-ablit-${ABLIT_REVISION:0:8}" ]]; then
   WORKER_CACHE_DIR+="-ablit-${ABLIT_REVISION:0:8}"
 fi
+# TP=3: each worker's own folder (a path on the worker, the same on every worker): its kit, the served model folder
+# (config, tokenizer, vision tower), its Engram rows and its weight file (~67 GiB), copied there by prepare.sh over NFS
+# and checked by sha256. No rank reads the checkpoint over NFS at TP=3.
+WORKER_TP3_DIR="${WORKER_TP3_DIR:-\$HOME/.cache/dsv41-tensorfold/tp3-${MODEL_REVISION:0:8}}"
+if [[ "$ABLIT" == 1 && "$WORKER_TP3_DIR" != *"-ablit-${ABLIT_REVISION:0:8}" ]]; then
+  WORKER_TP3_DIR+="-ablit-${ABLIT_REVISION:0:8}"
+fi
+# TP=3: rank 0's own folder (kit, model, rank-cache, engram, as each worker's WORKER_TP3_DIR) and prepare.sh's work
+# files, under DATA_DIR, so that the workers copy theirs over the NFS export
+TP3_SUB="$DATA_SUB/tp3"
 STATE_DIR="${STATE_DIR:-$HOME/.local/state/dsv41-tensorfold}"   # locks and the prepared marker
 LOG_DIR="${LOG_DIR:-$HOME/.cache/dsv41-tensorfold/logs}"
 LOG_KEEP="${LOG_KEEP:-10}"
@@ -278,8 +348,29 @@ model_in_container()  {
   else echo "/hf/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)"; fi
 }
 engram_in_container() { echo "/hf/hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)"; }
-# The folder rank 0 serves (prepare.sh): the checkpoint's files linked, with the recipe's chat template.
-served_in_container() { echo "/hf/$DATA_SUB/model"; }
+# The folder rank 0 serves (prepare.sh): the checkpoint's files linked, with the recipe's chat template. TP=3: the
+# model folder LakyFx's engine reads (its config for three ranks, the tokenizer, the template and the vision tower).
+served_in_container() { if [[ "$TP" == 3 ]]; then echo "/hf/$TP3_SUB/model"; else echo "/hf/$DATA_SUB/model"; fi; }
+# TP=3: the RoPE tables' rows the pool needs (LakyFx's make_rope.py: POOL + 49, in whole 4,096-row blocks)
+tp3_rope_rows() { echo $(( (POOL + 49 + 4095) / 4096 * 4096 )); }
+
+# tp3_check: at TP=3, refuse what LakyFx's engine does not have (the two-Spark engine's zig/patches and scripts/port.sh:
+# spill v2, KV sharding, the EAQ v1.1 mixed-pack loader, the graph cap, the RDMA nap, the prefill interleave, the
+# connect window, the reasoning-history drop; rank 0's own Engram folder), and a pool its RoPE tables and engine cannot
+# hold. Nothing at TP=2.
+tp3_check() {
+  [[ "$TP" == 3 ]] || return 0
+  local bad=(${TP3_REFUSED[@]+"${TP3_REFUSED[@]}"})
+  [[ "$EAQ_V1_1" != 1 ]] || bad+=("EAQ_V1_1=1")
+  [[ "$DROP_REASONING_HISTORY" != 1 ]] || bad+=("DROP_REASONING_HISTORY=1")
+  [[ "$KV_SHARD" == 0 ]] || bad+=("KV_SHARD=$KV_SHARD")
+  ! port_spill_on || bad+=("SPILL_GIB=$SPILL_GIB")
+  (( ${#bad[@]} == 0 )) || die "TP=3 runs LakyFx's TP3 engine, which has none of: ${bad[*]} (they are the two-Spark engine's: zig/patches, scripts/port.sh). Unset them for TP=3 (docs/tp3.md)"
+  [[ "$POOL" =~ ^[1-9][0-9]{0,7}$ ]] && (( POOL >= (CONTEXT + 50 + 2047) / 2048 * 2048 && POOL <= 10000000 )) ||
+    die "POOL is $POOL: at TP=3 it is the pool every request shares (TF_DS_POOL_TOKENS), at least CONTEXT + 50 in whole 2,048-position blocks ($(( (CONTEXT + 50 + 2047) / 2048 * 2048 ))) and at most 10,000,000 (LakyFx's reference RoPE tables). 3300000 is the qualified one"
+  [[ "$ROUND_ROWS" == 16 ]] || die "ROUND_ROWS is 16 at TP=3 (LakyFx's qualified TF29 profile), not '$ROUND_ROWS'"
+  [[ "$PROMPT_CACHE_GIB" =~ ^[0-9]+$ ]] || die "PROMPT_CACHE_GIB is a whole number of GiB (rank 0's --prompt-cache-gib), not $PROMPT_CACHE_GIB"
+}
 
 # What scripts/prepare.sh last left ready (start.sh runs it again when this line changes). "+stock-dtypes": an overlay
 # checkpoint prepared before scripts/ablit_stock_dtypes.py gets that step on the next start.
@@ -297,6 +388,8 @@ prepared_state() {
      "hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
   for i in 2 3; do [[ -z "$(worker_host "$i")" ]] || f+=("w$i=$(worker_host "$i")"); done
   for i in 1 2 3; do f+=("nfs$i=$(wval NFS_SERVER "$i")"); done
+  # TP=3's own files: another engine, plan and folders, and RoPE tables cut to the pool (only then: TP=2's line is as it was)
+  [[ "$TP" != 3 ]] || f+=("tp=3" "tp3=$TP3_REV" "arm=$TP3_ARM" "wtp3=$WORKER_TP3_DIR" "rope=$(tp3_rope_rows)" "tp3template=$TP3_TEMPLATE_SHA256")
   (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
 }
 # prepare.sh's last step: computed first and swapped in whole, so a failure leaves the previous marker as it was

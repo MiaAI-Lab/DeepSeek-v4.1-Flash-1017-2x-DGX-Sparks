@@ -25,6 +25,8 @@ case_() {
     die()  { echo "DIE: $*"; exit 1; }
     warn() { echo "WARN: $*"; }
     log()  { echo "LOG: $*"; }
+    # scripts/nodes.sh's worker list (wvar, worker_ids): port.sh's steps on a worker go over it, the one worker at TP=2
+    eval "$(grep -E '^(wvar|worker_ids)\(\) ' "$here/nodes.sh")"
     eval "$1"
     : "${POOL=}"   # scripts/config.sh's (zig/patches/0008's setting), before port.sh
     # shellcheck source=scripts/port.sh
@@ -368,6 +370,50 @@ case_ "engram check: the worker's folder not there yet -> silent" 0 "SPILL_GIB=6
 case_ "engram check: the worker cannot be reached -> a warning, not a refusal" 0 "SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/real WORKER_ENGRAM_DIR=/y" "$expect; $et_stubs
   worker() { return 255; }
   expect \"[\$(port_engram_check 2>&1)]\" \"[WARN: could not compare /y on w with rank 0's Engram folder ($et/real)]\""
+# ---- two workers (TP=3's worker list: scripts/nodes.sh's worker_ids 1 2, WORKER2): every check above reaches each
+# worker, names the one that fails, and keeps each rank's own value. TP=3 is refused before any of them runs (check_workers):
+# these drive the functions alone.
+tw_stubs="worker_host() { echo w\$1; }; DATA_DIR=/x; WORKER_CACHE_DIR=/y; WORKER_ENGRAM_DIR=/y; HEAD_ENGRAM_DIR="
+case_ "two workers: each worker's own weight-file digest, the log names every rank" 0 "TP=3 SPILL_GIB=8" "$expect; $tw_stubs
+  STATE_DIR=\$(mktemp -d); trap 'rm -rf \"\$STATE_DIR\"' EXIT
+  worker() { [[ \"\$2\" == *\"rank_cache_sha 1 '/y' \$1\" ]] || { echo \"ERR asked for another rank: \$2\"; return 0; }
+             echo sha256:\$(printf \"\$1%.0s\" \$(seq 64)); }
+  rank_cache_sha() { echo sha256:\$(printf 'a%.0s' \$(seq 64)); }
+  out=\$(port_weights_check 2>&1); port_weights_check >/dev/null
+  [[ \"\${PORT_RANK_SHA[1]}\" == sha256:1111* && \"\${PORT_RANK_SHA[2]}\" == sha256:2222* ]] || { echo \"[\${PORT_RANK_SHA[*]}]\"; exit 1; }
+  grep -q 'LOG: Weights: rank 0 sha256:aaa.*, rank 1 sha256:111.*, rank 2 sha256:222.* (' <<<\"\$out\" || { echo \"\$out\"; exit 1; }"
+case_ "two workers: rank 2 without a digest refuses the start, by name" 0 "TP=3 SPILL_GIB=8" "$tw_stubs
+  STATE_DIR=\$(mktemp -d); trap 'rm -rf \"\$STATE_DIR\"' EXIT
+  worker() { if [[ \"\$1\" == 2 ]]; then echo 'ERR 0 weight files rank2of3-*.bin in /y'; else echo sha256:\$(printf 'b%.0s' \$(seq 64)); fi; }
+  rank_cache_sha() { echo sha256:\$(printf 'a%.0s' \$(seq 64)); }
+  out=\$( (port_weights_check) 2>&1) && { echo \"\$out\"; exit 1; }
+  grep -q 'DIE: no weight-file digest (rank 2: 0 weight files rank2of3' <<<\"\$out\" || { echo \"\$out\"; exit 1; }"
+case_ "two workers: every worker's spill folder checked and named" 0 "TP=3 SPILL_GIB=64" "$expect; $tw_stubs
+  spill_dir_probe() { echo '$ok_line'; }; worker() { echo '$ok_line'; }
+  out=\$(port_spill_check 2>&1); port_spill_check >/dev/null
+  expect \"\${PORT_SPILL_REAL[1]} \${PORT_SPILL_REAL[2]}\" '/home/u/.cache/dsv41-tensorfold-spill /home/u/.cache/dsv41-tensorfold-spill'
+  grep -q 'quota 0 GiB; rank 0 /home/u/.cache/dsv41-tensorfold-spill, rank 1 /home/u/.cache/dsv41-tensorfold-spill, rank 2 /home/u/.cache/dsv41-tensorfold-spill$' <<<\"\$out\" || { echo \"\$out\"; exit 1; }"
+case_ "two workers, SPILL_GIB=64 set: rank 2's folder on NFS refuses the start, w2 named" 0 "TP=3 SPILL_GIB=64" "$tw_stubs
+  spill_dir_probe() { echo '$ok_line'; }; worker() { if [[ \"\$1\" == 2 ]]; then echo '$nfs_line'; else echo '$ok_line'; fi; }
+  out=\$( (port_spill_check) 2>&1) && { echo \"\$out\"; exit 1; }
+  grep -q 'DIE: .*WORKER_SPILL_DIR /mnt/x/spill on w2 is on a network file system' <<<\"\$out\" || { echo \"\$out\"; exit 1; }"
+case_ "two workers, DRY_RUN: rank 2 out of reach prints as <WORKER2:...>, rank 1 is still checked" 0 "TP=3 SPILL_GIB=64 DRY_RUN=1" "$expect; $tw_stubs
+  WORKER_DOWN[2]=1; spill_dir_probe() { echo '$ok_line'; }; worker() { echo '$ok_line'; }
+  out=\$(port_spill_check 2>&1); port_spill_check >/dev/null 2>&1
+  expect \"\${PORT_SPILL_REAL[1]}|\${PORT_SPILL_REAL[2]}\" '/home/u/.cache/dsv41-tensorfold-spill|<WORKER2:/home/u/.cache/dsv41-tensorfold-spill>'
+  grep -q 'WARN: DRY_RUN: the worker cannot be reached' <<<\"\$out\" || { echo \"\$out\"; exit 1; }"
+case_ "two workers: rank 2's Engram folder differs -> refused, rank 2 named" 0 "TP=3 SPILL_GIB=64 HEAD_ENGRAM_DIR=$et/real" "$expect; $et_stubs; $tw_stubs
+  HEAD_ENGRAM_DIR=$et/real
+  worker() { if [[ \"\$1\" == 2 ]]; then printf 'config.json:5;\n'; else printf 'config.json:5;\nmodel.safetensors.index.json:7;\n'; fi; }
+  out=\$(port_engram_check 2>&1); rc=\$?
+  expect \"\$rc\" 1
+  grep -q 'rank 2 (w2, /y) lists \[config.json:5;\]' <<<\"\$out\" || { echo \"\$out\"; exit 1; }"
+case_ "two workers: the spill files are given back on every worker, each in its own folder" 0 "TP=3 SPILL_GIB=64" "$expect; $tw_stubs
+  t=\$(mktemp -d); trap 'rm -rf \"\$t\"' EXIT
+  spill_fix_owner() { :; }; worker() { echo \"\$1 \${2##*; }\" >> \"\$t/calls\"; }
+  PORT_SPILL_REAL=(/s0 /s1 /s2); IMAGE=img; port_spill_fix_both
+  expect \"\$(cat \"\$t/calls\")\" \"1 spill_fix_owner '/s1' 'img' 1
+2 spill_fix_owner '/s2' 'img' 1\""
 rm -rf "$et"
 
 # ---- spill_dir_probe itself (GNU coreutils and util-linux: Linux only)
@@ -535,15 +581,16 @@ check_ "POOL: the derived sharding pool goes through start.sh's 0008 mapping, on
 # stop.sh before a launch removes it, and stop.sh saves each rank's log before its docker rm: a restart keeps the evidence
 check_ "start.sh: a container left over, running or exited, is stopped by stop.sh (its log saved) before the launch" '
   t=$(mktemp -d "${TMPDIR:-/tmp}/port-test.XXXXXX"); trap "rm -rf -- \"$t\"" EXIT
-  eval "$(grep -E "^exists_(here|worker)\(\) " "$here/../start.sh")"
+  eval "$(grep -E "^(exists_(here|worker)|any_exists)\(\) " "$here/../start.sh")"
+  eval "$(grep -E "^worker_ids\(\) " "$here/nodes.sh")"; TP=2
   CONTAINER_NAME=c
   docker() { [[ "$*" == "inspect c" && -e "$t/here" ]]; }
   worker() { [[ "$1" == 1 && "${*:2}" == "docker inspect c" && -e "$t/there" ]]; }
-  ! exists_here && ! exists_worker 1 || { echo "a container found where there is none"; exit 1; }
-  : > "$t/here"; exists_here || { echo "an exited container here is not found"; exit 1; }
-  rm "$t/here"; : > "$t/there"; exists_worker 1 || { echo "a container on the worker is not found"; exit 1; }
+  ! exists_here && ! exists_worker 1 && ! any_exists || { echo "a container found where there is none"; exit 1; }
+  : > "$t/here"; exists_here && any_exists || { echo "an exited container here is not found"; exit 1; }
+  rm "$t/here"; : > "$t/there"; exists_worker 1 && any_exists || { echo "a container on the worker is not found"; exit 1; }
   launch=$(sed -n "/^if (( ! DRY )); then/,/^  memguard_start/p" "$here/../start.sh")
-  [[ "$launch" == *"if exists_here || exists_worker 1; then ./stop.sh; fi"*"docker rm -f"* ]] || { echo "start.sh removes a container stop.sh has not seen"; exit 1; }
+  [[ "$launch" == *"if any_exists; then ./stop.sh; fi"*"docker rm -f"* ]] || { echo "start.sh removes a container stop.sh has not seen"; exit 1; }
   grep -q "^if names=\$(docker ps -a --format" "$here/../stop.sh" || { echo "stop.sh does not count an exited container here"; exit 1; }
   for f in stop_here stop_worker; do
     body=$(sed -n "/^$f() {/,/^}/p" "$here/../stop.sh")

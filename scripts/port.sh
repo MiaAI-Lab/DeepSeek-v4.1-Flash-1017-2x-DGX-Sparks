@@ -381,35 +381,39 @@ rank_cache_sha() {
   { printf '%s %s\n' "$st" "$sum" > "$cache.$$" && mv -f -- "$cache.$$" "$cache"; } 2>/dev/null || rm -f -- "$cache.$$" 2>/dev/null
   echo "sha256:$sum"
 }
-# port_weights_check: PORT_RANK_SHA[0] and [1], both Sparks at once (start.sh, step 2; DRY_RUN computes nothing and
-# uses a cached digest only). The digest enters the rank's fingerprint and so the store's folder (native-spill-<compat>):
-# a rank that started once with it and once without would open another, empty store and every kept state would be
-# lost. So a real start refuses when either rank's digest cannot be had (the worker's probe is tried twice); only
-# DRY_RUN warns and goes on. Nothing with the tier off or SPILL_WEIGHTS_SHA=0 (which names another store, too).
+# port_weights_check: PORT_RANK_SHA[0] and [i] for each worker i, every Spark at once (start.sh, step 2; DRY_RUN
+# computes nothing and uses a cached digest only). The digest enters the rank's fingerprint and so the store's folder
+# (native-spill-<compat>): a rank that started once with it and once without would open another, empty store and every
+# kept state would be lost. So a real start refuses when any rank's digest cannot be had (a worker's probe is tried
+# twice); only DRY_RUN warns and goes on. Nothing with the tier off or SPILL_WEIGHTS_SHA=0 (which names another store, too).
 declare -a PORT_RANK_SHA=()
-port_weights_probe() {   # port_weights_probe <compute>: the worker's line
+port_weights_probe() {   # port_weights_probe <i> <compute>: worker i's line
   local out
-  [[ -z "${WORKER_DOWN[1]:-}" ]] || { echo "ERR the worker cannot be reached"; return 0; }
-  out=$(worker 1 "$(declare -f rank_cache_sha); rank_cache_sha $1 '$WORKER_CACHE_DIR' 1" 2>/dev/null | head -n 1) || true
+  [[ -z "${WORKER_DOWN[$1]:-}" ]] || { echo "ERR the worker cannot be reached"; return 0; }
+  out=$(worker "$1" "$(declare -f rank_cache_sha); rank_cache_sha $2 '$WORKER_CACHE_DIR' $1" 2>/dev/null | head -n 1) || true
   echo "${out:-ERR no answer from the worker}"
 }
 port_weights_check() {
   PORT_RANK_SHA=()
   port_spill_on && [[ "$SPILL_WEIGHTS_SHA" == 1 ]] || return 0
-  local compute=1 t0=$SECONDS l0 l1="" tmp r line bad=""
+  local compute=1 t0=$SECONDS i r line bad="" ranks=""
+  local -a lines=() tmp=()
   [[ "${DRY_RUN:-0}" != 1 ]] || compute=0
   (( compute == 0 )) || log "Weights' digests (TF_DS_RANK_CACHE_SHA): a few seconds when cached, about a minute a Spark when a weight file is new"
-  if tmp=$(mktemp "${STATE_DIR:-/tmp}/rank-sha.XXXXXX" 2>/dev/null); then
-    port_weights_probe "$compute" > "$tmp" &
-    l0=$(rank_cache_sha "$compute" "$DATA_DIR/rank-cache" 0)
-    wait
-    l1=$(head -n 1 "$tmp" 2>/dev/null); rm -f -- "$tmp"
-  else
-    l0=$(rank_cache_sha "$compute" "$DATA_DIR/rank-cache" 0)
-  fi
-  case "$l1" in sha256:*|PENDING) ;; *) l1=$(port_weights_probe "$compute") ;; esac   # a second try: an ssh glitch
-  for r in 0 1; do
-    if (( r == 0 )); then line=$l0; else line=$l1; fi
+  # every worker's probe in the background (each into its own file), this Spark's meanwhile
+  for i in $(worker_ids); do
+    tmp[i]=$(mktemp "${STATE_DIR:-/tmp}/rank-sha.XXXXXX" 2>/dev/null) || { tmp[i]=""; continue; }
+    port_weights_probe "$i" "$compute" > "${tmp[i]}" &
+  done
+  lines[0]=$(rank_cache_sha "$compute" "$DATA_DIR/rank-cache" 0)
+  wait
+  for i in $(worker_ids); do
+    lines[i]=""
+    if [[ -n "${tmp[i]}" ]]; then lines[i]=$(head -n 1 "${tmp[i]}" 2>/dev/null); rm -f -- "${tmp[i]}"; fi
+    case "${lines[i]}" in sha256:*|PENDING) ;; *) lines[i]=$(port_weights_probe "$i" "$compute") ;; esac   # a second try: an ssh glitch
+  done
+  for r in 0 $(worker_ids); do
+    line=${lines[r]}
     case "$line" in
       sha256:*) PORT_RANK_SHA[r]=$line ;;
       PENDING) log "DRY_RUN: rank $r's weight-file digest is not cached yet: start.sh computes it" ;;
@@ -418,7 +422,8 @@ port_weights_check() {
     esac
   done
   [[ -z "$bad" ]] || die "no weight-file digest ($bad). It names the spill store, so a rank without it would open another, empty store and lose every kept state: fix that, or set SPILL_WEIGHTS_SHA=0 on purpose (a different store too). Nothing was stopped"
-  log "Weights: rank 0 ${PORT_RANK_SHA[0]:-(revision only)}, rank 1 ${PORT_RANK_SHA[1]:-(revision only)} ($((SECONDS - t0)) s)"
+  for r in $(worker_ids); do ranks+=", rank $r ${PORT_RANK_SHA[r]:-(revision only)}"; done
+  log "Weights: rank 0 ${PORT_RANK_SHA[0]:-(revision only)}$ranks ($((SECONDS - t0)) s)"
 }
 
 # port_identity: the settings both ranks run with, as one word (the containers' tf.recipe.port label): "off" when every
@@ -524,8 +529,9 @@ port_spill_judge() {
   return 0
 }
 
-# port_spill_check: both ranks' spill directories, before anything is stopped (start.sh, step 2): created when missing
-# (as you; DRY_RUN=1 creates nothing), on a local disk, outside the export and the model folders, above the floor.
+# port_spill_check: every rank's spill directory (this Spark's, then each worker's), before anything is stopped
+# (start.sh, step 2): created when missing (as you; DRY_RUN=1 creates nothing), on a local disk, outside the export and
+# the model folders, above the floor.
 # The two ranks run with the same settings by construction (port_map); this checks what each Spark has under them.
 # start.sh runs it before port_map and before it compares a running pair's tf.recipe.port label, so a default tier
 # that cannot run is off everywhere it matters: the flags, the variables, the mounts and the label. With SPILL_GIB
@@ -533,21 +539,25 @@ port_spill_judge() {
 # ranks, when either Spark's folder fails.
 port_spill_check() {
   port_spill_on || return 0
-  local create=1 line
+  local create=1 line i down=0 ranks=""
   [[ "${DRY_RUN:-0}" != 1 ]] || create=0
   PORT_SPILL_WHY=""
   line=$(spill_dir_probe "$create" "$SPILL_DIR" "$HF_CACHE" "$(port_nfs_path)" "$HEAD_ENGRAM_DIR" "$DATA_DIR")
   if ! port_spill_judge 0 "this Spark" "$line"; then port_spill_default_off "$PORT_SPILL_WHY"; return 0; fi
-  if [[ -n "${WORKER_DOWN[1]:-}" ]]; then
-    warn "DRY_RUN: the worker cannot be reached: WORKER_SPILL_DIR ($WORKER_SPILL_DIR) is not checked"
-    PORT_SPILL_REAL[1]="<WORKER:$WORKER_SPILL_DIR>"; return 0
-  fi
-  if ! line=$(worker 1 "$(declare -f spill_dir_probe); spill_dir_probe $create '$WORKER_SPILL_DIR' '$WORKER_ENGRAM_DIR' '$WORKER_CACHE_DIR' \"\${HF_HOME:-\$HOME/.cache/huggingface}\""); then
-    port_spill_refuse "could not check WORKER_SPILL_DIR on $(worker_host 1)"
-    port_spill_default_off "$PORT_SPILL_WHY"; return 0
-  fi
-  if ! port_spill_judge 1 "$(worker_host 1)" "$line"; then port_spill_default_off "$PORT_SPILL_WHY"; return 0; fi
-  log "Spill tier: $SPILL_GIB GiB a Spark, floor $SPILL_FLOOR_GIB GiB, quota ${SPILL_QUOTA_GIB} GiB; rank 0 ${PORT_SPILL_REAL[0]}, rank 1 ${PORT_SPILL_REAL[1]}"
+  for i in $(worker_ids); do
+    if [[ -n "${WORKER_DOWN[$i]:-}" ]]; then
+      warn "DRY_RUN: the worker cannot be reached: WORKER_SPILL_DIR ($WORKER_SPILL_DIR) is not checked"
+      PORT_SPILL_REAL[i]="<$(wvar WORKER "$i"):$WORKER_SPILL_DIR>"; down=1; continue
+    fi
+    if ! line=$(worker "$i" "$(declare -f spill_dir_probe); spill_dir_probe $create '$WORKER_SPILL_DIR' '$WORKER_ENGRAM_DIR' '$WORKER_CACHE_DIR' \"\${HF_HOME:-\$HOME/.cache/huggingface}\""); then
+      port_spill_refuse "could not check WORKER_SPILL_DIR on $(worker_host "$i")"
+      port_spill_default_off "$PORT_SPILL_WHY"; return 0
+    fi
+    if ! port_spill_judge "$i" "$(worker_host "$i")" "$line"; then port_spill_default_off "$PORT_SPILL_WHY"; return 0; fi
+    ranks+=", rank $i ${PORT_SPILL_REAL[i]}"
+  done
+  (( down == 0 )) || return 0
+  log "Spill tier: $SPILL_GIB GiB a Spark, floor $SPILL_FLOOR_GIB GiB, quota ${SPILL_QUOTA_GIB} GiB; rank 0 ${PORT_SPILL_REAL[0]}$ranks"
 }
 # engram_listing <dir>: what the engine's rank fingerprint reads from an Engram folder — every entry at its top but a
 # directory, dotfiles too, as name:size; with the size read through symlinks, sorted (rebased zig/patches/0016,
@@ -587,23 +597,26 @@ head_engram_dir() {
 # agreement marks engram "shard-only", 0018).
 port_engram_check() {
   port_spill_on || return 0
-  local head hlist wlist snap fix shards="" s
+  local head hlist wlist snap fix shards="" s i
   head=$(head_engram_dir) || return 0
   hlist=$(engram_listing "$head") || return 0
-  if [[ -n "${WORKER_DOWN[1]:-}" ]]; then
-    warn "DRY_RUN: $(worker_host 1) cannot be reached: its Engram folder is not compared with rank 0's"
-    return 0
-  fi
-  if ! wlist=$(worker 1 "$(declare -f engram_listing); engram_listing \"$WORKER_ENGRAM_DIR\" || echo __NO_DIR__"); then
-    warn "could not compare $WORKER_ENGRAM_DIR on $(worker_host 1) with rank 0's Engram folder ($head)"
-    return 0
-  fi
-  [[ "$wlist" == __NO_DIR__ ]] && return 0
-  [[ "$hlist" == "$wlist" ]] && return 0
-  snap="$HF_CACHE/hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)"
-  fix="$HOME/.cache/dsv41-tensorfold/engram-$(engram_rev | cut -c1-8)"
-  for s in $ENGRAM_SHARDS; do shards+=" $snap/$s"; done
-  die "the ranks' Engram folders list different files, and the engine's rank fingerprint compares exactly that (the revision, the kit's engram.json and the folder's files by name and size, read through symlinks). rank 0 ($head) lists [$(printf '%s' "$hlist" | tr '\n' ' ')], rank 1 ($(worker_host 1), $WORKER_ENGRAM_DIR) lists [$(printf '%s' "$wlist" | tr '\n' ' ')]. Make the two folders hold the same files, or put rank 0's on this Spark's disk and point HEAD_ENGRAM_DIR at that folder (hardlinks, no extra disk) — mkdir -p $fix && cp -lL $snap/config.json $snap/model.safetensors.index.json$shards $fix/ && echo \"HEAD_ENGRAM_DIR=$fix\" >> scripts/local.sh — then run ./start.sh restart (issue #61). Nothing was stopped."
+  for i in $(worker_ids); do
+    if [[ -n "${WORKER_DOWN[$i]:-}" ]]; then
+      warn "DRY_RUN: $(worker_host "$i") cannot be reached: its Engram folder is not compared with rank 0's"
+      continue
+    fi
+    if ! wlist=$(worker "$i" "$(declare -f engram_listing); engram_listing \"$WORKER_ENGRAM_DIR\" || echo __NO_DIR__"); then
+      warn "could not compare $WORKER_ENGRAM_DIR on $(worker_host "$i") with rank 0's Engram folder ($head)"
+      continue
+    fi
+    [[ "$wlist" == __NO_DIR__ ]] && continue
+    [[ "$hlist" == "$wlist" ]] && continue
+    snap="$HF_CACHE/hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)"
+    fix="$HOME/.cache/dsv41-tensorfold/engram-$(engram_rev | cut -c1-8)"
+    for s in $ENGRAM_SHARDS; do shards+=" $snap/$s"; done
+    die "the ranks' Engram folders list different files, and the engine's rank fingerprint compares exactly that (the revision, the kit's engram.json and the folder's files by name and size, read through symlinks). rank 0 ($head) lists [$(printf '%s' "$hlist" | tr '\n' ' ')], rank $i ($(worker_host "$i"), $WORKER_ENGRAM_DIR) lists [$(printf '%s' "$wlist" | tr '\n' ' ')]. Make the two folders hold the same files, or put rank 0's on this Spark's disk and point HEAD_ENGRAM_DIR at that folder (hardlinks, no extra disk) — mkdir -p $fix && cp -lL $snap/config.json $snap/model.safetensors.index.json$shards $fix/ && echo \"HEAD_ENGRAM_DIR=$fix\" >> scripts/local.sh — then run ./start.sh restart (issue #61). Nothing was stopped."
+  done
+  return 0
 }
 
 # NFS_PATH when it is a real path ("/" is an NFSv4 pseudo-root, not a folder of this Spark)
@@ -671,11 +684,14 @@ spill_fix_container() {
   img=$(docker inspect -f '{{.Image}}' "$c") || return 1
   spill_fix_owner "$dir" "$img"
 }
-# port_spill_fix_both: before a start, on both Sparks, once port_spill_check passed (warnings only: the engine runs as
+# port_spill_fix_both: before a start, on every Spark, once port_spill_check passed (warnings only: the engine runs as
 # root and reads them anyway); it marks each accepted folder, so later stops may hand its files back
 port_spill_fix_both() {
   port_spill_on || return 0
+  local i
   spill_fix_owner "${PORT_SPILL_REAL[0]}" "$IMAGE" 1 || warn "could not give rank 0's spill files back to you in ${PORT_SPILL_REAL[0]}"
-  worker 1 "$(declare -f spill_fix_target spill_fix_owner); spill_fix_owner '${PORT_SPILL_REAL[1]}' '$IMAGE' 1" ||
-    warn "could not give rank 1's spill files back to you in ${PORT_SPILL_REAL[1]} on $(worker_host 1)"
+  for i in $(worker_ids); do
+    worker "$i" "$(declare -f spill_fix_target spill_fix_owner); spill_fix_owner '${PORT_SPILL_REAL[i]}' '$IMAGE' 1" ||
+      warn "could not give rank $i's spill files back to you in ${PORT_SPILL_REAL[i]} on $(worker_host "$i")"
+  done
 }

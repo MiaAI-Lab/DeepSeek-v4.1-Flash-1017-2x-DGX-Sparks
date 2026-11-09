@@ -1,0 +1,80 @@
+# The engine image at TP=3 (three Sparks, experimental; docs/tp3.md): LakyFx's TensorFold TP3 port of BertholomusAI's
+# DeepSeek-V4.1 Zig engine (LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark at TP3_REV), on the same NVIDIA PyTorch base
+# as zig/Dockerfile. That repository ships the TensorFold runtime as a frozen snapshot: its tensorfold/extract.py checks
+# every shipped archive and preparation file against tensorfold/inputs.json and unpacks the runtime's sources, its kernel
+# kit (the SM121 cubins, the Triton AOT set, Engram's constants and token map) and the RoPE reference into a new folder;
+# the snapshot it reports must be TP3_SNAPSHOT. Zig ZIG_VERSION builds the head (tensorfold-native) and the follower
+# (tf-dsv41-lanes) from those sources with the kit's prebuilt fatbins, as LakyFx's docs/TENSORFOLD-INSTALL.md and
+# easthambuilds' scripts/prepare.sh build them. NCCL 2.30.7 with the switchless patches for direct cables
+# (alexellis/switchless-nccl v0.0.1: the archive and its libnccl.so.2.30.7 by sha256) goes first on LD_LIBRARY_PATH: the
+# engine opens libnccl.so.2 by name, and the base image's own NCCL 2.30.7 has no switchless ring.
+# Kept for scripts/prepare-tp3.sh (CPU only, no GPU): /opt/tp3/kit, /opt/tp3/reference, /opt/tp3/tools (the runtime's
+# tools/dsv41-tp3: the rank-file exporter rank_cache.py, rank_verify.py, source_verify.py and their modules) and
+# /opt/tp3/lakyfx (the repository's tensorfold/ preparation plans, native keys, profiles, RoPE hashes, make_rope.py and
+# prepare_engram.py, its tools/engram_local.py, and its license). None of zig/patches is in this image.
+# Built by scripts/prepare.sh, never by hand: it passes the build arguments and a build context of this file only.
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+FROM ${BASE_IMAGE}
+# ABLIT=1's overlay and scripts/ablit_stock_dtypes.py use the image's PyTorch and safetensors on CPU, as at TP=2.
+RUN python3 -m pip install --no-cache-dir safetensors
+ARG ZIG_VERSION
+ARG ZIG_SHA256
+# The compiler as zig/Dockerfile fetches it: the first of ZIG_MIRRORS that serves the pinned sha256, then ziglang.org.
+ARG ZIG_MIRRORS="https://zig.linus.dev/zig"
+RUN ok=0; \
+    for base in ${ZIG_MIRRORS} "https://ziglang.org/download/${ZIG_VERSION}"; do \
+      url="${base%/}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz"; echo "zig: trying ${url}"; \
+      if curl --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 --retry-max-time 600 -fsSL -o /tmp/zig.tar.xz "${url}" && \
+         echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -; then ok=1; break; fi; \
+      rm -f /tmp/zig.tar.xz; \
+    done; \
+    [ "$ok" = 1 ] || { echo "zig ${ZIG_VERSION}: no source served the pinned sha256" >&2; exit 1; }; \
+    mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz && \
+    /opt/zig/zig version
+
+# LakyFx's repository at the pinned commit, its inputs checked and unpacked by its own extract.py
+ARG TP3_REPO
+ARG TP3_REV
+ARG TP3_SNAPSHOT
+RUN git init -q /lakyfx && cd /lakyfx && git remote add origin "${TP3_REPO}" && \
+    git fetch -q --depth 1 origin "${TP3_REV}" && git checkout -q --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${TP3_REV}" && \
+    python3 -I tensorfold/extract.py --out /opt/tp3 > /tmp/extract.json && cat /tmp/extract.json && \
+    grep -q '"VERIFIED_EXTRACTED"' /tmp/extract.json && grep -q "\"${TP3_SNAPSHOT}\"" /tmp/extract.json && rm /tmp/extract.json && \
+    mkdir -p /opt/tp3/lakyfx/tensorfold /opt/tp3/lakyfx/tools && \
+    cp -a tensorfold/preparation tensorfold/profiles tensorfold/rope-hashes.json tensorfold/inputs.json \
+          tensorfold/make_rope.py tensorfold/prepare_engram.py /opt/tp3/lakyfx/tensorfold/ && \
+    cp -a tools/engram_local.py /opt/tp3/lakyfx/tools/ && \
+    cp -a LICENSE THIRD_PARTY_NOTICES.md /opt/tp3/lakyfx/ && \
+    cd / && rm -rf /lakyfx
+
+# the head and the follower, for sm_121, with the kit's fatbins embedded (no nvcc step)
+RUN cd /opt/tp3/source && ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache /opt/zig/zig build native dsv41-tools -j"$(nproc)" \
+      -Dtarget=aarch64-linux-gnu -Dfatbins=/opt/tp3/kit/build-fatbins --prefix /opt/tensorfold && \
+    test -x /opt/tensorfold/native/bin/tensorfold-native && test -x /opt/tensorfold/bin/tf-dsv41-lanes && \
+    mkdir -p /opt/tensorfold/share/doc/tensorfold && \
+    for f in LICENSE NOTICE THIRD_PARTY_NOTICES.md LICENSES; do \
+      if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done && \
+    cp -a /opt/tp3/lakyfx/LICENSE /opt/tensorfold/share/doc/tensorfold/LICENSE-lakyfx && \
+    mv tools/dsv41-tp3 /opt/tp3/tools && \
+    cd / && rm -rf /opt/tp3/source /tmp/zig-cache /root/.cache/zig
+
+# NCCL 2.30.7, switchless
+ARG NCCL_TGZ_URL
+ARG NCCL_TGZ_SHA256
+ARG NCCL_LIB_SHA256
+RUN curl --connect-timeout 20 --max-time 600 --retry 3 --retry-delay 5 -fsSL -o /tmp/nccl.tgz "${NCCL_TGZ_URL}" && \
+    echo "${NCCL_TGZ_SHA256}  /tmp/nccl.tgz" | sha256sum -c - && \
+    mkdir -p /tmp/nccl /opt/nccl-switchless/lib && tar -xzf /tmp/nccl.tgz -C /tmp/nccl && \
+    lib=$(find /tmp/nccl -name libnccl.so.2.30.7 -type f | head -1) && test -n "$lib" && \
+    echo "${NCCL_LIB_SHA256}  ${lib}" | sha256sum -c - && \
+    cp "$lib" /opt/nccl-switchless/lib/ && \
+    ln -s libnccl.so.2.30.7 /opt/nccl-switchless/lib/libnccl.so.2 && ln -s libnccl.so.2 /opt/nccl-switchless/lib/libnccl.so && \
+    for f in $(dirname "$lib")/*.txt $(dirname "$lib")/*.md; do [ -e "$f" ] && cp "$f" /opt/nccl-switchless/; done; \
+    rm -rf /tmp/nccl /tmp/nccl.tgz
+
+ARG PATCHES_HASH
+LABEL tf.patches=${PATCHES_HASH} tf.engine=zig-tp3 tf.tp3=${TP3_REV} tf.tp3.snapshot=${TP3_SNAPSHOT}
+ENV PATH=/opt/tensorfold/native/bin:/opt/tensorfold/bin:${PATH}
+ENV LD_LIBRARY_PATH=/opt/nccl-switchless/lib:${LD_LIBRARY_PATH}
+WORKDIR /workspace

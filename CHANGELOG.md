@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Three Sparks, experimental (`TP=3`, issue #54).** Three Sparks cabled as a triangle serve the same checkpoint on
+  LakyFx's TensorFold TP3 port (the two-Spark engine runs two or four ranks only): `zig/Dockerfile.tp3` builds it from
+  `LakyFx/deepseek-v41-flash-exl3-tp3-tp4-spark` at `14a6d49` (tag `v1.2.2TF`; its `extract.py` checks the runtime
+  snapshot `61357deb`) with Zig 0.17.0 on the same base image, with NCCL 2.30.7 switchless (`alexellis/switchless-nccl`
+  `v0.0.1`, sha256-checked), as easthambuilds' three-Spark recipe runs it. `scripts/nodes.sh` pairs the triangle by
+  subnet (the GLM-5.3 3x recipe's `node_inventory` and pairing): each rank's four rails in port order, its peer masks,
+  its NCCL devices (the first of each cable), the master, the routes each rank needs, printed as the commands that add
+  them when missing. `scripts/prepare-tp3.sh` (from easthambuilds' `prepare.sh`) makes the receipt (a local source
+  manifest, so the `ABLIT=1` checkpoint works too), the plan (`scripts/tp3_plan.py`, checked against LakyFx's TF29 plan:
+  144,286 tensors, none missing or different; pinned for the default checkpoint), the kit with RoPE tables cut to
+  `POOL`, the model folder, each rank's weight file (66.8 GiB) and Engram rows, and copies the workers' over NFS,
+  checked by sha256. `start.sh` launches the workers then rank 0 with LakyFx's variables (`TF_DS_EXPERIMENTAL_TP3=1`,
+  `TF_RDMA_PEER_MASKS`, ...) and the four switchless NCCL settings three Sparks needed. Defaults at `TP=3`: LakyFx's
+  qualified TF29 profile (`POOL` 3300000, `CONTEXT` 401408, `PARALLEL` 8, 16-row rounds, a 1 GiB prompt cache),
+  `MIN_AVAIL_GIB` 80; the spill tier, KV sharding, EAQ v1.1, `GRAPH_CAP`, `RDMA_IDLE_S`, `RDMA_NAP_US`,
+  `PREFILL_INTERLEAVE_MS`, `TF_DS_CONNECT_S`, `DROP_REASONING_HISTORY=1` and `HEAD_ENGRAM_DIR` are refused. At `TP=3`
+  rank 0 serves LakyFx's qualified 1017 chat template (sha256 `7d135667`, downloaded from its model repository at a
+  pinned revision), which the runtime's model-file step requires; `TP=2` keeps `model/chat_template.jinja`. Run once on
+  three Sparks: prepared, loaded in 128.5 s, smoke test and `tools/validate.py` pass but video (LakyFx's engine
+  refuses video parts), 60.7 tokens/s for one 1,000-token reply; the workers' copies were made over ssh, not NFS
+  ([docs/tp3.md](docs/tp3.md)). At `TP=2` nothing changes: `scripts/test_tp3.py` compares
+  `start.sh` and `stop.sh` with the tree before (`9912367`), and tests the settings, the pairing, the rank commands
+  and starts with fakes; `scripts/test_tp3_inputs.py` tests the Python tools. An `ABLIT=1` shard the overlay leaves as
+  a symbolic link becomes the stock shard's file itself before the dtype step (at either `TP`).
+- The scripts take their workers as a list, so that three Sparks can follow: `scripts/nodes.sh`'s `worker_ids` (the
+  GLM-5.3 3x and the 4x recipes' form; the one worker at `TP=2`). Every step that reached worker 1 now takes each
+  worker in turn and names the one that fails: `start.sh`'s running-pair check, stops, NFS check, launch, load,
+  `FOREGROUND=1` watch and summary; `scripts/prepare.sh`'s preflight, image copy and steps 6 and 7; `scripts/port.sh`'s
+  weight digests, spill folders, Engram listing and spill give-back; `await_memory` and the `MIN_AVAIL_GIB` refusal.
+  Rank i runs `tf-dsv41-lanes ... <i> <TP>` against the head's address on its own link and reads `rank<i>of<TP>`.
+  `WORKER2`, `FABRIC_PEER2` and `NFS_SERVER2` are settings (`scripts/config.sh`, `scripts/local.sh.example`) and `TP`
+  takes the environment's value, but only `TP=2` is served: `TP=3` is refused before anything is stopped (the links
+  of three Sparks and their launch come next), and a `WORKER2` set at `TP=2` is left alone. At `TP=2` nothing changes:
+  `scripts/test_nodes_tpn.py` runs `start.sh` (dry runs and, with fakes, starts, restarts and a failed load) and
+  `stop.sh` from this tree and from `31457d0` and compares the output, the ssh commands and the docker calls; it and
+  seven new `scripts/port_test.sh` cases drive the steps with two workers.
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
