@@ -1,4 +1,4 @@
-From 6d79597f0330808157749ee91d9ba9965f6214f4 Mon Sep 17 00:00:00 2001
+From e39156114fd3bf902e6f6458d5e0e451198c0cf1 Mon Sep 17 00:00:00 2001
 From: Hector Isaza <76170012+hecisaza@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 02:53:02 +0000
 Subject: [PATCH] dsv41: TF_DS_RDMA_CPUS pins the RDMA proxy thread to a CPU,
@@ -26,10 +26,10 @@ pinned to a CPU the process may use runs there alone and is named; unset keeps t
 mask, or one outside the process's mask, keeps it too, without a fault; the affinity queries checked).
 ---
  zig/src/families/dsv41/model.zig    |  2 +-
- zig/src/families/dsv41/rdma.zig     | 67 +++++++++++++++++++++++++++++
+ zig/src/families/dsv41/rdma.zig     | 71 +++++++++++++++++++++++++++++
  zig/src/families/dsv41/rdma_env.zig | 26 +++++++++++
  zig/src/families/dsv41/ring2d.zig   | 14 ++++--
- 4 files changed, 105 insertions(+), 4 deletions(-)
+ 4 files changed, 109 insertions(+), 4 deletions(-)
 
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
 index 8b37d6e..aa68d3d 100644
@@ -45,7 +45,7 @@ index 8b37d6e..aa68d3d 100644
          const per = @sizeOf(rdma.Info);
          const mine = [2]rdma.Info{ r.info(0), r.info(1) };
 diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
-index a12d9b3..870e425 100644
+index a12d9b3..9085c65 100644
 --- a/zig/src/families/dsv41/rdma.zig
 +++ b/zig/src/families/dsv41/rdma.zig
 @@ -67,6 +67,22 @@ fn monotonicNs() u64 {
@@ -87,7 +87,7 @@ index a12d9b3..870e425 100644
          const nd = r.nd;
          const need: u32 = (r.world - 1) * nd;
          var sends: seqs.Sends = .{ .need = need, .slots = r.s.slots };
-@@ -838,3 +856,52 @@ test "a sized transfer's segments are dsv41_shard.cu's TfDsRingRows (passed by v
+@@ -838,3 +856,56 @@ test "a sized transfer's segments are dsv41_shard.cu's TfDsRingRows (passed by v
      try std.testing.expect(!r.rowsFit(s, 0, 1));
      try std.testing.expect(!r.rowsFit(s, 2, 65));
  }
@@ -133,11 +133,15 @@ index a12d9b3..870e425 100644
 +    try T.after(60000); // past the mask: unpinned, no fault
 +    try std.testing.expect(!T.placed);
 +    try std.testing.expectEqual(mine, T.set);
-+    // inside the mask but not a CPU this process may use: the kernel refuses it, unpinned (only where 1023 is unavailable)
++    // inside the mask but outside this process's mask: pinned there if the kernel allows the CPU, else refused with the
++    // inherited mask kept (a narrower taskset mask is not the set of CPUs the kernel permits)
 +    if (mine[1023 / bits] & (@as(usize, 1) << @intCast(1023 % bits)) == 0) {
 +        try T.after(1023);
-+        try std.testing.expect(!T.placed);
-+        try std.testing.expectEqual(mine, T.set);
++        if (T.placed) {
++            var at: linux.cpu_set_t = @splat(0);
++            at[1023 / bits] = @as(usize, 1) << @intCast(1023 % bits);
++            try std.testing.expectEqual(at, T.set);
++        } else try std.testing.expectEqual(mine, T.set);
 +    }
 +}
 diff --git a/zig/src/families/dsv41/rdma_env.zig b/zig/src/families/dsv41/rdma_env.zig
