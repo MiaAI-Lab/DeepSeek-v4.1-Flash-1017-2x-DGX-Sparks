@@ -50,6 +50,13 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   ([hecisaza](https://github.com/hecisaza)), its parse first as `0052` of the 4-Spark recipe in
   [pull request #49](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/49); its live
   mode keeps the live call streaming of `0048` by **[nuk3s](https://github.com/nuk3s)**.
+- **`zig/patches/0066-load-prefetch.patch`** (`TF_DS_LOAD_PREFETCH`, the rank cache read ahead of the weight loader) was
+  authored by **[shalk3](https://github.com/shalk3)** in
+  [pull request #20](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/20) of the 4-Spark
+  recipe, where it is `0046` (commit
+  [`bf514ca`](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/20/commits/bf514caf66de2843baaa8b4fc7af18957ffb1bfb)); ported
+  to this engine by **Hector Isaza** ([hecisaza](https://github.com/hecisaza)), who made it skip the expert entries this
+  engine's loader reads whole with direct reads.
 - **`tools/claims/0046-server-get-delete-body-discard.sh`** (checks that patch on a running server) was written by **Hector Isaza**
   ([hecisaza](https://github.com/hecisaza)) with the verify step of [inference-agent-kit](https://github.com/hecisaza/inference-agent-kit), in
   [hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold](https://github.com/hecisaza/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold)
