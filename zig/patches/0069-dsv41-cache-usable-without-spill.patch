@@ -1,0 +1,157 @@
+From 91cc8090f4a3804f0322b763149ff5a9c34a102a Mon Sep 17 00:00:00 2001
+From: pr0b3r7 <14915771+pr0b3r7@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 11:28:20 -0500
+Subject: [PATCH] dsv41: the prompt cache passes over a stale kept state
+ without the spill tier too
+
+Patch 0014 (core cache tier) made Store.find stale-aware through the family's
+Snapshots.usable, but the dsv41 family sets usable only when the spill tier is
+on (native.zig, o.spill) and the CUDA host copies it only inside
+`if (loaded.tier)`. With SPILL_GIB unset the callback stays null, so a stale
+longer kept state still shadows a usable shorter one and the turn prefills
+from 0.
+
+Keep side: keepWith refreshed a stale duplicate (same at and tokens) instead
+of replacing it, so recomputing an evicted prefix could not restore it.
+
+This wires usable regardless of the tier and replaces a stale duplicate on
+keep (staleness only, so a valid state near the prompt end is never copied
+again). Two prompt_cache_test cases cover it.
+---
+ zig/src/core/prompt_cache.zig      |  8 ++++-
+ zig/src/core/prompt_cache_test.zig | 52 +++++++++++++++++++++++++++++-
+ zig/src/families/dsv41/native.zig  |  4 ++-
+ zig/src/native/cuda.zig            |  2 +-
+ 4 files changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 821d8fc..e0e65db 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -960,7 +960,13 @@ pub const Store = struct {
+         if (at == 0 or n > prompt.len) return false;
+         s.clock += 1;
+         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
+-        for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
++        for (s.entries.items, 0..) |e, i| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
++            // the same state again, but the family let it go (stale): it no longer restores, so a fresh copy replaces
++            // it. Staleness only (no prompt length), so a valid state near the prompt end is never copied again.
++            if (e.point == null) if (s.family.vtable.usable) |f| if (!f(s.family.ptr, e.saved, std.math.maxInt(u32))) {
++                s.remove(i);
++                break;
++            };
+             e.used = s.clock; // the same state again: no copy
+             if (shared and !e.shared) if (e.point) |p| if (s.tier) |t| if (t.vtable.share) |f| { // now a shared prefix, on disk too
+                 f(t.ptr, p);
+diff --git a/zig/src/core/prompt_cache_test.zig b/zig/src/core/prompt_cache_test.zig
+index 2a74cd6..2b22b07 100644
+--- a/zig/src/core/prompt_cache_test.zig
++++ b/zig/src/core/prompt_cache_test.zig
+@@ -33,7 +33,7 @@ const Fake = struct {
+     spare_bytes: u64 = 0,
+     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
+ 
+-    const State = struct { at: u32, sum: u64 };
++    const State = struct { at: u32, sum: u64, stale: bool = false };
+ 
+     fn snapshots(f: *Fake) Snapshots {
+         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn } };
+@@ -97,6 +97,18 @@ const Fake = struct {
+         const f = of(ptr);
+         f.spare_bytes = @min(f.spare_bytes, room_);
+     }
++    /// With the family's own rule: a state restores unless the family marked it stale.
++    fn withUsable(f: *Fake) Snapshots {
++        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .usable = usableFn } };
++    }
++    fn usableFn(_: *anyopaque, saved: Saved, _: u32) bool {
++        const st: *State = @ptrCast(@alignCast(saved));
++        return !st.stale;
++    }
++    fn letGo(saved: Saved) void {
++        const st: *State = @ptrCast(@alignCast(saved));
++        st.stale = true;
++    }
+     fn of(ptr: *anyopaque) *Fake {
+         return @ptrCast(@alignCast(ptr));
+     }
+@@ -494,3 +506,41 @@ test "past the learned-state cap the least recently used state is forgotten, and
+     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
+     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
+ }
++
++test "a state the family let go is passed over: the lookup falls back to a shorter usable state, not to a fresh pass" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.withUsable(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    const t1 = [_]u32{ 1, 2, 3, 4, 5, 9, 9 };
++    _ = f.pass(&s, &t1, try s.begin(a, &t1, 5, &.{}, &.{}, null)); // keeps at 5
++    const t2 = [_]u32{ 1, 2, 3, 4, 5, 9, 7, 7, 6, 6, 9, 9 };
++    _ = f.pass(&s, &t2, try s.begin(a, &t2, 10, &.{}, &.{}, null)); // resumes at 5, keeps at 10
++    const t3 = [_]u32{ 1, 2, 3, 4, 5, 9, 7, 7, 6, 6, 9, 8, 8, 9 }; // extends t2 past both states
++    try std.testing.expectEqual(@as(u32, 10), s.find(&t3, &.{}).?.at);
++    Fake.letGo(s.find(&t3, &.{}).?.saved); // the family lets the longer state go
++    try std.testing.expectEqual(@as(u32, 5), s.find(&t3, &.{}).?.at); // the shorter usable one, not the stale one
++    const p = try s.begin(a, &t3, 12, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 5), p.from);
++    try std.testing.expectEqual(fresh(&t3), f.pass(&s, &t3, p));
++}
++
++test "keeping a state again that the family let go replaces the dead copy instead of counting it as kept" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.withUsable(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    const t1 = [_]u32{ 1, 2, 3, 4, 5, 9, 9 };
++    _ = f.pass(&s, &t1, try s.begin(a, &t1, 5, &.{}, &.{}, null));
++    Fake.letGo(s.find(&t1, &.{}).?.saved);
++    try std.testing.expect(s.find(&t1, &.{}) == null); // nothing usable left: a fresh pass
++    _ = f.pass(&s, &t1, try s.begin(a, &t1, 5, &.{}, &.{}, null)); // the fresh pass keeps at 5 again
++    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
++    try std.testing.expectEqual(@as(u32, 5), s.find(&t1, &.{}).?.at); // usable again: replaced, not refreshed
++}
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 51644e4..be7eac4 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -274,9 +274,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     const L = lanes_mod.Lanes;
+     var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
+     const window: ?usize = if (st.m.kvs != null or st.m.pool_cap != o.context) st.m.window_cap else null;
++    // a stale, loading or ineligible kept state is passed over by the prompt cache with or without the spill tier:
++    // without it a stale longer state shadowed a usable shorter one and the turn prefilled from 0
++    snaps.usable = L.usableFn;
+     var tier: ?spill_tier.prompt_cache.Tier = null;
+     if (o.spill != null) {
+-        snaps.usable = L.usableFn;
+         tier = st.lanes.spill.?.tier();
+     }
+     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index ecf4247..f0dd314 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -450,12 +450,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+         if (want > 0) {
+             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
++            if (@hasField(@TypeOf(sn), "usable")) h.snap_vt.usable = sn.usable; // the family's rule, tier or not
+             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+             // the spill tier (off by default: nothing below runs then)
+             if (@hasField(@TypeOf(loaded), "tier")) {
+                 const store = &h.cache.?;
+                 if (loaded.tier) |t| {
+-                    if (@hasField(@TypeOf(sn), "usable")) h.snap_vt.usable = sn.usable;
+                     var seed: [4]u8 = undefined;
+                     io.random(&seed);
+                     store.setTier(t, std.mem.readInt(u32, &seed, .little));
+-- 
+2.55.0
+
