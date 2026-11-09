@@ -1,4 +1,4 @@
-From 704e84e5263fe55495e2808fed3297a7a380b453 Mon Sep 17 00:00:00 2001
+From f3c1325f2878e68a57490d034d7384e6678a652b Mon Sep 17 00:00:00 2001
 From: Hector Isaza <76170012+hecisaza@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 00:16:34 +0000
 Subject: [PATCH] dsv41: the rank cache is read ahead of the loader
@@ -25,11 +25,11 @@ threads stop); the lead (the threads read only the chunks within it until the lo
 finish while threads wait behind the lead; a chunk that runs past the file's end (read as far as the file goes) and a
 read that fails (the threads stop, the loader's read unchanged).
 ---
- zig/src/families/dsv41/weights.zig | 282 ++++++++++++++++++++++++++++-
- 1 file changed, 281 insertions(+), 1 deletion(-)
+ zig/src/families/dsv41/weights.zig | 283 ++++++++++++++++++++++++++++-
+ 1 file changed, 282 insertions(+), 1 deletion(-)
 
 diff --git a/zig/src/families/dsv41/weights.zig b/zig/src/families/dsv41/weights.zig
-index 2eef209..0468983 100644
+index 2eef209..0ae9745 100644
 --- a/zig/src/families/dsv41/weights.zig
 +++ b/zig/src/families/dsv41/weights.zig
 @@ -114,7 +114,7 @@ pub const Weights = struct {
@@ -185,7 +185,7 @@ index 2eef209..0468983 100644
      w.embed = try L.plain("embed.weight", null);
      w.norm = try L.plain("norm.weight", null);
      const vr = s.headCols(c);
-@@ -642,3 +758,167 @@ test "rank cache span: entries read whole come back byte for byte, the rest one
+@@ -642,3 +758,168 @@ test "rank cache span: entries read whole come back byte for byte, the rest one
      try std.testing.expectEqual(@as(usize, 9000), tail.len);
      for (tail) |b| try std.testing.expectEqual(@as(u8, 5), b);
  }
@@ -317,6 +317,7 @@ index 2eef209..0468983 100644
 +    var pf: Prefetch = .{ .io = io, .fd = file.handle, .chunks = chunks, .lead = 4096 };
 +    pf.pos.store(chunks[0][0], .monotonic);
 +    pf.start();
++    defer pf.finish(); // a failed check below still stops the threads before chunks and pf go away
 +    try std.testing.expect(pf.started > 0);
 +    try waitWarmed(&pf, 8192);
 +    pf.finish();
