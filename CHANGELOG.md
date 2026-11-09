@@ -115,6 +115,17 @@
   The bound stays hard: if the kept state is gone when the pass opens (stale, or no room to move it), dsv41's `fillOpen` refuses the
   cut-in (`error.FillBusy`) before anything changes, and it waits for the pass in pieces as a long prompt does (it used to be dropped).
   By **Dick Lai ([laidick](https://github.com/laidick))**, [pull request #95](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/95).
+- **Podman is supported alongside Docker.** `CONTAINER_RT=podman` sends every call through podman: the image build
+  (`--network host`, so the Dockerfile's downloads resolve on a Spark), the two rank containers, the Engram and NFS
+  volumes, the log handling, the memory guard and `scripts/publish-image.sh` (`podman login --authfile` / `push`).
+  `CONTAINER_RT_SUDO=1` selects rootful podman, which the worker's NFS volume and a system cgroup parent need;
+  `CGROUP_PARENT` (e.g. `tensorfold.slice`) keeps a host tuning's `MemorySwapMax=0` in force. Docker stays the default
+  and nothing changes for an existing setup. New `scripts/runtime.sh` holds the switch and the one command word the
+  scripts use; `docs/PODMAN.md` covers the three places podman is not a drop-in and how to move a pair across.
+  `CGROUP_PARENT` is optional and checked as a slice name (`tensorfold.slice`), because the value reaches the worker
+  inside an ssh command line.
+- `scripts/memguard.sh` logs a kill it could not complete (the runtime's `kill` failing, or `timeout`) instead of
+  staying silent, once per run of failures; a failed kill used to leave no trace in the guard's log.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).

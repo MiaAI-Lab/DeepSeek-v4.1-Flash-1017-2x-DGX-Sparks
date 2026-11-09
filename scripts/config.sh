@@ -113,6 +113,10 @@ prebuilt_image() {
   if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
 }
 CONTAINER_NAME="${CONTAINER_NAME:-dsv41-1017-exl3-tf}"   # the same name on both Sparks
+# The container runtime: docker by default; CONTAINER_RT=podman runs everything through podman instead (the calls are
+# the same). CONTAINER_RT_SUDO=1 runs podman as root (rootful), which is what a pair needs for the worker's NFS volume
+# and for a system cgroup parent; CGROUP_PARENT names that parent (e.g. tensorfold.slice, no swap). scripts/runtime.sh
+# has the details and the one command word the scripts use (ctr).
 
 # ---------------------------------------------------------------- serving
 SERVED_NAME="${SERVED_NAME:-DeepSeek-V4.1-Flash-1017}"
@@ -305,6 +309,10 @@ write_prepared_marker() {
   state=$(prepared_state) || return 1
   printf '%s\n' "$state" > "$PREPARED_MARKER.new" && mv -f "$PREPARED_MARKER.new" "$PREPARED_MARKER"
 }
+
+# ---------------------------------------------------------------- the container runtime
+# docker (default) or podman, with the one command word the scripts use (ctr); see scripts/runtime.sh.
+source "$_cfg_root/scripts/runtime.sh"
 
 # ---------------------------------------------------------------- API key
 # The API is open on the network by default: anyone who can reach PORT can use the GPUs. API_KEY=1 makes rank 0 require a key

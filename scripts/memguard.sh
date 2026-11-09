@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Memory watchdog for a DGX Spark running a rank: a Spark's GPU shares its 121 GiB with the host, so a rank that takes
 # all of it does not get a clean CUDA out-of-memory error, the whole machine stops answering (and has to be power-cycled).
-# This kills the rank's container (docker kill, no grace period) before the machine gets there, on either of two levels:
+# This kills the rank's container (docker/podman kill, no grace period) before the machine gets there, on either of two levels:
 #   - MemAvailable under the HARD floor (default 1 GiB) in two samples in a row (0.25 s apart): at once;
 #   - MemAvailable under the (soft) floor for HOLD seconds without once coming back over it (default 4 s): a long prompt's workspace
 #     takes a few GiB for a moment and gives them back, which is not a rank in trouble. A dip that recovers is logged, not killed.
@@ -13,6 +13,19 @@
 # The engine keeps its own reserve (TENSORFOLD_MEMORY_RESERVE_GIB, 12.2 GiB by default) free, so a healthy rank stays well
 # above a floor of a few GiB; only something else eating into the reserve (or a reserve set too low) trips this.
 set -u
+
+# The container runtime (scripts/runtime.sh travels beside this script: start.sh copies both to the worker). It sets
+# RT, the runtime's own words: the kill below runs under timeout, which needs an executable, not the ctr function.
+_here=$(cd "$(dirname "$0")" && pwd)
+if [[ -r "$_here/runtime.sh" ]]; then
+  . "$_here/runtime.sh"
+else
+  if [[ "${CONTAINER_RT:-docker}" == podman ]]; then
+    if [[ "${CONTAINER_RT_SUDO:-0}" == 1 ]]; then RT=(sudo -n podman); else RT=(podman); fi
+  else
+    RT=(docker)
+  fi
+fi
 
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 avail_kb() { local k v; while read -r k v _; do [[ $k == MemAvailable: ]] && { echo "$v"; return; }; done <"${MEMGUARD_MEMINFO:-/proc/meminfo}"; }
@@ -31,7 +44,7 @@ stop_guard() {
 nap() { sleep "$1" & wait $!; }
 
 run_guard() {
-  local c=$1 floor_kb hard_kb log=$3 pidfile=$4 hold_us a snap now since=0 low_min=0 hard_low=0 floor_gib=$2 hold=${5:-4} hard_gib=${6:-1}
+  local c=$1 floor_kb hard_kb log=$3 pidfile=$4 hold_us a snap now since=0 low_min=0 hard_low=0 floor_gib=$2 hold=${5:-4} hard_gib=${6:-1} kill_failed=0
   floor_kb=$(awk -v g="$floor_gib" 'BEGIN {printf "%d", g * 1048576}')
   hard_kb=$(awk -v g="$hard_gib" 'BEGIN {printf "%d", g * 1048576}')
   hold_us=$(awk -v h="$hold" 'BEGIN {printf "%d", h * 1000000}')
@@ -47,7 +60,7 @@ run_guard() {
       if (( since )); then
         echo "$(stamp) memguard: MemAvailable was under the $floor_gib GiB floor for $(( (now - since) / 1000 )) ms (lowest $(( low_min / 1024 )) MiB) and recovered: no kill" >> "$log"
       fi
-      since=0; hard_low=0; continue
+      since=0; hard_low=0; kill_failed=0; continue
     fi
     if (( ! since )); then since=$now; low_min=$a; fi
     (( a < low_min )) && low_min=$a
@@ -58,7 +71,7 @@ run_guard() {
     # Kill first, log afterwards: on a machine that is already thrashing every command ahead of the kill costs time. The
     # process snapshot runs beside it (it shows who else holds the memory); docker kill fails when the container is not running.
     ps -eo rss,pid,comm --sort=-rss 2>/dev/null | head -6 > "$snap" &
-    if timeout 20 docker kill "$c" >/dev/null 2>&1; then
+    if timeout 20 "${RT[@]}" kill "$c" >/dev/null 2>&1; then
       wait
       {
         echo "$(stamp) memguard: MemAvailable $(( a / 1024 )) MiB (lowest $(( low_min / 1024 )) MiB) was under the $floor_gib GiB floor for $hold s or under the $hard_gib GiB hard floor: killed container $c"
@@ -67,6 +80,9 @@ run_guard() {
       nap 5
     else
       wait
+      # once per run of failures: a container that is already gone fails the kill on every pass, and the guard keeps watching
+      (( kill_failed )) || echo "$(stamp) memguard: the kill of $c did not complete (${RT[*]} kill): the guard keeps watching" >> "$log"
+      kill_failed=1
     fi
   done
 }

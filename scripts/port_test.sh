@@ -537,17 +537,18 @@ check_ "start.sh: a container left over, running or exited, is stopped by stop.s
   t=$(mktemp -d "${TMPDIR:-/tmp}/port-test.XXXXXX"); trap "rm -rf -- \"$t\"" EXIT
   eval "$(grep -E "^exists_(here|worker)\(\) " "$here/../start.sh")"
   CONTAINER_NAME=c
-  docker() { [[ "$*" == "inspect c" && -e "$t/here" ]]; }
+  RT_WORDS=docker
+  ctr() { [[ "$*" == "inspect c" && -e "$t/here" ]]; }
   worker() { [[ "$1" == 1 && "${*:2}" == "docker inspect c" && -e "$t/there" ]]; }
   ! exists_here && ! exists_worker 1 || { echo "a container found where there is none"; exit 1; }
   : > "$t/here"; exists_here || { echo "an exited container here is not found"; exit 1; }
   rm "$t/here"; : > "$t/there"; exists_worker 1 || { echo "a container on the worker is not found"; exit 1; }
   launch=$(sed -n "/^if (( ! DRY )); then/,/^  memguard_start/p" "$here/../start.sh")
-  [[ "$launch" == *"if exists_here || exists_worker 1; then ./stop.sh; fi"*"docker rm -f"* ]] || { echo "start.sh removes a container stop.sh has not seen"; exit 1; }
-  grep -q "^if names=\$(docker ps -a --format" "$here/../stop.sh" || { echo "stop.sh does not count an exited container here"; exit 1; }
+  [[ "$launch" == *"if exists_here || exists_worker 1; then ./stop.sh; fi"*"ctr rm -f"* ]] || { echo "start.sh removes a container stop.sh has not seen"; exit 1; }
+  grep -q "^if names=\$(ctr ps -a --format" "$here/../stop.sh" || { echo "stop.sh does not count an exited container here"; exit 1; }
   for f in stop_here stop_worker; do
     body=$(sed -n "/^$f() {/,/^}/p" "$here/../stop.sh")
-    [[ "$body" == *save_log*"docker rm -f"* ]] || { echo "stop.sh $f: no log saved before docker rm"; exit 1; }
+    [[ "$body" == *save_log*"rm -f"* ]] || { echo "stop.sh $f: no log saved before rm"; exit 1; }
   done'
 check_ "port-patches: newreadme keeps the prose and is idempotent" '
   PORT_PATCHES_LIB=1; source "$here/port-patches.sh"

@@ -49,38 +49,37 @@ if [[ "$ABLIT" == 1 ]]; then
     die "cannot download the gated overlay: use your HF read token (HF_TOKEN or hf auth login) and obtain access at https://huggingface.co/$ABLIT_ID"
 fi
 log "Preflight checks on both Sparks"
-command -v docker >/dev/null || die "docker is not installed"
-docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon (is your user in the docker group?)"
+rt_require "scripts/prepare.sh"
 nvidia-smi -L >/dev/null 2>&1 || warn "nvidia-smi failed on this node: is the NVIDIA driver working?"
 check_workers
 need_worker 1
-worker 1 'docker info >/dev/null 2>&1' || die "$(worker_host 1) cannot talk to its docker daemon (docker group?)"
+worker 1 "$RT_WORDS info >/dev/null 2>&1" || die "$(worker_host 1) cannot talk to its $CONTAINER_RT daemon"
 worker 1 'nvidia-smi -L >/dev/null 2>&1' || warn "nvidia-smi failed on $(worker_host 1)"
 detect_links
 log "Link: this node $HEAD_ADDR ($HEAD_DEV, RoCE $HEAD_HCAS) <-> $(worker_host 1) $WORKER_ADDR ($WORKER_DEV, RoCE $WORKER_HCAS); NFS from $(nfs_server 1)"
 
 # ---------------------------------------------------------------- 2. the image
 hash=$(image_hash)
-built=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
+built=$(ctr image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 prebuilt=$(prebuilt_image)            # the pinned digest (config.sh's IMAGE_TAG / IMAGE_DIGEST), else the hash's tag
 if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built" != "$hash" ]]; then
   log "Pulling the prebuilt image $prebuilt if there is one (PULL=0 builds instead)"
-  if docker pull "$prebuilt" >/dev/null 2>&1 &&
-     [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$hash" ]]; then
-    docker tag "$prebuilt" "$IMAGE"; built=$hash
+  if ctr pull "$prebuilt" >/dev/null 2>&1 &&
+     [[ "$(ctr image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$hash" ]]; then
+    ctr tag "$prebuilt" "$IMAGE"; built=$hash
     log "Using $prebuilt as $IMAGE"
   else
     log "No prebuilt image for these pins ($prebuilt): building it locally"
   fi
 fi
 if [[ $REBUILD -eq 1 || "$built" != "$hash" ]]; then
-  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || { log "Pulling $BASE_IMAGE"; docker pull "$BASE_IMAGE" >/dev/null; }
+  ctr image inspect "$BASE_IMAGE" >/dev/null 2>&1 || { log "Pulling $BASE_IMAGE"; ctr pull "$BASE_IMAGE" >/dev/null; }
   log "Building $IMAGE (TensorFold ${TF_REF:0:12} + inputs' tools ${INPUTS_REF:0:12}, $(compgen -G 'zig/patches/*.patch' | wc -l) engine + $(compgen -G 'zig/patches-inputs/*.patch' | wc -l) inputs patches, Zig $ZIG_VERSION; two Zig builds, ~6 min on a Spark)"
   ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
   trap 'rm -rf -- "$ctx"' EXIT
   mkdir -p "$ctx/zig"; cp -r zig/patches "$ctx/zig/patches"; cp -r zig/patches-inputs "$ctx/zig/patches-inputs"; cp zig/Dockerfile "$ctx/Dockerfile"
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
-  docker build "${nocache[@]}" -t "$IMAGE" -f "$ctx/Dockerfile" --build-arg BASE_IMAGE="$BASE_IMAGE" \
+  ctr build "${nocache[@]}" $(rt_build_net) -t "$IMAGE" -f "$ctx/Dockerfile" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" --build-arg INPUTS_REF="$INPUTS_REF" \
     --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" --build-arg ZIG_MIRRORS="$ZIG_MIRRORS" \
     --build-arg PATCHES_HASH="$hash" "$ctx"
@@ -90,13 +89,13 @@ else
 fi
 ident=$(image_ident "$IMAGE")
 if [[ "$(worker_image_ident 1 "$IMAGE")" != "$ident" ]]; then
-  if [[ "${PULL:-1}" == 1 ]] && docker image inspect "$prebuilt" >/dev/null 2>&1 && worker 1 docker pull "$prebuilt" >/dev/null 2>&1 &&
+  if [[ "${PULL:-1}" == 1 ]] && ctr image inspect "$prebuilt" >/dev/null 2>&1 && worker 1 "$RT_WORDS pull $prebuilt" >/dev/null 2>&1 &&
      [[ "$(worker_image_ident 1 "$prebuilt")" == "$ident" ]]; then
-    worker 1 docker tag "$prebuilt" "$IMAGE"
+    worker 1 "$RT_WORDS tag $prebuilt $IMAGE"
     log "Using $prebuilt as $IMAGE on $(worker_host 1)"
   else
-    log "Copying $IMAGE to $(worker_host 1) (docker save | docker load; only missing layers are stored)"
-    docker save "$IMAGE" | worker 1 docker load >/dev/null
+    log "Copying $IMAGE to $(worker_host 1) ($CONTAINER_RT save | load; only missing layers are stored)"
+    rt_save "$IMAGE" | worker 1 "$RT_WORDS load" >/dev/null
   fi
   [[ "$(worker_image_ident 1 "$IMAGE")" == "$ident" ]] || die "$(worker_host 1)'s $IMAGE differs from this Spark's"
 fi
@@ -148,7 +147,7 @@ if [[ "$ENGRAM_ID" == deepseek-ai/DeepSeek-V4.1-Flash-1017 ]]; then
 fi
 log "Engram: $ESNAP ($(du -shL "$ESNAP" | cut -f1))"
 # a container's view of HF_CACHE (the snapshot's files are links into ../../blobs)
-in_hf() { docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$HF_CACHE:/hf" "$@"; }
+in_hf() { ctr run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$HF_CACHE:/hf" "$@"; }
 
 # Apply before either rank's cache is built: the index hash alone cannot distinguish changed tensor contents.
 if [[ "$ABLIT" == 1 ]]; then
@@ -266,7 +265,7 @@ manifest() {  # the files a rank reads, with their sizes, as paths under HF_CACH
 want=$(manifest)
 ensure_nfs_volume 1
 worker_files_check 1
-have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
+have=$(worker 1 "$RT_WORDS run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
 [[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
   die "$(worker_host 1) does not see every file over NFS ($NFS_VOLUME)"; }
 log "Worker ($(worker_host 1)) reads the checkpoint, the kit and rank 0's files over NFS"
@@ -282,10 +281,10 @@ else
   spare=150; worker 1 "find $WORKER_CACHE_DIR -maxdepth 1 -name 'rank1of2-*.bin' 2>/dev/null | grep -q ." && spare=10
   (( free + have > need + spare * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR), its weight file ~106 GB (unless it is already there), and $spare GiB to spare"
   log "Worker: copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over NFS, once)"
-  worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
+  worker 1 "$RT_WORDS run --rm --network none --user \$(id -u):\$(id -g) -v '$NFS_VOLUME:/hf:ro' -v $WORKER_ENGRAM_DIR:/out --entrypoint bash '$IMAGE' -c 'for f in model.safetensors.index.json config.json ${shards[*]}; do cp /hf/$SNAP_REL/\$f /out/\$f.part && mv /out/\$f.part /out/\$f || exit 1; done'" ||
     die "copying Engram's tables to $(worker_host 1) failed"
 fi
-wwant=$(worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' --entrypoint bash '$IMAGE' -c 'tf-dsv41-rank-cache $SNAP_C /tmp/x 1 2 --index-only | sha256sum | cut -c1-20'")
+wwant=$(worker 1 "$RT_WORDS run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' --entrypoint bash '$IMAGE' -c 'tf-dsv41-rank-cache $SNAP_C /tmp/x 1 2 --index-only | sha256sum | cut -c1-20'")
 if worker 1 "[[ -f $WORKER_CACHE_DIR/rank1of2-$wwant.bin ]]"; then log "Worker: weight file of rank 1 ready"
 else
   # find, not a glob: the worker's login shell may be zsh, which fails a command whose glob matches nothing
@@ -293,7 +292,7 @@ else
   free=$(worker 1 "df -B1 --output=avail $WORKER_CACHE_DIR | tail -1")
   (( free > 130 * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free for rank 1's weight file (WORKER_CACHE_DIR): it needs ~106 GB"
   log "Worker: weight file of rank 1 from the checkpoint over NFS (~106 GB, a few minutes)"
-  worker 1 "docker run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' -v $WORKER_CACHE_DIR:/out --entrypoint tf-dsv41-rank-cache '$IMAGE' '$SNAP_C' /out 1 2" >/dev/null ||
+  worker 1 "$RT_WORDS run --rm --network none --user \$(id -u):\$(id -g) -e HOME=/tmp -v '$NFS_VOLUME:/hf:ro' -v $WORKER_CACHE_DIR:/out --entrypoint tf-dsv41-rank-cache '$IMAGE' '$SNAP_C' /out 1 2" >/dev/null ||
     die "writing rank 1's weight file on $(worker_host 1) failed"
 fi
 
