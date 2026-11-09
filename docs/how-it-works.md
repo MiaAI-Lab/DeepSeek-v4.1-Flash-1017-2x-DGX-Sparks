@@ -1,6 +1,9 @@
 # What `start.sh` and `scripts/prepare.sh` do
 
-
+When a running pair needs a new image, use `./start.sh restart` instead of invoking `scripts/prepare.sh` directly.
+`start.sh` stops both ranks before preparation because the Dockerfile builds Zig with all available CPU cores; running
+that build beside the model's unified-memory allocation can cross the memguard floor and kill rank 0. A standalone
+`scripts/prepare.sh` is appropriate only while the pair is already stopped.
 
 `scripts/prepare.sh` (run by `start.sh` when something is missing; safe to re-run) on the head:
 
