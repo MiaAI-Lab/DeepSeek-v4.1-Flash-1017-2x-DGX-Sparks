@@ -496,3 +496,15 @@
   until the loader's reads move it; finish while they wait; a chunk past the file's end; a read that fails). The 4-Spark
   recipe's `0046` ([pull request #20](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/20)),
   by **[shalk3](https://github.com/shalk3)**; ported by **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
+- `zig/patches/0067-orphan-dsml-closer-diagnostic.patch` (always on): a reply whose whole answer is DSML closing tags (both
+  spellings) and whitespace, with tools offered, gets `tensorfold.tool_parse_warning: "orphan_dsml_closers"` in the whole
+  reply, in a chat stream's finish chunk and in a `/v1/responses` stream's final response (Messages carries no
+  `tensorfold` fields), and a log line with the reply id. Diagnostic only: content, token ids, usage and the finish reason
+  are unchanged, no call is invented and no retry started. The check reads the answer the finish parses (after the think
+  split, or the Harmony split with thinking off), which for such a reply holds no opener, so the parse returns no call in
+  either `TENSORFOLD_TOOL_STREAM` mode. On a pair, ordinary and tool-call replies logged no warning. Tests in
+  `zig/src/server/output_diagnostics.zig` and `zig/src/server/dsml_stream_test.zig` (the three routes, live and hold,
+  whole and streamed, thinking on and off, with and without tools, ended by the end token or cut by `max_tokens`, and
+  Harmony answers: every reply the same with and without the diagnostic once ids and times are set aside). `0043` of the
+  4-Spark recipe ([pull request #32](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/32)),
+  by **[SvangenStudios](https://github.com/SvangenStudios)**; ported by **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
