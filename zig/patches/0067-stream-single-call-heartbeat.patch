@@ -1,6 +1,6 @@
-From b5d305dfff311783382945a74b21fd3360d289ce Mon Sep 17 00:00:00 2001
+From 0244bdfbb94e67b6270cbe74d2e27b18fb274790 Mon Sep 17 00:00:00 2001
 From: "tianxu.zhang" <tianxu.zhang@bytedance.com>
-Date: Mon, 9 Nov 2026 21:21:22 +0800
+Date: Mon, 9 Nov 2026 21:36:28 +0800
 Subject: [PATCH] server: stream max-one DSML calls safely
 
 Stream the first DSML call under parallel_tool_calls=false while keeping the final parser authoritative for closure, with explicit close metadata so argument braces remain data. Reuse the existing silence clock and emit standard empty chat chunks for OpenAI keep-alives.
@@ -104,7 +104,7 @@ index a1ab3754..dd362add 100644
  const StopHook = struct {
      srv: *Server,
 diff --git a/zig/src/server/dsml_hold_test.zig b/zig/src/server/dsml_hold_test.zig
-index e3e8fd98..c865073b 100644
+index e3e8fd98..ce60d613 100644
 --- a/zig/src/server/dsml_hold_test.zig
 +++ b/zig/src/server/dsml_hold_test.zig
 @@ -120,7 +120,7 @@ const Seen = struct {
@@ -132,12 +132,12 @@ index e3e8fd98..c865073b 100644
      const answer = try std.mem.concat(a, u8, &.{ "Writing it.", try spWrite(a, spellings[0], "write", "x") });
      const routes = [_][3][]const u8{
 -        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\n: ping\n\n" },
-+        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\"delta\":{}" },
++        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\"delta\": {}" },
          .{ "/v1/responses", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"input\":\"x\",\"max_output_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"name\":\"write\",\"parameters\":", schema, "}]}" }), "\n: ping\n\n" },
          .{ "/v1/messages", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"tools\":[{\"name\":\"write\",\"input_schema\":", schema, "}]}" }), "event: ping" },
      };
 diff --git a/zig/src/server/dsml_stream_test.zig b/zig/src/server/dsml_stream_test.zig
-index f4ca00d5..517b923c 100644
+index f4ca00d5..d7773572 100644
 --- a/zig/src/server/dsml_stream_test.zig
 +++ b/zig/src/server/dsml_stream_test.zig
 @@ -1,8 +1,8 @@
@@ -325,7 +325,7 @@ index f4ca00d5..517b923c 100644
      const answer = try std.mem.concat(a, u8, &.{ "Writing it.", try spWrite(a, spellings[0], "write", value) });
      const routes = [_][3][]const u8{
 -        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\n: ping\n\n" },
-+        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\"delta\":{}" },
++        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\"delta\": {}" },
          .{ "/v1/responses", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"input\":\"x\",\"max_output_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"name\":\"write\",\"parameters\":", schema, "}]}" }), "\n: ping\n\n" },
          .{ "/v1/messages", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"tools\":[{\"name\":\"write\",\"input_schema\":", schema, "}]}" }), "event: ping" },
      };
