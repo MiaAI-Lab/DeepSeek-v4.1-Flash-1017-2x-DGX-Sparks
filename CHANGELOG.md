@@ -508,3 +508,17 @@
   Harmony answers: every reply the same with and without the diagnostic once ids and times are set aside). `0043` of the
   4-Spark recipe ([pull request #32](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/32)),
   by **[SvangenStudios](https://github.com/SvangenStudios)**; ported by **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
+- `zig/patches/0068-rdma-proxy-cpus.patch` (off unless set): `TF_DS_RDMA_CPUS` pins the RDMA ring's proxy thread to one
+  CPU. The proxy busy-polls while the ranks decode and holds a core at 100%; unset, it keeps the affinity it inherits, as
+  before. The value is read as on the 4-Spark recipe, `a,b,c` in the four-node order; the pair's one proxy takes the
+  first, so `TF_DS_RDMA_CPUS=0` pins it to CPU 0 (on a GB10, CPUs 0-4 and 10-14 are Cortex-A725 at 2.8 GHz, 5-9 and 15-19
+  Cortex-X925 at 3.9 GHz). A word that is not a CPU number, or a CPU the kernel refuses, leaves the proxy unpinned with no
+  message. The proxy thread is named `tf-rdma-proxy`, so `ps -L` shows it and `taskset -pc <tid>` shows where it runs.
+  The main thread is not pinned. `start.sh` forwards `TF_DS_*` to both ranks, so `export TF_DS_RDMA_CPUS=0` in
+  `scripts/local.sh` is enough. On a pair, one run per setting under a four-stream load, the proxy pinned to a
+  Cortex-A725 core showed no large temperature change (the thread that drives the GPU also holds an X925 core at 100%),
+  so the default stays unpinned. Tests in `zig/src/families/dsv41/rdma_env.zig` and `rdma.zig`. The setting comes from
+  `0001` of the 4-Spark recipe, by Mia's AI Lab, after **[making](https://github.com/making)**'s measurement there
+  ([#40](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40)): 59-67 °C pinned
+  against 70-81 °C unpinned with three proxies on a four-GB10 ring, no throughput change. Ported by **Hector Isaza
+  ([hecisaza](https://github.com/hecisaza))**.
