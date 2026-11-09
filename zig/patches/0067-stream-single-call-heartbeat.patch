@@ -1,0 +1,585 @@
+From 0244bdfbb94e67b6270cbe74d2e27b18fb274790 Mon Sep 17 00:00:00 2001
+From: "tianxu.zhang" <tianxu.zhang@bytedance.com>
+Date: Mon, 9 Nov 2026 21:36:28 +0800
+Subject: [PATCH] server: stream max-one DSML calls safely
+
+Stream the first DSML call under parallel_tool_calls=false while keeping the final parser authoritative for closure, with explicit close metadata so argument braces remain data. Reuse the existing silence clock and emit standard empty chat chunks for OpenAI keep-alives.
+---
+ zig/src/server/anthropic.zig        |  2 +-
+ zig/src/server/chat.zig             | 23 ++++++---
+ zig/src/server/dsml_hold_test.zig   |  8 ++--
+ zig/src/server/dsml_stream_test.zig | 72 +++++++++++++++++++++++------
+ zig/src/server/openai.zig           | 68 +++++++++++++++++++++------
+ zig/src/server/responses.zig        |  2 +-
+ zig/src/server/tool_stream.zig      | 26 +++++++----
+ 7 files changed, 153 insertions(+), 48 deletions(-)
+
+diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
+index 6fc62239..fd489831 100644
+--- a/zig/src/server/anthropic.zig
++++ b/zig/src/server/anthropic.zig
+@@ -109,7 +109,7 @@ const Wire = struct {
+         return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .ping = ping } };
+     }
+ 
+-    fn ping(ctx: *anyopaque) error{Closed}!void {
++    fn ping(ctx: *anyopaque, _: Value) error{Closed}!void {
+         const w: *Wire = @ptrCast(@alignCast(ctx));
+         const o = json.newObject(w.reply.a) catch return error.Closed;
+         o.put(w.reply.a, "type", .{ .string = "ping" }) catch return error.Closed;
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index a1ab3754..dd362add 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -43,7 +43,8 @@ pub const Sink = struct {
+     ctx: *anyopaque,
+     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!bool,
+     ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+-    calls_live: bool = true, // the route sends DSML call deltas as they come (the one-call policy drops them)
++    calls_live: bool = true, // the route sends DSML call deltas as they come
++    max_calls: ?usize = null,
+ };
+ 
+ /// How long a streaming reply may be silent before a sink that has a ping gets one (a long cold prefill, a call's value
+@@ -265,7 +266,9 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
++        if (sink != null and input.tools.len > 0) {
++            gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
++        }
+         gen.loop(gone) catch |e| break :blk e;
+         break :blk gen.finish(cx, prepared.prompt_len, received, submitted, thinking, effort, prepared.sampled, prepared.drafts);
+     };
+@@ -473,7 +476,8 @@ const Generation = struct {
+         }
+         if (g.calls) |*c| {
+             var out: std.ArrayList(Value) = .empty;
+-            try c.feed(g.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
++            if (sink.max_calls == null)
++                try c.feed(g.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
+             try c.feedDsml(answer, &out); // DeepSeek-V4.1's DSML calls as they decode, never the reasoning
+             for (out.items) |d| try g.emit(sink, d);
+             _ = g.deferCalls(sink);
+@@ -632,7 +636,7 @@ const Generation = struct {
+             if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
+             // thinking off, the parse reads the final Harmony channel: a call only the text outside it holds is none
+             const channels = g.srv.config.tool_stream == .live and !g.thinking and std.mem.indexOf(u8, text, "<|channel|>") != null;
+-            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0 and !channels) {
++            if (g.calls) |*c| if (close.len > 0 and c.dsml.released == 0 and !channels and sink.max_calls == null) {
+                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas (after
+                 // DSML calls went out, the finish's check sends such a call under the next index instead)
+                 var out: std.ArrayList(Value) = .empty;
+@@ -690,15 +694,18 @@ const Generation = struct {
+         try spec.put(a, "tokens_per_round", .{ .float = if (s.rounds > 0) @as(f64, @floatFromInt(g.collected.items.len)) / @as(f64, @floatFromInt(s.rounds)) else 0 });
+         if (m.telemetry.len > 0) if ((try json.parse(a, m.telemetry)) == .ok) try spec.put(a, "proposer", (try json.parse(a, m.telemetry)).ok);
+         const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
++        const max_calls = if (g.sink) |sink| sink.max_calls else null;
++        const streamed_calls = if (g.calls) |*c| limitedCalls(c.dsml.streamed(), max_calls) else &.{};
++        const wire_calls = if (g.calls) |*c| limitedCalls(try c.dsml.wire(a), max_calls) else &.{};
+         const reply: Reply = .{
+             .content = content,
+             .stop_sequence = g.stops.matched(raw),
+             .reasoning = reasoning,
+             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
+-            .streamed_calls = if (g.calls) |*c| c.dsml.streamed() else &.{},
++            .streamed_calls = streamed_calls,
+             .answer_deferred = g.held,
+             .withheld = if (g.calls) |*c| c.dsml.withheld.items else &.{},
+-            .wire_calls = if (g.calls) |*c| try c.dsml.wire(a) else &.{},
++            .wire_calls = wire_calls,
+             .finish_reason = reason,
+             .prompt_tokens = prompt_len,
+             .cached_tokens = m.cached orelse 0,
+@@ -716,6 +723,10 @@ const Generation = struct {
+     }
+ };
+ 
++fn limitedCalls(calls: []const tool_stream.SentCall, max_calls: ?usize) []const tool_stream.SentCall {
++    return calls[0..@min(calls.len, max_calls orelse calls.len)];
++}
++
+ /// The request's stop strings as the engine checks them after each token: the newest tokens' text holds one.
+ const StopHook = struct {
+     srv: *Server,
+diff --git a/zig/src/server/dsml_hold_test.zig b/zig/src/server/dsml_hold_test.zig
+index e3e8fd98..ce60d613 100644
+--- a/zig/src/server/dsml_hold_test.zig
++++ b/zig/src/server/dsml_hold_test.zig
+@@ -120,7 +120,7 @@ const Seen = struct {
+         return .{ .ctx = s, .vt = &.{ .open = open, .event = event, .reply = reply, .ping = ping } };
+     }
+ 
+-    fn ping(ctx: *anyopaque) error{Closed}!void {
++    fn ping(ctx: *anyopaque, _: json.Value) error{Closed}!void {
+         const s: *Seen = @ptrCast(@alignCast(ctx));
+         s.pings += 1;
+     }
+@@ -1399,8 +1399,8 @@ test "a held reply over HTTP: Messages and Responses events in order, text befor
+     try std.testing.expectEqualStrings(want.text, got.text);
+ }
+ 
+-// With the silence bound at zero, a held reply's queued rounds get pings on the wire of each streaming route (an SSE
+-// comment on chat completions and Responses, a ping event on Messages), and the call still arrives.
++// With the silence bound at zero, a held reply's queued rounds get pings on the wire of each streaming route (an empty
++// data chunk on chat completions, an SSE comment on Responses, a ping event on Messages), and the call still arrives.
+ test "a held reply's keep-alive on the wire: chat completions, Responses and Messages each get pings" {
+     if (builtin.os.tag != .linux) return error.SkipZigTest;
+     const chat = @import("chat.zig");
+@@ -1415,7 +1415,7 @@ test "a held reply's keep-alive on the wire: chat completions, Responses and Mes
+     const schema = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}}}";
+     const answer = try std.mem.concat(a, u8, &.{ "Writing it.", try spWrite(a, spellings[0], "write", "x") });
+     const routes = [_][3][]const u8{
+-        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\n: ping\n\n" },
++        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\"delta\": {}" },
+         .{ "/v1/responses", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"input\":\"x\",\"max_output_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"name\":\"write\",\"parameters\":", schema, "}]}" }), "\n: ping\n\n" },
+         .{ "/v1/messages", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"tools\":[{\"name\":\"write\",\"input_schema\":", schema, "}]}" }), "event: ping" },
+     };
+diff --git a/zig/src/server/dsml_stream_test.zig b/zig/src/server/dsml_stream_test.zig
+index f4ca00d5..d7773572 100644
+--- a/zig/src/server/dsml_stream_test.zig
++++ b/zig/src/server/dsml_stream_test.zig
+@@ -1,8 +1,8 @@
+ //! DeepSeek-V4.1's DSML tool calls stream as they decode. Real token sequences (the DeepSeek-V4.1
+ //! tokenizer, testdata/dsml_stream.json) run through the chat route and the Messages route with a CPU fake engine. Each
+ //! stream's argument pieces join to the whole reply's arguments byte for byte, in order, sent once; a stream without
+-//! tools, or with the one-call policy, is the same as before the patch event for event (testdata/dsml_stream_golden.json,
+-//! recorded without the patch). A value that holds its block's own closer (a file about DSML) streams up to the closer,
++//! tools is the same as before the patch event for event (testdata/dsml_stream_golden.json, recorded without the patch).
++//! A value that holds its block's own closer (a file about DSML) streams up to the closer,
+ //! then waits until the text says where the block ends, and the call completes to the whole reply's; where the whole
+ //! reply's parse rejects a call whose header went out, the stream ends with the reply's own finish reason.
+ const std = @import("std");
+@@ -14,6 +14,7 @@ const json = server.json;
+ const model_text = @import("model_text.zig");
+ const openai = @import("openai.zig");
+ const anthropic = @import("anthropic.zig");
++const tool_stream = @import("tool_stream.zig");
+ const tool_streaming = @import("tool_streaming.zig");
+ const Conn = @import("http_conn.zig").Conn;
+ const Allocator = std.mem.Allocator;
+@@ -116,15 +117,17 @@ const Seen = struct {
+     done: bool = false,
+     whole: ?json.Value = null,
+     pings: usize = 0,
++    ping_payload: ?json.Value = null,
+ 
+     fn out(s: *Seen) openai.Out {
+         return .{ .ctx = s, .vt = &.{ .open = open, .event = event, .reply = reply, .ping = ping } };
+     }
+ 
+     /// A keep-alive, kept among the events (as `{"ping":true}`, which readers of choices skip) to see what it came between.
+-    fn ping(ctx: *anyopaque) error{Closed}!void {
++    fn ping(ctx: *anyopaque, payload: json.Value) error{Closed}!void {
+         const s: *Seen = @ptrCast(@alignCast(ctx));
+         s.pings += 1;
++        s.ping_payload = payload;
+         s.events.append(s.a, "{\"ping\":true}") catch return error.Closed;
+     }
+ 
+@@ -228,6 +231,7 @@ const Read = struct {
+         var role = false;
+         var text_after_header = false; // text came after the newest call's header
+         for (seen.events.items) |text| {
++            try std.testing.expect(std.mem.indexOf(u8, text, tool_stream.call_close_field) == null);
+             const ev = (try json.parse(a, text)).ok;
+             const choices = ev.get("choices") orelse continue;
+             if (choices.array.len == 0) continue; // a usage chunk
+@@ -327,6 +331,24 @@ test "a call to a tool the request did not offer streams as the parse returns it
+     try expectStreamed("unoffered", &.{ 4, 4 });
+ }
+ 
++test "the one-call policy streams only the first DSML call as it decodes" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f = try Fixture.load(a);
++    defer f.tok.deinit();
++    for ([_][]const usize{ &.{1}, &.{ 3, 1, 4, 1, 5, 2 }, &.{64} }) |pattern| {
++        const whole = wholeMessage(&try chatRun(a, &f, .{ .case = "two_calls", .stream = false, .single = true }));
++        const r = try Read.of(a, &try chatRun(a, &f, .{ .case = "two_calls", .single = true, .pattern = pattern }));
++        try std.testing.expectEqual(@as(usize, 1), whole.calls.len);
++        try std.testing.expectEqual(@as(usize, 1), r.calls.items.len);
++        try std.testing.expectEqualStrings(whole.finish, r.finish.?);
++        try std.testing.expectEqualStrings(whole.calls[0].get("function").?.strField("name").?, r.calls.items[0].name);
++        try std.testing.expectEqualStrings(whole.calls[0].get("function").?.strField("arguments").?, r.calls.items[0].arguments.items);
++        if (pattern[0] == 1) try std.testing.expect(r.calls.items[0].pieces >= 6);
++    }
++}
++
+ test "DSML written in the reasoning, or quoted in the answer, is no call: no tool delta, the same content" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+@@ -376,14 +398,12 @@ fn normal(a: Allocator, text: []const u8) ![]const u8 {
+ }
+ 
+ /// The streams the patch must leave as they were: no tools (a reply with DSML in it, and one with DSML only quoted),
+-/// tools without a call, and the one-call policy (its calls go out when the reply ends).
++/// tools without a call.
+ pub const golden_asks = [_]struct { key: []const u8, ask: Ask }{
+     .{ .key = "no_tools_write", .ask = .{ .case = "write", .tools = false, .pattern = &.{ 29, 61 } } },
+     .{ .key = "no_tools_two_calls", .ask = .{ .case = "two_calls", .tools = false, .pattern = &.{ 7, 13 } } },
+     .{ .key = "no_tools_quoted", .ask = .{ .case = "quoted", .tools = false } },
+     .{ .key = "tools_quoted", .ask = .{ .case = "quoted" } },
+-    .{ .key = "single_unoffered", .ask = .{ .case = "unoffered", .single = true } },
+-    .{ .key = "single_two_calls_by_token", .ask = .{ .case = "two_calls", .single = true, .pattern = &.{1} } },
+ };
+ 
+ /// The golden file's text: each golden ask's normalized events (how testdata/dsml_stream_golden.json was recorded).
+@@ -400,7 +420,7 @@ pub fn goldenJson(a: Allocator) ![]const u8 {
+     return json.stringify(a, .{ .object = o }, .{ .ascii = true });
+ }
+ 
+-test "without tools, without a call, or with the one-call policy, a stream is event for event what it was before the patch" {
++test "without tools or without a call, a stream is event for event what it was before the patch" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+@@ -862,6 +882,7 @@ const ByteServer = struct {
+             };
+             got.finish = c.strField("finish_reason") orelse "";
+         } else for (seen.events.items) |e| {
++            try std.testing.expect(std.mem.indexOf(u8, e, tool_stream.call_close_field) == null);
+             const v = (try json.parse(a, e)).ok;
+             if (v.has("error")) got.errors += 1;
+             const cs = v.get("choices") orelse continue;
+@@ -897,6 +918,23 @@ const ByteServer = struct {
+     }
+ };
+ 
++test "the one-call policy does not mistake a string value's brace for the call's closing brace" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var bs: ByteServer = .{};
++    try bs.init(false);
++    defer bs.deinit();
++    const answer = comptime ("Running it." ++ b_open ++ bInvoke("Bash", bParam("command", "}" ++ b_close)) ++ b_close);
++    const whole = try bs.chat(a, answer, false, true, &.{5});
++    const stream = try bs.chat(a, answer, true, true, &.{1});
++    try std.testing.expectEqual(@as(usize, 1), whole.calls);
++    try std.testing.expectEqual(whole.calls, stream.calls);
++    try std.testing.expectEqualStrings(whole.finish, stream.finish);
++    try std.testing.expectEqualStrings(whole.names[0], stream.names[0]);
++    try std.testing.expectEqualStrings(whole.args[0], stream.args[0]);
++}
++
+ // A tool-call block too short to hold the DSML block it opens with (patch 0064): before the length guard the final parse
+ // sliced past the payload's start. Through the chat route, whole and streamed in rounds of 1, 5, 3-and-4 bytes and in
+ // one round, with and without the one-call policy and with and without reasoning first: no call, no error, finish "stop",
+@@ -1088,8 +1126,9 @@ test "a DSML value holding its block's own closer: the call keeps its whole valu
+ // (Read). A V4.1 stream reads the block as reply_text.blockEnd does, past the closer, and sends the Write's header and
+ // value as it decodes; what would complete it waits for the reply's end, and the parse does not take it: the Write stays
+ // open (its arguments not JSON), no complete call the parse does not return goes out, and the stream ends as the reply
+-// did (stop), the settle warning logged. With the one-call policy the calls go out at the end, the parse's; a V4 block is
+-// another call form to the stream, so its calls go out at the end too: Read, as the whole reply has it.
++// did (stop), the settle warning logged. The one-call policy streams the same first DSML call, capped at one, so it has
++// the same safe partial result. A V4 block is another call form to the stream, so its calls go out at the end: Read, as
++// the whole reply has it.
+ test "a DSML value holding its closer and then a call in another form: the parse keeps that call on a tie, and no stream completes a call the parse does not return" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+@@ -1111,7 +1150,7 @@ test "a DSML value holding its closer and then a call in another form: the parse
+                 try std.testing.expectEqual(@as(usize, 0), r.errors);
+                 try std.testing.expectEqual(@as(usize, 1), r.calls);
+                 try expectCompleteCallsParsed(a, r.names, r.args, whole.names, whole.args);
+-                if (single or si == 2) {
++                if (si == 2) {
+                     try std.testing.expectEqualStrings("tool_calls", r.finish);
+                     try std.testing.expectEqualStrings("Read", r.names[0]);
+                     try std.testing.expectEqualStrings(whole.args[0], r.args[0]);
+@@ -1350,7 +1389,7 @@ test "random DSML replies through the chat route: a stream gets the whole reply'
+         try std.testing.expect(s.done);
+         try std.testing.expectEqual(@as(usize, 0), s.errors);
+         with_calls += @intFromBool(whole.calls > 0);
+-        if ((mode.plain or (!mode.closers and !mode.malformed and !mode.cut)) and !g.repeated) {
++        if (!single and (mode.plain or (!mode.closers and !mode.malformed and !mode.cut)) and !g.repeated) {
+             try std.testing.expectEqualStrings(whole.finish, s.finish);
+             try std.testing.expectEqual(whole.calls, s.calls);
+             for (whole.names, s.names, whole.args, s.args) |wn, sn, wa, sa| {
+@@ -1479,6 +1518,12 @@ test "the keep-alive pings while a value waits past a closer inside it, and leav
+     chat.ping_after_ns = 0;
+     const pinged = try bytesAsk(a, answer, .{ .pattern = &.{1} });
+     try std.testing.expect(longestPingRun(&pinged) >= tail.len);
++    const heartbeat = pinged.ping_payload.?;
++    try std.testing.expectEqualStrings("chat.completion.chunk", heartbeat.strField("object").?);
++    const heartbeat_choices = heartbeat.get("choices").?.array;
++    try std.testing.expectEqual(@as(usize, 1), heartbeat_choices.len);
++    try std.testing.expectEqual(@as(usize, 0), heartbeat_choices[0].get("delta").?.object.count());
++    try std.testing.expect(heartbeat_choices[0].get("finish_reason").? == .null);
+     const x = try Read.of(a, &quiet);
+     const y = try Read.of(a, &pinged);
+     try std.testing.expectEqualStrings("tool_calls", y.finish.?);
+@@ -1682,7 +1727,7 @@ test "over HTTP, a value holding its closer: events in order and the whole call;
+ }
+ 
+ // With the silence bound at zero, the rounds a value waits past a closer inside it get pings on the wire of each
+-// streaming route (an SSE comment on chat completions and Responses, a ping event on Messages), and the call still
++// streaming route (an empty data chunk on chat completions, an SSE comment on Responses, a ping event on Messages), and the call still
+ // arrives whole.
+ test "keep-alive on the wire while a value waits past a closer inside it: chat completions, Responses and Messages each get pings" {
+     if (builtin.os.tag != .linux) return error.SkipZigTest;
+@@ -1700,7 +1745,7 @@ test "keep-alive on the wire while a value waits past a closer inside it: chat c
+     const value = "end: </" ++ BD ++ " calls>" ++ &ys;
+     const answer = try std.mem.concat(a, u8, &.{ "Writing it.", try spWrite(a, spellings[0], "write", value) });
+     const routes = [_][3][]const u8{
+-        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\n: ping\n\n" },
++        .{ "/v1/chat/completions", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":", schema, "}}]}" }), "\"delta\": {}" },
+         .{ "/v1/responses", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"input\":\"x\",\"max_output_tokens\":4096,\"stream\":true,\"tools\":[{\"type\":\"function\",\"name\":\"write\",\"parameters\":", schema, "}]}" }), "\n: ping\n\n" },
+         .{ "/v1/messages", try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"tools\":[{\"name\":\"write\",\"input_schema\":", schema, "}]}" }), "event: ping" },
+     };
+@@ -2119,4 +2164,3 @@ test "over HTTP, prose with leading whitespace, then a DSML call cut by max_toke
+         }
+     }
+ }
+-
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index f9baed3d..2780436a 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -36,7 +36,7 @@ pub const Out = struct {
+         /// A whole JSON reply.
+         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
+         /// A keep-alive the stream sends while nothing else is; optional.
+-        ping: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
++        ping: ?*const fn (ctx: *anyopaque, payload: Value) error{Closed}!void = null,
+     };
+ };
+ 
+@@ -65,9 +65,9 @@ const ClientOut = struct {
+         return sse.open(c.conn);
+     }
+ 
+-    fn ping(ctx: *anyopaque) error{Closed}!void {
++    fn ping(ctx: *anyopaque, payload: Value) error{Closed}!void {
+         const c: *ClientOut = @ptrCast(@alignCast(ctx));
+-        return sse.comment(c.conn, "ping");
++        return sse.data(c.conn, c.a, payload);
+     }
+ 
+     fn event(ctx: *anyopaque, payload: ?Value) error{Closed}!void {
+@@ -254,6 +254,7 @@ const Run = struct {
+     created: i64,
+     streamed_prose: bool = false,
+     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
++    single_close: ?Value = null, // the first call's closing brace, held until the max-one final parse accepts it
+ 
+     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
+         const a = r.a;
+@@ -317,7 +318,6 @@ const Run = struct {
+         };
+         reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+         reply.finish_reason = "tool_calls";
+-        if (r.plan.policy.single) reply.tool_calls_streamed = false;
+         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+     }
+ 
+@@ -398,7 +398,10 @@ const Run = struct {
+ 
+         fn ping(ctx: *anyopaque) error{Closed}!void {
+             const s: *StreamSink = @ptrCast(@alignCast(ctx));
+-            if (s.run.out.vt.ping) |p| return p(s.run.out.ctx);
++            if (s.run.out.vt.ping) |p| {
++                const payload = s.run.chunk(null, null) catch return error.Closed;
++                return p(s.run.out.ctx, payload);
++            }
+         }
+ 
+         fn call(ctx: *anyopaque, delta: Value) error{Closed}!bool {
+@@ -409,6 +412,10 @@ const Run = struct {
+                 try r.emit(r.chunk(delta, null) catch return error.Closed);
+                 return true;
+             }
++            if (r.plan.policy.single and tool_stream.closingCall(delta) == 0) {
++                r.single_close = delta;
++                return false;
++            }
+             const filtered = r.policyDelta(delta) catch return error.Closed;
+             const d = filtered orelse return false;
+             try r.prose();
+@@ -418,17 +425,31 @@ const Run = struct {
+         }
+     };
+ 
+-    /// The one-call policy on a streamed delta: text filtered, tool_calls dropped; null when nothing is left.
++    /// The one-call policy on a streamed delta: text filtered and tool deltas capped at index zero.
+     fn policyDelta(r: *Run, delta: Value) Allocator.Error!?Value {
+-        if (!r.plan.policy.single) return if (delta.truthy()) delta else null;
+         if (delta == .string) {
+-            const t = try r.plan.policy.text(r.a, delta.string);
++            const t = if (r.plan.policy.single) try r.plan.policy.text(r.a, delta.string) else delta.string;
+             return if (t.len > 0) Value{ .string = t } else null;
+         }
++        if (!r.plan.policy.single and tool_stream.closingCall(delta) == null) return if (delta.truthy()) delta else null;
+         const o = try json.newObject(r.a);
+         var content: ?[]const u8 = null;
+         for (delta.object.keys(), delta.object.values()) |k, v| {
+-            if (std.mem.eql(u8, k, "tool_calls")) continue;
++            if (std.mem.eql(u8, k, tool_stream.call_close_field)) continue;
++            if (std.mem.eql(u8, k, "tool_calls")) {
++                if (!r.plan.policy.single) {
++                    try o.put(r.a, k, v);
++                    continue;
++                }
++                if (v != .array) continue;
++                var kept: std.ArrayList(Value) = .empty;
++                for (v.array) |call| {
++                    const index = if (call.get("index")) |i| i.int64() orelse 0 else 0;
++                    if (index == 0) try kept.append(r.a, call);
++                }
++                if (kept.items.len > 0) try o.put(r.a, k, .{ .array = kept.items });
++                continue;
++            }
+             if (std.mem.eql(u8, k, "content") and v == .string) {
+                 content = v.string;
+                 continue;
+@@ -442,6 +463,15 @@ const Run = struct {
+         return if (o.count() > 0) Value{ .object = o } else null;
+     }
+ 
++    fn releaseSingleClose(r: *Run, reply: *const chat.Reply, calls: ?[]Value) Allocator.Error!bool {
++        const close = r.single_close orelse return true;
++        r.single_close = null;
++        if (!tool_stream.parseTakes(reply.streamed_calls, calls orelse &.{})) return false;
++        const filtered = try r.policyDelta(close);
++        if (filtered) |out| r.emit(try r.chunk(out, null)) catch return false;
++        return true;
++    }
++
+     /// ``stands``: the client has a call it can read whole; ``matched``: every call that went out is the parse's.
+     const Settled = struct { stands: bool, matched: bool };
+ 
+@@ -521,7 +551,12 @@ const Run = struct {
+         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+         var sink_state: StreamSink = .{ .run = r, .tools = tools };
+         handed = true;
+-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .ping = StreamSink.ping, .calls_live = !r.plan.policy.single }, gone) catch |e| {
++        var reply = chat.generate(r.srv, &cx, prepared, .{
++            .ctx = &sink_state,
++            .call = StreamSink.call,
++            .ping = StreamSink.ping,
++            .max_calls = r.plan.policy.maxCalls(),
++        }, gone) catch |e| {
+             switch (e) {
+                 error.Cancelled => return,
+                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
+@@ -549,7 +584,11 @@ const Run = struct {
+             const raw = reply.content;
+             const calls = r.attachCalls(&reply) catch return;
+             const takes = tool_stream.parseTakes(reply.streamed_calls, calls orelse &.{});
+-            if (takes) for (reply.withheld) |d| r.emit(r.chunk(d, null) catch return) catch return;
++            const single_closed = r.releaseSingleClose(&reply, calls) catch return;
++            if (takes) for (reply.withheld) |d| {
++                const filtered = r.policyDelta(d) catch return;
++                if (filtered) |out| r.emit(r.chunk(out, null) catch return) catch return;
++            };
+             const view = reply_text.hideToolCalls(a, raw, true) catch return;
+             const shown = r.prose_sent.items;
+             // whitespace alone, before any prose and with calls made, stays held, as the live finish holds it
+@@ -560,7 +599,7 @@ const Run = struct {
+                 r.emit(r.chunk(.{ .string = view[shown.len..] }, null) catch return) catch return;
+             }
+             const settled = r.settle(&reply, if (takes) reply.streamed_calls else reply.wire_calls, calls) catch return;
+-            if (!settled.stands or (!settled.matched and std.mem.eql(u8, ended, "length"))) reply.finish_reason = ended;
++            if (!single_closed or !settled.stands or (!settled.matched and std.mem.eql(u8, ended, "length"))) reply.finish_reason = ended;
+             if (std.mem.eql(u8, ended, "length")) {
+                 r.contentRest(&reply) catch return;
+                 reply.finish_reason = ended;
+@@ -610,11 +649,12 @@ const Run = struct {
+                 r.prose_sent.appendSlice(a, tail) catch return;
+                 r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
+             }
+-            if (!r.plan.policy.single and reply.streamed_calls.len > 0) {
++            const single_closed = r.releaseSingleClose(&reply, calls) catch return;
++            if (reply.streamed_calls.len > 0) {
+                 // the reply's own reason stands when the client has no whole call, or holds a call the parse rejects
+                 // in a reply cut by the length
+                 const settled = r.settle(&reply, reply.streamed_calls, calls) catch return;
+-                if (live and (!settled.stands or (!settled.matched and std.mem.eql(u8, ended, "length")))) reply.finish_reason = ended;
++                if (live and (!single_closed or !settled.stands or (!settled.matched and std.mem.eql(u8, ended, "length")))) reply.finish_reason = ended;
+             } else if (calls != null and !reply.tool_calls_streamed) {
+                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+                 const deltas = tool_parse.deltas(a, calls.?) catch return;
+diff --git a/zig/src/server/responses.zig b/zig/src/server/responses.zig
+index 6e6fc8ec..6dd14bf0 100644
+--- a/zig/src/server/responses.zig
++++ b/zig/src/server/responses.zig
+@@ -207,7 +207,7 @@ const Wire = struct {
+     }
+ 
+     /// An SSE comment while the reply is silent (a long prefill, an answer held from its call's opener on).
+-    fn ping(ctx: *anyopaque) error{Closed}!void {
++    fn ping(ctx: *anyopaque, _: Value) error{Closed}!void {
+         const w: *Wire = @ptrCast(@alignCast(ctx));
+         return sse.comment(w.reply.conn, "ping");
+     }
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index 16954127..d7bda169 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -617,13 +617,15 @@ pub const Dsml = struct {
+         }
+     }
+ 
+-    fn delta(a: Allocator, index: usize, fragment: []const u8) Allocator.Error!Value {
++    fn delta(a: Allocator, index: usize, fragment: []const u8, closes_call: bool) Allocator.Error!Value {
+         const function = try json.newObject(a);
+         try function.put(a, "arguments", .{ .string = fragment });
+         const one = try json.newObject(a);
+         try one.put(a, "index", try json.intValue(a, index));
+         try one.put(a, "function", .{ .object = function });
+-        return wrap(a, .{ .object = one });
++        const out = try wrap(a, .{ .object = one });
++        if (closes_call) try out.object.put(a, call_close_field, try json.intValue(a, index));
++        return out;
+     }
+ 
+     /// ``fragment`` of the current call's arguments, unless its pieces stopped.
+@@ -632,7 +634,7 @@ pub const Dsml = struct {
+         const c = &d.sent.items[i];
+         if (c.held or fragment.len == 0) return;
+         try c.arguments.appendSlice(a, fragment);
+-        try d.dest(out).append(a, try delta(a, i, fragment));
++        try d.dest(out).append(a, try delta(a, i, fragment, false));
+     }
+ 
+     /// A parameter's key, after "{" or ",", then ``after``.
+@@ -660,14 +662,13 @@ pub const Dsml = struct {
+         if (d.holding and i < d.released) {
+             // the block's first call went out: its brace waits with the block's later calls, so a block that never
+             // closes leaves it open, as the parse takes none of the block's calls
+-            try d.queue.append(a, try delta(a, i, if (c.opened) "}" else "{}"));
++            try d.queue.append(a, try delta(a, i, if (c.opened) "}" else "{}", true));
+             d.late = i;
+             return;
+         }
+-        const was = d.current;
+-        d.current = i;
+-        try d.piece(a, if (c.opened) "}" else "{}", out);
+-        d.current = was;
++        const fragment = if (c.opened) "}" else "{}";
++        try c.arguments.appendSlice(a, fragment);
++        try d.dest(out).append(a, try delta(a, i, fragment, true));
+         c.closed = true;
+     }
+ 
+@@ -677,6 +678,15 @@ pub const Dsml = struct {
+     }
+ };
+ 
++/// Private metadata carried between the DSML streamer and a route. Routes remove it before writing a chunk.
++pub const call_close_field = "_tensorfold_tool_call_close";
++
++pub fn closingCall(delta: Value) ?usize {
++    const v = delta.get(call_close_field) orelse return null;
++    const i = v.int64() orelse return null;
++    return if (i >= 0) @intCast(i) else null;
++}
++
+ /// Bytes of ``rest`` that cannot be the start of a ``tail``-byte closer (Python slices characters).
+ fn trimTail(rest: []const u8, tail: usize) usize {
+     const chars = reply_text.charCount(rest);
+-- 
+2.50.1 (Apple Git-155)
+
