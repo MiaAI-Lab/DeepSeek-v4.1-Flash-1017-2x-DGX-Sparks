@@ -1,0 +1,249 @@
+From 1684540bb9b5c74e2a3a519720db0a22af51cb73 Mon Sep 17 00:00:00 2001
+From: Hector Isaza <76170012+hecisaza@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 01:16:02 +0000
+Subject: [PATCH] server: a reply made only of DSML closing tags, with tools
+ offered, is flagged (tool_parse_warning), not repaired
+
+SvangenStudios's 0043 of the 4-Spark recipe (https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/32),
+ported. A reply whose whole answer is DSML closing tags (both spellings) and whitespace, with tools offered, gets
+tensorfold.tool_parse_warning = "orphan_dsml_closers" in the whole reply, in a chat stream's finish chunk and in a
+Responses stream's final response, and a log line with the reply id (Messages carries no tensorfold fields). Diagnostic only: content, token ids, usage and the finish reason are unchanged, no call is invented and no
+retry started. output_diagnostics.zig is 0043's unchanged, plus a test-only switch; the check reads the same answer the
+finish parses (after the think split, or the Harmony split thinking off), so it agrees with this engine's parse: such an
+answer holds no opener, so the parse returns no call in either TENSORFOLD_TOOL_STREAM mode.
+
+Tests: output_diagnostics.zig (0043's: the closers in both spellings, and prose, quotes, fences, JSON, an opener, a
+spacing or a missing '>' not flagged) and dsml_stream_test.zig (the chat, Responses and Messages routes, live and hold,
+whole and streamed in rounds of one byte and all bytes, thinking on and off, with and without tools, ended by the end
+token or cut by max_tokens, and Harmony answers with thinking off: the warning only on chat and Responses for a
+closers-only answer with tools, and every reply the same with and without the diagnostic once ids and times are set
+aside).
+---
+ zig/src/server/chat.zig               |   7 ++
+ zig/src/server/dsml_stream_test.zig   | 123 ++++++++++++++++++++++++++
+ zig/src/server/output_diagnostics.zig |  38 ++++++++
+ zig/src/server/root.zig               |   1 +
+ 4 files changed, 169 insertions(+)
+ create mode 100644 zig/src/server/output_diagnostics.zig
+
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index a1ab375..5f04ed2 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -1,5 +1,6 @@
+ //! One reply, as ``ChatApp.chat`` makes it: render, submit to the engine, stream text, reasoning and calls.
+ const std = @import("std");
++const builtin = @import("builtin");
+ const api = @import("engine_api");
+ const json = @import("json.zig");
+ const errors = @import("errors.zig");
+@@ -7,6 +8,7 @@ const fields_mod = @import("fields.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
++const output_diagnostics = @import("output_diagnostics.zig");
+ const prompt_mod = @import("prompt.zig");
+ const log = @import("log.zig");
+ const ids = @import("ids.zig");
+@@ -653,6 +655,11 @@ const Generation = struct {
+         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
+         const decode_tokens = g.collected.items.len -| 1;
+         const runtime = try json.newObject(a);
++        if (g.tools.len > 0 and !(builtin.is_test and output_diagnostics.test_off)) if (output_diagnostics.toolWarning(content)) |warning| {
++            const code = @tagName(warning);
++            try runtime.put(a, "tool_parse_warning", .{ .string = code });
++            log.line("warning: {s} tool_parse_warning={s}", .{ g.reply_id, code });
++        };
+         try runtime.put(a, "enable_thinking", .{ .bool = thinking });
+         try runtime.put(a, "reasoning_effort", if (!thinking) .{ .string = "none" } else if (effort) |e| .{ .string = e } else .null);
+         try runtime.put(a, "engine", .{ .string = g.srv.info.name });
+diff --git a/zig/src/server/dsml_stream_test.zig b/zig/src/server/dsml_stream_test.zig
+index f4ca00d..a400b0e 100644
+--- a/zig/src/server/dsml_stream_test.zig
++++ b/zig/src/server/dsml_stream_test.zig
+@@ -2120,3 +2120,126 @@ test "over HTTP, prose with leading whitespace, then a DSML call cut by max_toke
+     }
+ }
+ 
++
++const output_diagnostics = @import("output_diagnostics.zig");
++
++/// `v` without what changes from one request to the next (ids, times); `warning` drops the diagnostic's field as well.
++fn diagScrub(a: Allocator, v: json.Value, warning: bool) !json.Value {
++    switch (v) {
++        .array => |items| {
++            const out = try a.alloc(json.Value, items.len);
++            for (items, out) |x, *y| y.* = try diagScrub(a, x, warning);
++            return .{ .array = out };
++        },
++        .object => |o| {
++            const out = try json.newObject(a);
++            for (o.keys(), o.values()) |k, x| {
++                const drop = [_][]const u8{ "id", "created", "created_at", "completed_at", "call_id", "item_id", "response_id", "system_fingerprint", "tokens_per_second", "seconds", "prefill_seconds", "time_to_first_token" };
++                if (for (drop) |d| {
++                    if (std.mem.eql(u8, k, d)) break true;
++                } else false) continue;
++                if (warning and std.mem.eql(u8, k, "tool_parse_warning")) continue;
++                try out.put(a, k, try diagScrub(a, x, warning));
++            }
++            return .{ .object = out };
++        },
++        else => return v,
++    }
++}
++
++/// A response's status line and its events (or its whole body), each scrubbed and on its own line.
++fn diagWire(a: Allocator, wire: []const u8, warning: bool) ![]const u8 {
++    var out: std.ArrayList(u8) = .empty;
++    const body = wire[(std.mem.indexOf(u8, wire, "\r\n\r\n") orelse return error.NoBody) + 4 ..];
++    try out.appendSlice(a, wire[0 .. std.mem.indexOf(u8, wire, "\r\n").?]);
++    try out.append(a, '\n');
++    var lines = std.mem.splitScalar(u8, body, '\n');
++    while (lines.next()) |raw| {
++        const line = std.mem.trimEnd(u8, raw, "\r");
++        if (line.len == 0) continue;
++        const data = if (std.mem.startsWith(u8, line, "data: ")) line[6..] else line;
++        if (data.len > 0 and data[0] == '{') {
++            if (json.parse(a, data) catch null) |p| if (p == .ok) {
++                try out.appendSlice(a, try json.stringify(a, try diagScrub(a, p.ok, warning), .{ .ascii = false, .compact = true }));
++                try out.append(a, '\n');
++                continue;
++            };
++        }
++        if (std.fmt.parseInt(usize, line, 16)) |_| continue else |_| {}
++        try out.appendSlice(a, line);
++        try out.append(a, '\n');
++    }
++    return out.items;
++}
++
++// Patch 0067 (0043 of the 4-Spark recipe): a reply made only of DSML closing tags, with tools offered, gets
++// tensorfold.tool_parse_warning on the chat and Responses routes (the whole reply and the stream's last event); Messages
++// carries no runtime stamps. Diagnostic only: with it and without it every route's reply is the same, byte for byte
++// once ids and times are set aside, in live and hold mode, whole and streamed, thinking on and off.
++test "orphan DSML closers with tools: the warning on chat and Responses, and every reply as without the diagnostic, cut by max_tokens or not" {
++    if (builtin.os.tag != .linux) return error.SkipZigTest;
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    defer output_diagnostics.test_off = false;
++    const close = "</" ++ BD ++ " calls>";
++    // warn_thinking: the warning with thinking on, where the answer is the text after the think block (no Harmony split)
++    const Case = struct { answer: []const u8, warn: bool, warn_thinking: ?bool = null };
++    const cases = [_]Case{
++        .{ .answer = close, .warn = true },
++        .{ .answer = " \n" ++ close ++ "\t" ++ close ++ "\r\n", .warn = true },
++        .{ .answer = "</" ++ BD ++ " parameter></" ++ BD ++ " invoke></" ++ BD ++ " calls>", .warn = true },
++        .{ .answer = "</" ++ BD ++ "parameter></" ++ BD ++ "invoke></" ++ BD ++ "tool_calls>", .warn = true },
++        .{ .answer = "Example: " ++ close, .warn = false },
++        .{ .answer = close ++ " suffix", .warn = false },
++        .{ .answer = "```\n" ++ close ++ "\n```", .warn = false },
++        .{ .answer = "OK", .warn = false },
++        .{ .answer = comptime (b_open ++ bInvoke("Read", bParam("file_path", "/a")) ++ b_close), .warn = false },
++        .{ .answer = "Writing it.<" ++ BD ++ " calls><" ++ BD ++ " invoke name=\"Write\"><" ++ BD ++ " parameter name=\"content\">x" ++ close ++ "y", .warn = false },
++        // thinking off, the finish reads Harmony channels: the final channel holds only closers, or there is none
++        .{ .answer = "<|channel|>final<|message|>" ++ close, .warn = true, .warn_thinking = false },
++        .{ .answer = "<|channel|>analysis<|message|>x<|end|><|start|>assistant<|channel|>final<|message|>" ++ close ++ "<|return|>", .warn = true, .warn_thinking = false },
++        .{ .answer = "<|channel|>analysis<|message|>" ++ close ++ "<|end|>", .warn = false },
++    };
++    const schema = "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}}}";
++    const user = "\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]";
++    for ([_]tool_streaming.Mode{ .live, .hold }) |mode| for ([_]bool{ false, true }) |thinking| {
++        var bs: ByteServer = .{ .mode = mode };
++        try bs.init(thinking);
++        defer bs.deinit();
++        for (cases) |case| for ([_]bool{ true, false }) |with_tools| for ([_]bool{ false, true }) |cut| {
++            const answer = if (thinking) try std.mem.concat(a, u8, &.{ "r</think>", case.answer }) else case.answer;
++            const warn = if (thinking) case.warn_thinking orelse case.warn else case.warn;
++            const ids = try a.alloc(u32, answer.len);
++            for (answer, ids) |c, *id| id.* = c;
++            bs.backend.ids = ids;
++            bs.backend.cut = cut; // ended by max_tokens (length) or by the end token
++            const chat_tools = if (with_tools) ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"Read\",\"parameters\":" ++ schema ++ "}},{\"type\":\"function\",\"function\":{\"name\":\"Write\",\"parameters\":" ++ schema ++ "}}]" else "";
++            const msg_tools = if (with_tools) ",\"tools\":[{\"name\":\"Read\",\"input_schema\":" ++ schema ++ "},{\"name\":\"Write\",\"input_schema\":" ++ schema ++ "}]" else "";
++            const resp_tools = if (with_tools) ",\"tools\":[{\"type\":\"function\",\"name\":\"Read\",\"parameters\":" ++ schema ++ "},{\"type\":\"function\",\"name\":\"Write\",\"parameters\":" ++ schema ++ "}]" else "";
++            const routes = [_]struct { path: []const u8, body: []const u8, stamps: bool }{
++                .{ .path = "/v1/chat/completions", .body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"max_tokens\":4096,", user, chat_tools, "}" }), .stamps = true },
++                .{ .path = "/v1/responses", .body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"max_output_tokens\":4096,\"input\":\"x\"", resp_tools, "}" }), .stamps = true },
++                .{ .path = "/v1/messages", .body = try std.mem.concat(a, u8, &.{ "{\"model\":\"test-model\",\"max_tokens\":4096,", user, msg_tools, "}" }), .stamps = false },
++            };
++            for (routes) |r| for ([_]?usize{ null, 1, answer.len }) |round| {
++                bs.backend.pattern = &.{round orelse answer.len};
++                const body = try withStream(a, r.body, round != null);
++                output_diagnostics.test_off = true;
++                const off = try wirePost(a, bs.srv, r.path, body);
++                output_diagnostics.test_off = false;
++                const on = try wirePost(a, bs.srv, r.path, body);
++                const flagged = std.mem.indexOf(u8, on, "orphan_dsml_closers") != null;
++                std.testing.expectEqual(warn and with_tools and r.stamps, flagged) catch |e| {
++                    std.debug.print("{s} mode {s} thinking {} tools {} cut {} round {any}: {f}\n", .{ r.path, @tagName(mode), thinking, with_tools, cut, round, std.zig.fmtString(case.answer) });
++                    return e;
++                };
++                try std.testing.expect(std.mem.indexOf(u8, off, "tool_parse_warning") == null);
++                std.testing.expectEqualStrings(try diagWire(a, off, false), try diagWire(a, on, true)) catch |e| {
++                    std.debug.print("{s} mode {s} thinking {} cut {} round {any}: {f}\n", .{ r.path, @tagName(mode), thinking, cut, round, std.zig.fmtString(case.answer) });
++                    return e;
++                };
++            };
++        };
++    };
++}
+diff --git a/zig/src/server/output_diagnostics.zig b/zig/src/server/output_diagnostics.zig
+new file mode 100644
+index 0000000..b47fc46
+--- /dev/null
++++ b/zig/src/server/output_diagnostics.zig
+@@ -0,0 +1,38 @@
++//! Conservative output diagnostics. A warning never repairs or reclassifies content.
++const std = @import("std");
++
++pub const ToolWarning = enum { orphan_dsml_closers };
++
++/// Tests only: the route runs as without the diagnostic, to compare its replies byte for byte.
++pub var test_off = false;
++
++/// Recognize only a whole answer made of known closing tags and ASCII whitespace.
++/// Prose, quotes, JSON, code fences, openers and partial/unknown tags remain ordinary text.
++/// The caller limits this check to answers with active tools outside the JSON channel.
++pub fn toolWarning(answer: []const u8) ?ToolWarning {
++    const blanks = " \t\r\n";
++    const closers = [_][]const u8{
++        "</\u{ff5c}DSML\u{ff5c} parameter>",
++        "</\u{ff5c}DSML\u{ff5c} invoke>",
++        "</\u{ff5c}DSML\u{ff5c} calls>",
++        "</\u{ff5c}DSML\u{ff5c}parameter>",
++        "</\u{ff5c}DSML\u{ff5c}invoke>",
++        "</\u{ff5c}DSML\u{ff5c}tool_calls>",
++    };
++    var rest = std.mem.trim(u8, answer, blanks);
++    if (rest.len == 0) return null;
++    while (rest.len > 0) {
++        const n = for (closers) |tag| {
++            if (std.mem.startsWith(u8, rest, tag)) break tag.len;
++        } else return null;
++        rest = std.mem.trimStart(u8, rest[n..], blanks);
++    }
++    return .orphan_dsml_closers;
++}
++
++test "output diagnostic is limited to complete orphan closing tags" {
++    const close = "</\u{ff5c}DSML\u{ff5c} calls>";
++    try std.testing.expectEqual(ToolWarning.orphan_dsml_closers, toolWarning(" \n" ++ close ++ "\t" ++ close ++ "\r").?);
++    try std.testing.expectEqual(ToolWarning.orphan_dsml_closers, toolWarning("</\u{ff5c}DSML\u{ff5c}parameter></\u{ff5c}DSML\u{ff5c}invoke></\u{ff5c}DSML\u{ff5c}tool_calls>").?);
++    for ([_][]const u8{ "", " \t", "\"" ++ close ++ "\"", "```\n" ++ close ++ "\n```", "Example: " ++ close, close ++ " suffix", "{\"example\":\"" ++ close ++ "\"}", "<\u{ff5c}DSML\u{ff5c} calls>" ++ close, "</\u{ff5c}DSML\u{ff5c}  calls>", "</\u{ff5c}DSML\u{ff5c} calls" }) |text| try std.testing.expect(toolWarning(text) == null);
++}
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index fc218ba..7ff1572 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -22,6 +22,7 @@ test {
+     _ = @import("reply_text.zig");
+     _ = @import("tool_parse.zig");
+     _ = @import("tool_stream.zig");
++    _ = @import("output_diagnostics.zig");
+     _ = @import("dsml_stream_test.zig");
+     _ = @import("dsml_hold_test.zig");
+     _ = @import("dsml_fuzz_test.zig");
+-- 
+2.34.1
+
