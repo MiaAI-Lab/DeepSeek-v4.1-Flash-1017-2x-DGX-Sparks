@@ -2,6 +2,8 @@
 WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-copy-id user@192.0.2.2)
 # FABRIC_PEER=192.0.2.12       # the worker's CX7 address, when WORKER is reached over another network
 # NFS_SERVER=192.0.2.1         # the head's address the worker mounts the checkpoint from (default: its address on the link)
+# WORKER2=user@192.0.2.3       # rank 2's Spark, for TP=3 only (not served yet: TP=2 leaves it alone); FABRIC_PEER2 and
+#                             # NFS_SERVER2 are its FABRIC_PEER and NFS_SERVER
 # HF_CACHE=/models/hf          # this Spark's Hugging Face cache, if it is not ~/.cache/huggingface (it needs ~505 GB free)
 # WORKER_ENGRAM_DIR='$HOME/.cache/dsv41-tensorfold/engram-1bae0e10'     # on the worker: Engram's tables (~203 GB)
 # WORKER_CACHE_DIR='$HOME/.cache/dsv41-tensorfold/rank-cache-c178a012'  # on the worker: rank 1's weight file (~106 GB)

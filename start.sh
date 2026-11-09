@@ -111,7 +111,7 @@ source ./scripts/banner.sh
 echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · 2 x DGX Spark · %s at once · %s-token window%s · EXL3 2.9 bpw · port %s%s\n\n' "$D" "$MODEL_ID" "$PARALLEL" "$CONTEXT" "$(port_summary)" "$PORT" "$R"
+printf '%s  %s · %s x DGX Spark · %s at once · %s-token window%s · EXL3 2.9 bpw · port %s%s\n\n' "$D" "$MODEL_ID" "$TP" "$PARALLEL" "$CONTEXT" "$(port_summary)" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
@@ -128,21 +128,29 @@ running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CO
 # a container of that name at all, running or exited (a rank that failed, or rank 0 ended by a broken pair's status 75)
 exists_here()    { docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
 exists_worker()  { worker "$1" docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; }
-if (( ! DRY )) && [[ "$MODE" == start ]] && running_here && running_worker 1; then
+# every rank running (this Spark's and each worker's), any of them running, any container left
+all_running() { local i; running_here || return 1; for i in $(worker_ids); do running_worker "$i" || return 1; done; }
+any_running() { local i; running_here && return 0; for i in $(worker_ids); do running_worker "$i" && return 0; done; return 1; }
+any_exists()  { local i; exists_here && return 0; for i in $(worker_ids); do exists_worker "$i" && return 0; done; return 1; }
+if (( ! DRY )) && [[ "$MODE" == start ]] && all_running; then
   # Preparation may have run separately while the old server stayed up: inspect the live ranks too.
   live_head=$(docker inspect -f '{{index .Config.Labels "tf.recipe.ablit"}}' "$CONTAINER_NAME")
-  live_worker=$(worker 1 "docker inspect -f '{{index .Config.Labels \"tf.recipe.ablit\"}}' '$CONTAINER_NAME'")
   # Containers launched before this flag existed are stock.
   [[ -n "$live_head" && "$live_head" != '<no value>' ]] || live_head=0
-  [[ -n "$live_worker" && "$live_worker" != '<no value>' ]] || live_worker=0
-  [[ "$live_head" == "$(ablit_identity)" && "$live_worker" == "$(ablit_identity)" ]] || \
-    die "the running ranks use a different ABLIT mode or overlay revision; run ./start.sh restart with ABLIT=$ABLIT"
+  for i in $(worker_ids); do
+    live_worker=$(worker "$i" "docker inspect -f '{{index .Config.Labels \"tf.recipe.ablit\"}}' '$CONTAINER_NAME'")
+    [[ -n "$live_worker" && "$live_worker" != '<no value>' ]] || live_worker=0
+    [[ "$live_head" == "$(ablit_identity)" && "$live_worker" == "$(ablit_identity)" ]] || \
+      die "the running ranks use a different ABLIT mode or overlay revision; run ./start.sh restart with ABLIT=$ABLIT"
+  done
   # the ported features (scripts/port.sh): containers started before them carry no label, and run with all of them off
   live_head=$(docker inspect -f '{{index .Config.Labels "tf.recipe.port"}}' "$CONTAINER_NAME")
-  live_worker=$(worker 1 "docker inspect -f '{{index .Config.Labels \"tf.recipe.port\"}}' '$CONTAINER_NAME'")
   [[ -n "$live_head" && "$live_head" != '<no value>' ]] || live_head=off
-  [[ -n "$live_worker" && "$live_worker" != '<no value>' ]] || live_worker=off
-  [[ "$live_head" == "$live_worker" ]] || die "the two running ranks disagree on the ported features ($live_head here, $live_worker on $(worker_host 1)): run ./start.sh restart"
+  for i in $(worker_ids); do
+    live_worker=$(worker "$i" "docker inspect -f '{{index .Config.Labels \"tf.recipe.port\"}}' '$CONTAINER_NAME'")
+    [[ -n "$live_worker" && "$live_worker" != '<no value>' ]] || live_worker=off
+    [[ "$live_head" == "$live_worker" ]] || die "the two running ranks disagree on the ported features ($live_head here, $live_worker on $(worker_host "$i")): run ./start.sh restart"
+  done
   [[ "$live_head" == "$(port_identity)" ]] || \
     die "the running ranks use other spill / KV-shard / pool settings ($live_head, asked: $(port_identity)); run ./start.sh restart"
   state=$(prepared_state) || die "cannot tell whether the setup is ready: see the error above"
@@ -166,7 +174,7 @@ if (( need_prepare )); then
   if (( DRY )); then log "DRY_RUN: scripts/prepare.sh would run now (not ready yet)"
   else
     # setup builds the image and writes ~106 GB files: with ~104 GiB of a Spark's memory held by a running rank that can freeze it
-    if running_here || running_worker 1; then
+    if any_running; then
       log "Setup is needed and a server is running: stopping it first (the build needs the memory)"
       ./stop.sh
     fi
@@ -194,7 +202,7 @@ if [[ -n "$HEAD_ENGRAM_DIR" ]] && (( ! DRY )); then
 fi
 detect_links
 log "Link: rendezvous $MASTER_ADDR:$MASTER_PORT"
-for r in 0 1; do
+for r in 0 $(worker_ids); do
   log "  rank $r ($( (( r == 0 )) && echo this node || worker_host "$r")): RoCE ${NODE_HCAS[r]} (GID ${NODE_GID[r]})$( (( r == 0 )) || echo ", NFS from ${LINK_HEAD_ADDR[r]:-?}")"
 done
 # the serve flags against what this build of tensorfold-native serves (scripts/zig_flags.py, from the GLM-5.3-Flash recipe):
@@ -210,12 +218,12 @@ port_ident_map "$IMAGE"
 port_weights_check
 if (( ! DRY )); then
   # Preparation's marker cannot detect an export/root change since the last run.
-  worker_files_check 1
+  for i in $(worker_ids); do worker_files_check "$i"; done
   # stop.sh for any container left, an exited one too: it saves each rank's log before it removes the container, so a
   # restart (./start.sh restart, or a supervisor's start after rank 0 exited) keeps the failed run's last lines
-  if exists_here || exists_worker 1; then ./stop.sh; fi
+  if any_exists; then ./stop.sh; fi
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  worker 1 "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"
+  for i in $(worker_ids); do worker "$i" "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"; done
   if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"; fi
   # memory: a rank that takes all of a Spark's memory freezes the machine, so refuse to start on one that cannot hold it.
   # Counted as the engine's startup budget counts it (0119): MemAvailable plus the pages parked on the per-CPU free
@@ -228,9 +236,11 @@ if (( ! DRY )); then
       shm=$(du -sm /dev/shm 2>/dev/null | cut -f1); shm=${shm:-0}
       die "only $here_gb GiB memory available here (MemAvailable plus the pages parked on the per-CPU lists), $MIN_AVAIL_GIB GiB needed (the weights plus the engine's reserve): free memory first${shm:+ (/dev/shm holds $shm MiB)}; MIN_AVAIL_GIB=0 skips this check, and a rank that takes all the memory freezes the Spark"
     fi
-    g=$WORKER_GB
-    awk -v a="$g" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a < m)}' &&
-      die "only $g GiB memory available on $(worker_host 1), $MIN_AVAIL_GIB GiB needed: stop other GPU work there (MIN_AVAIL_GIB=0 skips this check)"
+    for i in $(worker_ids); do
+      g=${WORKER_GB[i]}
+      awk -v a="$g" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a < m)}' &&
+        die "only $g GiB memory available on $(worker_host "$i"), $MIN_AVAIL_GIB GiB needed: stop other GPU work there (MIN_AVAIL_GIB=0 skips this check)"
+    done
   fi
   memguard_start
 fi
@@ -239,18 +249,20 @@ fi
 # FOREGROUND=1: stay attached to rank 0's log and exit with its code, so that a supervisor (systemd's Restart=on-failure)
 # can restart the server. Either rank ending takes the other one down: a lone rank waits for its peer forever. SIGINT and
 # SIGTERM run ./stop.sh. Note the supervisor restarts a start that was killed by memguard too; give it a RestartSec.
-# (From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's start.sh, for the one worker here.)
+# (From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's start.sh, for each worker of worker_ids.)
 foreground() {
-  local watch w code
+  local watch w code i
   trap './stop.sh; exit 130' INT TERM
   ( exec 8>&-                                        # not holding start.sh's lock once start.sh has exited
     while sleep 30; do
       running_here || exit 0
-      worker 1 true 2>/dev/null || continue         # a worker out of reach for a moment says nothing about its rank
-      running_worker 1 && continue
-      warn "rank 1 on $(worker_host 1) exited: stopping rank 0"
-      docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
-      exit 1
+      for i in $(worker_ids); do
+        worker "$i" true 2>/dev/null || continue     # a worker out of reach for a moment says nothing about its rank
+        running_worker "$i" && continue
+        warn "rank $i on $(worker_host "$i") exited: stopping rank 0"
+        docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
+        exit 1
+      done
     done ) &
   watch=$!
   docker logs -f "$CONTAINER_NAME" || true
@@ -258,7 +270,7 @@ foreground() {
   w=0; wait "$watch" || w=$?
   code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
   [[ "$w" != 1 || "$code" != 0 ]] || code=1         # the worker's rank failed, even if rank 0 then shut down cleanly
-  worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
+  for i in $(worker_ids); do worker "$i" "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true; done
   exit "$code"
 }
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)
@@ -305,19 +317,23 @@ if [[ "$API_KEY" == 1 ]]; then
   if (( DRY )); then log "DRY_RUN: API_KEY=1: the key would be read from $API_KEY_FILE (created, mode 600, when missing)"
   else api_key_ensure; AUTH=(-H "@$(api_header_file)"); fi
 fi
-step 3 "Launch: container $CONTAINER_NAME, rank 1 on the worker, then rank 0 here"
+step 3 "Launch: container $CONTAINER_NAME, $( (( TP == 2 )) && echo "rank 1 on the worker" || echo "ranks 1 to $((TP - 1)) on the workers"), then rank 0 here"
 # spill files a crashed run left as root go back to their directory's owner (scripts/port.sh; nothing with SPILL_GIB=0)
 (( DRY )) || port_spill_fix_both
-cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache 1 2 ${LINK_HEAD_ADDR[1]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
-[[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[1]}"   # this node's RoCE devices
-spill1=$(port_spill_args 1)   # rank 1's spill directory (scripts/port.sh; empty, and no extra space, with it off)
-remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill1:+$spill1 }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}" ${PORT_RANK_SHA[1]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[1]}"} ${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"}) $(rank_nccl_env 1) $IMAGE $cmd"
-if (( DRY )); then printf '[dry-run] rank 1 on %s:\n  %s\n' "$(worker_host 1)" "$remote"
-else
-  log "Rank 1 on $(worker_host 1): $cmd"
-  worker 1 "$remote" >/dev/null || die "could not start rank 1 on $(worker_host 1)"
-fi
-ENV0=(TF_TP_WORLD=2 "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA/rank-cache" "TF_DS_KIT=$KIT"
+# rank i on worker i, rendezvous at the head's address on that worker's link
+for i in $(worker_ids); do
+  cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache $i $TP ${LINK_HEAD_ADDR[i]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
+  [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[i]}"   # this node's RoCE devices
+  spill=$(port_spill_args "$i")   # rank i's spill directory (scripts/port.sh; empty, and no extra space, with it off)
+  rank_env=(); (( i != 1 )) || rank_env=(${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"})   # RANK1_EXTRA_ENV: rank 1's alone
+  remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill:+$spill }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[i]}" ${PORT_RANK_SHA[i]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[i]}"} ${rank_env[@]+"${rank_env[@]}"}) $(rank_nccl_env "$i") $IMAGE $cmd"
+  if (( DRY )); then printf '[dry-run] rank %s on %s:\n  %s\n' "$i" "$(worker_host "$i")" "$remote"
+  else
+    log "Rank $i on $(worker_host "$i"): $cmd"
+    worker "$i" "$remote" >/dev/null || die "could not start rank $i on $(worker_host "$i")"
+  fi
+done
+ENV0=("TF_TP_WORLD=$TP" "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA/rank-cache" "TF_DS_KIT=$KIT"
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container)" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json"
       "TF_DS_GRAPHS=$GRAPHS" "TF_DS_GRAPH_CAP=$GRAPH_CAP" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
 if (( DRY )); then HEAD_HF=${HEAD_NFS_SERVER:+$HEAD_NFS_VOLUME}; HEAD_HF=${HEAD_HF:-$HF_CACHE}; else HEAD_HF=$(head_hf_mount); fi
@@ -343,14 +359,17 @@ docker logs -f "$CONTAINER_NAME" 2>&1 | sed -u "s/^/  ${D}│${R} /" &
 LOGS_PID=$!
 trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
 fail() {
+  local i
   kill $LOGS_PID 2>/dev/null || true
-  printf '%s── rank 1 (%s): last log lines ──%s\n' "$D" "$(worker_host 1)" "$R"; worker 1 docker logs --tail 15 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
+  for i in $(worker_ids); do
+    printf '%s── rank %s (%s): last log lines ──%s\n' "$D" "$i" "$(worker_host "$i")" "$R"; worker "$i" docker logs --tail 15 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
+  done
   die "$1"
 }
 start=$SECONDS
 until curl -sf --max-time 5 "${AUTH[@]}" "$URL/v1/models" >/dev/null 2>&1; do
   running_here || fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
-  running_worker 1 || fail "rank 1 on $(worker_host 1) exited before the server was ready"
+  for i in $(worker_ids); do running_worker "$i" || fail "rank $i on $(worker_host "$i") exited before the server was ready"; done
   (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running"
   sleep 5
 done
@@ -371,9 +390,13 @@ fi
 # kills the rank if it reaches the floor. A head that also runs a desktop and other containers has the least.
 if awk -v g="$MEMGUARD_GIB" 'BEGIN {exit !(g > 0)}'; then
   mem_here=$(mem_available_gib)
-  mem_there=$(worker 1 "awk '/^MemAvailable:/ {printf \"%.1f\", \$2 / 1048576}' /proc/meminfo" 2>/dev/null || echo "?")
-  log "Memory after the load: ${mem_here} GiB available on this Spark, ${mem_there} GiB on $(worker_host 1); memguard's floor is $MEMGUARD_GIB GiB"
-  for pair in "this Spark:$mem_here" "$(worker_host 1):$mem_there"; do
+  mem_pairs=("this Spark:$mem_here"); mem_workers=""
+  for i in $(worker_ids); do
+    mem_there=$(worker "$i" "awk '/^MemAvailable:/ {printf \"%.1f\", \$2 / 1048576}' /proc/meminfo" 2>/dev/null || echo "?")
+    mem_workers+=", ${mem_there} GiB on $(worker_host "$i")"; mem_pairs+=("$(worker_host "$i"):$mem_there")
+  done
+  log "Memory after the load: ${mem_here} GiB available on this Spark$mem_workers; memguard's floor is $MEMGUARD_GIB GiB"
+  for pair in "${mem_pairs[@]}"; do
     v=${pair##*:}; [[ "$v" =~ ^[0-9.]+$ ]] || continue
     awk -v a="$v" -v g="$MEMGUARD_GIB" 'BEGIN {exit !(a < g + 3)}' &&
       warn "only $v GiB available on ${pair%:*}, within 3 GiB of memguard's floor ($MEMGUARD_GIB GiB): a long prompt can take that and memguard then kills the rank. Free memory there (desktop, other containers: README, Memory and safety) before relying on this server"
@@ -386,7 +409,7 @@ cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)
     Access   $( [[ "$API_KEY" == 1 ]] && echo "API key required: Authorization: Bearer \$(cat $API_KEY_FILE)" || echo "open: no key, anyone who reaches port $PORT can use it (API_KEY=1 requires one)")
     Window   $CONTEXT tokens · $PARALLEL at once · EXL3 2.9 bpw · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images on$(port_summary)
-    Logs     docker logs -f $CONTAINER_NAME   (rank 1: ssh $(worker_host 1) docker logs -f $CONTAINER_NAME)
+    Logs     docker logs -f $CONTAINER_NAME$(for i in $(worker_ids); do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)
     Restart  ./start.sh restart
     Stop     ./stop.sh
 

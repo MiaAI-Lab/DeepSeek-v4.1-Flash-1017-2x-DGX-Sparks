@@ -30,8 +30,12 @@ unset _n _line _key _value
 # ---------------------------------------------------------------- the two Sparks
 # This machine serves rank 0 and the API; WORKER (an ssh target, key-based) is rank 1. The two are cabled directly
 # through their ConnectX-7 ports (scripts/nodes.sh finds the link).
-TP=2
+# TP: the ranks, one a Spark. 2 is the only value served: the scripts take their workers as a list already (rank i on
+# worker i: WORKER, then WORKER2 with its own FABRIC_PEER2 and NFS_SERVER2, as the GLM-5.3 3x and the 4x recipes name
+# them), and refuse any other TP. WORKER2 and its settings are read only when TP is 3.
+TP="${TP:-2}"
 WORKER="${WORKER:-}"; FABRIC_PEER="${FABRIC_PEER:-}"
+WORKER2="${WORKER2:-}"; FABRIC_PEER2="${FABRIC_PEER2:-}"
 MASTER_PORT="${MASTER_PORT:-29620}"  # the ranks' rendezvous port (keep it on the private link)
 # The rendezvous address: this node's address on the link to the worker (scripts/nodes.sh sets it from the link when it
 # is empty).
@@ -184,13 +188,14 @@ KIT_SUB="tensorfold-dsv41/kit-${KIT_REF:0:8}"
 # The worker reads this Spark's HF_CACHE over NFS (the recipe's only mode: one copy of the 196 GiB checkpoint, here): a
 # read-only docker volume NFS_VOLUME on the worker that prepare.sh creates (no sudo there). This Spark must export
 # NFS_PATH (default: HF_CACHE; "/" for an NFSv4 export with fsid=0) to the worker's address on its link. NFS_SERVER: the
-# head's address the worker mounts from (default: the head's address on the link, found by scripts/nodes.sh).
+# head's address the worker mounts from (default: the head's address on the link, found by scripts/nodes.sh);
+# NFS_SERVER2 is WORKER2's.
 NFS_PATH="${NFS_PATH:-$HF_CACHE}"
-NFS_SERVER="${NFS_SERVER:-}"
+NFS_SERVER="${NFS_SERVER:-}"; NFS_SERVER2="${NFS_SERVER2:-}"
 NFS_VOLUME="${NFS_VOLUME:-dsv41-1017-exl3-hf}"
-# On the worker's own disk (paths on the worker): Engram's tables (a decode round reads ~70 random 4 KiB rows from
-# them; over NFS that took most of a round), and its weight file (~106 GB; written there by prepare.sh from the
-# checkpoint over NFS, so it never crosses the network twice).
+# On the worker's own disk (paths on the worker, the same on every worker): Engram's tables (a decode round reads ~70
+# random 4 KiB rows from them; over NFS that took most of a round), and its weight file (~106 GB; written there by
+# prepare.sh from the checkpoint over NFS, so it never crosses the network twice).
 WORKER_ENGRAM_DIR="${WORKER_ENGRAM_DIR:-\$HOME/.cache/dsv41-tensorfold/engram-${ENGRAM_REVISION:0:8}}"
 WORKER_CACHE_DIR="${WORKER_CACHE_DIR:-\$HOME/.cache/dsv41-tensorfold/rank-cache-${MODEL_REVISION:0:8}}"
 # Keep stock and abliterated weights separate even when the user sets WORKER_CACHE_DIR.

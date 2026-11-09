@@ -361,6 +361,17 @@ detect_links() {
         self.assertNotEqual(code, 0, out)
         self.assertEqual(self.launched(), [], out)
 
+    def test_tp3_is_refused_before_anything_stops(self):
+        # the scripts take WORKER2, but three Sparks are not served yet (scripts/nodes.sh, check_workers)
+        for h in ["head", "w1", "w2"]:
+            self.containers(h, NAME)
+        code, out = self.run_script(["start.sh", "restart"], {"PREPARE": "0", "TP": "3", "WORKER2": "w2"})
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("TP=3 (three Sparks) is not served yet", out)
+        self.assertEqual(self.launched(), [], out)
+        for h in ["head", "w1", "w2"]:
+            self.assertEqual(self.left(h), [NAME], h)
+
     def test_template_that_cannot_be_hashed_starts_nothing(self):
         # no marker yet, or an empty one: a failed hash must not read as "Ready" and start the ranks
         (self.repo / "model" / "chat_template.jinja").unlink()

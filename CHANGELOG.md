@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The scripts take their workers as a list, so that three Sparks can follow: `scripts/nodes.sh`'s `worker_ids` (the
+  GLM-5.3 3x and the 4x recipes' form; the one worker at `TP=2`). Every step that reached worker 1 now takes each
+  worker in turn and names the one that fails: `start.sh`'s running-pair check, stops, NFS check, launch, load,
+  `FOREGROUND=1` watch and summary; `scripts/prepare.sh`'s preflight, image copy and steps 6 and 7; `scripts/port.sh`'s
+  weight digests, spill folders, Engram listing and spill give-back; `await_memory` and the `MIN_AVAIL_GIB` refusal.
+  Rank i runs `tf-dsv41-lanes ... <i> <TP>` against the head's address on its own link and reads `rank<i>of<TP>`.
+  `WORKER2`, `FABRIC_PEER2` and `NFS_SERVER2` are settings (`scripts/config.sh`, `scripts/local.sh.example`) and `TP`
+  takes the environment's value, but only `TP=2` is served: `TP=3` is refused before anything is stopped (the links
+  of three Sparks and their launch come next), and a `WORKER2` set at `TP=2` is left alone. At `TP=2` nothing changes:
+  `scripts/test_nodes_tpn.py` runs `start.sh` (dry runs and, with fakes, starts, restarts and a failed load) and
+  `stop.sh` from this tree and from `31457d0` and compares the output, the ssh commands and the docker calls; it and
+  seven new `scripts/port_test.sh` cases drive the steps with two workers.
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
