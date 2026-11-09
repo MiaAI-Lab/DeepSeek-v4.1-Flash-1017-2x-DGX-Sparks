@@ -19,7 +19,7 @@
 # checkpoint's model card lists (a few minutes of reading 203 GB).
 # ABLIT=1 applies Keys' matching Mia EAQ 2.9 bpw overlay in a separate folder. Requires your Hugging Face read token
 # (HF_TOKEN or hf auth login) AND access to https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated;
-# EAQ_V1_1 must be 0 (the default).
+# The pinned EAQ v1.1 pack is supported with header and byte-preservation checks.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 source ./scripts/config.sh
@@ -156,6 +156,11 @@ if [[ "$ABLIT" == 1 ]]; then
   for f in apply_mia29_wo_b_graft.py "$ABLIT_SIDECAR" EXL3_MIA29_ABLIT_META.json; do
     [[ -s "$HF_CACHE/$overlay_sub/$f" ]] || die "matching Mia overlay file is missing: $f"
   done
+  validate_graft() {
+    python3 -I "$PWD/scripts/ablit_validate.py" "$SNAP" \
+      "$HF_CACHE/$overlay_sub/$ABLIT_SIDECAR" ${1:+"$1"}
+  }
+  validate_graft || die "the Mia overlay is incompatible with this checkpoint"
   # The overlay script casts four MTP tensors to F32 for another engine; this one reads the drafter's confidence head
   # as F16 whatever the file holds, so an F32 copy makes it draft almost nothing. Give them their stock dtypes back
   # (scripts/ablit_stock_dtypes.py; headers only when they already match).
@@ -180,14 +185,17 @@ if [[ "$ABLIT" == 1 ]]; then
     python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["n_edited"] == 104, "expected 104 Mia overlay tensors"' \
       "$DATA_DIR/checkpoint.new/ABLIT_META.json" || die "Mia overlay did not replace all 104 tensors"
     stock_dtypes "/hf/$DATA_SUB/checkpoint.new" || die "could not give the overlay checkpoint its stock dtypes back"
+    # Dropping temporary hardlinks changes stock inodes' ctime; settle them before recording the verification receipt.
+    rm -rf "$DATA_DIR/stock.new"
+    validate_graft "$DATA_DIR/checkpoint.new" || die "overlay verification failed; no checkpoint is marked ready"
     touch "$DATA_DIR/checkpoint.new/.ablit-ready"
     rm -rf "$DATA_DIR/checkpoint"
     mv "$DATA_DIR/checkpoint.new" "$DATA_DIR/checkpoint"
-    rm -rf "$DATA_DIR/stock.new"
   else
     log "Matching Mia overlay checkpoint: ready"
     # prepared before the dtype step: a tensor given back changes the weight files' index, so step 5 and 7 rebuild them
     stock_dtypes "/hf/$DATA_SUB/checkpoint" || die "could not give the overlay checkpoint its stock dtypes back"
+    validate_graft "$DATA_DIR/checkpoint" || die "the prepared overlay no longer passes verification"
   fi
   SNAP="$DATA_DIR/checkpoint"
 fi

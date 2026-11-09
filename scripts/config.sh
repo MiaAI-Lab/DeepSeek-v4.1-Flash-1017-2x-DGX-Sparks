@@ -59,8 +59,8 @@ case "$MODEL_ID" in
   Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw) _rev=aee640e2afba93be683bb5b9b420115fe7fbac20 ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-# Keys' matching Mia EAQ 2.9 bpw overlay (not a standalone checkpoint). It matches EAQ v1, not v1.1: ABLIT=1 with
-# EAQ v1.1 is refused below; leave EAQ_V1_1=0 (the default) for the overlay.
+# Keys' matching Mia EAQ 2.9 bpw overlay (not a standalone checkpoint). The pinned v1.1 pack also retains these
+# 104 EXL3 wo_b tensors; prepare.sh validates the graft and preserves all other tensors, including BF16 linears.
 export ABLIT="${ABLIT:-0}"
 ABLIT_ID=drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 ABLIT_REVISION="${ABLIT_REVISION:-0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0}"
@@ -260,7 +260,11 @@ ablit_notice() {
   [[ "$ABLIT" == 1 ]] || return 0
   case "$MODEL_ID" in
     Mia-AiLab/DeepSeek-V4.1-Flash-1017-EAQ-v1-2.9-bpw|Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw) ;;
-    *) die "ABLIT=1 requires the Mia EAQ v1 2.9 bpw checkpoint and its matching $ABLIT_SIDECAR overlay (EAQ_V1_1=0)" ;;
+    Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw)
+      [[ "$MODEL_REVISION" == aee640e2afba93be683bb5b9b420115fe7fbac20 &&
+         "$ABLIT_REVISION" == 0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0 ]] ||
+        die "v1.1 ABLIT requires the inspected stock and overlay pins; validate new revisions before enabling them" ;;
+    *) die "ABLIT=1 requires the Mia EAQ v1 or pinned v1.1 2.9 bpw checkpoint and its matching $ABLIT_SIDECAR overlay" ;;
   esac
   [[ "$ABLIT_REVISION" =~ ^[0-9a-f]{40}$ ]] || die "ABLIT_REVISION must be a full Hugging Face commit hash"
   warn "ABLIT=1: $ABLIT_ID is gated. You must have access at https://huggingface.co/$ABLIT_ID (accept its terms while logged in) and use your Hugging Face read token: export HF_TOKEN=hf_... or hf auth login. The token's account must have access to this repository."
@@ -281,8 +285,8 @@ engram_in_container() { echo "/hf/hub/models--${ENGRAM_ID//\//--}/snapshots/$(en
 # The folder rank 0 serves (prepare.sh): the checkpoint's files linked, with the recipe's chat template.
 served_in_container() { echo "/hf/$DATA_SUB/model"; }
 
-# What scripts/prepare.sh last left ready (start.sh runs it again when this line changes). "+stock-dtypes": an overlay
-# checkpoint prepared before scripts/ablit_stock_dtypes.py gets that step on the next start.
+# What scripts/prepare.sh last left ready (start.sh runs it again when this line changes).
+# Include the graft validator so older checkpoints get validated before caches are reused.
 PREPARED_MARKER="$STATE_DIR/prepared"
 # Every field is quoted (printf %q), so a value holding another field's text cannot shift into it, and the template's
 # sha256 is part of it (a changed model/chat_template.jinja is served only after prepare.sh linked it again). It fails
@@ -295,6 +299,12 @@ prepared_state() {
      "w=$(worker_host 1)" "wengram=$WORKER_ENGRAM_DIR" "wcache=$WORKER_CACHE_DIR" "ablit=$ABLIT"
      "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
      "hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
+  if [[ "$ABLIT" == 1 ]]; then
+    local validator
+    validator=$(sha256sum "$_cfg_root/scripts/ablit_validate.py" | cut -c1-64) && [[ -n "$validator" ]] ||
+      die "cannot hash scripts/ablit_validate.py"
+    f+=("graft-validator=$validator")
+  fi
   for i in 2 3; do [[ -z "$(worker_host "$i")" ]] || f+=("w$i=$(worker_host "$i")"); done
   for i in 1 2 3; do f+=("nfs$i=$(wval NFS_SERVER "$i")"); done
   (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
