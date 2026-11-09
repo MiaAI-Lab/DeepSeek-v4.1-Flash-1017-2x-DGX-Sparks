@@ -1,0 +1,277 @@
+From 8d9fcb26e8e3176b1d949aaf0f541c3c5594a9fa Mon Sep 17 00:00:00 2001
+From: "tianxu.zhang" <tianxu.zhang@bytedance.com>
+Date: Mon, 9 Nov 2026 18:40:00 +0800
+Subject: [PATCH] dsv41: expose picture resume metrics
+
+Patch 0043 skips vision work for pictures wholly before a resumed prompt
+pass, but production had no direct signal that the skip happened. Publish
+four counters from the DSV lane thread through the existing status snapshot:
+vision tower runs, pictures skipped by resume, pictures still needed after
+resume, and picture rows installed and sent to follower ranks.
+
+The counters add no clock reads, GPU synchronization, allocation, or second
+copy of picture data. Text-only families publish no picture metrics. Server
+and engine tests cover the status plumbing and Prometheus names.
+
+---
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 0bd41ab9265fdbfe7ad06e1413a2a725d9ef9034..c1460ec945f648e4a5e21ffff773ddfb8e8b25b3 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -355,6 +355,8 @@ pub const Status = struct {
+     cache: ?CacheStats = null,
+     /// KV ownership's counters and parts (a backend that shards its pool over the ranks: dsv41's TF_DS_KV_SHARD).
+     kv_parts: ?KvParts = null,
++    /// A vision backend's picture preparation and resume counters.
++    pictures: ?PictureStats = null,
+     /// The rank pair's robustness counters and state (a backend with a broken-pair policy, or the prompt cache's
+     /// disk tier); null otherwise (no /health or /metrics output).
+     pair: ?PairStatus = null,
+@@ -395,6 +397,7 @@ pub const PairStatus = struct {
+ 
+ /// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
+ pub const KvParts = lanes.kv_parts.Stats;
++pub const PictureStats = lanes.picture_stats.Stats;
+ 
+ pub const SubmitError = error{ Closed, Busy };
+ 
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 5245739cd0befd088d97e2425b6c38652bc9a052..8a68c970af56791af39b6d70401320f26c0e6b49 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -91,6 +91,9 @@ pub const LaneHost = struct {
+     /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
+     kv_parts: ?lanes.kv_parts.Source = null,
+     kv_tele: ?api.KvParts = null,
++    /// A vision backend's picture counters, read and published beside the other backend telemetry.
++    picture_stats: ?lanes.picture_stats.Source = null,
++    picture_tele: ?api.PictureStats = null,
+     // -- a broken rank pair (the backend's policy, set before start; null: off, nothing below runs) ---------------
+     pair: ?PairPolicy = null,
+     pair_state: std.atomic.Value(u8) = .init(0), // 0 whole, 1 a cause being recorded, 2 broken (why/drain/since set)
+@@ -416,6 +419,7 @@ pub const LaneHost = struct {
+             .generation_tokens = h.live_generated,
+             .cache = h.tele,
+             .kv_parts = h.kv_tele,
++            .pictures = h.picture_tele,
+             .pair = h.pairStatus(now),
+         };
+     }
+@@ -937,6 +941,11 @@ pub const LaneHost = struct {
+             parts = .{};
+             src.read(src.ctx, &parts.?);
+         }
++        var pictures: ?api.PictureStats = null;
++        if (h.picture_stats) |src| {
++            pictures = .{};
++            src.read(src.ctx, &pictures.?);
++        }
+         h.lock();
+         defer h.unlock();
+         h.live_tokens.clearRetainingCapacity();
+@@ -947,6 +956,7 @@ pub const LaneHost = struct {
+         };
+         if (tele) |t| h.tele = t;
+         if (parts) |p| h.kv_tele = p;
++        if (pictures) |p| h.picture_tele = p;
+     }
+ 
+     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index f07d04e8efee1e8867ea7cf3f2466ea32198a578..b6f286beb0d84368edae11f1db207d227499c610 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -21,6 +21,7 @@ pub const trail = @import("trail.zig");
+ pub const engine = @import("engine.zig");
+ pub const fake = @import("fake.zig");
+ pub const kv_parts = @import("kv_parts.zig");
++pub const picture_stats = @import("picture_stats.zig");
+ 
+ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+diff --git a/zig/src/core/lanes/picture_stats.zig b/zig/src/core/lanes/picture_stats.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..f008fb25f5aeb00f2d555bbd1327a983ab2faac5
+--- /dev/null
++++ b/zig/src/core/lanes/picture_stats.zig
+@@ -0,0 +1,28 @@
++//! A vision backend's picture counters for /metrics. A backend hands the lane host a `Source`; the host reads it on
++//! its engine thread and publishes a copy for status readers.
++const std = @import("std");
++
++pub const Stats = struct {
++    vision_tower_runs_total: u64 = 0,
++    pictures_resume_skipped_total: u64 = 0,
++    pictures_rows_sent_total: u64 = 0,
++    pictures_after_resume_total: u64 = 0,
++
++    pub const help = .{
++        .vision_tower_runs_total = "Pictures whose embedding rows ran through the vision tower.",
++        .pictures_resume_skipped_total = "Pictures wholly before a resumed prompt pass and already present in its kept state.",
++        .pictures_rows_sent_total = "Picture embedding rows installed on rank 0 and sent to follower ranks.",
++        .pictures_after_resume_total = "Pictures a resumed prompt pass still had to prepare because they straddled or followed its kept state.",
++    };
++};
++
++pub const Source = struct {
++    ctx: *anyopaque,
++    read: *const fn (ctx: *anyopaque, out: *Stats) void,
++};
++
++test "every picture counter has help" {
++    inline for (@typeInfo(Stats).@"struct".field_names) |name| {
++        try std.testing.expect(@field(Stats.help, name).len > 0);
++    }
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 40006aaecadbf74d26454cef0dc22e337ba04ce3..215e5b36cda110ee34af8bca26b71a10e1b5d4bc 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -473,6 +473,7 @@ pub const Lanes = struct {
+     kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
+     kv_stats: lanes.kv_parts.Stats = .{}, // the last parts' stats kvPartsFn built (the engine loop reads them every
+     kv_stats_at: u64 = 0, //   iteration: rebuilt at most each kv_stats_ns, Model.now; 0: never built)
++    picture_stats: lanes.picture_stats.Stats = .{},
+     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
+     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
+     rw: ?*rank_wire.Leader = null,
+@@ -769,6 +770,10 @@ pub const Lanes = struct {
+         self.kv_stats = out.*;
+     }
+ 
++    pub fn pictureStatsFn(ptr: *anyopaque, out: *lanes.picture_stats.Stats) void {
++        out.* = of(ptr).picture_stats;
++    }
++
+     /// How stale /health's parts' stats may be (kvPartsFn).
+     const kv_stats_ns: u64 = 250 * std.time.ns_per_ms;
+ 
+@@ -972,13 +977,18 @@ pub const Lanes = struct {
+             const resume_at: usize = if (kept) |sn| sn.at else 0;
+             for (s.images) |img| {
+                 try markPicture(seq.items, img.at, img.tokens, image_id);
+-                if (!pictureNeedsRows(img.at, img.tokens, resume_at)) continue;
++                if (!pictureNeedsRows(img.at, img.tokens, resume_at)) {
++                    self.picture_stats.pictures_resume_skipped_total += 1;
++                    continue;
++                }
++                if (resume_at > 0) self.picture_stats.pictures_after_resume_total += 1;
+                 if (img.rows) {
+                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
+                     try rows.appendSlice(gpa, img.bytes);
+                 } else {
+                     // a prepared picture (vision.zig): the tower's span rows, here on rank 0
+                     const v = self.vision orelse return error.NoVisionTower;
++                    self.picture_stats.vision_tower_runs_total += 1;
+                     if (try v.rows(img.bytes, gpa, &rows) != img.tokens) return error.BadImageSpan;
+                 }
+                 try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
+@@ -1019,6 +1029,7 @@ pub const Lanes = struct {
+                 off += n;
+             }
+             try m.setImages(spans.items, rows.items);
++            self.picture_stats.pictures_rows_sent_total += @intCast(rows.items.len / (m.cfg.hidden * 2));
+         }
+         const replay = len -| m.cfg.window;
+         var start: usize = 0;
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 51644e44179154499b310b6cf38b2904f4427306..fc14d1a782fbea57ec5a12938a3eb5e65755cb55 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -130,6 +130,8 @@ pub const Loaded = struct {
+     replay: u32 = 0,
+     /// TF_DS_KV_SHARD: the parts' counters and rows for /health and /metrics (null: the switch off).
+     kv_parts: ?lanes.kv_parts.Source = null,
++    /// A vision checkpoint's picture preparation and resume counters.
++    picture_stats: ?lanes.picture_stats.Source = null,
+     /// The broken-pair policy's hooks (TF_DS_PAIR_BROKEN, exit by default; null: degrade). `ctx` is `ctx`.
+     pair: ?Pair = null,
+     /// Whether the model's stream is free of a CUDA graph capture (the lane host's service fence), with `ctx`.
+@@ -280,9 +282,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         tier = st.lanes.spill.?.tier();
+     }
+     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
++    const picture_stats: ?lanes.picture_stats.Source = if (st.m.cfg.vision) .{ .ctx = &st.lanes, .read = L.pictureStatsFn } else null;
+     const pair: ?Pair = if (pair_mode == .exit) .{ .watch = pairWatch, .abort = pairAbort } else null;
+     if (pair != null) std.log.info("dsv41: a broken rank pair ends this server with status {d} for a restart of both ranks (TF_DS_PAIR_BROKEN=degrade: requests fail one by one instead)", .{api.LaneHost.pair_exit_code});
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .picture_stats = picture_stats, .pair = pair, .quiet = quietFn };
+ }
+ 
+ // -- the broken-pair policy (robustness, docs/port/robustness.md) ------------------------------------------------
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index ecf424730a96ba7cf77952b2441a930300b32b92..d813d02fcbc2c2b426ac7b3e8210bcf1ac839635 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -162,6 +162,7 @@ const Host = struct {
+     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
++    picture_stats: ?lanes.picture_stats.Source = null, // the family's vision picture counters
+     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+     spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
+     // robustness: the family's broken-pair policy and service fence, handed to the lane host before it starts
+@@ -214,6 +215,7 @@ const Host = struct {
+         h.host.explain = explain;
+         if (h.cache) |*store| h.host.cache = store;
+         h.host.kv_parts = h.kv_parts;
++        h.host.picture_stats = h.picture_stats;
+         if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
+         h.host.pair = h.pair;
+         h.host.quiet = h.quiet;
+@@ -436,6 +438,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     });
+     errdefer gpa.free(h.startup);
+     if (@hasField(@TypeOf(loaded), "kv_parts")) h.kv_parts = loaded.kv_parts;
++    if (@hasField(@TypeOf(loaded), "picture_stats")) h.picture_stats = loaded.picture_stats;
+     // robustness: a family's broken-pair policy (dsv41: TF_DS_PAIR_BROKEN=exit) and its device's word for the
+     // lane host's service fence; both null keep the host exactly as before
+     if (@hasField(@TypeOf(loaded), "pair")) if (loaded.pair) |p| {
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 064410be2b81988ea475c6eb45fbc8ed51a8f309..f92f7533b9e4d8ae8e3f4b8a27df0fd277747915 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -161,6 +161,7 @@ pub const Metrics = struct {
+         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+         if (status.cache) |c| try cacheFamilies(w, c);
+         if (status.kv_parts) |k| try kvPartFamilies(w, k);
++        if (status.pictures) |p| try pictureFamilies(w, p);
+         if (status.pair) |p| try pairFamilies(w, p);
+     }
+ };
+@@ -179,6 +180,12 @@ pub fn pairFamilies(w: *std.Io.Writer, p: api.PairStatus) !void {
+     }
+ }
+ 
++pub fn pictureFamilies(w: *std.Io.Writer, p: api.PictureStats) !void {
++    inline for (@typeInfo(api.PictureStats).@"struct".field_names) |name| {
++        try gauge(w, name, "counter", @field(api.PictureStats.help, name), @field(p, name));
++    }
++}
++
+ /// The prompt cache's counters (its tier or grouping on): the GLM engine's names for continuation, then
+ /// tensorfold:prompt_cache_* and the tier's tensorfold:spill_*{rank="N"}.
+ pub fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStats) !void {
+@@ -484,6 +491,22 @@ test "pair families: present only with the pair's status, the two counters and t
+     }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+ }
+ 
++test "picture families expose tower work and resumed-picture skips" {
++    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
++    defer out.deinit();
++    try pictureFamilies(&out.writer, .{
++        .vision_tower_runs_total = 3,
++        .pictures_resume_skipped_total = 2,
++        .pictures_rows_sent_total = 1152,
++        .pictures_after_resume_total = 1,
++    });
++    const body = out.written();
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:vision_tower_runs_total 3\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:pictures_resume_skipped_total 2\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:pictures_rows_sent_total 1152\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:pictures_after_resume_total 1\n") != null);
++}
++
+ test "kv shard families: present only with a sharded backend's stats, its counters and every part's rows" {
+     const gpa = std.testing.allocator;
+     var m: Metrics = .{ .gpa = gpa };
