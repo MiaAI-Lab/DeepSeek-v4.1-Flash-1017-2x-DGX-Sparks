@@ -1,0 +1,224 @@
+From e39156114fd3bf902e6f6458d5e0e451198c0cf1 Mon Sep 17 00:00:00 2001
+From: Hector Isaza <76170012+hecisaza@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 02:53:02 +0000
+Subject: [PATCH] dsv41: TF_DS_RDMA_CPUS pins the RDMA proxy thread to a CPU,
+ ported from the 4-Spark recipe
+
+The RDMA ring's proxy thread busy-polls while the ranks decode; under load it holds one core at 100%, and the
+scheduler often puts it on a Cortex-X925 (3.9 GHz) core. TF_DS_RDMA_CPUS=a,b,c pins the proxies to one CPU each in the
+four-node order (the ring's, the column pair's, the row pair's), exactly as the 4-Spark recipe reads it; the pair's
+one proxy takes the first, so TF_DS_RDMA_CPUS=0 pins it to CPU 0 (on a GB10, CPUs 0-4 and 10-14 are Cortex-A725 at
+2.8 GHz, 5-9 and 15-19 Cortex-X925). Unset, it keeps the affinity it inherits, as before. A word that is not a CPU number, a CPU
+past the affinity mask, or one the kernel refuses (offline, outside the container's cpuset) leaves the proxy unpinned,
+with no message, as on the 4-Spark recipe; a CPU number past the mask is checked before it is set, where the 4-Spark
+code would index past it. The proxy thread is now named tf-rdma-proxy, so `ps -L` and /proc/<pid>/task/*/comm show
+which thread it is and `taskset -pc <tid>` shows where it runs. Nothing else changes: the main thread is not pinned.
+
+The setting and its reading are the 4-Spark recipe's (its 0001, by Mia's AI Lab); the measurement that led to it
+(59-67 C pinned to 0,10,11 against 70-81 C unpinned on a four-GB10 ring, no throughput change) is making's
+(https://github.com/making), https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40,
+with three proxies on a four-node ring. On a 2-Spark pair, one run per setting under a four-stream load, the proxy
+pinned to a Cortex-A725 core showed no large temperature change (the thread that drives the GPU also holds an X925 core
+at 100%); the setting stays off by default.
+
+Tests: rdma_env.zig (the list read in order; unset, empty, bad and out-of-range words unpinned); rdma.zig (a thread
+pinned to a CPU the process may use runs there alone and is named; unset keeps the inherited affinity; a CPU past the
+mask, or one outside the process's mask, keeps it too, without a fault; the affinity queries checked).
+---
+ zig/src/families/dsv41/model.zig    |  2 +-
+ zig/src/families/dsv41/rdma.zig     | 71 +++++++++++++++++++++++++++++
+ zig/src/families/dsv41/rdma_env.zig | 26 +++++++++++
+ zig/src/families/dsv41/ring2d.zig   | 14 ++++--
+ 4 files changed, 109 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 8b37d6e..aa68d3d 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -581,7 +581,7 @@ pub const Model = struct {
+     /// connected, and started once both are (an all-gather as the barrier).
+     pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
+         if (comm.world != 2) return error.NotTwoRanks;
+-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = try rdma_env.servedGidIndex(), .ack_timeout = try rdma_env.servedAckTimeout() });
++        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = try rdma_env.servedGidIndex(), .ack_timeout = try rdma_env.servedAckTimeout(), .cpu = rdma_env.proxyCpus()[0] });
+         errdefer r.destroy(gpa);
+         const per = @sizeOf(rdma.Info);
+         const mine = [2]rdma.Info{ r.info(0), r.info(1) };
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index a12d9b3..9085c65 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -67,6 +67,22 @@ fn monotonicNs() u64 {
+     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+ }
+ 
++const pr_set_name: c_int = 15;
++
++/// The calling thread named for `ps`/`/proc/<pid>/task/*/comm`, and on `cpu` alone when one is set. A CPU past the
++/// affinity mask, offline or outside the container's set keeps the affinity the thread inherited (false).
++fn placeProxy(cpu: ?u16) bool {
++    if (@import("builtin").os.tag != .linux) return false;
++    _ = prctl(pr_set_name, @intFromPtr("tf-rdma-proxy"), 0, 0, 0);
++    const c = cpu orelse return false;
++    var set: std.os.linux.cpu_set_t = @splat(0);
++    const bits = @bitSizeOf(usize);
++    if (c / bits >= set.len) return false;
++    set[c / bits] |= @as(usize, 1) << @intCast(c % bits);
++    std.os.linux.sched_setaffinity(0, &set) catch return false;
++    return true;
++}
++
+ fn nap(ns: u64) void {
+     const ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+     _ = std.c.nanosleep(&ts, null);
+@@ -92,6 +108,7 @@ pub const Settings = struct {
+     unroll: bool = true,
+     fence: bool = true,
+     probing: bool = false,
++    cpu: ?u16 = null, // the proxy thread's CPU (TF_DS_RDMA_CPUS), else the affinity it inherits
+ };
+ 
+ /// What the other side's queue pairs toward this rank need (a device each), and where this rank's receive ring is.
+@@ -412,6 +429,7 @@ pub const Ring = struct {
+     }
+ 
+     fn proxyLoop(r: *Ring) void {
++        _ = placeProxy(r.s.cpu);
+         const nd = r.nd;
+         const need: u32 = (r.world - 1) * nd;
+         var sends: seqs.Sends = .{ .need = need, .slots = r.s.slots };
+@@ -838,3 +856,56 @@ test "a sized transfer's segments are dsv41_shard.cu's TfDsRingRows (passed by v
+     try std.testing.expect(!r.rowsFit(s, 0, 1));
+     try std.testing.expect(!r.rowsFit(s, 2, 65));
+ }
++
++test "TF_DS_RDMA_CPUS: the proxy thread runs on its CPU alone when one is set, and keeps its inherited affinity otherwise" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const linux = std.os.linux;
++    const bits = @bitSizeOf(usize);
++    const T = struct {
++        var placed: bool = undefined;
++        var set: linux.cpu_set_t = undefined;
++        var query: usize = undefined;
++        var name: [16]u8 = undefined;
++        fn run(cpu: ?u16) void {
++            placed = placeProxy(cpu);
++            set = @splat(0);
++            query = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set);
++            name = @splat(0);
++            _ = prctl(16, @intFromPtr(&name), 0, 0, 0); // PR_GET_NAME
++        }
++        fn after(cpu: ?u16) !void {
++            const t = try std.Thread.spawn(.{}, run, .{cpu});
++            t.join();
++            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(query));
++        }
++    };
++    var mine: linux.cpu_set_t = @splat(0);
++    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &mine)));
++    // a CPU this process may run on: the lowest in its own mask
++    const cpu: u16 = for (0..mine.len * bits) |c| {
++        if (mine[c / bits] & (@as(usize, 1) << @intCast(c % bits)) != 0) break @intCast(c);
++    } else return error.SkipZigTest;
++    try T.after(cpu);
++    try std.testing.expect(T.placed);
++    var only: linux.cpu_set_t = @splat(0);
++    only[cpu / bits] = @as(usize, 1) << @intCast(cpu % bits);
++    try std.testing.expectEqual(only, T.set);
++    try std.testing.expectEqualStrings("tf-rdma-proxy", std.mem.sliceTo(&T.name, 0));
++    try T.after(null); // unset: the inherited affinity
++    try std.testing.expect(!T.placed);
++    try std.testing.expectEqual(mine, T.set);
++    try std.testing.expectEqualStrings("tf-rdma-proxy", std.mem.sliceTo(&T.name, 0));
++    try T.after(60000); // past the mask: unpinned, no fault
++    try std.testing.expect(!T.placed);
++    try std.testing.expectEqual(mine, T.set);
++    // inside the mask but outside this process's mask: pinned there if the kernel allows the CPU, else refused with the
++    // inherited mask kept (a narrower taskset mask is not the set of CPUs the kernel permits)
++    if (mine[1023 / bits] & (@as(usize, 1) << @intCast(1023 % bits)) == 0) {
++        try T.after(1023);
++        if (T.placed) {
++            var at: linux.cpu_set_t = @splat(0);
++            at[1023 / bits] = @as(usize, 1) << @intCast(1023 % bits);
++            try std.testing.expectEqual(at, T.set);
++        } else try std.testing.expectEqual(mine, T.set);
++    }
++}
+diff --git a/zig/src/families/dsv41/rdma_env.zig b/zig/src/families/dsv41/rdma_env.zig
+index beaa884..decbe34 100644
+--- a/zig/src/families/dsv41/rdma_env.zig
++++ b/zig/src/families/dsv41/rdma_env.zig
+@@ -37,6 +37,21 @@ pub fn servedAckTimeout() error{InvalidRdmaTimeout}!u8 {
+     };
+ }
+ 
++/// TF_DS_RDMA_CPUS=a,b,c: the RDMA proxy threads' CPUs, in the four-node order (the ring's, the column pair's, the row
++/// pair's); a two-node ring's one proxy takes the first. Unset, each keeps the affinity it inherits. A word that is not a
++/// CPU number leaves that proxy unpinned, as the 4-Spark recipe reads it.
++pub fn parseProxyCpus(text: ?[]const u8) [3]?u16 {
++    var cpus: [3]?u16 = .{ null, null, null };
++    const value = text orelse return cpus;
++    var it = std.mem.splitScalar(u8, value, ',');
++    for (&cpus) |*c| c.* = if (it.next()) |w| std.fmt.parseInt(u16, std.mem.trim(u8, w, " "), 10) catch null else null;
++    return cpus;
++}
++
++pub fn proxyCpus() [3]?u16 {
++    return parseProxyCpus(if (std.c.getenv("TF_DS_RDMA_CPUS")) |v| std.mem.span(v) else null);
++}
++
+ test "served GID defaults to 5 and accepts explicit 3 without silently accepting malformed settings" {
+     try std.testing.expectEqual(@as(u8, 5), try parseGidIndex(null));
+     try std.testing.expectEqual(@as(u8, 3), try parseGidIndex("3"));
+@@ -54,3 +69,14 @@ test "TF_RDMA_TIMEOUT: unset or empty keeps 14, 1 to 31 are taken, anything else
+     for ([_][]const u8{ "0", "32", "-1", "+20", " 20", "20 ", "0x14", "1_4", "256", "x" }) |bad|
+         try std.testing.expectError(error.InvalidRdmaTimeout, parseAckTimeout(bad));
+ }
++test "TF_DS_RDMA_CPUS: one CPU per proxy in order, unset or a bad word leaves that proxy unpinned" {
++    const none: [3]?u16 = .{ null, null, null };
++    try std.testing.expectEqual(none, parseProxyCpus(null));
++    try std.testing.expectEqual(none, parseProxyCpus(""));
++    try std.testing.expectEqual([3]?u16{ 0, null, null }, parseProxyCpus("0"));
++    try std.testing.expectEqual([3]?u16{ 0, 10, 11 }, parseProxyCpus("0,10,11"));
++    try std.testing.expectEqual([3]?u16{ 3, 4, null }, parseProxyCpus(" 3 , 4"));
++    try std.testing.expectEqual([3]?u16{ 1, 2, 3 }, parseProxyCpus("1,2,3,4"));
++    try std.testing.expectEqual([3]?u16{ null, 12, null }, parseProxyCpus("x,12,"));
++    try std.testing.expectEqual([3]?u16{ null, null, 5 }, parseProxyCpus("-1,70000,5"));
++}
+diff --git a/zig/src/families/dsv41/ring2d.zig b/zig/src/families/dsv41/ring2d.zig
+index db728ed..e21a84e 100644
+--- a/zig/src/families/dsv41/ring2d.zig
++++ b/zig/src/families/dsv41/ring2d.zig
+@@ -8,6 +8,7 @@
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const rdma = @import("rdma.zig");
++const rdma_env = @import("rdma_env.zig");
+ const Comm = @import("comm.zig").Comm;
+ 
+ pub const Rings = struct {
+@@ -24,11 +25,18 @@ pub const Rings = struct {
+         if (g >= 4 or comm.world != 4) return error.NotFourNodes;
+         const r = g % 2;
+         const p = g / 2;
+-        const all4 = try rdma.Ring.create(gpa, d, k, devices, g, 4, s);
++        const cpus = rdma_env.proxyCpus();
++        var s4 = s;
++        s4.cpu = cpus[0];
++        var sc = s;
++        sc.cpu = cpus[1];
++        var sr = s;
++        sr.cpu = cpus[2];
++        const all4 = try rdma.Ring.create(gpa, d, k, devices, g, 4, s4);
+         errdefer all4.destroy(gpa);
+-        const col = try rdma.Ring.create(gpa, d, k, devices, p, 2, s); // members (r, 0), (r, 1): ring rank = pair
++        const col = try rdma.Ring.create(gpa, d, k, devices, p, 2, sc); // members (r, 0), (r, 1): ring rank = pair
+         errdefer col.destroy(gpa);
+-        const pair = try rdma.Ring.create(gpa, d, k, devices, r, 2, s); // members (0, p), (1, p): ring rank = TP2 rank
++        const pair = try rdma.Ring.create(gpa, d, k, devices, r, 2, sr); // members (0, p), (1, p): ring rank = TP2 rank
+         errdefer pair.destroy(gpa);
+         // this node's infos: the four-node ring's toward each node, the column pair's and the row pair's toward each member
+         const per = @sizeOf(rdma.Info);
+-- 
+2.34.1
+

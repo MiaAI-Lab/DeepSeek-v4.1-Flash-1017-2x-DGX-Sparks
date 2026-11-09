@@ -222,6 +222,9 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
 - **[SvangenStudios](https://github.com/SvangenStudios)** authored `zig/patches/0067-orphan-dsml-closer-diagnostic.patch` (a diagnostic for
   replies made only of orphan DSML closing tags), first as `0043` of the 4-Spark recipe in
   [pull request #32](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/32); ported to this engine by Hector Isaza.
+- **[making](https://github.com/making)** measured the CPU temperature with the RDMA proxies pinned to Cortex-A725 cores, in
+  [issue #40](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/issues/40) of the 4-Spark recipe;
+  `zig/patches/0068-rdma-proxy-cpus.patch` ports that recipe's `TF_DS_RDMA_CPUS` (its `0001`, by Mia's AI Lab) to this engine, by Hector Isaza.
 - **eleata** ([eleata](https://github.com/eleata)) authored the engine pin `fbbc971` and the rebase of the patch series onto it, in [#77](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/77).
 - **Maciej Kowalik** ([koniaik](https://github.com/koniaik)) authored `zig/patches/0029` to `0032` (the Anthropic frontend's thinking
   budget, `clear_thinking`, mid-conversation `system` and the stream keep-alive ping), in [#53](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/53), [#71](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/71), [#72](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/72) and [#76](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/76).
