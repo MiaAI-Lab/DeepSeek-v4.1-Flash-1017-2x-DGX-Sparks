@@ -1,0 +1,76 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] test: a pass that loses its kept state asks the tier once
+
+Host tests in lane_host_robust_test.zig, on the fake tier: a pass whose kept state the placement gave
+away restores its durable point and resumes at it (cached = 8, not 0), and a pass that loses its
+state again prefills after one ask instead of asking forever. The fake tier gains drop_kept (the
+placement gave the state away) in fake.zig.
+---
+
+diff --git a/zig/src/core/lane_host_robust_test.zig b/zig/src/core/lane_host_robust_test.zig
+index d0595222..8447ab25 100644
+--- a/zig/src/core/lane_host_robust_test.zig
++++ b/zig/src/core/lane_host_robust_test.zig
+@@ -41,6 +41,36 @@ test "a restore the tier refuses for capacity is asked again shortly, then resum
+     try std.testing.expectEqual(@as(u64, 0), s.parked);
+ }
+ 
++// -- a pass that loses its kept state to the placement -----------------------------------------------------------
++
++test "a pass whose kept state the placement gave away asks the tier once and resumes its point" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    _ = try r.point(&t2, 8);
++    r.target.drop_kept = 1; // the pass opens on a state the placement gave away (dsv41 fillOpen)
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached); // restored, not computed from 0
++    try b.exact(&t2);
++}
++
++test "a pass that loses its kept state again prefills: the tier is asked once, never in a loop" {
++    const r = try Rig.create(.{ .load_ms = 5 });
++    defer r.destroy();
++    _ = try r.point(&t2, 8);
++    r.target.drop_kept = 2; // both passes lose it
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b.cached); // the second pass ran from 0, as before
++    try b.exact(&t2);
++}
++
+ test "a full tier refuses before any room is made: the request asks again, the refusal counted once" {
+     const r = try Rig.create(.{ .load_ms = 5 });
+     defer r.destroy();
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 4cf9c514..7d42569d 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -42,6 +42,7 @@ pub const Fake = struct {
+     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+     refuse_busy: usize = 0, // a cut-in (Stream.cut_in) is refused this many times with error.FillBusy (its state gone)
++    drop_kept: usize = 0, // this many passes lose the state they resume (dsv41: "found no room to move to; the prompt runs from 0")
+ 
+     pub fn deinit(x: *Fake) void {
+         var it = x.lanes.valueIterator();
+@@ -122,6 +123,12 @@ pub const Fake = struct {
+             x.refuse_busy -= 1;
+             return error.FillBusy;
+         }
++        if (x.drop_kept > 0) { // the placement gave the kept state's rows away: this pass runs from 0
++            x.drop_kept -= 1;
++            s.reuse = .{};
++            s.reuse_failed = true;
++            s.restore_wanted = true;
++        }
+         const got = try x.lanes.getOrPut(x.gpa, s);
+         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
+         got.value_ptr.* = .{};

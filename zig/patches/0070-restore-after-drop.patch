@@ -1,0 +1,122 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: a pass that lost its kept state asks the durable tier once
+
+With the spill tier on (SPILL_GIB), a prompt pass opens on the kept state its request resumed. A
+placement made for room can give that state's rows away while the pass waits: dsv41's fillOpen then
+says "the prompt runs from 0" and the whole prompt is computed again, although the store still holds
+the state's durable point. On the pair that is the difference between seconds (a restore) and minutes
+(a cold pass) for a long conversation.
+
+A pass that loses its state that way now goes back to the queue once with its disk lookup open: park
+finds the point (a stale state is passed over by Snapshots.usable) and the pass resumes there. The
+retry is bounded — a second pass that loses its state the same way prefills as before, so a store
+that cannot serve the point does not loop. New counter restores_after_drop, published with the other
+prompt-cache counters.
+
+Replies are unchanged: the pass computes the same state, from the durable point instead of from 0.
+---
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 9163b02d..78a337c3 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -261,6 +261,7 @@ pub const CacheStats = struct {
+     restores_deferred_expired: u64 = 0,
+     restores_room_waits: u64 = 0,
+     restores_room_wait_expired: u64 = 0,
++    restores_after_drop: u64 = 0,
+     writes_enqueued: u64 = 0,
+     shared_promoted: u64 = 0,
+     flushes: u64 = 0,
+@@ -308,6 +309,7 @@ pub const CacheStats = struct {
+         .restores_deferred_expired = "Of them, requests admitted on what memory holds after TF_SPILL_DEFER_MS without the restore starting.",
+         .restores_room_waits = "Requests whose disk restore the KV pool had no room for while streams ran, and that waited for room as a prompt pass does instead of prefilling.",
+         .restores_room_wait_expired = "Of them, requests admitted on what memory holds after TF_SPILL_LOAD_WAIT_MS without room for the restore.",
++        .restores_after_drop = "Requests whose prompt pass lost the kept state it resumed to a placement (its rows went for room), and that asked the durable tier for the point once instead of prefilling from 0.",
+         .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
+         .shared_promoted = "Disk points promoted to shared prefixes.",
+         .flushes = "Clean-shutdown flushes of the disk tier.",
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 4764dddf..0f944ec4 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -229,6 +229,7 @@ pub const LaneHost = struct {
+         restores_deferred_expired: u64 = 0, // of them, admitted on memory at defer_ns
+         restores_room_waits: u64 = 0, // requests whose restore the pool had no room for while streams ran: they waited
+         restores_room_wait_expired: u64 = 0, // of them, admitted on memory at load_wait_ns
++        restores_after_drop: u64 = 0, // requests whose pass lost its kept state to a placement: the tier was asked once
+     };
+ 
+     const Job = struct {
+@@ -256,6 +257,7 @@ pub const LaneHost = struct {
+         fork: u32 = 0,
+         lineage: []pc.Fork = &.{}, // the computation its pass's rows belong to (gpa-owned; Store.passLineage)
+         whole: bool = false, // refused as a cut-in (error.FillBusy: its kept state gone): it waits for the pass in pieces
++        restore_retried: bool = false, // its pass lost its kept state to a placement and the tier was asked once
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+@@ -832,6 +834,17 @@ pub const LaneHost = struct {
+             return h.drop(job, h.words(e));
+         };
+         if (h.aborted()) return h.dropBroken(job); // (the collectives were stopped under it: its rows are not the model's)
++        // The pass opened on a state its own placement gave away for room (dsv41 fillOpen: "the prompt runs from 0").
++        // The store still holds that state's durable point, and a restore beats computing the prompt again by seconds
++        // against minutes. Ask once: the job goes back to the queue with its disk lookup open, park finds the point
++        // (a stale state is passed over by Snapshots.usable) and the pass resumes there. A second pass that loses its
++        // state the same way prefills, as before.
++        if (job.stream.restore_wanted and !job.restore_retried) {
++            job.restore_retried = true;
++            job.tried_disk = false;
++            h.host_counts.restores_after_drop += 1;
++            return h.requeue(job);
++        }
+         if (h.core.filling == &job.stream) {
+             h.filling = job; // its next pieces run between rounds (fillOne)
+             return true;
+@@ -1807,6 +1820,7 @@ pub const LaneHost = struct {
+         t.restores_deferred_expired = hc.restores_deferred_expired;
+         t.restores_room_waits = hc.restores_room_waits;
+         t.restores_room_wait_expired = hc.restores_room_wait_expired;
++        t.restores_after_drop = hc.restores_after_drop;
+         t.cached_tokens = hc.cached_tokens;
+         t.computed_tokens = hc.computed_tokens;
+         t.parked = h.loading.items.len + h.deferred.items.len;
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 134debd7..1ced973f 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -188,6 +188,9 @@ pub const Stream = struct {
+     cut_in: u32 = 0,
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
++    /// The backend's placement gave the kept state's rows away to place this pass (`reuse_failed`): the host asks the
++    /// durable tier for a point once, instead of prefilling from 0. Cleared on the host's retry.
++    restore_wanted: bool = false,
+     context: std.ArrayList(u32) = .empty,
+     pending: ?u32 = null,
+     force: std.ArrayList(u32) = .empty,
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 370dda77..b618c219 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -1041,6 +1041,7 @@ pub const Lanes = struct {
+         // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent, or in one of its own
+         // with the kept rows copied there when a live stream holds that extent (a burst's second request on a prompt)
+         s.cached = 0;
++        s.restore_wanted = false;
+         const parted: ?PlacedParts = if (kv) |k| try self.placeParts(k, s, size, slot, len) else null;
+         errdefer if (parted) |pp| kv.?.release(pp.id) catch |err| std.log.err("dsv41: a failed prompt pass kept its part's extent: {s}", .{@errorName(err)});
+         var kept: ?*Snap = if (parted) |pp| pp.kept else null;
+@@ -1077,6 +1078,10 @@ pub const Lanes = struct {
+             if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} found no room to move to ({d} positions); the prompt runs from 0", .{ sn.at, sn.base, size });
+             kept = null;
+             s.reuse_failed = true;
++            // The store still holds this state's durable point: a stale state is passed over by Snapshots.usable, so
++            // the host's next lookup finds the point and restores it instead of computing the prompt from 0. The host
++            // asks once (its job's retry flag): a second pass that loses its state the same way prefills as before.
++            s.restore_wanted = true;
+         };
+         // the rows this stream writes are no other kept state's
+         if (parted == null) self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);

@@ -1,0 +1,137 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] prompt-cache: the durable tier reports why a lookup missed
+
+A prompt lookup that finds a point and refuses it was indistinguishable from one that found nothing:
+1,233 compatible misses on 2026-11-08 with no reason (the 60-360k re-prefills). disk_lookups also
+counted probes, not tier queries, because it increments before maxAt and the memory-hit guard.
+
+- disk_queries: probes that reached the tier's lookup.
+- disk_rejected_no_longer / _structural / _rule / _bytes: the gate that refused, in pointFits order,
+  from one copy of the gates (pointReject; pointFits wraps it).
+
+Published as tensorfold:prompt_cache_disk_queries and prompt_cache_disk_rejected_*. No behaviour
+change: a lookup that finds nothing or refuses a point still misses as before.
+---
+ zig/src/core/engine_api.zig   | 12 +++++++++++-
+ zig/src/core/lane_host.zig    |  5 +++++
+ zig/src/core/prompt_cache.zig | 35 +++++++++++++++++++++++++++++++----
+ 3 files changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 9163b02..d920cbc 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -242,6 +242,11 @@ pub const CacheStats = struct {
+     disk_lookups: u64 = 0,
+     disk_hits: u64 = 0,
+     disk_hits_committed: u64 = 0,
++    disk_queries: u64 = 0,
++    disk_rejected_no_longer: u64 = 0,
++    disk_rejected_structural: u64 = 0,
++    disk_rejected_rule: u64 = 0,
++    disk_rejected_bytes: u64 = 0,
+     restores_begun: u64 = 0,
+     restores_shared: u64 = 0,
+     restores_failed: u64 = 0,
+@@ -286,9 +291,14 @@ pub const CacheStats = struct {
+         .failed = "Kept states that failed to save or restore.",
+         .entries = "Prompt states kept in memory now.",
+         .held_bytes = "Bytes the kept states hold now.",
+-        .disk_lookups = "Lookups that asked the disk tier.",
++        .disk_lookups = "Lookups that considered the disk tier (probes; a probe that stops at the memory hit is not a query).",
+         .disk_hits = "Lookups whose durable point was longer than the best usable memory state.",
+         .disk_hits_committed = "Disk restores every rank installed, adopted as kept states.",
++        .disk_queries = "Probes that reached the disk tier's lookup.",
++        .disk_rejected_no_longer = "Durable points refused: not longer than the state memory already resumed.",
++        .disk_rejected_structural = "Durable points refused: their token count is not at + lookahead, or past the prompt.",
++        .disk_rejected_rule = "Durable points refused: the resume rule (grid, window) or a chunk start refused them.",
++        .disk_rejected_bytes = "Durable points refused: their bytes exceed the prompt cache's budget.",
+         .restores_begun = "Disk restore jobs started.",
+         .restores_shared = "Requests that joined a disk restore already in flight.",
+         .restores_failed = "Disk restores aborted on every rank (missing, damaged, guarded).",
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 4764ddd..72f8ac6 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -1776,6 +1776,11 @@ pub const LaneHost = struct {
+             t.disk_lookups = s.disk_lookups;
+             t.disk_hits = s.disk_hits;
+             t.disk_hits_committed = s.disk_hits_committed;
++            t.disk_queries = s.disk_queries;
++            t.disk_rejected_no_longer = s.disk_rejected_no_longer;
++            t.disk_rejected_structural = s.disk_rejected_structural;
++            t.disk_rejected_rule = s.disk_rejected_rule;
++            t.disk_rejected_bytes = s.disk_rejected_bytes;
+             t.restores_begun = s.restores_begun;
+             t.restores_shared = s.restores_shared;
+             t.restores_failed = s.restores_failed;
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 07e9e7f..40e03f2 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -352,11 +352,22 @@ pub const Restore = struct {
+ /// How a polled restore stands.
+ pub const Restored = enum { pending, adopted, dropped, failed };
+ 
++/// Why a found durable point cannot serve a prompt (Store.pointReject; the disk_rejected_* counters).
++pub const Reject = enum { no_longer, structural, rule, bytes };
++
+ /// The store's own counters for the tier and continuation (totals).
+ pub const Stats = struct {
+     disk_lookups: u64 = 0,
+     disk_hits: u64 = 0, // lookups that found a durable point longer than the best usable memory state
+     disk_hits_committed: u64 = 0, // restores adopted as memory states (every rank agreed)
++    // Why a durable lookup failed once one was made: the gate that answered no (Store.pointReject). With
++    // `disk_lookups` (probes) and `disk_queries` (probes that reached the tier) they answer "why never", which
++    // the absence of a hit could not (the 2026-11-08 re-prefill report: 1,233 compatible misses, no reason given).
++    disk_queries: u64 = 0, // probes that reached the tier's lookup (past maxAt and the memory hit)
++    disk_rejected_no_longer: u64 = 0, // a point was found, not longer than the memory hit (p.at <= have)
++    disk_rejected_structural: u64 = 0, // a point was found whose tokens are not at + lookahead, or past the key
++    disk_rejected_rule: u64 = 0, // a point was found but the resume rule (grid/window) or a chunk start refused it
++    disk_rejected_bytes: u64 = 0, // a point was found but its bytes exceed the prompt cache's budget
+     restores_begun: u64 = 0,
+     restores_shared: u64 = 0, // requests that joined a restore already in flight
+     restores_failed: u64 = 0,
+@@ -604,18 +615,34 @@ pub const Store = struct {
+         s.stats.disk_lookups += 1;
+         const max_at = s.rules.maxAt(key.len) orelse return .{ .memory = m };
+         if (max_at <= have) return .{ .memory = m };
++        s.stats.disk_queries += 1; // from here the tier is really asked (a probe that stops above is not a query)
+         const want: Want = .{ .key = key, .beyond = have, .max_at = max_at, .grid = s.rules.grid, .lookahead = s.rules.lookahead, .images = images, .media = media };
+         const p = t.vtable.lookup(t.ptr, &want) orelse return .{ .memory = m };
+-        if (!s.pointFits(p, key, starts, have)) return .{ .memory = m };
++        if (s.pointReject(p, key, starts, have)) |why| {
++            switch (why) {
++                .no_longer => s.stats.disk_rejected_no_longer += 1,
++                .structural => s.stats.disk_rejected_structural += 1,
++                .rule => s.stats.disk_rejected_rule += 1,
++                .bytes => s.stats.disk_rejected_bytes += 1,
++            }
++            return .{ .memory = m };
++        }
+         s.stats.disk_hits += 1;
+         return .{ .memory = m, .durable = p };
+     }
+ 
+     /// A durable answer checked again: past the memory hit, eligible here, its ids inside the key, inside the budget.
+     fn pointFits(s: *const Store, p: Point, key: []const u32, starts: []const u32, have: u32) bool {
+-        if (p.at <= have or @as(u64, p.at) + s.rules.lookahead != p.tokens or p.tokens > key.len) return false;
+-        if (!s.rules.eligible(p.at, key.len) or !s.usable(p.at, starts)) return false;
+-        return s.pointBytes(p) <= s.budget;
++        return s.pointReject(p, key, starts, have) == null;
++    }
++
++    /// Why a durable point cannot serve `key` (null: it can). The gates in the order `pointFits` tests them, so a
++    /// rejection is attributable to exactly one: what the counters `disk_rejected_*` publish.
++    fn pointReject(s: *const Store, p: Point, key: []const u32, starts: []const u32, have: u32) ?Reject {
++        if (p.at <= have) return .no_longer;
++        if (@as(u64, p.at) + s.rules.lookahead != p.tokens or p.tokens > key.len) return .structural;
++        if (!s.rules.eligible(p.at, key.len) or !s.usable(p.at, starts)) return .rule;
++        return if (s.pointBytes(p) <= s.budget) null else .bytes;
+     }
+ 
+     fn pointBytes(s: *const Store, p: Point) u64 {
+-- 
+2.43.0
+
