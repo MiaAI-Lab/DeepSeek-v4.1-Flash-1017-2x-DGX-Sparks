@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `zig/patches/0070-restore-after-drop.patch` (acts with `SPILL_GIB`, no switch): a prompt pass whose kept state
+  its own placement gave away for room goes back to the queue once with its disk lookup open and resumes at the
+  durable point instead of computing the prompt from 0; a second pass that loses its state the same way prefills
+  as before, so a store that cannot serve the point does not loop. Counter `restores_after_drop`. Replies
+  unchanged: the pass computes the same state, from the point instead of from 0.
+- `zig/patches/0071-durable-lookup-reasons.patch` (always on): `/metrics` adds `prompt_cache_disk_queries` and
+  the four `prompt_cache_disk_rejected_*` counters, the gate that refused a durable point in `pointFits` order,
+  from one copy of the gates (`pointReject`). A lookup that found a point and refused it was indistinguishable
+  from one that found nothing (1,233 compatible misses on 2026-11-08). No behaviour change.
+- `zig/patches/0072-restore-after-drop-test.patch` (tests): host tests for `0070` in `lane_host_robust_test.zig`:
+  a pass whose kept state the placement gave away resumes its point, and one that loses it again prefills after
+  one ask, never in a loop. The fake tier gains `drop_kept`.
+
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with
