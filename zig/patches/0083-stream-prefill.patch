@@ -1,0 +1,147 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: publish the filling pass's progress on its stream
+
+prompt_stream_done_tokens and prompt_stream_total_tokens, aligned with streams/stream_groups, so a
+card can name the session whose prompt is filling. The chunk loop publishes the pass's address and
+the host maps it to the admitted stream; only one pass fills at a time, so at most one entry is
+non-zero.
+---
+ zig/src/core/engine_api.zig      |  4 ++++
+ zig/src/core/lane_host.zig       | 11 +++++++++++
+ zig/src/core/lanes/prefill.zig   |  1 +
+ zig/src/families/dsv41/lanes.zig | 10 ++++++++--
+ zig/src/server/metrics.zig       | 13 +++++++++++++
+ 5 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 4872513..afe5105 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -376,6 +376,10 @@ pub const Status = struct {
+     /// restored 60 k of 120 k opens at 50 %.
+     prefill_done: u64 = 0,
+     prefill_total: u64 = 0,
++    /// The same pair for the streams above, aligned with `streams`/`stream_groups` (0/0: that stream's pass is
++    /// not the one filling). Only one pass fills at a time, so at most one entry here is non-zero.
++    prefill_stream_done: [max_stream_groups]u64 = @splat(0),
++    prefill_stream_total: [max_stream_groups]u64 = @splat(0),
+     /// Live streams' conversation ids, aligned with `streams` (0: grouping off).
+     stream_groups: [max_stream_groups]u64 = @splat(0),
+     /// The most recently used conversations whose kept states still hold pool rows, newest first.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 0c8025b..0f91d8c 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -438,6 +438,7 @@ pub const LaneHost = struct {
+         // family drives it whole, and its chunks still write these.
+         var fill_done: u64 = 0;
+         var fill_total: u64 = 0;
++        var fill_ptr: u64 = 0;
+         var prefill_tokens: ?u64 = null;
+         var chunk_tokens: u64 = 0;
+         var chunk_ns: u64 = 0;
+@@ -449,12 +450,20 @@ pub const LaneHost = struct {
+             chunk_ns = ps.chunk_ns;
+             fill_done = ps.fill_done;
+             fill_total = ps.fill_total;
++            fill_ptr = ps.fill_ptr;
+         }
+         var stream_groups: [api.max_stream_groups]u64 = @splat(0);
++        var stream_done: [api.max_stream_groups]u64 = @splat(0);
++        var stream_total: [api.max_stream_groups]u64 = @splat(0);
+         var sg: usize = 0;
+         for (h.admitted.items) |job| if (job.started) {
+             if (sg < stream_groups.len) {
+                 stream_groups[sg] = job.join.group;
++                // The pass filling now is this stream's: the chunk loop published its address.
++                if (fill_ptr != 0 and fill_ptr == @intFromPtr(&job.stream) and job.prefilled == null) {
++                    stream_done[sg] = fill_done;
++                    stream_total[sg] = fill_total;
++                }
+                 sg += 1;
+             }
+         };
+@@ -475,6 +484,8 @@ pub const LaneHost = struct {
+             .prefill_chunk_ns = chunk_ns,
+             .prefill_done = fill_done,
+             .prefill_total = fill_total,
++            .prefill_stream_done = stream_done,
++            .prefill_stream_total = stream_total,
+             .prefill_ms = if (prefilling > 0 and oldest != 0) @intCast(@divTrunc(@max(now - oldest, 0), std.time.ns_per_ms)) else 0,
+             .stream_groups = stream_groups,
+             .kept_groups = h.kept_tele,
+diff --git a/zig/src/core/lanes/prefill.zig b/zig/src/core/lanes/prefill.zig
+index 8290d48..9f9fce0 100644
+--- a/zig/src/core/lanes/prefill.zig
++++ b/zig/src/core/lanes/prefill.zig
+@@ -11,6 +11,7 @@ pub const Stats = struct {
+     chunk_ns: u64 = 0, // that chunk's own duration
+     fill_done: u64 = 0, // tokens the pass filling now has of its prompt
+     fill_total: u64 = 0, // that prompt's whole length (0: no pass has run)
++    fill_ptr: u64 = 0, // the stream that pass belongs to (0: no pass)
+ };
+ 
+ pub const Source = struct {
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 9980b35..9df44d9 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -489,6 +489,9 @@ pub const Lanes = struct {
+     /// interleaved one — the host's `filling` slot is null during a lone pass, 2026-11-04).
+     fill_done: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+     fill_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    /// The stream that pass belongs to (its address; 0: no pass): the host maps it to the
++    /// admitted stream whose progress it is, so the card can name the session.
++    fill_ptr: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
+     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
+     rw: ?*rank_wire.Leader = null,
+@@ -876,6 +879,7 @@ pub const Lanes = struct {
+                 out.chunk_ns = cn;
+                 out.fill_done = self.fill_done.load(.monotonic);
+                 out.fill_total = self.fill_total.load(.monotonic);
++                out.fill_ptr = self.fill_ptr.load(.monotonic);
+                 return;
+             }
+         }
+@@ -951,8 +955,10 @@ pub const Lanes = struct {
+             _ = self.chunk_seq.fetchAdd(1, .release);
+             self.chunk_tokens.store(@intCast(n), .monotonic);
+             self.chunk_ns.store(@intCast(chunk_ns), .monotonic);
+-            self.fill_done.store(@intCast(f.start), .monotonic);
+-            self.fill_total.store(@intCast(s.prompt_len), .monotonic);
++            const finished = f.start >= f.len;
++            self.fill_ptr.store(if (finished) 0 else @intFromPtr(s), .monotonic);
++            self.fill_done.store(if (finished) 0 else @intCast(f.start), .monotonic);
++            self.fill_total.store(if (finished) 0 else @intCast(s.prompt_len), .monotonic);
+             _ = self.chunk_seq.fetchAdd(1, .release);
+             // the live prefill rate's counter: the rows this chunk COMPUTED. A kept state's restored
+             // prefix (stream.cached) is cache, not work; the replay before the sliding window is
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 4f017b6..4bd59c3 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -177,6 +177,19 @@ pub const Metrics = struct {
+             }
+             try gauge(w, "decode_round_tokens", "gauge", "Tokens the last decode round committed (one a stream, plus the drafts MTP accepted).", status.decode_round_tokens);
+             try gauge(w, "decode_round_ns", "gauge", "The last decode round's own duration, in nanoseconds.", status.decode_round_ns);
++            var any_pass = false;
++            for (status.prefill_stream_total[0..@min(status.streams, status.prefill_stream_total.len)]) |tv| {
++                if (tv > 0) any_pass = true;
++            }
++            if (any_pass) {
++                try family(w, "prompt_stream_done_tokens", "gauge", "Tokens the prompt pass of this stream already has.");
++                try family(w, "prompt_stream_total_tokens", "gauge", "That prompt's whole length (absent: the stream is not the one filling).");
++                for (status.prefill_stream_total[0..@min(status.streams, status.prefill_stream_total.len)], 0..) |tot, i| {
++                    if (tot == 0) continue;
++                    try w.print("{s}prompt_stream_done_tokens{{stream=\"{d}\"}} {d}\n", .{ prefix, i, status.prefill_stream_done[i] });
++                    try w.print("{s}prompt_stream_total_tokens{{stream=\"{d}\"}} {d}\n", .{ prefix, i, tot });
++                }
++            }
+             if (status.kept_groups_n > 0) {
+                 try family(w, "kv_kept_group", "gauge", "Rows of the pool one conversation's kept prompt states hold (the most recently used).");
+                 for (status.kept_groups[0..status.kept_groups_n]) |k|
+-- 
+2.43.0
+

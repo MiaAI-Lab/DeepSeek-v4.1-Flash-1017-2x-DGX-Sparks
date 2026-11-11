@@ -1,0 +1,29 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] lane_host: read a request's slot under the lock
+
+submitFn read the request's slot — freeSlot walks the admitted and queued lists — before taking the
+mutex, while every other reader and writer holds it. A concurrent append's reallocation could free
+the buffer under the walk: the segfault at lane_host.zig:433 on 2026-11-03, 11-04, 11-06, 11-07
+(twice) and 11-09, each one a whole-engine restart. The read moves under the lock.
+---
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 0f944ec4..d7566b81 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -396,9 +396,13 @@ pub const LaneHost = struct {
+     fn submitFn(ctx: *anyopaque, id: Id, request: *const Request, sink: Sink) SubmitError!void {
+         const h = self(ctx);
+         const job = h.gpa.create(Job) catch return error.Busy;
+-        job.* = .{ .host = h, .id = id, .request = request, .sink = sink, .slot = h.freeSlot() };
+         h.mutex.lockUncancelable(h.io);
+         defer h.mutex.unlock(h.io);
++        // The slot is read from the admitted and queued lists: under the lock, like every other reader and
++        // writer of them. Unlocked, a concurrent append's reallocation frees the buffer while freeSlot walks
++        // it — the segfault at lane_host.zig:433 seen on the pair 2026-11-03, 11-04, 11-06, 11-07 (twice) and
++        // 11-09, each one a whole-engine restart.
++        job.* = .{ .host = h, .id = id, .request = request, .sink = sink, .slot = h.freeSlot() };
+         if (h.closing or h.isBroken()) { // (a broken pair admits nothing more: the process restarts)
+             h.gpa.destroy(job);
+             return error.Closed;

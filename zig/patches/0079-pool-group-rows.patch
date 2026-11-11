@@ -1,0 +1,234 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: the pool is the authority for a conversation's kept rows
+
+A prompt-cache entry is "kept" even when its rows went to the spill tier, and its `at` is a length,
+not a row count: summing the entries by conversation named 4.2M rows of a 3.15M pool on 2026-11-03.
+The pool's own snapshot already unions each conversation's spans with the same rule as its kept
+total, so the groups now come from it (lanes/pool.zig Groups/GroupSource) and can never overstate the
+pool.
+
+Ordering is by most recent use, so a card's palette gives its first colours to the newest
+conversations. At most 8 groups, as before.
+---
+ zig/src/core/lane_host.zig            | 61 ++++++++++++++-------------
+ zig/src/core/lanes/pool.zig           |  9 ++++
+ zig/src/core/prompt_cache.zig         |  5 +++
+ zig/src/families/dsv41/lanes.zig      | 36 +++++++++++++++-
+ zig/src/families/dsv41/lanes_main.zig |  2 +-
+ 5 files changed, 81 insertions(+), 32 deletions(-)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index cc7d42d..813b538 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -1009,38 +1009,39 @@ pub const LaneHost = struct {
+         if (tele) |t| h.tele = t;
+         if (parts) |p| h.kv_tele = p;
+         if (pool) |p| h.pool_tele = p;
+-        // The kept states, by conversation: the bar's grey block, split like the live one. A kept
+-        // state's `group` is the conversation that kept it; `used` orders the newest first.
+-        const G = struct { group: u64 = 0, rows: u64 = 0, used: u64 = 0 };
+-        var kept: [api.max_kept_groups]G = @splat(G{});
+-        var kept_n: usize = 0;
+-        if (h.cache) |store| for (store.entries.items) |e| {
+-            if (e.at == 0 or e.group == 0) continue;
+-            var i: usize = 0;
+-            while (i < kept_n) : (i += 1) if (kept[i].group == e.group) break;
+-            if (i < kept_n) {
+-                kept[i].rows += e.at;
+-                kept[i].used = @max(kept[i].used, e.used);
+-                continue;
+-            }
+-            if (kept_n < kept.len) {
+-                kept[kept_n] = .{ .group = e.group, .rows = e.at, .used = e.used };
+-                kept_n += 1;
+-                continue;
++        // The kept states by conversation, for the card's colours — and the POOL is the authority. A cache entry
++        // is "kept" even when its rows went to the spill tier, and its `at` is a length, not a row count: summing
++        // those named 4.2M rows in a 3.15M pool (caught 2026-11-03). The pool's snapshot unions each
++        // conversation's spans with the same rule as its own kept total, so the groups can never overstate it
++        // (lanes/pool.zig Groups).
++        h.kept_tele_n = 0;
++        if (h.pool_tele) |p| {
++            const n: usize = @min(@as(usize, p.kept_groups_n), api.max_kept_groups);
++            var used: [api.max_kept_groups]u64 = @splat(0);
++            for (0..n) |i| {
++                h.kept_tele[i] = .{ .group = p.kept_groups[i].group, .rows = p.kept_groups[i].rows };
++                if (h.cache) |store| {
++                    for (store.entries.items) |e| {
++                        if (e.group == p.kept_groups[i].group) used[i] = @max(used[i], e.used);
++                    }
++                }
+             }
+-            var lru: usize = 0;
+-            for (1..kept_n) |j| if (kept[j].used < kept[lru].used) {
+-                lru = j;
+-            };
+-            if (e.used > kept[lru].used) kept[lru] = .{ .group = e.group, .rows = e.at, .used = e.used };
+-        };
+-        std.mem.sort(G, kept[0..kept_n], {}, struct {
+-            fn f(_: void, a: G, b: G) bool {
+-                return a.used > b.used;
++            // Most recently used first: the card's palette hands its first colours to the newest conversations.
++            // n is at most eight, so an insertion sort is the honest instrument here.
++            var i: usize = 1;
++            while (i < n) : (i += 1) {
++                var j = i;
++                while (j > 0 and used[j - 1] < used[j]) : (j -= 1) {
++                    const t = h.kept_tele[j];
++                    h.kept_tele[j] = h.kept_tele[j - 1];
++                    h.kept_tele[j - 1] = t;
++                    const u = used[j];
++                    used[j] = used[j - 1];
++                    used[j - 1] = u;
++                }
+             }
+-        }.f);
+-        h.kept_tele_n = @intCast(kept_n);
+-        for (0..kept_n) |i| h.kept_tele[i] = .{ .group = kept[i].group, .rows = kept[i].rows };
++            h.kept_tele_n = @intCast(n);
++        }
+     }
+ 
+     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
+diff --git a/zig/src/core/lanes/pool.zig b/zig/src/core/lanes/pool.zig
+index 7facbec..f2fdb1d 100644
+--- a/zig/src/core/lanes/pool.zig
++++ b/zig/src/core/lanes/pool.zig
+@@ -6,12 +6,21 @@
+ //! reads it on its engine thread (the backend's own thread) and publishes the copy for status readers.
+ const std = @import("std");
+ 
++/// One conversation's kept prompt-state rows that still hold pool positions (a row in the spill tier is not one).
++pub const Group = struct { group: u64 = 0, rows: u64 = 0 };
++/// How many conversations the pool names (the card's palette: one colour each).
++pub const max_groups = 8;
++
+ pub const Stats = struct {
+     rows: u64 = 0, // the pool's positions
+     live: u64 = 0, // rows live streams hold (their reserved extents)
+     kept: u64 = 0, // rows kept prompt states hold outside live extents
+     free: u64 = 0, // rows free
+     streams: u64 = 0, // live streams
++    /// The kept rows split by conversation (the card colours one conversation with these). Their sum is at most
++    /// `kept`: it is the same span arithmetic, so no group can claim rows the pool does not hold.
++    kept_groups: [max_groups]Group = @splat(Group{}),
++    kept_groups_n: u8 = 0,
+ };
+ 
+ pub const Source = struct {
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 43484c5..07e9e7f 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -23,6 +23,10 @@ pub const Snapshots = struct {
+         /// Make the live state `saved`'s: the next prompt chunk starts at its position.
+         restore: *const fn (ptr: *anyopaque, owner: ?*anyopaque, saved: Saved) anyerror!void,
+         drop: *const fn (ptr: *anyopaque, saved: Saved) void,
++        /// Record the conversation `saved` belongs to (null: the family keeps no per-conversation accounting).
++        /// Called once, right after a keep, on the thread that keeps — a family that reports its pool per
++        /// conversation (lanes/pool.zig) needs it to say which rows are whose.
++        tag: ?*const fn (ptr: *anyopaque, saved: Saved, group: u64) void = null,
+         /// The storage a kept state holds: new storage up to `bytes`, or the spare storage it took (null: `bytes`).
+         charged: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
+         /// Free storage the family keeps for later saves, inside the budget (null: none).
+@@ -1029,6 +1033,7 @@ pub const Store = struct {
+             s.free(e);
+             return s.fail(at, error.OutOfMemory);
+         };
++        if (s.family.vtable.tag) |f| f(s.family.ptr, saved, info.group);
+         s.held += charged;
+         s.counts.kept += 1;
+         if (s.tier) |t| { // write at keep: the tier stages the state's bytes between rounds
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index c09d4f6..17d95dc 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -425,6 +425,7 @@ pub const Snap = struct {
+     loading: bool = false, // a restore's destination: its rows held back, not usable until every rank installed it
+     restored: bool = false, // read back from the spill tier
+     part: u8 = 0, // TF_DS_KV_SHARD: the part holding its rows (parts.zig's Kept; a live move changes it)
++    group: u64 = 0, // the conversation that kept it (the store's keep note, 0047; the pool counts its rows per group)
+ };
+ 
+ /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
+@@ -805,6 +806,11 @@ pub const Lanes = struct {
+         }
+         var spans: std.ArrayList([2]usize) = .empty;
+         defer spans.deinit(self.gpa);
++        // The same spans, kept apart by conversation: the card colours one conversation with them. Their sum can
++        // never exceed `kept` — one rule (a state whose rows sit inside a live extent is that stream's) feeds both.
++        var gspans: [lanes.pool.max_groups]std.ArrayList([2]usize) = @splat(std.ArrayList([2]usize).empty);
++        var gids: [lanes.pool.max_groups]u64 = @splat(0);
++        defer for (&gspans) |*g| g.deinit(self.gpa);
+         for (self.snaps.items) |sn| {
+             if (sn.stale or sn.at == 0) continue;
+             var clash = false;
+@@ -816,14 +822,35 @@ pub const Lanes = struct {
+                 }
+             }
+             if (clash) continue; // (rows inside a live extent are that stream's, as the parts' stats count them)
+-            spans.append(self.gpa, .{ sn.base, sn.base + sn.at }) catch {
++            const span = [2]usize{ sn.base, sn.base + sn.at };
++            spans.append(self.gpa, span) catch {
+                 s.kept = 0; // (out of memory: report what is certain, never a wrong free count)
+                 s.free = cap -| s.live;
+                 return s;
+             };
++            if (sn.group == 0) continue; // (grouping off)
++            var slot: usize = 0;
++            while (slot < gids.len and gids[slot] != 0 and gids[slot] != sn.group) slot += 1;
++            if (slot == gids.len) continue; // a conversation with no slot: its rows stay in the pool, unnamed
++            gids[slot] = sn.group;
++            gspans[slot].append(self.gpa, span) catch continue;
+         }
+         s.kept = @intCast(parts.covered(spans.items, 0, self.m.pool_cap));
+         s.free = cap -| (s.live + s.kept);
++        for (&gspans, gids) |*g, id| {
++            if (id == 0 or g.items.len == 0) continue;
++            const rows = parts.covered(g.items, 0, self.m.pool_cap);
++            if (rows == 0) continue;
++            if (s.kept_groups_n >= s.kept_groups.len) break;
++            s.kept_groups[s.kept_groups_n] = .{ .group = id, .rows = @intCast(rows) };
++            s.kept_groups_n += 1;
++        }
++        // Biggest first: the card's palette then goes to the conversations holding the most rows.
++        std.mem.sort(lanes.pool.Group, s.kept_groups[0..s.kept_groups_n], {}, struct {
++            fn f(_: void, a: lanes.pool.Group, b: lanes.pool.Group) bool {
++                return a.rows > b.rows;
++            }
++        }.f);
+         return s;
+     }
+ 
+@@ -1382,6 +1409,13 @@ pub const Lanes = struct {
+         return of(ptr).usable(@ptrCast(@alignCast(saved)), len);
+     }
+ 
++    /// The store's keep note: which conversation this state belongs to (prompt_cache's Snapshots.tag, 0047).
++    pub fn snapTagFn(ptr: *anyopaque, saved: *anyopaque, group: u64) void {
++        _ = ptr;
++        const sn: *Snap = @ptrCast(@alignCast(saved));
++        sn.group = group;
++    }
++
+     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
+     pub fn snapBytesFn(ptr: *anyopaque, at: u32) u64 {
+         _ = at;
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index a6ec0ae..7166397 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -305,7 +305,7 @@ pub fn main(init: std.process.Init) !u8 {
+     };
+     if (spill != null) {
+         const L = dsv41.lanes.Lanes;
+-        snap_vt = .{ .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.usableFn };
++        snap_vt = .{ .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .usable = L.usableFn, .tag = L.snapTagFn };
+         store_v = pcache.Store.init(gpa, .{ .ptr = &ln, .vtable = &snap_vt }, .{ .grid = dsv41.model.chunk_rows, .window = @intCast(m.cfg.window) }, @intFromFloat(cache_gib * (1 << 30)));
+         var seed: [4]u8 = undefined;
+         io.random(&seed);
+-- 
+2.43.0
+

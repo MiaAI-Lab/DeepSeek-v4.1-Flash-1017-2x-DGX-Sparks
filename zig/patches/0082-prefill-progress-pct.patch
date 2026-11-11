@@ -1,0 +1,129 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: publish how far the pass filling now stands
+
+/metrics adds prompt_prefill_done_tokens and prompt_prefill_total_tokens. done counts the tokens the
+pass already has, a resumed prefix included, so a request that restored 60k of 120k opens at 50 %.
+The chunk loop writes both (the same seqlock as the chunk gauges): a lone pass never occupies the
+host's `filling` slot, so the slot cannot be the source.
+---
+ zig/src/core/engine_api.zig      | 5 +++++
+ zig/src/core/lane_host.zig       | 9 +++++++++
+ zig/src/core/lanes/prefill.zig   | 2 ++
+ zig/src/families/dsv41/lanes.zig | 9 +++++++++
+ zig/src/server/metrics.zig       | 2 ++
+ 5 files changed, 27 insertions(+)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 79c0b03..4872513 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -371,6 +371,11 @@ pub const Status = struct {
+     /// The last prompt chunk's rows and its own duration (the instantaneous prefill speed).
+     prefill_chunk_tokens: u64 = 0,
+     prefill_chunk_ns: u64 = 0,
++    /// The prompt pass filling now: its prompt's length and how far into it the cache stands (0/0: no pass).
++    /// `cache_len` counts the tokens the pass already has — a resumed prefix included, so a request that
++    /// restored 60 k of 120 k opens at 50 %.
++    prefill_done: u64 = 0,
++    prefill_total: u64 = 0,
+     /// Live streams' conversation ids, aligned with `streams` (0: grouping off).
+     stream_groups: [max_stream_groups]u64 = @splat(0),
+     /// The most recently used conversations whose kept states still hold pool rows, newest first.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 813b538..0c8025b 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -433,6 +433,11 @@ pub const LaneHost = struct {
+             prefilling += 1;
+             if (oldest == 0 or job.began < oldest) oldest = job.began;
+         }
++        // How far the pass filling now is into its prompt: published by the chunk loop itself
++        // (lanes.fill_done/fill_total), because a LONE pass never occupies the `filling` slot — the
++        // family drives it whole, and its chunks still write these.
++        var fill_done: u64 = 0;
++        var fill_total: u64 = 0;
+         var prefill_tokens: ?u64 = null;
+         var chunk_tokens: u64 = 0;
+         var chunk_ns: u64 = 0;
+@@ -442,6 +447,8 @@ pub const LaneHost = struct {
+             prefill_tokens = ps.tokens;
+             chunk_tokens = ps.chunk_tokens;
+             chunk_ns = ps.chunk_ns;
++            fill_done = ps.fill_done;
++            fill_total = ps.fill_total;
+         }
+         var stream_groups: [api.max_stream_groups]u64 = @splat(0);
+         var sg: usize = 0;
+@@ -466,6 +473,8 @@ pub const LaneHost = struct {
+             .prefilling = prefilling,
+             .prefill_chunk_tokens = chunk_tokens,
+             .prefill_chunk_ns = chunk_ns,
++            .prefill_done = fill_done,
++            .prefill_total = fill_total,
+             .prefill_ms = if (prefilling > 0 and oldest != 0) @intCast(@divTrunc(@max(now - oldest, 0), std.time.ns_per_ms)) else 0,
+             .stream_groups = stream_groups,
+             .kept_groups = h.kept_tele,
+diff --git a/zig/src/core/lanes/prefill.zig b/zig/src/core/lanes/prefill.zig
+index 2223349..8290d48 100644
+--- a/zig/src/core/lanes/prefill.zig
++++ b/zig/src/core/lanes/prefill.zig
+@@ -9,6 +9,8 @@ pub const Stats = struct {
+     tokens: u64 = 0, // prompt tokens computed since the process started (monotone)
+     chunk_tokens: u64 = 0, // rows the last prompt chunk computed
+     chunk_ns: u64 = 0, // that chunk's own duration
++    fill_done: u64 = 0, // tokens the pass filling now has of its prompt
++    fill_total: u64 = 0, // that prompt's whole length (0: no pass has run)
+ };
+ 
+ pub const Source = struct {
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index c89544e..9980b35 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -484,6 +484,11 @@ pub const Lanes = struct {
+     chunk_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+     chunk_tokens: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+     chunk_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    /// How far into its prompt the pass filling now stands, and that prompt's whole length (the same
++    /// seqlock as the chunk gauges: written by the chunk loop, which a lone pass runs as well as the
++    /// interleaved one — the host's `filling` slot is null during a lone pass, 2026-11-04).
++    fill_done: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    fill_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
+     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
+     rw: ?*rank_wire.Leader = null,
+@@ -869,6 +874,8 @@ pub const Lanes = struct {
+             if (self.chunk_seq.load(.acquire) == s0) {
+                 out.chunk_tokens = ct;
+                 out.chunk_ns = cn;
++                out.fill_done = self.fill_done.load(.monotonic);
++                out.fill_total = self.fill_total.load(.monotonic);
+                 return;
+             }
+         }
+@@ -944,6 +951,8 @@ pub const Lanes = struct {
+             _ = self.chunk_seq.fetchAdd(1, .release);
+             self.chunk_tokens.store(@intCast(n), .monotonic);
+             self.chunk_ns.store(@intCast(chunk_ns), .monotonic);
++            self.fill_done.store(@intCast(f.start), .monotonic);
++            self.fill_total.store(@intCast(s.prompt_len), .monotonic);
+             _ = self.chunk_seq.fetchAdd(1, .release);
+             // the live prefill rate's counter: the rows this chunk COMPUTED. A kept state's restored
+             // prefix (stream.cached) is cache, not work; the replay before the sliding window is
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 352b76d..4f017b6 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -166,6 +166,8 @@ pub const Metrics = struct {
+             try gauge(w, "prompt_tokens_computed_total", "counter", "Prompt tokens this process has computed (monotone): a delta is the live prefill rate.", t);
+             try gauge(w, "prefill_streams", "gauge", "Prompt passes open now.", status.prefilling);
+             try gauge(w, "prefill_age_ms", "gauge", "How long the oldest open prompt pass has run, in milliseconds (0: none).", status.prefill_ms);
++            try gauge(w, "prompt_prefill_done_tokens", "gauge", "Tokens the prompt pass filling now already has (0: no pass).", status.prefill_done);
++            try gauge(w, "prompt_prefill_total_tokens", "gauge", "That prompt's whole length, in tokens (0: no pass).", status.prefill_total);
+             try gauge(w, "prompt_chunk_tokens", "gauge", "Rows the last prompt chunk computed.", status.prefill_chunk_tokens);
+             try gauge(w, "prompt_chunk_ns", "gauge", "The last prompt chunk's own duration, in nanoseconds.", status.prefill_chunk_ns);
+             if (status.streams > 0) {
+-- 
+2.43.0
+

@@ -1,0 +1,87 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: publish the last decode round's tokens and duration
+
+/metrics adds decode_round_tokens and decode_round_ns: one token per live stream plus the drafts MTP
+accepted, and the round's own duration — the decode step's exact speed, beside the per-reply averages
+the engine already publishes.
+---
+ zig/src/core/engine_api.zig |  3 +++
+ zig/src/core/lane_host.zig  | 19 ++++++++++++++++++-
+ zig/src/server/metrics.zig  |  2 ++
+ 3 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 431a081..79c0b03 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -376,6 +376,9 @@ pub const Status = struct {
+     /// The most recently used conversations whose kept states still hold pool rows, newest first.
+     kept_groups: [max_kept_groups]KeptGroup = @splat(KeptGroup{}),
+     kept_groups_n: u8 = 0,
++    /// The last decode round's tokens and its own duration (the instantaneous step speed).
++    decode_round_tokens: u32 = 0,
++    decode_round_ns: u64 = 0,
+     /// The rank pair's robustness counters and state (a backend with a broken-pair policy, or the prompt cache's
+     /// disk tier); null otherwise (no /health or /metrics output).
+     pair: ?PairStatus = null,
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 1e65d48..cc7d42d 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -95,6 +95,9 @@ pub const LaneHost = struct {
+     /// published as `pool_tele`.
+     kv_pool: ?lanes.pool.Source = null,
+     pool_tele: ?api.PoolStats = null,
++    /// The last decode round's tokens and its own duration (the instantaneous step speed).
++    round_tokens: u32 = 0,
++    round_ns: u64 = 0,
+     /// The kept states aggregated by conversation, the most recently used first (published on the engine
+     /// thread in noteLive, read by status readers under the same lock).
+     kept_tele: [api.max_kept_groups]api.KeptGroup = @splat(api.KeptGroup{}),
+@@ -467,6 +470,8 @@ pub const LaneHost = struct {
+             .stream_groups = stream_groups,
+             .kept_groups = h.kept_tele,
+             .kept_groups_n = h.kept_tele_n,
++            .decode_round_tokens = h.round_tokens,
++            .decode_round_ns = h.round_ns,
+             .pair = h.pairStatus(now),
+         };
+     }
+@@ -1161,7 +1166,19 @@ pub const LaneHost = struct {
+         defer h.rounds_open -= 1;
+         h.busyEnter();
+         defer h.busyLeave();
+-        return h.core.step();
++        const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        try h.core.step();
++        const t1 = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        // The round's own duration and the tokens it committed: the decode step's exact
++        // speed (a round emits one token per stream, plus the drafts MTP accepted).
++        var produced: usize = 0;
++        for (h.admitted.items) |job| if (job.started) {
++            produced += job.stream.emitted().len - job.delivered;
++        };
++        h.lock();
++        h.round_tokens = @intCast(produced);
++        h.round_ns = @intCast(t1 -| t0);
++        h.unlock();
+     }
+ 
+     // -- the stall monitor's clock (engine thread; nothing without `pair`) --------------------------------------
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 7f2e9a1..352b76d 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -173,6 +173,8 @@ pub const Metrics = struct {
+                 for (status.stream_groups[0..@min(status.streams, status.stream_groups.len)], 0..) |g, i|
+                     try w.print("{s}stream_group{{stream=\"{d}\"}} {d}\n", .{ prefix, i, g });
+             }
++            try gauge(w, "decode_round_tokens", "gauge", "Tokens the last decode round committed (one a stream, plus the drafts MTP accepted).", status.decode_round_tokens);
++            try gauge(w, "decode_round_ns", "gauge", "The last decode round's own duration, in nanoseconds.", status.decode_round_ns);
+             if (status.kept_groups_n > 0) {
+                 try family(w, "kv_kept_group", "gauge", "Rows of the pool one conversation's kept prompt states hold (the most recently used).");
+                 for (status.kept_groups[0..status.kept_groups_n]) |k|
+-- 
+2.43.0
+

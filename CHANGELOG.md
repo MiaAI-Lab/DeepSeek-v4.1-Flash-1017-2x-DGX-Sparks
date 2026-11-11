@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- `zig/patches/0073-kv-pool-rows.patch` (always on, with `KV_SHARD=0`): the replicated pool's occupancy is
+  published (`kv_pool_rows`, `kv_pool_live`, `kv_pool_kept`, `kv_pool_free`, `kv_pool_streams`). With KV
+  sharding off, every rank holds the whole pool and the shard's per-part counters had nothing to report: the
+  common case had no occupancy numbers at all.
+- `zig/patches/0074-prefill-progress.patch`, `0075-prefill-chunk.patch` (always on): `/metrics` adds
+  `prompt_tokens_computed_total`, `prefill_streams`, `prefill_age_ms`, `prompt_chunk_tokens` and
+  `prompt_chunk_ns`: a scrape's delta is the live pass speed, and the last chunk's own duration is the
+  instantaneous prefill speed (the total only gives the pass average).
+- `zig/patches/0076-kept-groups.patch`, `0077-keep-refresh.patch` (always on): `/metrics` adds `stream_group` and
+  `kv_kept_group`, each live stream's conversation and the rows one conversation's kept states still hold, most
+  recently used first; the kept states are republished at each keep so the last one is visible before the engine
+  goes idle.
+- `zig/patches/0078-decode-round.patch` (always on): `/metrics` adds `decode_round_tokens` and `decode_round_ns`,
+  one token a stream plus the drafts MTP accepted and the round's own duration.
+- `zig/patches/0079-pool-group-rows.patch` (always on): a conversation's kept rows come from the pool, not from
+  the prompt-cache entries: an entry is "kept" even when its rows went to the spill tier and its `at` is a
+  length, not a row count, so summing entries named 4.2M rows of a 3.15M pool (2026-11-03). The groups can no
+  longer overstate the pool's kept total.
+- `zig/patches/0080-server-snap-tag.patch` (always on): `Snaps.tag` tells the pool which conversation a kept
+  state belongs to.
+- `zig/patches/0081-pool-kept-minus-live.patch` (always on): a conversation's kept rows are the pool's spans
+  minus the live extents, exactly. Skipping a state that clashed with a live stream at all moved occupancy with
+  traffic: 761,856 kept with nothing live, 583,680 with one stream, on the same rows (2026-11-04).
+- `zig/patches/0082-prefill-progress-pct.patch`, `0083-stream-prefill.patch` (always on): `/metrics` adds
+  `prompt_prefill_done_tokens`, `prompt_prefill_total_tokens`, `prompt_stream_done_tokens` and
+  `prompt_stream_total_tokens`, how far the filling pass stands (resumed prefix included) and which stream it
+  belongs to.
+- `zig/patches/0084-snapshot.patch` (always on): `GET /snapshot` returns one document with one timestamp and a
+  `schema_version`: the session spine (`streams[]`, a stable `slot` per request, the request's own facts), why
+  requests wait (counted where each hold is decided), the prompt-cache memory tier, the store's conversations,
+  and the pool's kept rows by conversation. Session-level facts leave `/metrics`; new card facts are
+  consumer-side work.
+- `zig/patches/0085-submit-slot-under-lock.patch` (always on): `submitFn` reads a request's slot under the lock;
+  the unguarded read could walk a buffer a concurrent append's reallocation had freed — the segfault at
+  `lane_host.zig:433` on 2026-11-03, 11-04, 11-06, 11-07 (twice) and 11-09, each a whole-engine restart.
+
 - `start.sh` warns when `GRAPHS=1` and the pool (`POOL`, else `CONTEXT`) is not a multiple of 4096. A round's context
   bucket is capped at the pool (`round.zig` `bucketFor`), and an off-grid cap gives the indexer an `_index_score` tile
   count the kit has no captured variant for: at `CONTEXT=400000` a prompt past 262,144 positions failed with

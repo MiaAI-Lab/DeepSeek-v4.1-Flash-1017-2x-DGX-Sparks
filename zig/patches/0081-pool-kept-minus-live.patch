@@ -1,0 +1,120 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: kept rows are the pool spans minus the live extents
+
+The pool's kept rows are "kept states outside the live extents". Skipping a state that clashed with a
+live stream at all was not that rule, and it moved the pool's occupancy with traffic: 761,856 kept
+with nothing live, 583,680 with one stream, on the same rows (2026-11-04), 5.6 % of the pool.
+coveredMinus subtracts only the overlap, so one rule now feeds both the kept total and the
+per-conversation groups.
+---
+ zig/src/families/dsv41/lanes.zig | 26 +++++++++++----------
+ zig/src/families/dsv41/parts.zig | 39 ++++++++++++++++++++++++++++++++
+ 2 files changed, 53 insertions(+), 12 deletions(-)
+
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 17d95dc..c89544e 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -806,22 +806,24 @@ pub const Lanes = struct {
+         }
+         var spans: std.ArrayList([2]usize) = .empty;
+         defer spans.deinit(self.gpa);
++        // The live extents, to be taken OUT of the kept spans: a kept state a resumed stream sits on is the
++        // stream's only where they overlap (parts.coveredMinus). Skipping states that clash at all was not
++        // the same rule, and it moved the pool's occupancy with traffic (2026-11-04).
++        var live_spans: std.ArrayList([2]usize) = .empty;
++        defer live_spans.deinit(self.gpa);
++        {
++            var live = self.streams.valueIterator();
++            while (live.next()) |l| {
++                if (l.end > l.base) live_spans.append(self.gpa, .{ l.base, l.end }) catch {};
++            }
++        }
+         // The same spans, kept apart by conversation: the card colours one conversation with them. Their sum can
+-        // never exceed `kept` — one rule (a state whose rows sit inside a live extent is that stream's) feeds both.
++        // never exceed `kept` — one rule feeds both.
+         var gspans: [lanes.pool.max_groups]std.ArrayList([2]usize) = @splat(std.ArrayList([2]usize).empty);
+         var gids: [lanes.pool.max_groups]u64 = @splat(0);
+         defer for (&gspans) |*g| g.deinit(self.gpa);
+         for (self.snaps.items) |sn| {
+             if (sn.stale or sn.at == 0) continue;
+-            var clash = false;
+-            var live = self.streams.valueIterator();
+-            while (live.next()) |l| {
+-                if (sn.base < l.end and l.base < sn.base + sn.at) {
+-                    clash = true;
+-                    break;
+-                }
+-            }
+-            if (clash) continue; // (rows inside a live extent are that stream's, as the parts' stats count them)
+             const span = [2]usize{ sn.base, sn.base + sn.at };
+             spans.append(self.gpa, span) catch {
+                 s.kept = 0; // (out of memory: report what is certain, never a wrong free count)
+@@ -835,11 +837,11 @@ pub const Lanes = struct {
+             gids[slot] = sn.group;
+             gspans[slot].append(self.gpa, span) catch continue;
+         }
+-        s.kept = @intCast(parts.covered(spans.items, 0, self.m.pool_cap));
++        s.kept = @intCast(parts.coveredMinus(spans.items, live_spans.items, 0, self.m.pool_cap));
+         s.free = cap -| (s.live + s.kept);
+         for (&gspans, gids) |*g, id| {
+             if (id == 0 or g.items.len == 0) continue;
+-            const rows = parts.covered(g.items, 0, self.m.pool_cap);
++            const rows = parts.coveredMinus(g.items, live_spans.items, 0, self.m.pool_cap);
+             if (rows == 0) continue;
+             if (s.kept_groups_n >= s.kept_groups.len) break;
+             s.kept_groups[s.kept_groups_n] = .{ .group = id, .rows = @intCast(rows) };
+diff --git a/zig/src/families/dsv41/parts.zig b/zig/src/families/dsv41/parts.zig
+index 6c21afd..70c8461 100644
+--- a/zig/src/families/dsv41/parts.zig
++++ b/zig/src/families/dsv41/parts.zig
+@@ -1708,6 +1708,45 @@ pub const Planner = struct {
+     }
+ };
+ 
++/// The rows of [lo, hi) that the spans cover with `holes` taken out of them (overlaps counted once).
++///
++/// The pool's kept rows are "kept states outside the live extents", and a kept state that a resumed
++/// stream sits on is mostly NOT the stream's: only its overlapping part is. Subtracting the live
++/// extents is exact where skipping the whole state was not — that skip made the pool's occupancy
++/// swing by up to 5.6 % of itself just because a stream was running (measured 2026-11-04: kept
++/// 761,856 with nothing live, 583,680 with one stream, on the same rows).
++pub fn coveredMinus(spans: [][2]usize, holes: [][2]usize, lo: usize, hi: usize) usize {
++    std.mem.sort([2]usize, spans, {}, struct {
++        fn f(_: void, a: [2]usize, b: [2]usize) bool {
++            return a[0] < b[0];
++        }
++    }.f);
++    std.mem.sort([2]usize, holes, {}, struct {
++        fn f(_: void, a: [2]usize, b: [2]usize) bool {
++            return a[0] < b[0];
++        }
++    }.f);
++    var n: usize = 0;
++    var last: usize = lo; // every row below this is already counted (spans may overlap each other)
++    var h: usize = 0;
++    for (spans) |s| {
++        var a = @max(@max(s[0], last), lo);
++        const b = @min(s[1], hi);
++        if (b <= a) continue; // inside an earlier span, or outside the pool
++        while (h < holes.len and holes[h][1] <= a) h += 1;
++        var k = h;
++        while (k < holes.len and holes[k][0] < b) : (k += 1) {
++            const ha = @max(holes[k][0], a);
++            if (ha > a) n += ha - a;
++            if (holes[k][1] > a) a = @min(holes[k][1], b);
++            if (a >= b) break;
++        }
++        if (a < b) n += b - a;
++        if (b > last) last = b;
++    }
++    return n;
++}
++
+ /// The rows of [lo, hi) that the spans cover (overlaps counted once).
+ pub fn covered(spans: [][2]usize, lo: usize, hi: usize) usize {
+     std.mem.sort([2]usize, spans, {}, struct {
+-- 
+2.43.0
+
