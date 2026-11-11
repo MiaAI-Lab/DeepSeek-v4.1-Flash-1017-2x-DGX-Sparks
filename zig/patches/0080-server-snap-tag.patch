@@ -1,0 +1,52 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: tell the pool which conversation a kept state belongs to
+
+Snaps gains `tag` (Lanes.snapTagFn) and the CUDA host passes it into the prompt cache's vtable,
+guarded with @hasField so an older Snaps struct (a caller that does not set it) still opens. The pool
+needs it to count a conversation's kept rows.
+---
+ zig/src/families/dsv41/native.zig | 4 +++-
+ zig/src/native/cuda.zig           | 4 ++++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 8819427..bd2ae7d 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -150,6 +150,8 @@ pub const Snaps = struct {
+     tail: u32 = 0,
+     /// Whether a kept state still restores (Lanes.usable): given with the spill tier only.
+     usable: ?*const fn (*anyopaque, *anyopaque, u32) bool = null,
++    /// Which conversation a kept state belongs to (Lanes.snapTagFn): the pool counts its rows per conversation.
++    tag: ?*const fn (*anyopaque, *anyopaque, u64) void = null,
+ };
+ 
+ /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
+@@ -276,7 +278,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     st.lanes.vision = st.vision;
+     // the pool is the model's (preallocated): a stream takes no device memory of its own
+     const L = lanes_mod.Lanes;
+-    var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
++    var snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tag = L.snapTagFn, .tail = @intCast(st.m.cfg.window) };
+     const window: ?usize = if (st.m.kvs != null or st.m.pool_cap != o.context) st.m.window_cap else null;
+     var tier: ?spill_tier.prompt_cache.Tier = null;
+     if (o.spill != null) {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 26bbd81..1dedaca 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -456,6 +456,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+         if (want > 0) {
+             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
++            // which conversation a kept state belongs to (the pool's per-conversation rows: lanes/pool.zig)
++            if (@hasField(@TypeOf(sn), "tag")) {
++                if (sn.tag) |t| h.snap_vt.tag = t;
++            }
+             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+             // the spill tier (off by default: nothing below runs then)
+             if (@hasField(@TypeOf(loaded), "tier")) {
+-- 
+2.43.0
+

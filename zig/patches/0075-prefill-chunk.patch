@@ -1,0 +1,145 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: publish the last prompt chunk's rows and duration
+
+/metrics adds prompt_chunk_tokens and prompt_chunk_ns: the rows the last prompt chunk computed and
+that chunk's own duration, the instantaneous prefill speed where prompt_tokens_computed_total only
+gives an average over the pass. The chunk loop writes both under a seqlock (chunk_seq odd while a
+write is in flight), so a scrape reads a matching pair.
+---
+ zig/src/core/engine_api.zig      |  3 +++
+ zig/src/core/lane_host.zig       |  6 ++++++
+ zig/src/core/lanes/prefill.zig   |  2 ++
+ zig/src/families/dsv41/lanes.zig | 26 +++++++++++++++++++++++++-
+ zig/src/server/metrics.zig       |  2 ++
+ 5 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index ad129cb..358b73a 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -363,6 +363,9 @@ pub const Status = struct {
+     prefill_tokens: ?u64 = null,
+     prefilling: u32 = 0,
+     prefill_ms: u64 = 0,
++    /// The last prompt chunk's rows and its own duration (the instantaneous prefill speed).
++    prefill_chunk_tokens: u64 = 0,
++    prefill_chunk_ns: u64 = 0,
+     /// The rank pair's robustness counters and state (a backend with a broken-pair policy, or the prompt cache's
+     /// disk tier); null otherwise (no /health or /metrics output).
+     pair: ?PairStatus = null,
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 7fedb34..bd7a70c 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -423,10 +423,14 @@ pub const LaneHost = struct {
+             if (oldest == 0 or job.began < oldest) oldest = job.began;
+         }
+         var prefill_tokens: ?u64 = null;
++        var chunk_tokens: u64 = 0;
++        var chunk_ns: u64 = 0;
+         if (h.prefill) |src| {
+             var ps: lanes.prefill.Stats = .{};
+             src.read(src.ctx, &ps);
+             prefill_tokens = ps.tokens;
++            chunk_tokens = ps.chunk_tokens;
++            chunk_ns = ps.chunk_ns;
+         }
+         out.* = .{
+             .running = @intCast(h.admitted.items.len),
+@@ -441,6 +445,8 @@ pub const LaneHost = struct {
+             .pool = h.pool_tele,
+             .prefill_tokens = prefill_tokens,
+             .prefilling = prefilling,
++            .prefill_chunk_tokens = chunk_tokens,
++            .prefill_chunk_ns = chunk_ns,
+             .prefill_ms = if (prefilling > 0 and oldest != 0) @intCast(@divTrunc(@max(now - oldest, 0), std.time.ns_per_ms)) else 0,
+             .pair = h.pairStatus(now),
+         };
+diff --git a/zig/src/core/lanes/prefill.zig b/zig/src/core/lanes/prefill.zig
+index bb37668..2223349 100644
+--- a/zig/src/core/lanes/prefill.zig
++++ b/zig/src/core/lanes/prefill.zig
+@@ -7,6 +7,8 @@ const std = @import("std");
+ 
+ pub const Stats = struct {
+     tokens: u64 = 0, // prompt tokens computed since the process started (monotone)
++    chunk_tokens: u64 = 0, // rows the last prompt chunk computed
++    chunk_ns: u64 = 0, // that chunk's own duration
+ };
+ 
+ pub const Source = struct {
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index bff1850..c09d4f6 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -478,6 +478,11 @@ pub const Lanes = struct {
+     /// Prompt tokens this process has computed, monotone: the live prefill rate's counter. Written by the lane
+     /// thread as each chunk lands, read by the status path, so a pass's speed is visible while it runs.
+     prompt_tokens: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    /// The last chunk's rows and duration, written by the lane thread under a seqlock (`chunk_seq`
++    /// odd while a write is in flight) so the status path reads a matching pair.
++    chunk_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
++    chunk_tokens: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    chunk_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
+     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
+     rw: ?*rank_wire.Leader = null,
+@@ -825,7 +830,19 @@ pub const Lanes = struct {
+     /// The prompt tokens computed since start (monotone): the host's status reads it on the HTTP thread (an
+     /// atomic), so a reader's delta is the live prefill rate even while the engine thread is inside the pass.
+     pub fn prefillTokensFn(ptr: *anyopaque, out: *lanes.prefill.Stats) void {
+-        out.tokens = of(ptr).prompt_tokens.load(.monotonic);
++        const self = of(ptr);
++        out.tokens = self.prompt_tokens.load(.monotonic);
++        while (true) {
++            const s0 = self.chunk_seq.load(.acquire);
++            if (s0 & 1 != 0) continue;
++            const ct = self.chunk_tokens.load(.monotonic);
++            const cn = self.chunk_ns.load(.monotonic);
++            if (self.chunk_seq.load(.acquire) == s0) {
++                out.chunk_tokens = ct;
++                out.chunk_ns = cn;
++                return;
++            }
++        }
+     }
+ 
+     /// How stale /health's parts' stats may be (kvPartsFn).
+@@ -885,6 +902,7 @@ pub const Lanes = struct {
+                 try self.flush();
+             }
+             if (self.spill) |t| t.bump(f.base + start, f.base + start + n);
++            const chunk_t0 = m.now();
+             f.head = blk: {
+                 // TF_DS_KV_SHARD: the stream's twins pinned while its chunk runs (parts.zig setPartial), not between
+                 if (f.part) |id| self.kv.?.planner.setPartial(id, true);
+@@ -892,6 +910,12 @@ pub const Lanes = struct {
+                 break :blk try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+             };
+             f.start += n;
++            // the instantaneous speed: this chunk's own duration, published under a seqlock
++            const chunk_ns = m.now() -| chunk_t0;
++            _ = self.chunk_seq.fetchAdd(1, .release);
++            self.chunk_tokens.store(@intCast(n), .monotonic);
++            self.chunk_ns.store(@intCast(chunk_ns), .monotonic);
++            _ = self.chunk_seq.fetchAdd(1, .release);
+             // the live prefill rate's counter: the rows this chunk COMPUTED. A kept state's restored
+             // prefix (stream.cached) is cache, not work; the replay before the sliding window is
+             // encoder work and counts, exactly as prefilled()'s (prompt.len - cached) does.
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 4398f9e..d4a4546 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -166,6 +166,8 @@ pub const Metrics = struct {
+             try gauge(w, "prompt_tokens_computed_total", "counter", "Prompt tokens this process has computed (monotone): a delta is the live prefill rate.", t);
+             try gauge(w, "prefill_streams", "gauge", "Prompt passes open now.", status.prefilling);
+             try gauge(w, "prefill_age_ms", "gauge", "How long the oldest open prompt pass has run, in milliseconds (0: none).", status.prefill_ms);
++            try gauge(w, "prompt_chunk_tokens", "gauge", "Rows the last prompt chunk computed.", status.prefill_chunk_tokens);
++            try gauge(w, "prompt_chunk_ns", "gauge", "The last prompt chunk's own duration, in nanoseconds.", status.prefill_chunk_ns);
+         }
+         if (status.pair) |p| try pairFamilies(w, p);
+     }
+-- 
+2.43.0
+

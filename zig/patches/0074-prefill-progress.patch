@@ -1,0 +1,262 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: publish prompt-pass progress
+
+/metrics adds prompt_tokens_computed_total (monotone prompt tokens computed since the process
+started), prefill_streams (passes open) and prefill_age_ms (how old the oldest is). The counter is an
+atomic on the backend's side, so a scrape takes a delta without touching the engine thread's lists —
+and the delta is the pass speed while the engine thread is inside a long pass, which is exactly when
+a client sees silence.
+---
+ zig/src/core/engine_api.zig       |  5 +++++
+ zig/src/core/lane_host.zig        | 21 +++++++++++++++++++++
+ zig/src/core/lanes/lanes.zig      |  1 +
+ zig/src/core/lanes/prefill.zig    | 21 +++++++++++++++++++++
+ zig/src/families/dsv41/lanes.zig  | 14 ++++++++++++++
+ zig/src/families/dsv41/native.zig |  6 +++++-
+ zig/src/native/cuda.zig           |  3 +++
+ zig/src/server/metrics.zig        | 29 +++++++++++++++++++++++++++++
+ 8 files changed, 99 insertions(+), 1 deletion(-)
+ create mode 100644 zig/src/core/lanes/prefill.zig
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index fb74b89..ad129cb 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -358,6 +358,11 @@ pub const Status = struct {
+     /// The pool's rows when it is replicated, not cut into parts (dsv41 with TF_DS_KV_SHARD=0): what live
+     /// streams and kept prompt states hold, and what is free. Null when the backend publishes no pool.
+     pool: ?PoolStats = null,
++    /// The prompt pass in flight (dsv41): prompt tokens computed since the process started (monotone, so a
++    /// reader takes a delta for the live prefill rate), how many passes are open, and how old the oldest is.
++    prefill_tokens: ?u64 = null,
++    prefilling: u32 = 0,
++    prefill_ms: u64 = 0,
+     /// The rank pair's robustness counters and state (a backend with a broken-pair policy, or the prompt cache's
+     /// disk tier); null otherwise (no /health or /metrics output).
+     pair: ?PairStatus = null,
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 220f658..7fedb34 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -95,6 +95,9 @@ pub const LaneHost = struct {
+     /// published as `pool_tele`.
+     kv_pool: ?lanes.pool.Source = null,
+     pool_tele: ?api.PoolStats = null,
++    /// A backend's prompt-token counter (monotone), read on the status path (an atomic on the backend's side):
++    /// a reader's delta is the pass speed while the engine thread may be inside the pass.
++    prefill: ?lanes.prefill.Source = null,
+     // -- a broken rank pair (the backend's policy, set before start; null: off, nothing below runs) ---------------
+     pair: ?PairPolicy = null,
+     pair_state: std.atomic.Value(u8) = .init(0), // 0 whole, 1 a cause being recorded, 2 broken (why/drain/since set)
+@@ -410,6 +413,21 @@ pub const LaneHost = struct {
+         }
+         const n = @min(stream_tokens.len, h.live_tokens.items.len);
+         @memcpy(stream_tokens[0..n], h.live_tokens.items[0..n]);
++        var prefilling: u32 = 0;
++        var oldest: i96 = 0;
++        for (h.admitted.items) |job| {
++            // `started` means admitted and being worked (set before the pass); a pass is over when
++            // `prefilled` names its end. No `prefilled` yet = its prompt pass is running now.
++            if (!job.started or job.prefilled != null or job.began == 0) continue;
++            prefilling += 1;
++            if (oldest == 0 or job.began < oldest) oldest = job.began;
++        }
++        var prefill_tokens: ?u64 = null;
++        if (h.prefill) |src| {
++            var ps: lanes.prefill.Stats = .{};
++            src.read(src.ctx, &ps);
++            prefill_tokens = ps.tokens;
++        }
+         out.* = .{
+             .running = @intCast(h.admitted.items.len),
+             .waiting = @intCast(h.queued.items.len + h.waitingCount()),
+@@ -421,6 +439,9 @@ pub const LaneHost = struct {
+             .cache = h.tele,
+             .kv_parts = h.kv_tele,
+             .pool = h.pool_tele,
++            .prefill_tokens = prefill_tokens,
++            .prefilling = prefilling,
++            .prefill_ms = if (prefilling > 0 and oldest != 0) @intCast(@divTrunc(@max(now - oldest, 0), std.time.ns_per_ms)) else 0,
+             .pair = h.pairStatus(now),
+         };
+     }
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index afc6263..b77fd2b 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -22,6 +22,7 @@ pub const engine = @import("engine.zig");
+ pub const fake = @import("fake.zig");
+ pub const kv_parts = @import("kv_parts.zig");
+ pub const pool = @import("pool.zig");
++pub const prefill = @import("prefill.zig");
+ 
+ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+diff --git a/zig/src/core/lanes/prefill.zig b/zig/src/core/lanes/prefill.zig
+new file mode 100644
+index 0000000..bb37668
+--- /dev/null
++++ b/zig/src/core/lanes/prefill.zig
+@@ -0,0 +1,21 @@
++//! A backend's prompt-pass progress for /health and /metrics (family-neutral): how many prompt
++//! tokens it has computed (monotone, so a reader takes a delta and sees the pass's speed while it
++//! runs) and, through Status, how many passes are open and how old the oldest is.
++//! A backend hands the host a `Source`; the host reads it on the status path (an atomic, so a
++//! 1 s scrape never touches the engine thread's lists).
++const std = @import("std");
++
++pub const Stats = struct {
++    tokens: u64 = 0, // prompt tokens computed since the process started (monotone)
++};
++
++pub const Source = struct {
++    ctx: *anyopaque,
++    read: *const fn (ctx: *anyopaque, out: *Stats) void,
++};
++
++test "a prompt-token counter is a number a delta can be taken from" {
++    const a: Stats = .{ .tokens = 1000 };
++    const b: Stats = .{ .tokens = 2800 };
++    try std.testing.expectEqual(@as(u64, 1800), b.tokens - a.tokens);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index ebdecc7..bff1850 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -475,6 +475,9 @@ pub const Lanes = struct {
+     kv_stats_at: u64 = 0, //   iteration: rebuilt at most each kv_stats_ns, Model.now; 0: never built)
+     pool_stats: lanes.pool.Stats = .{}, // the last pool snapshot poolFn built (the same loop and cadence; the pool
+     pool_stats_at: u64 = 0, //   replicated, TF_DS_KV_SHARD=0: the parts above have nothing to say then)
++    /// Prompt tokens this process has computed, monotone: the live prefill rate's counter. Written by the lane
++    /// thread as each chunk lands, read by the status path, so a pass's speed is visible while it runs.
++    prompt_tokens: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
+     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
+     rw: ?*rank_wire.Leader = null,
+@@ -819,6 +822,12 @@ pub const Lanes = struct {
+         return s;
+     }
+ 
++    /// The prompt tokens computed since start (monotone): the host's status reads it on the HTTP thread (an
++    /// atomic), so a reader's delta is the live prefill rate even while the engine thread is inside the pass.
++    pub fn prefillTokensFn(ptr: *anyopaque, out: *lanes.prefill.Stats) void {
++        out.tokens = of(ptr).prompt_tokens.load(.monotonic);
++    }
++
+     /// How stale /health's parts' stats may be (kvPartsFn).
+     const kv_stats_ns: u64 = 250 * std.time.ns_per_ms;
+ 
+@@ -883,6 +892,11 @@ pub const Lanes = struct {
+                 break :blk try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+             };
+             f.start += n;
++            // the live prefill rate's counter: the rows this chunk COMPUTED. A kept state's restored
++            // prefix (stream.cached) is cache, not work; the replay before the sliding window is
++            // encoder work and counts, exactly as prefilled()'s (prompt.len - cached) does.
++            const fresh = if (start >= s.cached) n else if (start + n > s.cached) start + n - s.cached else 0;
++            if (fresh > 0) _ = self.prompt_tokens.fetchAdd(@intCast(fresh), .monotonic);
+             if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+             // the host's work between this pass's chunks (Stream.between: the prefill interleave's rounds, parked work's
+             // service): the read-ahead joined and the prompt's ids gone first, as at a piece's end and on rank 1, which
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 2e80036..8819427 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -132,6 +132,8 @@ pub const Loaded = struct {
+     kv_parts: ?lanes.kv_parts.Source = null,
+     /// TF_DS_KV_SHARD=0: the replicated pool's rows for /health and /metrics (null: the pool is sharded).
+     kv_pool: ?lanes.pool.Source = null,
++    /// Prompt tokens computed since the process started (monotone): a reader's delta is the live prefill rate.
++    prefill: ?lanes.prefill.Source = null,
+     /// The broken-pair policy's hooks (TF_DS_PAIR_BROKEN, exit by default; null: degrade). `ctx` is `ctx`.
+     pair: ?Pair = null,
+     /// Whether the model's stream is free of a CUDA graph capture (the lane host's service fence), with `ctx`.
+@@ -284,9 +286,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
+     // the replicated pool's own rows (TF_DS_KV_SHARD=0): the parts' counters above have nothing to say then
+     const kv_pool: ?lanes.pool.Source = if (st.m.kvs == null) .{ .ctx = &st.lanes, .read = L.poolFn } else null;
++    // the prompt pass's own counter: the live prefill rate reads it on the status path
++    const prefill: ?lanes.prefill.Source = .{ .ctx = &st.lanes, .read = L.prefillTokensFn };
+     const pair: ?Pair = if (pair_mode == .exit) .{ .watch = pairWatch, .abort = pairAbort } else null;
+     if (pair != null) std.log.info("dsv41: a broken rank pair ends this server with status {d} for a restart of both ranks (TF_DS_PAIR_BROKEN=degrade: requests fail one by one instead)", .{api.LaneHost.pair_exit_code});
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .kv_pool = kv_pool, .pair = pair, .quiet = quietFn };
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .kv_pool = kv_pool, .prefill = prefill, .pair = pair, .quiet = quietFn };
+ }
+ 
+ // -- the broken-pair policy (robustness, docs/port/robustness.md) ------------------------------------------------
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 917a49a..26bbd81 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -163,6 +163,7 @@ const Host = struct {
+     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
+     kv_pool: ?lanes.pool.Source = null, // the family's pool rows (its pool replicated, not sharded)
++    prefill: ?lanes.prefill.Source = null, // the family's prompt-token counter (monotone: a delta is the live rate)
+     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+     spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
+     // robustness: the family's broken-pair policy and service fence, handed to the lane host before it starts
+@@ -216,6 +217,7 @@ const Host = struct {
+         if (h.cache) |*store| h.host.cache = store;
+         h.host.kv_parts = h.kv_parts;
+         h.host.kv_pool = h.kv_pool;
++        h.host.prefill = h.prefill;
+         if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
+         h.host.pair = h.pair;
+         h.host.quiet = h.quiet;
+@@ -439,6 +441,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     errdefer gpa.free(h.startup);
+     if (@hasField(@TypeOf(loaded), "kv_parts")) h.kv_parts = loaded.kv_parts;
+     if (@hasField(@TypeOf(loaded), "kv_pool")) h.kv_pool = loaded.kv_pool;
++    if (@hasField(@TypeOf(loaded), "prefill")) h.prefill = loaded.prefill;
+     // robustness: a family's broken-pair policy (dsv41: TF_DS_PAIR_BROKEN=exit) and its device's word for the
+     // lane host's service fence; both null keep the host exactly as before
+     if (@hasField(@TypeOf(loaded), "pair")) if (loaded.pair) |p| {
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 89bd644..4398f9e 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -162,6 +162,11 @@ pub const Metrics = struct {
+         if (status.cache) |c| try cacheFamilies(w, c);
+         if (status.kv_parts) |k| try kvPartFamilies(w, k);
+         if (status.pool) |p| try poolFamilies(w, p);
++        if (status.prefill_tokens) |t| {
++            try gauge(w, "prompt_tokens_computed_total", "counter", "Prompt tokens this process has computed (monotone): a delta is the live prefill rate.", t);
++            try gauge(w, "prefill_streams", "gauge", "Prompt passes open now.", status.prefilling);
++            try gauge(w, "prefill_age_ms", "gauge", "How long the oldest open prompt pass has run, in milliseconds (0: none).", status.prefill_ms);
++        }
+         if (status.pair) |p| try pairFamilies(w, p);
+     }
+ };
+@@ -564,3 +569,27 @@ test "pool families: present only with a replicated pool's rows, every block a g
+         "tensorfold:kv_pool_streams 2\n",
+     }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+ }
++
++test "prefill progress: a monotone token counter, the passes open and the oldest one's age" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    var stub: RenderStub = .{};
++    var plain: std.Io.Writer.Allocating = .init(gpa);
++    defer plain.deinit();
++    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "prompt_tokens_computed") == null);
++    stub.status_value.prefill_tokens = 5000;
++    stub.status_value.prefilling = 1;
++    stub.status_value.prefill_ms = 1234;
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    for ([_][]const u8{
++        "# TYPE tensorfold:prompt_tokens_computed_total counter\n",
++        "tensorfold:prompt_tokens_computed_total 5000\n",
++        "# TYPE tensorfold:prefill_streams gauge\n",
++        "tensorfold:prefill_streams 1\n",
++        "tensorfold:prefill_age_ms 1234\n",
++    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
++}
+-- 
+2.43.0
+

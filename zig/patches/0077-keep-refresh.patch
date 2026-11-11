@@ -1,0 +1,29 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: republish kept rows at each keep
+
+The kept states are published at each noteLive, but the loop's next noteLive may never come once the
+engine goes idle: a session's last keep then sat stale in the bar until the next request. Republish
+on the engine thread at each keep, so the last state is visible before the engine sleeps.
+---
+ zig/src/core/lane_host.zig | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index d617dec..1e65d48 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -257,6 +257,10 @@ pub const LaneHost = struct {
+             const pics = r.images.len > 0; // (the tier records each picture's identity and the prompt's model ids)
+             // an image span keyed by its digest (Request.cacheKey)
+             _ = store.keepWith(r.cacheKey(), at, s, r.chunks, .{ .group = job.join.group, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{}, .parent = job.parent, .fork = job.fork, .lineage = job.lineage });
++            // The kept states changed: republish them now, on the engine thread, so a
++            // session's last keep is visible before the engine goes idle (the loop's
++            // next noteLive may never come, and the kept colours would sit stale).
++            job.host.noteLive();
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+-- 
+2.43.0
+

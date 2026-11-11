@@ -1,0 +1,146 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: publish kept prompt-state rows per conversation
+
+/metrics adds stream_group and kv_kept_group, the two halves of a KV bar that could only draw one
+grey "kept" slab: stream_group names the conversation of each live stream (0 when grouping is off)
+and kv_kept_group the rows one conversation's kept prompt states still hold, most recently used
+first. The host keeps at most 16 stream groups and 8 kept groups, aggregated on the engine thread at
+each noteLive and read under the same lock.
+---
+ zig/src/core/engine_api.zig | 10 ++++++++
+ zig/src/core/lane_host.zig  | 47 +++++++++++++++++++++++++++++++++++++
+ zig/src/server/metrics.zig  | 10 ++++++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 358b73a..431a081 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -338,6 +338,11 @@ pub const MemorySource = struct {
+     read: *const fn (ctx: ?*anyopaque, reset_peak: bool) ?Memory,
+ };
+ 
++/// A conversation's kept prompt-state rows still holding pool positions.
++pub const KeptGroup = struct { group: u64 = 0, rows: u64 = 0 };
++pub const max_stream_groups = 16;
++pub const max_kept_groups = 8;
++
+ pub const Status = struct {
+     /// Requests in prefill or decode, and those waiting for a lane.
+     running: u32 = 0,
+@@ -366,6 +371,11 @@ pub const Status = struct {
+     /// The last prompt chunk's rows and its own duration (the instantaneous prefill speed).
+     prefill_chunk_tokens: u64 = 0,
+     prefill_chunk_ns: u64 = 0,
++    /// Live streams' conversation ids, aligned with `streams` (0: grouping off).
++    stream_groups: [max_stream_groups]u64 = @splat(0),
++    /// The most recently used conversations whose kept states still hold pool rows, newest first.
++    kept_groups: [max_kept_groups]KeptGroup = @splat(KeptGroup{}),
++    kept_groups_n: u8 = 0,
+     /// The rank pair's robustness counters and state (a backend with a broken-pair policy, or the prompt cache's
+     /// disk tier); null otherwise (no /health or /metrics output).
+     pair: ?PairStatus = null,
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index bd7a70c..d617dec 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -95,6 +95,10 @@ pub const LaneHost = struct {
+     /// published as `pool_tele`.
+     kv_pool: ?lanes.pool.Source = null,
+     pool_tele: ?api.PoolStats = null,
++    /// The kept states aggregated by conversation, the most recently used first (published on the engine
++    /// thread in noteLive, read by status readers under the same lock).
++    kept_tele: [api.max_kept_groups]api.KeptGroup = @splat(api.KeptGroup{}),
++    kept_tele_n: u8 = 0,
+     /// A backend's prompt-token counter (monotone), read on the status path (an atomic on the backend's side):
+     /// a reader's delta is the pass speed while the engine thread may be inside the pass.
+     prefill: ?lanes.prefill.Source = null,
+@@ -432,6 +436,14 @@ pub const LaneHost = struct {
+             chunk_tokens = ps.chunk_tokens;
+             chunk_ns = ps.chunk_ns;
+         }
++        var stream_groups: [api.max_stream_groups]u64 = @splat(0);
++        var sg: usize = 0;
++        for (h.admitted.items) |job| if (job.started) {
++            if (sg < stream_groups.len) {
++                stream_groups[sg] = job.join.group;
++                sg += 1;
++            }
++        };
+         out.* = .{
+             .running = @intCast(h.admitted.items.len),
+             .waiting = @intCast(h.queued.items.len + h.waitingCount()),
+@@ -448,6 +460,9 @@ pub const LaneHost = struct {
+             .prefill_chunk_tokens = chunk_tokens,
+             .prefill_chunk_ns = chunk_ns,
+             .prefill_ms = if (prefilling > 0 and oldest != 0) @intCast(@divTrunc(@max(now - oldest, 0), std.time.ns_per_ms)) else 0,
++            .stream_groups = stream_groups,
++            .kept_groups = h.kept_tele,
++            .kept_groups_n = h.kept_tele_n,
+             .pair = h.pairStatus(now),
+         };
+     }
+@@ -985,6 +1000,38 @@ pub const LaneHost = struct {
+         if (tele) |t| h.tele = t;
+         if (parts) |p| h.kv_tele = p;
+         if (pool) |p| h.pool_tele = p;
++        // The kept states, by conversation: the bar's grey block, split like the live one. A kept
++        // state's `group` is the conversation that kept it; `used` orders the newest first.
++        const G = struct { group: u64 = 0, rows: u64 = 0, used: u64 = 0 };
++        var kept: [api.max_kept_groups]G = @splat(G{});
++        var kept_n: usize = 0;
++        if (h.cache) |store| for (store.entries.items) |e| {
++            if (e.at == 0 or e.group == 0) continue;
++            var i: usize = 0;
++            while (i < kept_n) : (i += 1) if (kept[i].group == e.group) break;
++            if (i < kept_n) {
++                kept[i].rows += e.at;
++                kept[i].used = @max(kept[i].used, e.used);
++                continue;
++            }
++            if (kept_n < kept.len) {
++                kept[kept_n] = .{ .group = e.group, .rows = e.at, .used = e.used };
++                kept_n += 1;
++                continue;
++            }
++            var lru: usize = 0;
++            for (1..kept_n) |j| if (kept[j].used < kept[lru].used) {
++                lru = j;
++            };
++            if (e.used > kept[lru].used) kept[lru] = .{ .group = e.group, .rows = e.at, .used = e.used };
++        };
++        std.mem.sort(G, kept[0..kept_n], {}, struct {
++            fn f(_: void, a: G, b: G) bool {
++                return a.used > b.used;
++            }
++        }.f);
++        h.kept_tele_n = @intCast(kept_n);
++        for (0..kept_n) |i| h.kept_tele[i] = .{ .group = kept[i].group, .rows = kept[i].rows };
+     }
+ 
+     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index d4a4546..7f2e9a1 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -168,6 +168,16 @@ pub const Metrics = struct {
+             try gauge(w, "prefill_age_ms", "gauge", "How long the oldest open prompt pass has run, in milliseconds (0: none).", status.prefill_ms);
+             try gauge(w, "prompt_chunk_tokens", "gauge", "Rows the last prompt chunk computed.", status.prefill_chunk_tokens);
+             try gauge(w, "prompt_chunk_ns", "gauge", "The last prompt chunk's own duration, in nanoseconds.", status.prefill_chunk_ns);
++            if (status.streams > 0) {
++                try family(w, "stream_group", "gauge", "The conversation id of a live stream (0: grouping off).");
++                for (status.stream_groups[0..@min(status.streams, status.stream_groups.len)], 0..) |g, i|
++                    try w.print("{s}stream_group{{stream=\"{d}\"}} {d}\n", .{ prefix, i, g });
++            }
++            if (status.kept_groups_n > 0) {
++                try family(w, "kv_kept_group", "gauge", "Rows of the pool one conversation's kept prompt states hold (the most recently used).");
++                for (status.kept_groups[0..status.kept_groups_n]) |k|
++                    try w.print("{s}kv_kept_group{{group=\"{d}\"}} {d}\n", .{ prefix, k.group, k.rows });
++            }
+         }
+         if (status.pair) |p| try pairFamilies(w, p);
+     }
+-- 
+2.43.0
+

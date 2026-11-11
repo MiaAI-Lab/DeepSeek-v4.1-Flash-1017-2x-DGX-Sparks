@@ -1,0 +1,329 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] dsv41: publish the replicated pool's rows
+
+With KV sharding off (KV_SHARD=0) the pool is replicated on every rank, so the shard's per-part
+counters (kv_parts) have nothing to report and the pool's occupancy was not published at all: the
+common case had no numbers. A backend now hands the host a pool Source (core/lanes/pool.zig,
+family-neutral), read on the engine thread at each noteLive and published for status readers.
+
+/metrics: kv_pool_rows, kv_pool_live, kv_pool_kept, kv_pool_free, kv_pool_streams; the status carries
+the same numbers under pool. A backend that publishes no pool shows nothing, as before.
+---
+ zig/src/core/engine_api.zig       |  6 ++++
+ zig/src/core/lane_host.zig        | 11 +++++++
+ zig/src/core/lanes/lanes.zig      |  1 +
+ zig/src/core/lanes/pool.zig       | 25 ++++++++++++++++
+ zig/src/families/dsv41/lanes.zig  | 50 +++++++++++++++++++++++++++++++
+ zig/src/families/dsv41/native.zig |  6 +++-
+ zig/src/families/dsv41/parts.zig  |  2 +-
+ zig/src/native/cuda.zig           |  3 ++
+ zig/src/server/metrics.zig        | 35 ++++++++++++++++++++++
+ 9 files changed, 137 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/core/lanes/pool.zig
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 0bd41ab..fb74b89 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -355,6 +355,9 @@ pub const Status = struct {
+     cache: ?CacheStats = null,
+     /// KV ownership's counters and parts (a backend that shards its pool over the ranks: dsv41's TF_DS_KV_SHARD).
+     kv_parts: ?KvParts = null,
++    /// The pool's rows when it is replicated, not cut into parts (dsv41 with TF_DS_KV_SHARD=0): what live
++    /// streams and kept prompt states hold, and what is free. Null when the backend publishes no pool.
++    pool: ?PoolStats = null,
+     /// The rank pair's robustness counters and state (a backend with a broken-pair policy, or the prompt cache's
+     /// disk tier); null otherwise (no /health or /metrics output).
+     pair: ?PairStatus = null,
+@@ -396,6 +399,9 @@ pub const PairStatus = struct {
+ /// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
+ pub const KvParts = lanes.kv_parts.Stats;
+ 
++/// The KV pool's rows when it is replicated rather than cut into parts (dsv41's TF_DS_KV_SHARD=0).
++pub const PoolStats = lanes.pool.Stats;
++
+ pub const SubmitError = error{ Closed, Busy };
+ 
+ pub const Engine = struct {
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 5245739..220f658 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -91,6 +91,10 @@ pub const LaneHost = struct {
+     /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
+     kv_parts: ?lanes.kv_parts.Source = null,
+     kv_tele: ?api.KvParts = null,
++    /// A backend's pool when it is replicated (not cut into parts): read on the engine thread at each noteLive,
++    /// published as `pool_tele`.
++    kv_pool: ?lanes.pool.Source = null,
++    pool_tele: ?api.PoolStats = null,
+     // -- a broken rank pair (the backend's policy, set before start; null: off, nothing below runs) ---------------
+     pair: ?PairPolicy = null,
+     pair_state: std.atomic.Value(u8) = .init(0), // 0 whole, 1 a cause being recorded, 2 broken (why/drain/since set)
+@@ -416,6 +420,7 @@ pub const LaneHost = struct {
+             .generation_tokens = h.live_generated,
+             .cache = h.tele,
+             .kv_parts = h.kv_tele,
++            .pool = h.pool_tele,
+             .pair = h.pairStatus(now),
+         };
+     }
+@@ -937,6 +942,11 @@ pub const LaneHost = struct {
+             parts = .{};
+             src.read(src.ctx, &parts.?);
+         }
++        var pool: ?api.PoolStats = null;
++        if (h.kv_pool) |src| {
++            pool = .{};
++            src.read(src.ctx, &pool.?);
++        }
+         h.lock();
+         defer h.unlock();
+         h.live_tokens.clearRetainingCapacity();
+@@ -947,6 +957,7 @@ pub const LaneHost = struct {
+         };
+         if (tele) |t| h.tele = t;
+         if (parts) |p| h.kv_tele = p;
++        if (pool) |p| h.pool_tele = p;
+     }
+ 
+     /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index f07d04e..afc6263 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -21,6 +21,7 @@ pub const trail = @import("trail.zig");
+ pub const engine = @import("engine.zig");
+ pub const fake = @import("fake.zig");
+ pub const kv_parts = @import("kv_parts.zig");
++pub const pool = @import("pool.zig");
+ 
+ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+diff --git a/zig/src/core/lanes/pool.zig b/zig/src/core/lanes/pool.zig
+new file mode 100644
+index 0000000..7facbec
+--- /dev/null
++++ b/zig/src/core/lanes/pool.zig
+@@ -0,0 +1,25 @@
++//! A backend's KV pool for /health and /metrics when the pool is NOT cut into parts (family-neutral):
++//! how many rows the pool has, how many live streams and kept prompt states hold, and what is free.
++//! dsv41's TF_DS_KV_SHARD=0 is the case this exists for: the pool is replicated on every rank, so the
++//! shard's per-part counters (kv_parts.zig) have nothing to report, and without this the pool's
++//! occupancy is not published at all. A backend that replicates hands the host a `Source`; the host
++//! reads it on its engine thread (the backend's own thread) and publishes the copy for status readers.
++const std = @import("std");
++
++pub const Stats = struct {
++    rows: u64 = 0, // the pool's positions
++    live: u64 = 0, // rows live streams hold (their reserved extents)
++    kept: u64 = 0, // rows kept prompt states hold outside live extents
++    free: u64 = 0, // rows free
++    streams: u64 = 0, // live streams
++};
++
++pub const Source = struct {
++    ctx: *anyopaque,
++    read: *const fn (ctx: *anyopaque, out: *Stats) void,
++};
++
++test "a pool's rows add up: live plus kept plus free is the whole pool" {
++    const s: Stats = .{ .rows = 100, .live = 30, .kept = 25, .free = 45 };
++    try std.testing.expectEqual(s.rows, s.live + s.kept + s.free);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 40006aa..ebdecc7 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -473,6 +473,8 @@ pub const Lanes = struct {
+     kv: ?*kv_lanes.Kv = null, // TF_DS_KV_SHARD: the parts' planner (startKv, at open; null: the switch off)
+     kv_stats: lanes.kv_parts.Stats = .{}, // the last parts' stats kvPartsFn built (the engine loop reads them every
+     kv_stats_at: u64 = 0, //   iteration: rebuilt at most each kv_stats_ns, Model.now; 0: never built)
++    pool_stats: lanes.pool.Stats = .{}, // the last pool snapshot poolFn built (the same loop and cadence; the pool
++    pool_stats_at: u64 = 0, //   replicated, TF_DS_KV_SHARD=0: the parts above have nothing to say then)
+     /// The pair's one rank_wire Leader (native.openPair: agreed with rank_identity's full fingerprint before anything
+     /// spill- or shard-related crosses), shared by the spill tier and the KV parts; owned here (null: neither is on).
+     rw: ?*rank_wire.Leader = null,
+@@ -769,6 +771,54 @@ pub const Lanes = struct {
+         self.kv_stats = out.*;
+     }
+ 
++    /// The replicated pool's rows for /health and /metrics (native.Loaded.kv_pool: the host reads them on its engine
++    /// thread, in noteLive, every engine-loop iteration). Rebuilt at most each kv_stats_ns: a rebuild walks every
++    /// live extent and kept state and sorts the kept spans (allocating), as the sharded parts' rebuild does.
++    pub fn poolFn(ptr: *anyopaque, out: *lanes.pool.Stats) void {
++        const self = of(ptr);
++        const now = self.m.now();
++        if (self.pool_stats_at != 0 and now -| self.pool_stats_at < kv_stats_ns) {
++            out.* = self.pool_stats;
++            return;
++        }
++        self.pool_stats_at = now;
++        out.* = self.poolSnapshot();
++        self.pool_stats = out.*;
++    }
++
++    /// The pool's rows now: the live streams' extents, the kept states outside them, and the rest free.
++    fn poolSnapshot(self: *Lanes) lanes.pool.Stats {
++        const cap: u64 = @intCast(self.m.pool_cap);
++        var s: lanes.pool.Stats = .{ .rows = cap };
++        var it = self.streams.valueIterator();
++        while (it.next()) |l| {
++            if (l.end > l.base) s.live += @intCast(l.end - l.base);
++            s.streams += 1;
++        }
++        var spans: std.ArrayList([2]usize) = .empty;
++        defer spans.deinit(self.gpa);
++        for (self.snaps.items) |sn| {
++            if (sn.stale or sn.at == 0) continue;
++            var clash = false;
++            var live = self.streams.valueIterator();
++            while (live.next()) |l| {
++                if (sn.base < l.end and l.base < sn.base + sn.at) {
++                    clash = true;
++                    break;
++                }
++            }
++            if (clash) continue; // (rows inside a live extent are that stream's, as the parts' stats count them)
++            spans.append(self.gpa, .{ sn.base, sn.base + sn.at }) catch {
++                s.kept = 0; // (out of memory: report what is certain, never a wrong free count)
++                s.free = cap -| s.live;
++                return s;
++            };
++        }
++        s.kept = @intCast(parts.covered(spans.items, 0, self.m.pool_cap));
++        s.free = cap -| (s.live + s.kept);
++        return s;
++    }
++
+     /// How stale /health's parts' stats may be (kvPartsFn).
+     const kv_stats_ns: u64 = 250 * std.time.ns_per_ms;
+ 
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 51644e4..2e80036 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -130,6 +130,8 @@ pub const Loaded = struct {
+     replay: u32 = 0,
+     /// TF_DS_KV_SHARD: the parts' counters and rows for /health and /metrics (null: the switch off).
+     kv_parts: ?lanes.kv_parts.Source = null,
++    /// TF_DS_KV_SHARD=0: the replicated pool's rows for /health and /metrics (null: the pool is sharded).
++    kv_pool: ?lanes.pool.Source = null,
+     /// The broken-pair policy's hooks (TF_DS_PAIR_BROKEN, exit by default; null: degrade). `ctx` is `ctx`.
+     pair: ?Pair = null,
+     /// Whether the model's stream is free of a CUDA graph capture (the lane host's service fence), with `ctx`.
+@@ -280,9 +282,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         tier = st.lanes.spill.?.tier();
+     }
+     const kv_parts: ?lanes.kv_parts.Source = if (st.m.kvs != null) .{ .ctx = &st.lanes, .read = L.kvPartsFn } else null;
++    // the replicated pool's own rows (TF_DS_KV_SHARD=0): the parts' counters above have nothing to say then
++    const kv_pool: ?lanes.pool.Source = if (st.m.kvs == null) .{ .ctx = &st.lanes, .read = L.poolFn } else null;
+     const pair: ?Pair = if (pair_mode == .exit) .{ .watch = pairWatch, .abort = pairAbort } else null;
+     if (pair != null) std.log.info("dsv41: a broken rank pair ends this server with status {d} for a restart of both ranks (TF_DS_PAIR_BROKEN=degrade: requests fail one by one instead)", .{api.LaneHost.pair_exit_code});
+-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .pair = pair, .quiet = quietFn };
++    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null, .window = window, .tier = tier, .grid = model.chunk_rows, .replay = @intCast(st.m.cfg.window), .kv_parts = kv_parts, .kv_pool = kv_pool, .pair = pair, .quiet = quietFn };
+ }
+ 
+ // -- the broken-pair policy (robustness, docs/port/robustness.md) ------------------------------------------------
+diff --git a/zig/src/families/dsv41/parts.zig b/zig/src/families/dsv41/parts.zig
+index c0c5eb2..6c21afd 100644
+--- a/zig/src/families/dsv41/parts.zig
++++ b/zig/src/families/dsv41/parts.zig
+@@ -1709,7 +1709,7 @@ pub const Planner = struct {
+ };
+ 
+ /// The rows of [lo, hi) that the spans cover (overlaps counted once).
+-fn covered(spans: [][2]usize, lo: usize, hi: usize) usize {
++pub fn covered(spans: [][2]usize, lo: usize, hi: usize) usize {
+     std.mem.sort([2]usize, spans, {}, struct {
+         fn f(_: void, a: [2]usize, b: [2]usize) bool {
+             return a[0] < b[0];
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index ecf4247..917a49a 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -162,6 +162,7 @@ const Host = struct {
+     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
++    kv_pool: ?lanes.pool.Source = null, // the family's pool rows (its pool replicated, not sharded)
+     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+     spill: ?api.Spill = null, // the spill tier the family bound: the lane host is configured with it
+     // robustness: the family's broken-pair policy and service fence, handed to the lane host before it starts
+@@ -214,6 +215,7 @@ const Host = struct {
+         h.host.explain = explain;
+         if (h.cache) |*store| h.host.cache = store;
+         h.host.kv_parts = h.kv_parts;
++        h.host.kv_pool = h.kv_pool;
+         if (h.spill) |sp| h.host.configure(sp); // (after the cache and its tier: Spill.unbound sees Status.cache)
+         h.host.pair = h.pair;
+         h.host.quiet = h.quiet;
+@@ -436,6 +438,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     });
+     errdefer gpa.free(h.startup);
+     if (@hasField(@TypeOf(loaded), "kv_parts")) h.kv_parts = loaded.kv_parts;
++    if (@hasField(@TypeOf(loaded), "kv_pool")) h.kv_pool = loaded.kv_pool;
+     // robustness: a family's broken-pair policy (dsv41: TF_DS_PAIR_BROKEN=exit) and its device's word for the
+     // lane host's service fence; both null keep the host exactly as before
+     if (@hasField(@TypeOf(loaded), "pair")) if (loaded.pair) |p| {
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 064410b..89bd644 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -161,6 +161,7 @@ pub const Metrics = struct {
+         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+         if (status.cache) |c| try cacheFamilies(w, c);
+         if (status.kv_parts) |k| try kvPartFamilies(w, k);
++        if (status.pool) |p| try poolFamilies(w, p);
+         if (status.pair) |p| try pairFamilies(w, p);
+     }
+ };
+@@ -222,6 +223,17 @@ pub fn kvPartFamilies(w: *std.Io.Writer, k: api.KvParts) !void {
+     }
+ }
+ 
++/// The KV pool's rows when it is replicated rather than cut into parts (dsv41's TF_DS_KV_SHARD=0):
++/// tensorfold:kv_pool_rows, kv_pool_live, kv_pool_kept, kv_pool_free and kv_pool_streams (gauges).
++/// The three blocks are exact rows and sum to kv_pool_rows, as the sharded parts' do.
++pub fn poolFamilies(w: *std.Io.Writer, p: api.PoolStats) !void {
++    try gauge(w, "kv_pool_rows", "gauge", "Positions the KV pool holds.", p.rows);
++    try gauge(w, "kv_pool_live", "gauge", "Rows live streams' extents hold.", p.live);
++    try gauge(w, "kv_pool_kept", "gauge", "Rows kept prompt states hold outside live extents.", p.kept);
++    try gauge(w, "kv_pool_free", "gauge", "Rows of the pool free.", p.free);
++    try gauge(w, "kv_pool_streams", "gauge", "Live streams holding rows in the pool.", p.streams);
++}
++
+ fn kindOf(comptime gauges: []const []const u8, comptime name: []const u8) []const u8 {
+     @setEvalBranchQuota(100_000);
+     for (gauges) |g| if (std.mem.eql(u8, g, name)) return "gauge";
+@@ -529,3 +541,26 @@ test "kv shard families: present only with a sharded backend's stats, its counte
+         "tensorfold:kv_shard_rank_copy_bytes{rank=\"1\"} 4096\n",
+     }) |line| try std.testing.expect(std.mem.indexOf(u8, out2.written(), line) != null);
+ }
++
++test "pool families: present only with a replicated pool's rows, every block a gauge" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    var stub: RenderStub = .{};
++    var plain: std.Io.Writer.Allocating = .init(gpa);
++    defer plain.deinit();
++    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "kv_pool") == null);
++    stub.status_value.pool = .{ .rows = 100, .live = 30, .kept = 25, .free = 45, .streams = 2 };
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    for ([_][]const u8{
++        "# TYPE tensorfold:kv_pool_rows gauge\n",
++        "tensorfold:kv_pool_rows 100\n",
++        "tensorfold:kv_pool_live 30\n",
++        "tensorfold:kv_pool_kept 25\n",
++        "tensorfold:kv_pool_free 45\n",
++        "tensorfold:kv_pool_streams 2\n",
++    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
++}
+-- 
+2.43.0
+

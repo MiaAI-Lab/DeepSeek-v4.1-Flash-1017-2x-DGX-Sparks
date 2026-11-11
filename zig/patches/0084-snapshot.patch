@@ -1,0 +1,443 @@
+From: Nguyen Phan <nguyen@nguyenphan.org>
+Date: Mon, 10 Nov 2026 20:00:00 +0700
+Subject: [PATCH] server: /snapshot, one document for the engine's sessions
+
+The dashboard needed a compiled gauge per question — pool rows, chunk speed, conversation ids,
+per-stream progress — which cost ten engine rebuilds in one night (2026-11-04). /snapshot is the
+interface instead: one document, one timestamp, and new facts are consumer-side work.
+
+- streams[] is the session spine: `slot` is stable for the request's life, so a series can never
+  switch conversation between scrapes; the request's own facts (prompt, cached, context, generated)
+  travel with it, as does the position of its prompt pass when it is the one filling.
+- why requests wait, counted where each hold is decided: the single "waiting" number hid six
+  reasons, and requests that gave their lane back for room (ContextFull) were published as a hard
+  zero.
+- the prompt cache's memory tier (bytes it may hold, and how much is spare), the conversations the
+  store knows, and the pool's kept rows by conversation.
+
+Session-level facts leave /metrics (it keeps the counters and the pair families): a gauge per
+question is what made the rebuilds necessary. The route joins the status allowlist in auth.zig,
+beside /metrics, /stats and /dashboard.
+---
+ zig/src/core/engine_api.zig      |  29 +++++++++
+ zig/src/core/lane_host.zig       |  68 +++++++++++++++++++--
+ zig/src/server/auth.zig          |   2 +-
+ zig/src/server/metrics.zig       |  54 ++--------------
+ zig/src/server/routes.zig        |   1 +
+ zig/src/server/status_routes.zig | 102 +++++++++++++++++++++++++++++++
+ 6 files changed, 200 insertions(+), 56 deletions(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index afe5105..9163b02 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -343,6 +343,22 @@ pub const KeptGroup = struct { group: u64 = 0, rows: u64 = 0 };
+ pub const max_stream_groups = 16;
+ pub const max_kept_groups = 8;
+ 
++/// One admitted stream, as a dashboard needs it: identity that does not move, the request's own facts, and the
++/// position of its prompt pass when it is the one filling.
++pub const StreamDetail = struct {
++    slot: u16 = 0,
++    group: u64 = 0,
++    prompt_tokens: u32 = 0,
++    cached_tokens: u32 = 0,
++    context_tokens: u32 = 0,
++    generated_tokens: u32 = 0,
++    prefill_done: u64 = 0,
++    prefill_total: u64 = 0,
++    state: State = .idle,
++
++    pub const State = enum(u8) { idle, prefill, decode };
++};
++
+ pub const Status = struct {
+     /// Requests in prefill or decode, and those waiting for a lane.
+     running: u32 = 0,
+@@ -380,6 +396,19 @@ pub const Status = struct {
+     /// not the one filling). Only one pass fills at a time, so at most one entry here is non-zero.
+     prefill_stream_done: [max_stream_groups]u64 = @splat(0),
+     prefill_stream_total: [max_stream_groups]u64 = @splat(0),
++    /// One record per admitted stream, the session spine: `slot` is stable for the request's life, so a series
++    /// labelled by it can never switch conversation between scrapes (an array POSITION can, and did).
++    streams_detail: [max_stream_groups]StreamDetail = @splat(StreamDetail{}),
++    /// Why requests wait, counted where each hold is decided (the single `waiting` number hides six).
++    waiting_lane: u32 = 0,
++    waiting_restore: u32 = 0,
++    waiting_deferred: u32 = 0,
++    waiting_pool_room: u32 = 0,
++    /// The prompt cache's memory tier: bytes it may hold, and how much of that is spare.
++    cache_budget_bytes: u64 = 0,
++    cache_spare_bytes: u64 = 0,
++    /// Conversations the store knows (each one can own kept states).
++    conversations: u32 = 0,
+     /// Live streams' conversation ids, aligned with `streams` (0: grouping off).
+     stream_groups: [max_stream_groups]u64 = @splat(0),
+     /// The most recently used conversations whose kept states still hold pool rows, newest first.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 0f91d8c..4764ddd 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -55,6 +55,12 @@ pub const LaneHost = struct {
+     /// A Metal engine's keepalive target, set by the family that owns the queue; null keeps the ticker off.
+     keepalive_target: ?api.keepalive.Target = null,
+     live_generated: u64 = 0,
++    /// The lowest slot no admitted request holds: a bounded series identity (0..15), reused once its request
++    /// finishes, so per-session rows never fragment the store with new labels.
++    slot_next: u16 = 0,
++    /// Requests that gave their lane back for room (ContextFull) and queued again: real preemptions, which the
++    /// status used to publish as a hard zero.
++    preemptions: u64 = 0,
+     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
+     lone_job: ?*Job = null, // the job that driver holds now
+     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+@@ -228,6 +234,8 @@ pub const LaneHost = struct {
+     const Job = struct {
+         host: *LaneHost,
+         id: Id,
++        /// This request's series identity, taken at admission and held until it finishes (0: not admitted yet).
++        slot: u16 = 0,
+         request: *const Request,
+         sink: Sink,
+         stream: lanes.Stream = undefined,
+@@ -386,7 +394,7 @@ pub const LaneHost = struct {
+     fn submitFn(ctx: *anyopaque, id: Id, request: *const Request, sink: Sink) SubmitError!void {
+         const h = self(ctx);
+         const job = h.gpa.create(Job) catch return error.Busy;
+-        job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
++        job.* = .{ .host = h, .id = id, .request = request, .sink = sink, .slot = h.freeSlot() };
+         h.mutex.lockUncancelable(h.io);
+         defer h.mutex.unlock(h.io);
+         if (h.closing or h.isBroken()) { // (a broken pair admits nothing more: the process restarts)
+@@ -413,6 +421,23 @@ pub const LaneHost = struct {
+         h.wake.signal(h.io);
+     }
+ 
++    /// The lowest slot no admitted request holds: a bounded identity for a series (0..15), reused once its
++    /// request finishes, so the card's per-session rows never fragment the store with new labels.
++    fn freeSlot(h: *LaneHost) u16 {
++        var slot: u16 = 0;
++        while (slot < 16) : (slot += 1) {
++            var taken = false;
++            for (h.admitted.items) |j| {
++                if (j.started and j.slot == slot) taken = true;
++            }
++            for (h.queued.items) |j| {
++                if (j.slot == slot) taken = true;
++            }
++            if (!taken) return slot;
++        }
++        return h.slot_next;
++    }
++
+     fn statusFn(ctx: *anyopaque, out: *Status, stream_tokens: []u32) void {
+         const h = self(ctx);
+         h.mutex.lockUncancelable(h.io);
+@@ -455,15 +480,32 @@ pub const LaneHost = struct {
+         var stream_groups: [api.max_stream_groups]u64 = @splat(0);
+         var stream_done: [api.max_stream_groups]u64 = @splat(0);
+         var stream_total: [api.max_stream_groups]u64 = @splat(0);
++        var detail: [api.max_stream_groups]api.StreamDetail = @splat(api.StreamDetail{});
+         var sg: usize = 0;
+         for (h.admitted.items) |job| if (job.started) {
+             if (sg < stream_groups.len) {
+                 stream_groups[sg] = job.join.group;
+-                // The pass filling now is this stream's: the chunk loop published its address.
+-                if (fill_ptr != 0 and fill_ptr == @intFromPtr(&job.stream) and job.prefilled == null) {
++                // Only ONE pass fills at a time, and the chunk loop publishes its position. It is this
++                // stream's when the host names it (`filling`), or when it is the only stream prefilling —
++                // a LONE pass never takes the `filling` slot, the family drives it whole.
++                const prefilling_now = job.prefilled == null and job.began != 0;
++                const mine = prefilling_now and
++                    ((h.filling != null and h.filling.? == job) or (h.filling == null and prefilling == 1));
++                if (mine) {
+                     stream_done[sg] = fill_done;
+                     stream_total[sg] = fill_total;
+                 }
++                detail[sg] = .{
++                    .slot = job.slot,
++                    .group = job.join.group,
++                    .prompt_tokens = @intCast(job.stream.prompt_len),
++                    .cached_tokens = job.stream.cached,
++                    .context_tokens = @intCast(job.stream.context.items.len),
++                    .generated_tokens = @intCast(job.stream.emitted().len),
++                    .prefill_done = if (mine) fill_done else 0,
++                    .prefill_total = if (mine) fill_total else 0,
++                    .state = if (prefilling_now) .prefill else .decode,
++                };
+                 sg += 1;
+             }
+         };
+@@ -472,8 +514,11 @@ pub const LaneHost = struct {
+             .waiting = @intCast(h.queued.items.len + h.waitingCount()),
+             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
+             .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
+-            .preemptions = 0,
+-            .streams = n,
++            .preemptions = h.preemptions,
++            // The admitted-and-started count, NOT `live_tokens`: that array is filled on the engine
++            // thread's noteLive, which a LONE pass never calls until its first commit — so a stream
++            // list bounded by it was empty for exactly the pass a dashboard wants to show (2026-11-04).
++            .streams = @min(sg, stream_groups.len),
+             .generation_tokens = h.live_generated,
+             .cache = h.tele,
+             .kv_parts = h.kv_tele,
+@@ -486,6 +531,14 @@ pub const LaneHost = struct {
+             .prefill_total = fill_total,
+             .prefill_stream_done = stream_done,
+             .prefill_stream_total = stream_total,
++            .streams_detail = detail,
++            .waiting_lane = @intCast(h.queued.items.len),
++            .waiting_restore = @intCast(h.loading.items.len),
++            .waiting_deferred = @intCast(h.deferred.items.len),
++            .waiting_pool_room = @intCast(h.full_wait orelse 0),
++            .cache_budget_bytes = if (h.cache) |store| store.budget else 0,
++            .cache_spare_bytes = if (h.cache) |store| store.spare() else 0,
++            .conversations = if (h.cache) |store| store.roots.count() else 0,
+             .prefill_ms = if (prefilling > 0 and oldest != 0) @intCast(@divTrunc(@max(now - oldest, 0), std.time.ns_per_ms)) else 0,
+             .stream_groups = stream_groups,
+             .kept_groups = h.kept_tele,
+@@ -765,7 +818,10 @@ pub const LaneHost = struct {
+             if (h.isBroken()) return h.dropBroken(job);
+             if (e == error.Cancelled) return h.cancel(job);
+             // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
+-            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
++            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) {
++                h.preemptions += 1;
++                return h.requeue(job);
++            }
+             // refused as a cut-in (its kept state gone as its pass opened): it waits for the pass in pieces, not
+             // tried again between that pass's pieces
+             if (e == error.FillBusy and h.filling != null) {
+diff --git a/zig/src/server/auth.zig b/zig/src/server/auth.zig
+index 475ae2a..9b43cc2 100644
+--- a/zig/src/server/auth.zig
++++ b/zig/src/server/auth.zig
+@@ -229,7 +229,7 @@ pub fn gated(raw_path: []const u8, metrics_open: bool) bool {
+     const path = routePath(raw_path);
+     if (metrics_open and (std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/metrics"))) return false;
+     if (std.mem.eql(u8, path, "/v1") or std.mem.startsWith(u8, path, "/v1/")) return true;
+-    for ([_][]const u8{ "/metrics", "/dashboard", "/stats", "/tokenize", "/detokenize", "/models", "/messages", "/messages/count_tokens", "/chat/completions", "/completions", "/decisions", "/responses" }) |p| if (std.mem.eql(u8, path, p)) return true;
++    for ([_][]const u8{ "/metrics", "/dashboard", "/stats", "/snapshot", "/tokenize", "/detokenize", "/models", "/messages", "/messages/count_tokens", "/chat/completions", "/completions", "/decisions", "/responses" }) |p| if (std.mem.eql(u8, path, p)) return true;
+     if (std.mem.startsWith(u8, path, "/responses/")) return true;
+     for ([_][]const u8{ "/chat/completions", "/completions", "/decisions", "/models" }) |end| if (std.mem.endsWith(u8, path, end)) return true;
+     return false;
+diff --git a/zig/src/server/metrics.zig b/zig/src/server/metrics.zig
+index 4bd59c3..39aacf1 100644
+--- a/zig/src/server/metrics.zig
++++ b/zig/src/server/metrics.zig
+@@ -103,6 +103,7 @@ pub const Metrics = struct {
+         var status: api.Status = .{};
+         var streams: [512]u32 = undefined;
+         engine.status(&status, &streams);
++        _ = window; // the per-stream ratios (the only use) moved to /snapshot
+         var snap: Metrics = undefined;
+         const requests = blk: {
+             m.mutex.lockUncancelable(io);
+@@ -121,16 +122,6 @@ pub const Metrics = struct {
+             try family(w, "requests_total", "counter", "HTTP replies by API key label and status.");
+             for (requests) |r| try w.print("{s}requests_total{{key=\"{s}\",status=\"{d}\"}} {d}\n", .{ prefix, r.key, r.status, r.count });
+         }
+-        try gauge(w, "requests_running", "gauge", "Requests in prefill or decode.", status.running);
+-        try gauge(w, "requests_waiting", "gauge", "Requests queued or held until a lane is free.", status.waiting);
+-        try gauge(w, "generation_tokens_running", "gauge", "Generated tokens held by live streams.", status.generation_tokens);
+-        try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests, those restored from kept prompt states included.", snap.prompt);
+-        const keeps = engine.info().prompt_cache; // an engine that keeps no prompt states has no cached count to give
+-        if (keeps) try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests restored from kept prompt states (counted in prompt_tokens_total too); the rest were computed.", snap.cached);
+-        try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
+-        const live = streams[0..@min(status.streams, streams.len)];
+-        try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
+-        try pools(w, "kv_cache_usage_ratio", "pool", live, window);
+         try gauge(w, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.", snap.drafted);
+         try gauge(w, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
+         try histogram(w, "request_latency_seconds", "Seconds from arrival to the reply leaving.", snap.latency);
+@@ -144,15 +135,12 @@ pub const Metrics = struct {
+             try gauge(w, "device_memory_bytes", "gauge", "Device memory the engine holds now: weights, caches and live streams; only where the backend counts it (CUDA).", mem.active);
+             try gauge(w, "device_memory_peak_bytes", "gauge", "The most device memory the engine has held since start or the last /health?reset_peak=1.", mem.peak);
+         }
+-        try gauge(w, "num_requests_running", "gauge", "Requests in prefill or decode. A mirror of tensorfold:requests_running.", status.running);
+-        try gauge(w, "num_requests_waiting", "gauge", "Requests queued or held until a lane is free. A mirror of tensorfold:requests_waiting.", status.waiting);
+-        try family(w, "kv_cache_usage_perc", "gauge", "A stream's cache occupancy under vLLM's name; same streams and ratios as tensorfold:kv_cache_usage_ratio.");
+-        try pools(w, "kv_cache_usage_perc", "stream", live, window);
+         try gauge(w, "spec_decode_num_draft_tokens_total", "counter", "Draft tokens verified on finished requests, this server's single draft counter.", snap.drafted);
+         try gauge(w, "spec_decode_num_accepted_tokens_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
+         try histogram(w, "e2e_request_latency_seconds", "Seconds from arrival to the reply leaving, under vLLM's name.", snap.latency);
+         try histogram(w, "request_decode_time_seconds", "Seconds a finished request spent decoding, under vLLM's name.", snap.decode);
+         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
++        const keeps = engine.info().prompt_cache; // an engine that keeps no prompt states has no cached count to give
+         if (keeps) {
+             try gauge(w, "prefix_cache_queries_total", "counter", "Prompt tokens of finished requests, looked up in the kept prompt states, under vLLM's name.", snap.prompt);
+             try gauge(w, "prefix_cache_hits_total", "counter", "Prompt tokens of finished requests restored from kept prompt states, under vLLM's name.", snap.cached);
+@@ -161,41 +149,9 @@ pub const Metrics = struct {
+         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+         if (status.cache) |c| try cacheFamilies(w, c);
+         if (status.kv_parts) |k| try kvPartFamilies(w, k);
+-        if (status.pool) |p| try poolFamilies(w, p);
+-        if (status.prefill_tokens) |t| {
+-            try gauge(w, "prompt_tokens_computed_total", "counter", "Prompt tokens this process has computed (monotone): a delta is the live prefill rate.", t);
+-            try gauge(w, "prefill_streams", "gauge", "Prompt passes open now.", status.prefilling);
+-            try gauge(w, "prefill_age_ms", "gauge", "How long the oldest open prompt pass has run, in milliseconds (0: none).", status.prefill_ms);
+-            try gauge(w, "prompt_prefill_done_tokens", "gauge", "Tokens the prompt pass filling now already has (0: no pass).", status.prefill_done);
+-            try gauge(w, "prompt_prefill_total_tokens", "gauge", "That prompt's whole length, in tokens (0: no pass).", status.prefill_total);
+-            try gauge(w, "prompt_chunk_tokens", "gauge", "Rows the last prompt chunk computed.", status.prefill_chunk_tokens);
+-            try gauge(w, "prompt_chunk_ns", "gauge", "The last prompt chunk's own duration, in nanoseconds.", status.prefill_chunk_ns);
+-            if (status.streams > 0) {
+-                try family(w, "stream_group", "gauge", "The conversation id of a live stream (0: grouping off).");
+-                for (status.stream_groups[0..@min(status.streams, status.stream_groups.len)], 0..) |g, i|
+-                    try w.print("{s}stream_group{{stream=\"{d}\"}} {d}\n", .{ prefix, i, g });
+-            }
+-            try gauge(w, "decode_round_tokens", "gauge", "Tokens the last decode round committed (one a stream, plus the drafts MTP accepted).", status.decode_round_tokens);
+-            try gauge(w, "decode_round_ns", "gauge", "The last decode round's own duration, in nanoseconds.", status.decode_round_ns);
+-            var any_pass = false;
+-            for (status.prefill_stream_total[0..@min(status.streams, status.prefill_stream_total.len)]) |tv| {
+-                if (tv > 0) any_pass = true;
+-            }
+-            if (any_pass) {
+-                try family(w, "prompt_stream_done_tokens", "gauge", "Tokens the prompt pass of this stream already has.");
+-                try family(w, "prompt_stream_total_tokens", "gauge", "That prompt's whole length (absent: the stream is not the one filling).");
+-                for (status.prefill_stream_total[0..@min(status.streams, status.prefill_stream_total.len)], 0..) |tot, i| {
+-                    if (tot == 0) continue;
+-                    try w.print("{s}prompt_stream_done_tokens{{stream=\"{d}\"}} {d}\n", .{ prefix, i, status.prefill_stream_done[i] });
+-                    try w.print("{s}prompt_stream_total_tokens{{stream=\"{d}\"}} {d}\n", .{ prefix, i, tot });
+-                }
+-            }
+-            if (status.kept_groups_n > 0) {
+-                try family(w, "kv_kept_group", "gauge", "Rows of the pool one conversation's kept prompt states hold (the most recently used).");
+-                for (status.kept_groups[0..status.kept_groups_n]) |k|
+-                    try w.print("{s}kv_kept_group{{group=\"{d}\"}} {d}\n", .{ prefix, k.group, k.rows });
+-            }
+-        }
++        // The session-level facts (per-stream context, group, prefill position, chunk speed, pool rows,
++        // kept-group rows) are NOT metrics any more: /snapshot carries them in one document with one timestamp.
++        // A gauge per question is what cost ten rebuilds in a night (2026-11-04).
+         if (status.pair) |p| try pairFamilies(w, p);
+     }
+ };
+diff --git a/zig/src/server/routes.zig b/zig/src/server/routes.zig
+index 276fd5f..b508311 100644
+--- a/zig/src/server/routes.zig
++++ b/zig/src/server/routes.zig
+@@ -48,6 +48,7 @@ fn get(srv: *Server, conn: *Conn, a: Allocator) void {
+     if (std.mem.eql(u8, route, "/metrics") or std.mem.eql(u8, route, "/v1/metrics")) return status.metrics(srv, conn, a);
+     if (std.mem.eql(u8, route, "/dashboard")) return status.dashboard(srv, conn, a);
+     if (std.mem.eql(u8, route, "/stats")) return status.stats(srv, conn, a);
++    if (std.mem.eql(u8, route, "/snapshot")) return status.snapshot(srv, conn, a) catch {};
+     if (route.len == 0 or std.mem.eql(u8, route, "/health")) return status.health(srv, conn, a) catch {};
+     if (std.mem.endsWith(u8, route, "/models")) return status.models(srv, conn, a) catch {};
+     unknown(conn, a);
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index 013ccd4..5024df0 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -43,6 +43,108 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     routes.sendValue(conn, a, code, .{ .object = o });
+ }
+ 
++/// GET /snapshot — everything the engine knows about its sessions, in ONE document with ONE timestamp.
++///
++/// The dashboard used to need a compiled gauge per question (pool rows, chunk speed, conversation ids,
++/// per-stream progress…): ten engine rebuilds in one night. This endpoint is the interface instead — new card
++/// facts are consumer-side work, and the schema is versioned so adding a key never breaks a reader.
++///   · `streams[]` is the session spine: `slot` is stable for the request's life, so a series can never switch
++///     conversation between scrapes; the request's own facts (prompt, cached, context, generated) travel with it.
++///   · `queue` says WHY requests wait, counted where each hold is decided.
++///   · `cache` carries the memory tier's budget, so "how full" has a denominator.
++/// Built on the request thread from state the engine thread already publishes; no walk, no allocation beyond the
++/// response body, and cheap enough to answer at 1 Hz.
++pub fn snapshot(srv: *Server, conn: *Conn, a: Allocator) !void {
++    var status: api.Status = .{};
++    srv.engine.status(&status, &.{});
++    const t = srv.metrics.totals(srv.io);
++    const o = try json.newObject(a);
++    try o.put(a, "schema_version", try json.intValue(a, 1));
++
++    const e = try json.newObject(a);
++    try e.put(a, "model", .{ .string = srv.config.served_name });
++    try e.put(a, "lanes", try json.intValue(a, srv.info.lanes));
++    try e.put(a, "prompt_cache", .{ .bool = srv.info.prompt_cache });
++    try e.put(a, "context_window", try json.intValue(a, srv.info.context_window));
++    try o.put(a, "engine", .{ .object = e });
++    const totals = try json.newObject(a);
++    try totals.put(a, "prompt_tokens_total", try json.intValue(a, t.prompt));
++    try totals.put(a, "prompt_tokens_cached_total", try json.intValue(a, t.cached));
++    try totals.put(a, "generation_tokens_total", try json.intValue(a, t.generation));
++    if (status.preemptions) |p| try totals.put(a, "preemptions_total", try json.intValue(a, p));
++    try o.put(a, "totals", .{ .object = totals });
++    const q = try json.newObject(a);
++    try q.put(a, "running", try json.intValue(a, status.running));
++    try q.put(a, "waiting", try json.intValue(a, status.waiting));
++    try q.put(a, "waiting_lane", try json.intValue(a, status.waiting_lane));
++    try q.put(a, "waiting_restore", try json.intValue(a, status.waiting_restore));
++    try q.put(a, "waiting_deferred", try json.intValue(a, status.waiting_deferred));
++    try q.put(a, "waiting_pool_room", try json.intValue(a, status.waiting_pool_room));
++    try q.put(a, "prefill_open", try json.intValue(a, status.prefilling));
++    try q.put(a, "prefill_oldest_ms", try json.intValue(a, status.prefill_ms));
++    try o.put(a, "queue", .{ .object = q });
++    const n = @min(status.streams, status.streams_detail.len);
++    const arr = try a.alloc(Value, n);
++    for (status.streams_detail[0..n], 0..) |d, i| {
++        const so = try json.newObject(a);
++        try so.put(a, "slot", try json.intValue(a, d.slot));
++        try so.put(a, "group", .{ .string = try std.fmt.allocPrint(a, "{d}", .{d.group}) });
++        try so.put(a, "state", .{ .string = if (d.state == .prefill) "prefill" else "decode" });
++        try so.put(a, "prompt_tokens", try json.intValue(a, d.prompt_tokens));
++        try so.put(a, "cached_tokens", try json.intValue(a, d.cached_tokens));
++        try so.put(a, "context_tokens", try json.intValue(a, d.context_tokens));
++        try so.put(a, "generated_tokens", try json.intValue(a, d.generated_tokens));
++        if (d.prefill_total > 0) {
++            const po = try json.newObject(a);
++            try po.put(a, "done_tokens", try json.intValue(a, d.prefill_done));
++            try po.put(a, "total_tokens", try json.intValue(a, d.prefill_total));
++            try so.put(a, "prefill", .{ .object = po });
++        }
++        arr[i] = .{ .object = so };
++    }
++    try o.put(a, "streams", .{ .array = arr });
++    if (status.pool) |p| {
++        const po = try json.newObject(a);
++        try po.put(a, "rows", try json.intValue(a, p.rows));
++        try po.put(a, "live_rows", try json.intValue(a, p.live));
++        try po.put(a, "kept_rows", try json.intValue(a, p.kept));
++        try po.put(a, "free_rows", try json.intValue(a, p.free));
++        const gn: usize = @intCast(status.kept_groups_n);
++        const gs = try a.alloc(Value, gn);
++        for (status.kept_groups[0..gn], 0..) |k, i| {
++            const go = try json.newObject(a);
++            try go.put(a, "group", .{ .string = try std.fmt.allocPrint(a, "{d}", .{k.group}) });
++            try go.put(a, "rows", try json.intValue(a, k.rows));
++            gs[i] = .{ .object = go };
++        }
++        try po.put(a, "groups", .{ .array = gs });
++        try o.put(a, "pool", .{ .object = po });
++    }
++    if (status.prefill_tokens) |computed| {
++        const pf = try json.newObject(a);
++        try pf.put(a, "computed_total", try json.intValue(a, computed));
++        try pf.put(a, "chunk_tokens", try json.intValue(a, status.prefill_chunk_tokens));
++        try pf.put(a, "chunk_ns", try json.intValue(a, status.prefill_chunk_ns));
++        try o.put(a, "prefill", .{ .object = pf });
++    }
++    if (status.cache) |c| {
++        const co = try json.newObject(a);
++        try co.put(a, "entries", try json.intValue(a, c.entries));
++        try co.put(a, "held_bytes", try json.intValue(a, c.held_bytes));
++        try co.put(a, "budget_bytes", try json.intValue(a, status.cache_budget_bytes));
++        try co.put(a, "spare_bytes", try json.intValue(a, status.cache_spare_bytes));
++        try co.put(a, "kept_total", try json.intValue(a, c.kept));
++        try co.put(a, "evicted_total", try json.intValue(a, c.evicted));
++        try co.put(a, "conversations", try json.intValue(a, status.conversations));
++        try co.put(a, "restored_tokens_total", try json.intValue(a, c.restored_tokens));
++        try co.put(a, "computed_tokens_total", try json.intValue(a, c.computed_tokens));
++        try co.put(a, "cached_tokens_total", try json.intValue(a, c.cached_tokens));
++        try o.put(a, "cache", .{ .object = co });
++    }
++    if (status.pair) |p| try putPair(a, o, p);
++    routes.sendValue(conn, a, 200, .{ .object = o });
++}
++
+ /// The token counts of finished requests, as /metrics counts them (the same totals, read together): `prompt_tokens_total`
+ /// (cached ones included), `cached_tokens_total` (the part restored from kept prompt states, only from an engine that
+ /// keeps some; the name a dashboard such as sparkDash reads) and `generation_tokens_total`. Computed prompt tokens are
+-- 
+2.43.0
+
