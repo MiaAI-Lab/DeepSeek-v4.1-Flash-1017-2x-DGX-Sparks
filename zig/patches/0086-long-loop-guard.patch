@@ -1,0 +1,330 @@
+# Backport of ashhart/TensorFold long-loop detector e9ba70f4b1c64152bacd287ae34ef5013206d8ad
+# and allocation safety follow-up 0ce409c75623ce6bcab73aadba7c8be2e52a4faa.
+# Upstream detector bytes unchanged; Stream.commit signature and reservation adapted to the pinned Mia TP2 engine.
+# Original authorship retained: BobClawblaw and upstream TensorFold maintainers.
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -7,6 +7,7 @@
+ const Proposer = @import("proposer.zig").Proposer;
+ const Sampling = @import("sampling.zig").Sampling;
+ const State = @import("depth.zig").State;
++const long_loop = @import("long_loop.zig");
+ 
+ pub const Reason = enum {
+     none,
+@@ -56,7 +57,8 @@
+     if (!s.loop_guard or !s.think_open or s.think_end < 0 or s.loop_period != null) return null;
+     for (tokens, 0..) |token, i| {
+         if (@as(i64, token) == s.think_end) return null;
+-        if (cycleAt(s.emitted(), tokens, s.emitted().len + i + 1) != null) return i;
++        const n = s.emitted().len + i + 1;
++        if (cycleAt(s.emitted(), tokens, n) != null or s.long_loop.cycleAt(s.emitted(), tokens, n) != null) return i;
+     }
+     return null;
+ }
+@@ -176,6 +178,7 @@
+     think_open: bool,
+     loop_guard: bool,
+     loop_period: ?u32 = null,
++    long_loop: long_loop.Index = .{},
+     chunks: []const u32,
+     reuse: Reuse = .{},
+     images: []const Image = &.{},
+@@ -255,6 +258,7 @@
+         if (s.gate) |*g| g.deinit(gpa);
+         s.context.deinit(gpa);
+         s.force.deinit(gpa);
++        s.long_loop.deinit(gpa);
+         s.dropRoundState(gpa);
+     }
+ 
+@@ -287,6 +291,14 @@
+ 
+     pub fn emitted(s: *const Stream) []const u32 {
+         return s.context.items[s.prompt_len..];
++    }
++
++    /// Check the latest committed run, then index it without allocating after publication.
++    fn longCycle(s: *Stream) ?u32 {
++        const e = s.emitted();
++        const period = s.long_loop.cycleAt(e, &.{}, e.len);
++        s.long_loop.addAssumeCapacity(e);
++        return period;
+     }
+ 
+     pub fn budgetLeft(s: *const Stream) i64 {
+@@ -424,6 +436,17 @@
+ 
+     /// Append tokens until the stream finishes; how many landed (a prefix of `tokens`).
+     pub fn commit(s: *Stream, gpa: Allocator, tokens: []const u32) !usize {
++        // Backport 0ce409c: reserve before any token, gate, or forced-close state is published.
++        if (tokens.len > 0 and !s.finished and s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) {
++            try s.context.ensureUnusedCapacity(gpa, tokens.len);
++            try s.force.ensureTotalCapacity(gpa, s.think_close.len);
++            var end: usize = 0;
++            for (tokens) |t| {
++                if (@as(i64, t) == s.think_end) break;
++                end += 1;
++            }
++            try s.long_loop.reserve(gpa, s.emitted().len + end);
++        }
+         var landed: usize = 0;
+         for (tokens) |t| {
+             if (s.finished) break;
+@@ -431,7 +454,8 @@
+             landed += 1;
+             if (s.gate) |*g| g.observe(gpa, t) catch return error.OutOfMemory;
+             if (@as(i64, t) == s.think_end) s.think_open = false;
+-            const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
++            const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
++            const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
+             if (s.isEos(t) or s.stopped()) {
+                 s.finished = true;
+                 s.reason = .stop;
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -31,6 +31,9 @@
+ test {
+     std.testing.refAllDecls(@This());
+     _ = @import("engine_test.zig");
++    _ = @import("long_loop.zig");
++    _ = @import("long_loop_test.zig");
++    _ = @import("long_loop_backport_test.zig");
+     _ = @import("gpu_full_test.zig");
+     _ = @import("calibration_test.zig");
+ }
+--- /dev/null
++++ b/zig/src/core/lanes/long_loop.zig
+@@ -0,0 +1,115 @@
++//! Long reasoning loops: a passage repeated verbatim, found from where each `gram`-token run of the reasoning ended.
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++
++/// Tokens a run is hashed over; the shortest period looked for (shorter ones are stream.zig's short cycles).
++pub const gram = 32;
++pub const min_period = 9;
++/// The repeat that fires: a whole period, and at least this many tokens, each equal to the one a period before.
++pub const min_repeat = 1024;
++
++/// Each indexed run's end (an emitted() position) chained to the previous end with the same hash.
++pub const Index = struct {
++    last: std.AutoHashMapUnmanaged(u64, u32) = .empty,
++    prev: std.ArrayList(u32) = .empty, // prev[n]: the previous end with run n's hash (0: none)
++    upto: usize = 0, // positions indexed so far: run ends in [gram, upto]
++
++    pub fn deinit(x: *Index, gpa: Allocator) void {
++        x.last.deinit(gpa);
++        x.prev.deinit(gpa);
++    }
++
++    /// Reserve every possible new run before publishing tokens or changing the index's logical state.
++    pub fn reserve(x: *Index, gpa: Allocator, upto: usize) !void {
++        if (upto <= x.upto) return;
++        try x.prev.ensureTotalCapacity(gpa, upto);
++        const first = @max(x.upto, gram - 1);
++        if (upto > first) try x.last.ensureUnusedCapacity(gpa, @intCast(upto - first));
++    }
++
++    /// Index every run end up to `tokens.len` (tokens: emitted(), committed only).
++    pub fn add(x: *Index, gpa: Allocator, tokens: []const u32) !void {
++        try x.reserve(gpa, tokens.len);
++        x.addAssumeCapacity(tokens);
++    }
++
++    /// Commit runs after reserve succeeded, without an allocation that could fail after token publication.
++    pub fn addAssumeCapacity(x: *Index, tokens: []const u32) void {
++        while (x.upto < tokens.len) {
++            x.upto += 1;
++            x.prev.appendAssumeCapacity(0);
++            if (x.upto < gram) continue;
++            const got = x.last.getOrPutAssumeCapacity(hash(tokens, &.{}, x.upto));
++            x.prev.items[x.upto - 1] = if (got.found_existing) got.value_ptr.* else 0;
++            got.value_ptr.* = @intCast(x.upto);
++        }
++    }
++
++    /// The period back to the run's latest end `min_period`+ back, if max(period, min_repeat) tokens repeat it.
++    pub fn cycleAt(x: *const Index, head: []const u32, tail: []const u32, n: usize) ?u32 {
++        if (n < gram + min_period) return null;
++        var q: u32 = x.last.get(hash(head, tail, n)) orelse return null;
++        while (q > 0 and q + min_period > n) q = x.prev.items[q - 1];
++        if (q == 0) return null;
++        const p = n - q;
++        const need = @max(p, min_repeat);
++        if (n < need + p) return null;
++        for (1..need + 1) |k| if (at(head, tail, n - k) != at(head, tail, n - k - p)) return null;
++        return @intCast(p);
++    }
++};
++
++fn at(head: []const u32, tail: []const u32, i: usize) u32 {
++    return if (i < head.len) head[i] else tail[i - head.len];
++}
++
++/// The run of `gram` tokens ending at position n.
++fn hash(head: []const u32, tail: []const u32, n: usize) u64 {
++    var h = std.hash.Wyhash.init(0x6c6f6f70);
++    for (n - gram..n) |i| h.update(std.mem.asBytes(&at(head, tail, i)));
++    return h.final();
++}
++
++/// Where the cycle fires in `prefix` unrelated tokens then a `period`-token passage repeated, `step` tokens a round.
++fn fireAt(gpa: Allocator, prefix: usize, period: usize, total: usize, step: usize) !?usize {
++    var prng = std.Random.DefaultPrng.init(period);
++    const r = prng.random();
++    var tokens: std.ArrayList(u32) = .empty;
++    defer tokens.deinit(gpa);
++    for (0..prefix) |_| try tokens.append(gpa, r.int(u32));
++    var passage: std.ArrayList(u32) = .empty;
++    defer passage.deinit(gpa);
++    for (0..period) |_| try passage.append(gpa, r.int(u32));
++    while (tokens.items.len < total) try tokens.append(gpa, passage.items[(tokens.items.len - prefix) % period]);
++    var x: Index = .{};
++    defer x.deinit(gpa);
++    var done: usize = 0;
++    while (done < total) {
++        const w = @min(step, total - done);
++        const head = tokens.items[0..done];
++        for (0..w) |i| if (x.cycleAt(head, tokens.items[done..][0..w], done + i + 1)) |p| {
++            try std.testing.expectEqual(@as(u32, @intCast(period)), p);
++            return done + i + 1;
++        };
++        done += w;
++        try x.add(gpa, tokens.items[0..done]);
++    }
++    return null;
++}
++
++test "a repeated passage fires once a whole period and 1,024 tokens repeat, at the same token in windows" {
++    const gpa = std.testing.allocator;
++    // 4,500-token passage: fires when its second copy completes
++    try std.testing.expectEqual(@as(?usize, 3000 + 2 * 4500), try fireAt(gpa, 3000, 4500, 20000, 1));
++    try std.testing.expectEqual(@as(?usize, 3000 + 2 * 4500), try fireAt(gpa, 3000, 4500, 20000, 6));
++    // 100-token passage: 1,024 repeated tokens past its first copy
++    try std.testing.expectEqual(@as(?usize, 500 + 100 + 1024), try fireAt(gpa, 500, 100, 5000, 1));
++    try std.testing.expectEqual(@as(?usize, 500 + 100 + 1024), try fireAt(gpa, 500, 100, 5000, 6));
++}
++
++test "no long cycle in text that does not repeat, or that repeats less than the rule asks" {
++    const gpa = std.testing.allocator;
++    try std.testing.expectEqual(@as(?usize, null), try fireAt(gpa, 20000, 1, 20000, 1));
++    // a 3,000-token passage written twice but cut 1 token short of its second copy
++    try std.testing.expectEqual(@as(?usize, null), try fireAt(gpa, 100, 3000, 100 + 2 * 3000 - 1, 6));
++}
+--- /dev/null
++++ b/zig/src/core/lanes/long_loop_test.zig
+@@ -0,0 +1,36 @@
++//! The loop guard on a long repeated passage: the reasoning closes at one token, a token at a time or in windows.
++const std = @import("std");
++const stream = @import("stream.zig");
++const long_loop = @import("long_loop.zig");
++
++/// The emitted length where the guard fired on a repeated 300-token passage, `step` tokens a round.
++fn closesAt(step: usize) !usize {
++    const gpa = std.testing.allocator;
++    var prng = std.Random.DefaultPrng.init(3);
++    const r = prng.random();
++    var tokens: std.ArrayList(u32) = .empty;
++    defer tokens.deinit(gpa);
++    for (0..200) |_| try tokens.append(gpa, 1000 + r.uintLessThan(u32, 50000));
++    var passage: [300]u32 = undefined;
++    for (&passage) |*t| t.* = 1000 + r.uintLessThan(u32, 50000);
++    while (tokens.items.len < 4000) try tokens.append(gpa, passage[(tokens.items.len - 200) % passage.len]);
++    var s = try stream.Stream.init(gpa, .{ .id = "long", .prompt = &.{1}, .max_new = 8000, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
++    defer s.deinit(gpa);
++    var at: usize = 0;
++    while (at < tokens.items.len and s.loop_period == null) {
++        const window = tokens.items[at..@min(at + step, tokens.items.len)];
++        const take = if (stream.loopCut(&s, window)) |cut| window[0 .. cut + 1] else window;
++        _ = try s.commit(gpa, take);
++        at += take.len;
++    }
++    try std.testing.expectEqual(@as(?u32, passage.len), s.loop_period);
++    try std.testing.expect(!s.think_open and std.mem.eql(u32, s.force.items, &.{ 90, 91, 92 }));
++    return s.emitted().len;
++}
++
++test "the loop guard closes a long repeated passage's reasoning at one token, a token at a time or in windows" {
++    // a 300-token passage repeats from token 200: 1,024 repeated tokens after its first copy
++    const want = 200 + 300 + long_loop.min_repeat;
++    try std.testing.expectEqual(want, try closesAt(1));
++    try std.testing.expectEqual(want, try closesAt(6));
++}
+--- /dev/null
++++ b/zig/src/core/lanes/long_loop_backport_test.zig
+@@ -0,0 +1,75 @@
++//! Backport safety: history retention, guard-off identity, and failed reservation before publication.
++const std = @import("std");
++const Stream = @import("stream.zig").Stream;
++const a = std.testing.allocator;
++const close = [_]u32{ 90, 91, 92 };
++
++test "history is not indexed or rewritten and healthy output is unchanged" {
++    var prompt: [3200]u32 = undefined;
++    for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + i % 300);
++    var tokens: [3000]u32 = undefined;
++    for (&tokens, 0..) |*t, i| t.* = @intCast(10000 + i);
++    var s = try Stream.init(a, .{ .id = "history retained", .prompt = &prompt, .max_new = 5000, .think_close = &close, .think_end = 91, .loop_guard = true });
++    defer s.deinit(a);
++    try std.testing.expectEqual(@as(usize, tokens.len), try s.commit(a, &tokens));
++    try std.testing.expectEqualSlices(u32, &prompt, s.prompt());
++    try std.testing.expectEqualSlices(u32, &tokens, s.emitted());
++    try std.testing.expect(s.loop_period == null and s.force.items.len == 0 and s.think_open);
++}
++
++test "disabled guard does not allocate an index or change output" {
++    var s = try Stream.init(a, .{ .id = "disabled", .prompt = &.{1}, .max_new = 3000, .think_close = &close, .think_end = 91, .loop_guard = false });
++    defer s.deinit(a);
++    const tokens: [2048]u32 = @splat(7);
++    try s.context.ensureUnusedCapacity(a, tokens.len);
++    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
++    try std.testing.expectEqual(tokens.len, try s.commit(fail.allocator(), &tokens));
++    try std.testing.expect(!fail.has_induced_failure and s.long_loop.upto == 0 and s.long_loop.prev.capacity == 0);
++    try std.testing.expect(s.loop_period == null);
++    try std.testing.expectEqualSlices(u32, &tokens, s.emitted());
++}
++
++fn failedReservation(map: bool) !void {
++    var s = try Stream.init(a, .{ .id = "reserve", .prompt = &.{ 1, 2 }, .max_new = 200, .think_close = &close, .think_end = 91, .loop_guard = true });
++    defer s.deinit(a);
++    const tokens: [33]u32 = @splat(7);
++    try s.context.ensureUnusedCapacity(a, tokens.len);
++    try s.force.append(a, 9);
++    try s.force.ensureTotalCapacity(a, close.len);
++    if (map) try s.long_loop.prev.ensureTotalCapacity(a, tokens.len);
++    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
++    try std.testing.expectError(error.OutOfMemory, s.commit(fail.allocator(), &tokens));
++    try std.testing.expect(fail.has_induced_failure);
++    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, s.context.items);
++    try std.testing.expectEqualSlices(u32, &.{9}, s.force.items);
++    try std.testing.expect(s.think_open and !s.finished and s.loop_period == null);
++    try std.testing.expect(s.long_loop.upto == 0 and s.long_loop.prev.items.len == 0 and s.long_loop.last.count() == 0);
++    try std.testing.expectEqual(tokens.len, try s.commit(a, &tokens));
++    try std.testing.expectEqualSlices(u32, &tokens, s.emitted());
++}
++
++test "index vector failure preserves stream state and retry" {
++    try failedReservation(false);
++}
++test "index map failure preserves stream state and retry" {
++    try failedReservation(true);
++}
++
++test "empty and finished commits allocate no detector storage" {
++    var s = try Stream.init(a, .{ .id = "no-op", .prompt = &.{1}, .max_new = 10, .think_close = &close, .think_end = 91, .loop_guard = true });
++    defer s.deinit(a);
++    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
++    try std.testing.expectEqual(@as(usize, 0), try s.commit(fail.allocator(), &.{}));
++    s.finished = true;
++    try std.testing.expectEqual(@as(usize, 0), try s.commit(fail.allocator(), &.{7}));
++    try std.testing.expect(!fail.has_induced_failure and s.long_loop.upto == 0);
++}
++
++test "answer after the think closer is not watched by the guard" {
++    var s = try Stream.init(a, .{ .id = "answer", .prompt = &.{1}, .max_new = 5000, .think_close = &close, .think_end = 91, .loop_guard = true });
++    defer s.deinit(a);
++    try std.testing.expectEqual(@as(usize, 4), try s.commit(a, &.{ 2, 3, 4, 91 }));
++    const answer: [2000]u32 = @splat(7);
++    try std.testing.expectEqual(answer.len, try s.commit(a, &answer));
++    try std.testing.expect(s.loop_period == null and s.long_loop.upto == 3 and !s.think_open);
++}

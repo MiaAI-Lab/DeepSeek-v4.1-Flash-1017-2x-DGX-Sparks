@@ -102,3 +102,5 @@ without writing.
 conversation's) is gone: the pin moved to `629c524`, whose `lanes.zig` does this itself (`placeSoft` leaves each kept extent room to grow, a
 conversation that shares a prefix copies the shared rows to a free extent, `9f82099`/`629c524`), and the patch no longer applies to it. A
 `TF_DS_CACHE_PLACEMENT` in your `scripts/local.sh` is ignored now.
+
+`0086-long-loop-guard.patch` backports ashhart/TensorFold e9ba70f and allocation-safety follow-up 0ce409c (BobClawblaw and TensorFold maintainers). The detector bytes are unchanged. Opt in through `LOOP_GUARD=1`; default off.

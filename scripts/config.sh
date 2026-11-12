@@ -132,6 +132,8 @@ POOL="${POOL:-}"
 PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams, TF_DS_STREAMS; the family measured 4)
 ROUND_ROWS="${ROUND_ROWS:-}"           # empty or 16: the pinned kit only has row kernels through 16 (issue #23)
 MAX_TOKENS="${MAX_TOKENS:-32768}"      # a reply's budget when a request sets none
+# Opt-in verbatim reasoning-loop mitigation; closes reasoning and continues the reply.
+LOOP_GUARD="${LOOP_GUARD:-0}"
 THINKING="${THINKING:-1}"              # think first unless a request turns it off
 # The reasoning effort when a request names none: low, medium, high or xhigh (empty: the chat template's default)
 REASONING_EFFORT="${REASONING_EFFORT:-}"

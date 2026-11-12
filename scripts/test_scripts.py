@@ -319,6 +319,20 @@ detect_links() {
     def prepared(self):
         return (self.sim / "events").exists()
 
+    def test_loop_guard_is_opt_in_and_retains_history_policy(self):
+        for enabled in ("0", "1"):
+            with self.subTest(enabled=enabled):
+                code, out = self.run_script(["start.sh", "restart"], {"LOOP_GUARD": enabled, "DROP_REASONING_HISTORY": "0"})
+                self.assertEqual(code, 0, out)
+                log = (self.sim / "docker.log").read_text()
+                head = [line for line in log.splitlines() if line.startswith("head docker run -d ")][-1]
+                self.assertEqual("--loop-guard" in head.split(), enabled == "1")
+                self.assertNotIn("--drop-reasoning-history", head)
+                self.assertNotIn("--loop-guard-stop", head)
+        code, out = self.run_script(["start.sh"], {"LOOP_GUARD": "bad"})
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("LOOP_GUARD is 0 or 1", out)
+
     def test_restart_starts_every_rank(self):
         for h in ["head", "w1"]:
             self.containers(h, NAME)
