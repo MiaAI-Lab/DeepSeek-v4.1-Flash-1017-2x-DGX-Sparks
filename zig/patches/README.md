@@ -102,3 +102,18 @@ without writing.
 conversation's) is gone: the pin moved to `629c524`, whose `lanes.zig` does this itself (`placeSoft` leaves each kept extent room to grow, a
 conversation that shares a prefix copies the shared rows to a free extent, `9f82099`/`629c524`), and the patch no longer applies to it. A
 `TF_DS_CACHE_PLACEMENT` in your `scripts/local.sh` is ignored now.
+
+## Optional spill expiry and host-memory admission floor
+
+`0087-spill-expiry-memory-floor.patch` adds `SPILL_TTL_H` (creation age in hours)
+and `SPILL_MEM_FLOOR_GIB` (host `MemAvailable` floor) with spill enabled. Both
+default to zero, preserving current retention and admission. Example: set
+`SPILL_TTL_H=24` and `SPILL_MEM_FLOOR_GIB=3.5` alongside `SPILL_GIB`.
+
+The memory check includes the configured staging reserve, refuses new writes,
+lookups and reads when memory is insufficient or unknown, and allows admitted
+operations to finish. Expired points are excluded from lookup/read; cache access
+prunes unpinned expired points. This is not a background deletion timer, a
+secure-erasure feature or a guarantee against host OOM. Creation age persists
+across restarts. No cache-format change is introduced. The same values reach
+both ranks. See `docs/spill-protections.md` for validation scope.

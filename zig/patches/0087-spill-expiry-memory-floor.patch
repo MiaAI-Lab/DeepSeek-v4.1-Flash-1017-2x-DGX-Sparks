@@ -1,0 +1,307 @@
+# Optional spill creation-age expiry and host-memory admission. Both default off.
+# New admissions fail closed below floor plus staging reserve; existing operations finish.
+diff --git a/zig/src/core/spill/fsio.zig b/zig/src/core/spill/fsio.zig
+index 498996e..0bcb79d 100644
+--- a/zig/src/core/spill/fsio.zig
++++ b/zig/src/core/spill/fsio.zig
+@@ -33,6 +33,7 @@ pub const Hooks = struct {
+     event: ?*const fn (ctx: ?*anyopaque, ev: Event, name: []const u8) void = null,
+     /// Overrides the free bytes of the store's file system.
+     free: ?*const fn (ctx: ?*anyopaque) u64 = null,
++    mem_available: ?*const fn (ctx: ?*anyopaque) ?u64 = null,
+     /// O_DIRECT opens fail with EINVAL (a file system without it).
+     no_direct: bool = false,
+     /// Counts every name the open's scan reads (a caller on another thread watches a long scan: a follower's open
+diff --git a/zig/src/core/spill/store.zig b/zig/src/core/spill/store.zig
+index d6d9887..7c4a0ee 100644
+--- a/zig/src/core/spill/store.zig
++++ b/zig/src/core/spill/store.zig
+@@ -68,6 +68,11 @@ pub const Config = struct {
+     limits: format.Limits,
+     /// Bytes this rank's store may hold.
+     cap_bytes: u64,
++    /// Maximum age since creation (0: upstream retention only).
++    ttl_ns: i96 = 0,
++    /// Refuse new reads and writes below this MemAvailable plus the staging reserve.
++    memory_floor: u64 = 0,
++    memory_reserve: u64 = 0,
+     /// No write leaves less than this free on the store's file system.
+     floor_bytes: u64 = 50 << 30,
+     /// A conversation holding more than this fraction of the cap trims its own old turns and forks first (0: off).
+@@ -1258,7 +1263,37 @@ pub const Store = struct {
+     /// At an eligible keep: queue the point's missing blocks (left in device memory; `stage` asks for them between
+     /// rounds), reserve its small state's slot (and a tail block's), or say why not. Ids stored or on their way are
+     /// not written again; kept again as a shared prefix their point becomes shared, durably.
++    fn expire(s: *Store) void {
++        if (s.cfg.ttl_ns == 0) return;
++        s.lockS();
++        defer s.unlockS();
++        const now_ns = s.now();
++        while (true) {
++            var key: ?Digest = null;
++            var it = s.points.iterator();
++            while (it.next()) |e| {
++                if (!s.reading.contains(e.key_ptr.*) and s.isExpired(e.value_ptr.*, now_ns)) {
++                    key = e.key_ptr.*;
++                    break;
++                }
++            }
++            s.remove(key orelse break, "dropped");
++        }
++    }
++
++    fn isExpired(s: *Store, p: *const Point, now_ns: i96) bool {
++        return s.cfg.ttl_ns > 0 and now_ns - @as(i96, p.created_ns) > s.cfg.ttl_ns;
++    }
++
++    fn memoryReady(s: *Store) bool {
++        if (s.cfg.memory_floor == 0) return true;
++        const available = if (s.hooks.mem_available) |f| f(s.hooks.ctx) else memoryAvailable();
++        return if (available) |v| v >= s.cfg.memory_floor +| s.cfg.memory_reserve else false;
++    }
++
+     pub fn keep(s: *Store, k: Keep) KeepResult {
++        if (!s.memoryReady()) return s.refuse(.no_staging);
++        s.expire();
+         const gpa = s.gpa;
+         const l = s.cfg.limits;
+         const at: u32 = @intCast(@min(k.keyed.len, std.math.maxInt(u32)));
+@@ -2244,6 +2279,8 @@ pub const Store = struct {
+     /// null. Points being written do not count. The prompt's block chain is hashed outside the lock, only as far as
+     /// the longest candidate needs; the comparison under it is digests and a tail of ids.
+     pub fn lookup(s: *Store, q: Query) ?Hit {
++        if (!s.memoryReady()) return null;
++        s.expire();
+         const gpa = s.gpa;
+         const block = s.cfg.limits.block_tokens;
+         var need: usize = 0;
+@@ -2273,7 +2310,7 @@ pub const Store = struct {
+         var it = s.points.valueIterator();
+         while (it.next()) |pp| {
+             const p = pp.*;
+-            if (!eligible(p, q) or p.chain.len > chain.len) continue;
++            if (s.isExpired(p, s.now()) or !eligible(p, q) or p.chain.len > chain.len) continue;
+             if (best != null and (p.at < best.?.at or (p.at == best.?.at and p.used <= best.?.used))) continue;
+             var same = true;
+             for (p.chain, chain[0..p.chain.len]) |a, b| if (!std.mem.eql(u8, &a, &b)) {
+@@ -2362,11 +2399,12 @@ pub const Store = struct {
+     /// they come free (several restores share the slots fairly). The point is pinned against eviction until
+     /// `endRead`. NoSlot / TooMany: defer the restore.
+     pub fn beginRead(s: *Store, key: Digest) BeginError!ReadId {
++        if (!s.memoryReady()) return error.NoSlot;
+         const gpa = s.gpa;
+         s.lockS();
+         defer s.unlockS();
+         const p = s.points.get(key) orelse return error.Missing;
+-        if (!s.complete_(p)) return error.Missing;
++        if (s.isExpired(p, s.now()) or !s.complete_(p)) return error.Missing;
+         if (s.liveReads() >= s.cfg.max_reads) {
+             s.counters.read_deferred += 1;
+             return error.TooMany;
+@@ -2906,3 +2944,17 @@ pub const Store = struct {
+         return out;
+     }
+ };
++
++fn memoryAvailable() ?u64 {
++    const fd = c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY }, @as(c.mode_t, 0));
++    if (fd < 0) return null;
++    defer _ = c.close(fd);
++    var buf: [4096]u8 = undefined;
++    const n = c.read(fd, &buf, buf.len);
++    if (n <= 0) return null;
++    const text = buf[0..@intCast(n)];
++    const at = std.mem.indexOf(u8, text, "MemAvailable:") orelse return null;
++    var it = std.mem.tokenizeAny(u8, text[at + "MemAvailable:".len ..], " \n");
++    const kb = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
++    return std.math.mul(u64, kb, 1024) catch null;
++}
+diff --git a/zig/src/core/spill/store_test.zig b/zig/src/core/spill/store_test.zig
+index 57ece3a..d44e99c 100644
+--- a/zig/src/core/spill/store_test.zig
++++ b/zig/src/core/spill/store_test.zig
+@@ -1829,3 +1829,81 @@ test "spill store mutants: every authored fix switched back off is caught" {
+     try testing.expectEqual(@as(usize, 0), survived);
+     try testing.expectEqual(@as(usize, 0), crashes);
+ }
++
++fn compatLowMemory(_: ?*anyopaque) ?u64 {
++    return 1535;
++}
++fn compatEnoughMemory(_: ?*anyopaque) ?u64 {
++    return 1536;
++}
++fn compatUnknownMemory(_: ?*anyopaque) ?u64 {
++    return null;
++}
++
++test "cache migration expiry survives restart and permits fresh replacement" {
++    const h = try H.init(testing.allocator, .{ .tag = "migration-expiry", .turns = 0 });
++    defer h.deinit();
++    const ids = try idsOf(testing.allocator, 64, 9091);
++    defer testing.allocator.free(ids);
++    const key = try write(h, ids, .{ .lineage = lin(91), .source = 91 });
++    const query: store.Query = .{ .keyed = ids, .max_at = 64 };
++    try testing.expect(h.s.lookup(query) != null);
++    h.cfg.ttl_ns = 1;
++    try h.reopen();
++    try testing.expectError(error.Missing, h.s.beginRead(key));
++    try testing.expect(h.s.lookup(query) == null);
++    try testing.expect(settle(h).done);
++    h.s.cfg.ttl_ns = 24 * 3600 * std.time.ns_per_s;
++    const renewed = try write(h, ids, .{ .lineage = lin(91), .source = 91 });
++    try testing.expectEqualSlices(u8, &key, &renewed);
++    try testing.expect(h.s.lookup(query) != null);
++}
++
++test "cache migration low memory blocks new reads and writes without destroying a healthy cache" {
++    const h = try H.init(testing.allocator, .{ .tag = "migration-memory", .turns = 0 });
++    defer h.deinit();
++    const ids = try idsOf(testing.allocator, 64, 9092);
++    defer testing.allocator.free(ids);
++    const key = try write(h, ids, .{ .lineage = lin(92), .source = 92 });
++    const query: store.Query = .{ .keyed = ids, .max_at = 64 };
++    h.s.cfg.memory_floor = 1024;
++    h.s.cfg.memory_reserve = 512;
++    h.s.hooks.mem_available = compatLowMemory;
++    try testing.expect(keepIds(h, ids, .{ .lineage = lin(92), .source = 92 }) == .no_staging);
++    try testing.expect(h.s.lookup(query) == null);
++    try testing.expectError(error.NoSlot, h.s.beginRead(key));
++    h.s.hooks.mem_available = compatUnknownMemory;
++    try testing.expect(h.s.lookup(query) == null);
++    h.s.hooks.mem_available = compatEnoughMemory;
++    try testing.expect(h.s.lookup(query) != null);
++    const restored = (try restore(h, key)).?;
++    defer testing.allocator.free(restored);
++    try testing.expectEqualSlices(u8, h.src(92)[0 .. 64 * bpt], restored);
++}
++
++
++test "cache policy leaves an admitted read pinned after expiry" {
++    const h = try H.init(testing.allocator, .{ .tag = "policy-pinned-expiry", .turns = 0 });
++    defer h.deinit();
++    const ids = try idsOf(testing.allocator, 64, 9093);
++    defer testing.allocator.free(ids);
++    const key = try write(h, ids, .{ .lineage = lin(93), .source = 93 });
++    const id = try h.s.beginRead(key);
++    h.s.cfg.ttl_ns = 1;
++    try testing.expect(h.s.lookup(.{ .keyed = ids, .max_at = 64 }) == null);
++    try testing.expect(h.s.points.contains(key));
++    _ = try h.s.endRead(id, .cancel);
++}
++
++test "cache policy disabled ignores unavailable memory" {
++    const h = try H.init(testing.allocator, .{ .tag = "policy-defaults", .turns = 0 });
++    defer h.deinit();
++    h.s.hooks.mem_available = compatUnknownMemory;
++    const ids = try idsOf(testing.allocator, 64, 9094);
++    defer testing.allocator.free(ids);
++    const key = try write(h, ids, .{ .lineage = lin(94), .source = 94 });
++    try testing.expect(h.s.lookup(.{ .keyed = ids, .max_at = 64 }) != null);
++    const restored = (try restore(h, key)).?;
++    defer testing.allocator.free(restored);
++    try testing.expect(restored.len > 0);
++}
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 51644e4..fa50840 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -441,6 +441,7 @@ pub fn spillSettings(dir: []const u8, gib: f64, min_free_gib: f64, quota: f64, m
+     var s: spill_tier.Settings = .{ .dir = dir, .gib = gib, .min_free_gib = min_free_gib, .quota = quota, .min_tokens = min_tokens, .turns = turns, .flush_ms = flush_ms };
+     if (getenv("TF_DS_SPILL_STAGING_MIB")) |v| s.staging_mib = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return error.BadSpillSetting;
+     if (s.staging_mib < spill_tier.min_staging_mib) return error.BadSpillSetting;
++    try s.readCompatibility(getenvFn);
+     s.image_cache = spill_tier.Settings.imageCache(getenv("TF_DS_IMAGE_CACHE")); // (pictures' points: the fingerprint's reading)
+     return s;
+ }
+diff --git a/zig/src/families/dsv41/spill_tier.zig b/zig/src/families/dsv41/spill_tier.zig
+index 6254b31..e9b636f 100644
+--- a/zig/src/families/dsv41/spill_tier.zig
++++ b/zig/src/families/dsv41/spill_tier.zig
+@@ -48,6 +48,8 @@ pub const Settings = struct {
+     quota: f64 = 0,
+     min_tokens: u32 = 8192,
+     turns: u32 = 4,
++    ttl_s: u64 = 0,
++    memory_floor: u64 = 0,
+     flush_ms: u32 = 60_000,
+     /// Pinned host staging for every write, read and small state together (the plan's 128 MiB a rank).
+     staging_mib: u32 = 128,
+@@ -93,6 +95,7 @@ pub const Settings = struct {
+         s.quota = try num(f64, flag("--spill-quota") orelse env("TF_DS_SPILL_QUOTA"), s.quota);
+         s.staging_mib = try num(u32, flag("--spill-staging-mib") orelse env("TF_DS_SPILL_STAGING_MIB"), s.staging_mib);
+         s.turns = try num(u32, env("TF_SPILL_TURNS"), s.turns);
++        try s.readCompatibility(env);
+         s.image_cache = imageCache(env("TF_DS_IMAGE_CACHE"));
+         s.flush_ms = try num(u32, env("TF_SPILL_FLUSH_MS"), s.flush_ms);
+         if (!std.math.isFinite(s.gib) or !std.math.isFinite(s.quota) or s.quota < 0 or s.quota > 1) return error.BadSpillSetting;
+@@ -100,6 +103,14 @@ pub const Settings = struct {
+         return s;
+     }
+ 
++    pub fn readCompatibility(s: *Settings, env: *const fn ([:0]const u8) ?[]const u8) !void {
++        const hours = try num(f64, env("TF_DS_SPILL_TTL_H"), 0);
++        const floor = try num(f64, env("TF_DS_SPILL_MEM_FLOOR_GIB"), 0);
++        if (!std.math.isFinite(hours) or !std.math.isFinite(floor) or hours < 0 or hours > 87600 or floor < 0 or floor > 1024) return error.BadSpillSetting;
++        s.ttl_s = @intFromFloat(hours * 3600);
++        s.memory_floor = @intFromFloat(floor * (1 << 30));
++    }
++
+     /// TF_DS_IMAGE_CACHE's value: on unless "0" (the server's and the fingerprint's reading).
+     pub fn imageCache(v: ?[]const u8) bool {
+         return pc.imageCacheOn(v); // (the server's reading too: exactly "0" is off)
+@@ -389,6 +400,9 @@ pub fn Side(comptime Dev: type) type {
+                 .owner_layout = storeLayout(&layout),
+                 .limits = .{ .max_tokens = max_tokens, .block_tokens = self.bt, .block_bytes = layout.block_bytes, .foreign_block_bytes = if (sharded) layout.foreign_block_bytes else 0, .own_part = rank, .max_small_bytes = std.mem.alignForward(u64, layout.small_bytes, 256) },
+                 .cap_bytes = s.capBytes(),
++                .ttl_ns = @as(i96, s.ttl_s) * std.time.ns_per_s,
++                .memory_floor = s.memory_floor,
++                .memory_reserve = s.stagingBytes(),
+                 .floor_bytes = s.floorBytes(),
+                 .quota = s.quota,
+                 .turns = s.turns,
+@@ -432,7 +446,7 @@ pub fn Side(comptime Dev: type) type {
+ 
+         /// The event of the slot a store-given slice starts in (small and restore slots: Queued.small, SmallView).
+         fn addrEvent(self: *const Self, pool: spill.slots.Pool, bytes: []const u8) u32 {
+-            const region = self.regions[@intFromEnum(pool)];
++            const region = self.regions[@backingInt(pool)];
+             const per = if (pool == .write or pool == .read) self.plan.block_slot else self.plan.small_slot;
+             const i = (@intFromPtr(bytes.ptr) - @intFromPtr(region.ptr)) / per;
+             return self.slotEvent(.{ .pool = pool, .index = @intCast(i) });
+@@ -2015,3 +2029,35 @@ const testing = std.testing;
+ test {
+     _ = @import("spill_tier_test.zig");
+ }
++
++test "cache migration parses the same expiry and memory guard on both ranks" {
++    const Env = struct {
++        fn get(key: [:0]const u8) ?[]const u8 {
++            if (std.mem.eql(u8, key, "TF_DS_SPILL_TTL_H")) return "24";
++            if (std.mem.eql(u8, key, "TF_DS_SPILL_MEM_FLOOR_GIB")) return "3.5";
++            return null;
++        }
++        fn bad(_: [:0]const u8) ?[]const u8 { return "nan"; }
++    };
++    var s: Settings = .{ .dir = "/private-cache", .gib = 16 };
++    try s.readCompatibility(Env.get);
++    try std.testing.expectEqual(@as(u64, 86400), s.ttl_s);
++    try std.testing.expectEqual(@as(u64, 7 * (1 << 29)), s.memory_floor);
++    try std.testing.expectError(error.BadSpillSetting, s.readCompatibility(Env.bad));
++}
++
++
++test "cache policy settings default off and reject invalid limits" {
++    const Env = struct {
++        fn absent(_: [:0]const u8) ?[]const u8 { return null; }
++        fn negative(_: [:0]const u8) ?[]const u8 { return "-1"; }
++        fn infinite(_: [:0]const u8) ?[]const u8 { return "inf"; }
++        fn huge(_: [:0]const u8) ?[]const u8 { return "1e300"; }
++    };
++    var s: Settings = .{ .dir = "/private-cache", .gib = 16 };
++    try s.readCompatibility(Env.absent);
++    try std.testing.expectEqual(@as(u64, 0), s.ttl_s);
++    try std.testing.expectEqual(@as(u64, 0), s.memory_floor);
++    for ([_]*const fn ([:0]const u8) ?[]const u8{ Env.negative, Env.infinite, Env.huge }) |env|
++        try std.testing.expectError(error.BadSpillSetting, s.readCompatibility(env));
++}

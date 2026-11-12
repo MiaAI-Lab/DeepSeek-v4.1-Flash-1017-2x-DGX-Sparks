@@ -719,6 +719,30 @@ EOF
   rm -rf -- "$G_T"
 fi
 
+# Optional creation-age and host-memory policies reach both ranks only with spill on.
+case_ "spill policy: defaults remain disabled" 0 'SPILL_GIB=16' '
+  port_validate; port_map
+  [[ " ${PORT_ENV[*]} " != *" TF_DS_SPILL_TTL_H="* ]]
+  [[ " ${PORT_ENV[*]} " != *" TF_DS_SPILL_MEM_FLOOR_GIB="* ]]'
+case_ "spill policy: explicit aliases map equally to both ranks" 0 'SPILL_GIB=16 TF_DS_SPILL_TTL_H=24 TF_DS_SPILL_MEM_FLOOR_GIB=3.5' '
+  port_validate; port_map
+  [[ " ${PORT_ENV[*]} " == *" TF_DS_SPILL_TTL_H=24 "* ]]
+  [[ " ${PORT_ENV[*]} " == *" TF_DS_SPILL_MEM_FLOOR_GIB=3.5 "* ]]'
+case_ "spill policy: off adds no environment" 0 'SPILL_GIB=0 SPILL_TTL_H=24 SPILL_MEM_FLOOR_GIB=3.5' '
+  port_validate; port_map; [[ ${#PORT_ENV[@]} == 0 ]]'
+for bad in -1 nan inf 1e300 87601; do
+  case_ "spill policy: invalid TTL $bad refuses" 1 "SPILL_GIB=16 SPILL_TTL_H=$bad" 'port_validate'
+done
+for bad in -1 nan inf 1e300 1025; do
+  case_ "spill policy: invalid memory floor $bad refuses" 1 "SPILL_GIB=16 SPILL_MEM_FLOOR_GIB=$bad" 'port_validate'
+done
+
+case_ "spill policy: changed limits require a running-pair restart" 0 'SPILL_GIB=16' '
+  port_validate; baseline=$(port_identity)
+  SPILL_TTL_H=24; ttl=$(port_identity); [[ "$ttl" != "$baseline" ]]
+  SPILL_MEM_FLOOR_GIB=3.5; [[ "$(port_identity)" != "$ttl" ]]
+  SPILL_TTL_H=0 SPILL_MEM_FLOOR_GIB=0; [[ "$(port_identity)" == "$baseline" ]]
+  SPILL_GIB=0; [[ "$(port_identity)" == off ]]'
 rm -rf -- "$mt"
 echo "$((n - fails)) of $n checks passed"
 (( fails == 0 ))

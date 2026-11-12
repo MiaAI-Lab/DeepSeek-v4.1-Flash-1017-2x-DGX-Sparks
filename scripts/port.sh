@@ -90,6 +90,8 @@ SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-${TF_DS_SPILL_MIN_TOKENS:-8192}}"
 SPILL_STAGING_MIB="${SPILL_STAGING_MIB:-${TF_DS_SPILL_STAGING_MIB:-128}}"
 SPILL_TURNS="${SPILL_TURNS:-${TF_SPILL_TURNS:-4}}"
 SPILL_FLUSH_MS="${SPILL_FLUSH_MS:-${TF_SPILL_FLUSH_MS:-60000}}"
+SPILL_TTL_H="${SPILL_TTL_H:-${TF_DS_SPILL_TTL_H:-0}}"
+SPILL_MEM_FLOOR_GIB="${SPILL_MEM_FLOOR_GIB:-${TF_DS_SPILL_MEM_FLOOR_GIB:-0}}"
 SPILL_WEIGHTS_SHA="${SPILL_WEIGHTS_SHA:-1}"
 MODEL_QUANT="${MODEL_QUANT:-}"
 KV_SHARD="${KV_SHARD:-${TF_DS_KV_SHARD:-$PORT_SHARD_DEFAULT}}"
@@ -204,6 +206,8 @@ port_validate() {
     elif [[ ! "$WORKER_SPILL_DIR" =~ ^(/|\$HOME/)[A-Za-z0-9._/-]+$ ]]; then port_spill_default_off "WORKER_SPILL_DIR '$WORKER_SPILL_DIR' is not an absolute path (or \$HOME/...) of A-Z a-z 0-9 . _ / - only"; fi
   fi
   if port_spill_on; then
+    port_num "$SPILL_TTL_H" && awk -v n="$SPILL_TTL_H" 'BEGIN {exit !(n >= 0 && n <= 87600)}' || die "SPILL_TTL_H is 0 to 87600 hours"
+    port_num "$SPILL_MEM_FLOOR_GIB" && awk -v n="$SPILL_MEM_FLOOR_GIB" 'BEGIN {exit !(n >= 0 && n <= 1024)}' || die "SPILL_MEM_FLOOR_GIB is 0 to 1024 GiB"
     [[ "$SPILL_FLUSH_MS" =~ ^[0-9]{1,9}$ ]] || die "SPILL_FLUSH_MS (TF_SPILL_FLUSH_MS) is a whole number of milliseconds, not $SPILL_FLUSH_MS"
     [[ "$SPILL_MIN_TOKENS" =~ ^[0-9]{1,9}$ ]] || die "SPILL_MIN_TOKENS is a token count, not $SPILL_MIN_TOKENS"
     (( 10#$SPILL_MIN_TOKENS % 2048 == 0 )) || warn "SPILL_MIN_TOKENS=$SPILL_MIN_TOKENS: kept points sit at 2,048-token boundaries, so it acts as the next multiple of 2048"
@@ -260,7 +264,7 @@ port_validate() {
 #   every rank's Model.open / kv_lanes.Settings: TF_DS_KV_SHARD, TF_DS_KV_SHARD_DECODE, TF_DS_KV_SHARD_CARRY,
 #     TF_DS_KV_SHARD_TWINS, TF_DS_KV_SHARD_CHECK (the pool and window are 0008's: start.sh, from POOL)
 PORT_MAPPED_BASE='TF_DS_POOL|TF_DS_WINDOW|TF_DS_KV_SHARD|TF_DS_KV_SHARD_DECODE|TF_SPILL_DIR|TF_SPILL_GIB|TF_SPILL_MIN_FREE_GIB|TF_SPILL_QUOTA'
-PORT_MAPPED_SPILL='TF_DS_SPILL_DIR|TF_DS_SPILL_GIB|TF_DS_SPILL_MIN_FREE_GIB|TF_DS_SPILL_MIN_TOKENS|TF_DS_SPILL_QUOTA|TF_DS_SPILL_STAGING_MIB|TF_SPILL_TURNS|TF_SPILL_FLUSH_MS|TF_DS_ENGINE_ID|TF_DS_RECIPE_PATCHES|TF_DS_MODEL_REVISION|TF_DS_RANK_CACHE_SHA|TF_DS_ENGRAM_REVISION'
+PORT_MAPPED_SPILL='TF_DS_SPILL_DIR|TF_DS_SPILL_GIB|TF_DS_SPILL_MIN_FREE_GIB|TF_DS_SPILL_MIN_TOKENS|TF_DS_SPILL_QUOTA|TF_DS_SPILL_STAGING_MIB|TF_SPILL_TURNS|TF_SPILL_FLUSH_MS|TF_DS_SPILL_TTL_H|TF_DS_SPILL_MEM_FLOOR_GIB|TF_DS_ENGINE_ID|TF_DS_RECIPE_PATCHES|TF_DS_MODEL_REVISION|TF_DS_RANK_CACHE_SHA|TF_DS_ENGRAM_REVISION'
 PORT_MAPPED_SHARD='TF_DS_KV_SHARD_CARRY|TF_DS_KV_SHARD_TWINS|TF_DS_KV_SHARD_CHECK'
 PORT_MAPPED_RE=$PORT_MAPPED_BASE
 port_map() {
@@ -284,6 +288,8 @@ port_map() {
                "TF_DS_SPILL_MIN_TOKENS=$(( 10#$SPILL_MIN_TOKENS ))" "TF_DS_SPILL_QUOTA=$share"
                "TF_DS_SPILL_STAGING_MIB=$(( 10#$SPILL_STAGING_MIB ))" "TF_SPILL_TURNS=$(( 10#$SPILL_TURNS ))"
                "TF_SPILL_FLUSH_MS=$(port_flush_ms)")
+    if port_gt0 "$SPILL_TTL_H"; then PORT_ENV+=("TF_DS_SPILL_TTL_H=$SPILL_TTL_H"); fi
+    if port_gt0 "$SPILL_MEM_FLOOR_GIB"; then PORT_ENV+=("TF_DS_SPILL_MEM_FLOOR_GIB=$SPILL_MEM_FLOOR_GIB"); fi
     PORT_MAPPED_RE+="|$PORT_MAPPED_SPILL"
   fi
   [[ -z "$RANK1_EXTRA_ENV" ]] || read -ra PORT_RANK1_ENV <<<"$RANK1_EXTRA_ENV"
@@ -429,6 +435,10 @@ port_identity() {
   [[ "$KV_SHARD" != 1 ]] || s+="/${KV_SHARD_DECODE:-fetch}/c${KV_SHARD_CARRY}t${KV_SHARD_TWINS}k$(( 10#$KV_SHARD_CHECK ))"
   # the folders as a checksum (one word, no paths in the label): another folder is another set of kept states
   if port_spill_on; then s+=",spill=$SPILL_GIB/$SPILL_FLOOR_GIB/$SPILL_QUOTA_GIB/$(( 10#$SPILL_MIN_TOKENS ))@$(port_dirs_sum)"; else s+=",spill=0"; fi
+  if port_spill_on; then
+    if port_gt0 "$SPILL_TTL_H"; then s+=",ttl=$SPILL_TTL_H"; fi
+    if port_gt0 "$SPILL_MEM_FLOOR_GIB"; then s+=",mem_floor=$SPILL_MEM_FLOOR_GIB"; fi
+  fi
   echo "$s"
 }
 
