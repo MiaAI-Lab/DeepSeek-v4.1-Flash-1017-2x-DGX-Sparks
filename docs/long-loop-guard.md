@@ -46,8 +46,8 @@ callers should keep their normal tool and task validation.
   duplicates, with the same count-31 instead of 32 final reporting error.
 
 The live results above are supporting deployment evidence for the stated builds,
-not isolated GPU qualification of this PR. Still outstanding before ready-for-
-review: a native two-Spark build of this branch alone, drafted-versus-plain token
+not isolated GPU qualification of this PR. Still outstanding for independent
+GPU qualification: a native two-Spark build of this branch alone, drafted-versus-plain token
 comparison, resumed/concurrent checks and headroom at upstream default context/
 concurrency. Existing production was not interrupted for PR preparation. Private
 conversation captures are not included; detector tests use synthetic token IDs.
