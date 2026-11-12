@@ -26,3 +26,6 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # POOL=2101248                # total pool positions (zig/patches/0008); with KV_SHARD=1, empty: two owner parts of a CONTEXT
 #                             # window each, derived; the same POOL costs about half the KV memory a Spark sharded
 # KV_SHARD_DECODE=fetch       # fetch (reference) or owner (owner-computed decode); empty: the engine's default
+
+# Optional long verbatim reasoning-loop guard (reasoning history is retained).
+# LOOP_GUARD=1

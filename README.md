@@ -267,3 +267,15 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   built on (CUDA, NCCL, cuBLAS; under NVIDIA's container license).
 
 Full list, with commits: [`CREDITS.md`](CREDITS.md).
+
+## Optional long reasoning-loop guard
+
+Set `LOOP_GUARD=1` in `scripts/local.sh` to enable TensorFold's verbatim long-loop
+detector, backported to this recipe's pinned engine. It closes a repeated
+reasoning passage and lets the same reply continue. Default `0` preserves current
+behavior. This is a mitigation, not a model-weight fix or a task-completion
+guarantee; a forced continuation can still make mistakes or repeat actions.
+It does not remove earlier reasoning, set a thinking budget, change compaction
+or enable `--loop-guard-stop`. See `docs/long-loop-guard.md` for evidence and limits.
+
+After changing `LOOP_GUARD`, use `./start.sh restart` to apply it to an existing pair; a running pair is not reconfigured in place.

@@ -98,6 +98,8 @@ SERVE=(tensorfold-native serve "$(served_in_container)" --backend cuda --host "$
 if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking); fi
 [[ -z "$REASONING_EFFORT" ]] || SERVE+=(--reasoning-effort "$REASONING_EFFORT")
 [[ -z "$THINKING_BUDGET" ]] || SERVE+=(--thinking-budget "$THINKING_BUDGET")
+[[ "$LOOP_GUARD" =~ ^[01]$ ]] || die "LOOP_GUARD is 0 or 1, not $LOOP_GUARD"
+[[ "$LOOP_GUARD" != 1 ]] || SERVE+=(--loop-guard)
 [[ "$DROP_REASONING_HISTORY" != 1 ]] || SERVE+=(--drop-reasoning-history)
 # drafts off on rank 0 as on rank 1 (a follower without the drafter refuses a drafted round)
 [[ "$DRAFTS" == 1 ]] || SERVE+=(--no-drafts)
