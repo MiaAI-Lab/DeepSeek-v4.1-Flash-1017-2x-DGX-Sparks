@@ -267,3 +267,18 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   built on (CUDA, NCCL, cuBLAS; under NVIDIA's container license).
 
 Full list, with commits: [`CREDITS.md`](CREDITS.md).
+
+## Optional spill expiry and host-memory admission floor
+
+`0087-spill-expiry-memory-floor.patch` adds `SPILL_TTL_H` (creation age in hours)
+and `SPILL_MEM_FLOOR_GIB` (host `MemAvailable` floor) with spill enabled. Both
+default to zero, preserving current retention and admission. Example: set
+`SPILL_TTL_H=24` and `SPILL_MEM_FLOOR_GIB=3.5` alongside `SPILL_GIB`.
+
+The memory check includes the configured staging reserve, refuses new writes,
+lookups and reads when memory is insufficient or unknown, and allows admitted
+operations to finish. Expired points are excluded from lookup/read; cache access
+prunes unpinned expired points. This is not a background deletion timer, a
+secure-erasure feature or a guarantee against host OOM. Creation age persists
+across restarts. No cache-format change is introduced. The same values reach
+both ranks. See `docs/spill-protections.md` for validation scope.
