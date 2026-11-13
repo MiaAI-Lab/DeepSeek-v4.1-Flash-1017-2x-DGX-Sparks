@@ -2,7 +2,7 @@
 # fork, branch deepseek-v41-zig (TF_REPO at TF_REF), plus zig/patches/*.patch if there are any (git apply in the
 # checkout's root, filename order). The inputs checkout below gets zig/patches-inputs/*.patch the same way (the
 # mixed-pack rank-cache planner). It builds on NVIDIA's PyTorch container, which every Spark already holds: its CUDA
-# toolchain compiles the sm_121 fatbins, its NCCL 2.30.7, cuBLAS and libibverbs are what the engine loads at run time,
+# toolchain compiles the sm_121 fatbins, its NCCL, cuBLAS and libibverbs are what the engine loads at run time,
 # its PyTorch makes the kit's RoPE tables, and its Python with Pillow decodes the picture formats other than PNG (the
 # engine starts a python3 child for them). No GPU is needed to build.
 #
@@ -12,10 +12,10 @@
 # which both engines read) and the standalone make_token_map.py and make_rope.py.
 # Built by scripts/prepare.sh, never by hand: it passes the build arguments and a build context of this file and
 # zig/patches only.
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3@sha256:6d347d649d5dd108b4652f1b9cea6a3c859692ac408617a9108616da40e3da1f
 FROM ${BASE_IMAGE}
 # Optional ABLIT preparation uses the image's PyTorch and safetensors on CPU.
-RUN python3 -m pip install --no-cache-dir safetensors
+RUN python3 -m pip install --no-cache-dir safetensors==0.8.0
 ARG ZIG_VERSION
 ARG ZIG_SHA256
 # The compiler from the first of ZIG_MIRRORS (community mirrors: <base>/zig-aarch64-linux-<version>.tar.xz) that answers
@@ -46,7 +46,12 @@ RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REP
 COPY zig/patches /opt/tf-patches
 RUN cd /tensorfold && \
     for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
-RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
+# Align the checkout's strict compiler pin only for the verified patch release.
+RUN cd /tensorfold && \
+    if [ "$ZIG_VERSION" = 0.17.1 ]; then \
+      test "$(cat .zig-version)" = 0.17.0 && printf '0.17.1\n' > .zig-version; \
+    fi && \
+    /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
       --prefix /opt/tensorfold -j"$(nproc)" install native && \
     test -x /opt/tensorfold/native/bin/tensorfold-native && test -x /opt/tensorfold/bin/tf-dsv41-lanes && \
     mkdir -p /opt/tensorfold/share/doc/tensorfold && \
@@ -63,7 +68,12 @@ RUN git init -q /tf-inputs && cd /tf-inputs && git remote add origin "${TF_REPO}
 COPY zig/patches-inputs /opt/tf-inputs-patches
 RUN cd /tf-inputs && \
     for p in /opt/tf-inputs-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
-RUN cd /tf-inputs && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
+# Align the checkout's strict compiler pin only for the verified patch release.
+RUN cd /tf-inputs && \
+    if [ "$ZIG_VERSION" = 0.17.1 ]; then \
+      test "$(cat .zig-version)" = 0.17.0 && printf '0.17.1\n' > .zig-version; \
+    fi && \
+    /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
       --prefix /opt/inputs -j"$(nproc)" install && \
     test -x /opt/inputs/bin/tf-dsv41-rank-cache && \
     cp /opt/inputs/bin/tf-dsv41-rank-cache /opt/tensorfold/bin/ && \
@@ -72,6 +82,9 @@ RUN cd /tf-inputs && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${S
        /opt/tensorfold/tools/inputs/ && \
     cp LICENSE /opt/tensorfold/share/doc/tensorfold/LICENSE-inputs-branch && \
     rm -rf /tf-inputs /opt/inputs /root/.cache/zig
+
+# Non-PNG vision input is decoded by an isolated Python child.
+RUN python3 -m pip install --no-cache-dir --only-binary=:all: Pillow==13.0.0
 
 ARG PATCHES_HASH
 LABEL tf.patches=${PATCHES_HASH} tf.engine=zig tf.ref=${TF_REF} tf.inputs=${INPUTS_REF}
