@@ -1,0 +1,372 @@
+From 8d4a25fe3568f229068b675a7509681e9cd3b534 Mon Sep 17 00:00:00 2001
+From: Sean Lin <seanlinmt@gmail.com>
+Date: Tue, 17 Nov 2026 02:37:59 +1300
+Subject: [PATCH] feat(core): reserve lanes for short requests and bypass
+ pool-blocked jobs
+
+TF_DS_SHORT_RESERVE_LANES reserves lanes on the host for short requests so long
+requests do not monopolize all streams. A request qualifies as short if short_reserve
+is active, uncached prompt tokens fit cut_in (when set), and uncached prompt tokens
+plus max_tokens does not exceed TF_DS_SHORT_MAX_TOKENS (default 40960). Each job records
+its short qualification at admission (is_short). When a request is requeued due to
+pool room exhaustion (ContextFull), it is marked pool_blocked so qualifying short
+requests behind it in the queue can be admitted immediately out-of-order without
+waiting for full_retry.
+---
+ zig/src/core/lane_host.zig      | 119 +++++++++++++++++++++-----
+ zig/src/core/lane_host_test.zig | 144 ++++++++++++++++++++++++++++++++
+ 2 files changed, 242 insertions(+), 21 deletions(-)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 5245739..4d086ef 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -79,6 +79,8 @@ pub const LaneHost = struct {
+     interleave_ns: i96 = 0,
+     passing: ?*Job = null, // the job whose prompt pass runs inside addStream (Stream.between's caller)
+     between_err: ?anyerror = null,
++    short_reserve: usize = 0,
++    short_max_tokens: usize = 40960,
+     // -- parked requests (0110). The lists are the engine thread's; changes take the lock (status reads their lengths).
+     ready: std.ArrayList(*Job) = .empty, // woken: admitted before the queue, in the order they woke
+     loading: std.ArrayList(Load) = .empty, // each waits for a restore job (several may share one)
+@@ -234,6 +236,8 @@ pub const LaneHost = struct {
+         fork: u32 = 0,
+         lineage: []pc.Fork = &.{}, // the computation its pass's rows belong to (gpa-owned; Store.passLineage)
+         whole: bool = false, // refused as a cut-in (error.FillBusy: its kept state gone): it waits for the pass in pieces
++        is_short: bool = false,
++        pool_blocked: bool = false,
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+@@ -285,6 +289,30 @@ pub const LaneHost = struct {
+         return @min(@as(usize, e.at), r.prompt.len);
+     }
+ 
++    /// Whether a request qualifies as short: short_reserve is active, uncached prompt tokens fit
++    /// cut_in (when set), and uncached prompt tokens + max_tokens fit short_max_tokens.
++    fn isShort(h: *LaneHost, r: *const Request) bool {
++        if (h.short_reserve == 0) return false;
++        const compute = r.prompt.len -| h.resumable(r);
++        if (h.core.cut_in > 0 and compute > h.core.cut_in) return false;
++        return compute +| @as(usize, r.max_tokens) <= h.short_max_tokens;
++    }
++
++    /// Count of admitted jobs that did not qualify as short when admitted.
++    fn longAdmittedCount(h: *const LaneHost) usize {
++        var count: usize = 0;
++        for (h.admitted.items) |job| {
++            if (!job.is_short) count += 1;
++        }
++        return count;
++    }
++
++    /// Whether another non-short job may be admitted while keeping `short_reserve` lanes free.
++    fn hasLongRoom(h: *const LaneHost) bool {
++        if (h.short_reserve == 0) return true;
++        return h.longAdmittedCount() < (h.info_.lanes -| h.short_reserve);
++    }
++
+     /// The pictures' identities the durable tier gets for a request: its `cache_media` only when they name exactly the
+     /// spans the engine runs (`images`: the spans its restored rows and tower work are placed by), one for one; anything
+     /// else gives none, and the tier then misses and keeps nothing for it (a disk hit must not resume pictures placed
+@@ -300,7 +328,12 @@ pub const LaneHost = struct {
+         enforced.loop_guard = true;
+         var ms: i96 = 0;
+         if (std.c.getenv("TF_DS_PREFILL_INTERLEAVE_MS")) |v| ms = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms };
++        var reserve: usize = 0;
++        if (std.c.getenv("TF_DS_SHORT_RESERVE_LANES")) |v| reserve = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
++        reserve = @min(reserve, enforced.lanes -| 1);
++        var short_max: usize = 40960;
++        if (std.c.getenv("TF_DS_SHORT_MAX_TOKENS")) |v| short_max = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 40960;
++        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms, .short_reserve = reserve, .short_max_tokens = short_max };
+     }
+ 
+     /// The tier's switches (before start). Telemetry is published from here on when either is on: a tier on the cache
+@@ -524,7 +557,10 @@ pub const LaneHost = struct {
+             for (h.queued.items, 0..) |job, i| if (job.id == id) {
+                 // the queue's front waits for room (requeue, waitRoom: full_wait holds every admission meanwhile);
+                 // cancelled, nothing waits for it any more
+-                if (i == 0) h.full_wait = null;
++                if (i == 0) {
++                    h.full_wait = null;
++                    for (h.queued.items) |j| j.pool_blocked = false;
++                }
+                 dropped.append(h.gpa, h.queued.orderedRemove(i)) catch {};
+                 break;
+             };
+@@ -586,25 +622,12 @@ pub const LaneHost = struct {
+             h.unlock();
+             return false;
+         }
+-        var at: usize = 0;
+-        if (h.filling != null) {
+-            at = for (h.queued.items, 0..) |j, i| {
+-                if (j.whole) continue;
+-                const r = j.request;
+-                const from = h.resumable(r);
+-                if (h.core.cutsIn(r.prompt.len - from, lanes.Engine.picturesPast(r.images, from))) break i;
+-            } else {
+-                h.unlock();
+-                return false;
+-            };
+-        }
+         if (h.full_wait) |n| {
+             const active = h.core.activeCount();
+-            if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
+-                h.unlock();
+-                return false;
++            if (active == 0 or active < n or std.Io.Clock.awake.now(h.io).toNanoseconds() >= h.full_retry) {
++                h.full_wait = null;
++                for (h.queued.items) |j| j.pool_blocked = false;
+             }
+-            h.full_wait = null;
+         }
+         if (h.finish_until) |t| {
+             if (std.Io.Clock.awake.now(h.io).toNanoseconds() < t and h.nearEnd()) {
+@@ -613,8 +636,44 @@ pub const LaneHost = struct {
+             }
+             h.finish_until = null;
+         }
++        const long_room = h.hasLongRoom();
+         // a woken (restored) request goes first, but not while a pass fills: then only a queued one that cuts in
+-        const job = if (h.filling == null and h.ready.items.len > 0) h.ready.orderedRemove(0) else h.queued.orderedRemove(at);
++        const job: *Job = if (h.filling != null) blk: {
++            const idx = for (h.queued.items, 0..) |j, i| {
++                if (j.whole or j.pool_blocked) continue;
++                const r = j.request;
++                const short = h.isShort(r);
++                if (h.full_wait != null and !short) continue;
++                if (!long_room and !short) continue;
++                const from = h.resumable(r);
++                if (h.core.cutsIn(r.prompt.len - from, lanes.Engine.picturesPast(r.images, from))) {
++                    j.is_short = short;
++                    break i;
++                }
++            } else {
++                h.unlock();
++                return false;
++            };
++            break :blk h.queued.orderedRemove(idx);
++        } else if (h.ready.items.len > 0 and (h.full_wait == null or h.isShort(h.ready.items[0].request))) blk: {
++            const j = h.ready.orderedRemove(0);
++            if (h.full_wait != null) j.is_short = true else j.is_short = h.isShort(j.request);
++            break :blk j;
++        } else blk: {
++            const idx = for (h.queued.items, 0..) |j, i| {
++                if (j.pool_blocked) continue;
++                const short = h.isShort(j.request);
++                if (h.full_wait != null and !short) continue;
++                if (long_room or short) {
++                    j.is_short = short;
++                    break i;
++                }
++            } else {
++                h.unlock();
++                return false;
++            };
++            break :blk h.queued.orderedRemove(idx);
++        };
+         if (h.parking()) {
+             h.unlock();
+             if (h.park(job)) return true; // waits for a restore, holding no lane
+@@ -689,7 +748,10 @@ pub const LaneHost = struct {
+             if (h.isBroken()) return h.dropBroken(job);
+             if (e == error.Cancelled) return h.cancel(job);
+             // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
+-            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
++            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) {
++                job.pool_blocked = true;
++                return h.requeue(job);
++            }
+             // refused as a cut-in (its kept state gone as its pass opened): it waits for the pass in pieces, not
+             // tried again between that pass's pieces
+             if (e == error.FillBusy and h.filling != null) {
+@@ -910,8 +972,22 @@ pub const LaneHost = struct {
+         };
+         h.full_wait = h.core.activeCount();
+         h.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
++        const has_more = blk: {
++            if (h.admitted.items.len >= h.info_.lanes) break :blk false;
++            if (h.filling == null and h.ready.items.len > 0 and h.isShort(h.ready.items[0].request)) break :blk true;
++            for (h.queued.items) |j| {
++                if (j.pool_blocked) continue;
++                if (!h.isShort(j.request)) continue;
++                if (h.filling != null) {
++                    if (j.whole) continue;
++                    const from = h.resumable(j.request);
++                    if (h.core.cutsIn(j.request.prompt.len - from, lanes.Engine.picturesPast(j.request.images, from))) break :blk true;
++                } else break :blk true;
++            }
++            break :blk false;
++        };
+         h.unlock();
+-        return false;
++        return has_more;
+     }
+ 
+     /// A job cancelled in its prompt pass, its lane already released.
+@@ -1173,6 +1249,7 @@ pub const LaneHost = struct {
+             note("reading {d} kept tokens from disk waited {d} ms for room in the pool ({d} streams hold it); it waits no longer", .{ p.at, @divTrunc(now - first, std.time.ns_per_ms), active });
+             return false;
+         }
++        job.pool_blocked = true;
+         h.lock();
+         h.queued.insert(h.gpa, 0, job) catch {
+             h.unlock();
+diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
+index 4b18c36..1b62f34 100644
+--- a/zig/src/core/lane_host_test.zig
++++ b/zig/src/core/lane_host_test.zig
+@@ -517,3 +517,147 @@ test "a cut-in its backend refuses as its pass opens (its kept state gone) waits
+     for (order[0..6], 0..) |o, i| try std.testing.expectEqual([2]usize{ CutIn.long.len, i }, o);
+     for (order[6..12], 0..) |o, i| try std.testing.expectEqual([2]usize{ 3, i }, o);
+ }
++test "with short_reserve on, a lane is kept for a short request while a second long request waits" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.short_reserve = 1;
++    host.short_max_tokens = 100;
++    try host.start();
++    defer host.stop();
++
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        done: ?Reason = null,
++        tokens: usize = 0,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens += t.len,
++                .finished => |f| b.done = f.reason,
++                else => {},
++            }
++        }
++        fn state(b: *@This()) struct { ?Reason, usize } {
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            return .{ b.done, b.tokens };
++        }
++        fn waitFor(b: *@This(), ms: u32) ?Reason {
++            for (0..ms) |_| {
++                if (b.state()[0]) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++            return b.state()[0];
++        }
++    };
++
++    const long_prompt: [128]u32 = @splat(1);
++    const short_prompt = [_]u32{ 2, 7, 1, 8 };
++    var long1: Box = .{};
++    var long2: Box = .{};
++    var short: Box = .{};
++    const e = host.engine();
++
++    // long1 prompt length (128) exceeds short_max_tokens (100)
++    try e.submit(1, &.{ .prompt = &long_prompt, .max_tokens = 1 << 30 }, .{ .ctx = &long1, .event = Box.event });
++    while (long1.state()[1] == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++
++    // long2 max_tokens (200) exceeds short_max_tokens (100)
++    try e.submit(2, &.{ .prompt = &short_prompt, .max_tokens = 200 }, .{ .ctx = &long2, .event = Box.event });
++    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
++    try std.testing.expectEqual(@as(usize, 0), long2.state()[1]);
++
++    // short request fits short_max_tokens (4 + 8 <= 100) and is admitted to the reserved lane
++    try e.submit(3, &.{ .prompt = &short_prompt, .max_tokens = 8 }, .{ .ctx = &short, .event = Box.event });
++    try std.testing.expectEqual(@as(?Reason, Reason.length), short.waitFor(5000));
++    try std.testing.expectEqual(@as(usize, 8), short.state()[1]);
++
++    try std.testing.expectEqual(@as(usize, 0), long2.state()[1]);
++
++    e.cancel(1);
++    try std.testing.expect(long1.waitFor(5000) != null);
++
++    for (0..5000) |_| {
++        if (long2.state()[1] > 0) break;
++        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++    }
++    try std.testing.expect(long2.state()[1] > 0);
++    e.cancel(2);
++    try std.testing.expect(long2.waitFor(5000) != null);
++}
++
++test "a request refused for room is marked pool_blocked and a short request behind it is admitted out of order" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .refuse_full = 1 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.short_reserve = 1;
++    try host.start();
++    defer host.stop();
++
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        done: ?Reason = null,
++        tokens: usize = 0,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens += t.len,
++                .finished => |f| b.done = f.reason,
++                else => {},
++            }
++        }
++        fn state(b: *@This()) struct { ?Reason, usize } {
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            return .{ b.done, b.tokens };
++        }
++        fn waitFor(b: *@This(), ms: u32) ?Reason {
++            for (0..ms) |_| {
++                if (b.state()[0]) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++            return b.state()[0];
++        }
++    };
++
++    const prompt = [_]u32{ 2, 7, 1, 8 };
++    var active_stream: Box = .{};
++    var blocked_req: Box = .{};
++    var short_req: Box = .{};
++    const e = host.engine();
++
++    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 1 << 30 }, .{ .ctx = &active_stream, .event = Box.event });
++    while (active_stream.state()[1] == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++
++    try e.submit(2, &.{ .prompt = &prompt, .max_tokens = 50 }, .{ .ctx = &blocked_req, .event = Box.event });
++    try e.submit(3, &.{ .prompt = &prompt, .max_tokens = 8 }, .{ .ctx = &short_req, .event = Box.event });
++
++    try std.testing.expectEqual(@as(?Reason, Reason.length), short_req.waitFor(500));
++    try std.testing.expectEqual(@as(usize, 8), short_req.state()[1]);
++
++    try std.testing.expectEqual(@as(usize, 0), target.refuse_full);
++    try std.testing.expect(blocked_req.state()[0] == null);
++
++    e.cancel(1);
++    try std.testing.expect(active_stream.waitFor(5000) != null);
++
++    try std.testing.expectEqual(@as(?Reason, Reason.length), blocked_req.waitFor(5000));
++    try std.testing.expectEqual(@as(usize, 50), blocked_req.state()[1]);
++}
+-- 
+2.43.0
+

@@ -26,3 +26,10 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # POOL=2101248                # total pool positions (zig/patches/0008); with KV_SHARD=1, empty: two owner parts of a CONTEXT
 #                             # window each, derived; the same POOL costs about half the KV memory a Spark sharded
 # KV_SHARD_DECODE=fetch       # fetch (reference) or owner (owner-computed decode); empty: the engine's default
+
+# Chunked prefill, cut-in & short request lanes:
+# TF_FILL_CHUNKS=1            # Run long prefills in 2048-token pieces
+# TF_FILL_FIRST=1             # Yield after the first 2048-token chunk
+# TF_FILL_CUT_IN=8192         # Requests computing <=8k uncached tokens cut in immediately
+# TF_DS_SHORT_RESERVE_LANES=2 # Reserve lanes for short requests (e.g. 2 of 8)
+# TF_DS_SHORT_MAX_TOKENS=40960 # Max uncached prompt + max_tokens to qualify as short (default: 40960)
